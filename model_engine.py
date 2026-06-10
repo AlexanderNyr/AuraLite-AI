@@ -11,6 +11,9 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_CPU_COUNT))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_COUNT))
 
 import math
+import re
+from collections import Counter
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,6 +26,194 @@ try:
     torch.set_num_interop_threads(max(1, _CPU_COUNT))
 except (RuntimeError, ValueError):
     pass
+
+
+# ===================================================================
+#  Tokenizers — character-level and BPE (Byte/Char Pair Encoding)
+# ===================================================================
+
+class CharTokenizer:
+    """Simple character-level tokenizer (original AuraLite behaviour)."""
+
+    kind = "char"
+
+    def __init__(self):
+        self.vocab: list[str] = []
+        self.token_to_id: dict[str, int] = {}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+    def train(self, text: str, vocab_size: int | None = None):
+        self.vocab = sorted(set(text))
+        self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
+
+    def encode(self, s: str) -> list[int]:
+        fb = self.token_to_id.get(" ", 0)
+        return [self.token_to_id.get(c, fb) for c in s]
+
+    def decode(self, ids) -> str:
+        return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else "?"
+                       for i in ids)
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "vocab": self.vocab}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CharTokenizer":
+        tok = cls()
+        tok.vocab = list(d["vocab"])
+        tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
+        return tok
+
+
+class BPETokenizer:
+    """Mini BPE tokenizer (classic word-frequency algorithm, GPT-2 style).
+
+    Trained on the corpus itself: starts from the character vocabulary and
+    greedily merges the most frequent adjacent pair until `vocab_size` is
+    reached. Merges never cross whitespace-split piece boundaries, and
+    encoding caches per-piece results, so both training and encoding stay
+    fast even on multi-megabyte texts.
+    """
+
+    kind = "bpe"
+
+    def __init__(self):
+        self.vocab: list[str] = []
+        self.token_to_id: dict[str, int] = {}
+        # ordered merge rules: (id_a, id_b) -> new_id, rank = list index
+        self.merges: list[tuple[int, int, int]] = []
+        self._ranks: dict[tuple[int, int], tuple[int, int]] = {}
+        self._cache: dict[str, list[int]] = {}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+    # ---- helpers -----------------------------------------------------
+    @staticmethod
+    def _split_pieces(text: str) -> list[str]:
+        # keep whitespace runs as separate pieces so nothing is lost
+        return [p for p in re.split(r"(\s+)", text) if p]
+
+    def _build_ranks(self):
+        self._ranks = {(a, b): (r, nid) for r, (a, b, nid) in enumerate(self.merges)}
+        self._cache = {}
+
+    # ---- training ----------------------------------------------------
+    def train(self, text: str, vocab_size: int = 512):
+        base_chars = sorted(set(text))
+        self.vocab = list(base_chars)
+        self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
+        self.merges = []
+
+        if vocab_size <= len(self.vocab):
+            self._build_ranks()
+            return
+
+        # word-frequency corpus: distinct pieces with counts
+        piece_counts = Counter(self._split_pieces(text))
+        corpus: list[tuple[list[int], int]] = [
+            ([self.token_to_id[c] for c in piece], cnt)
+            for piece, cnt in piece_counts.items()
+        ]
+
+        while len(self.vocab) < vocab_size:
+            pair_counts: Counter = Counter()
+            for ids, cnt in corpus:
+                for i in range(len(ids) - 1):
+                    pair_counts[(ids[i], ids[i + 1])] += cnt
+            if not pair_counts:
+                break
+            (a, b), best_cnt = pair_counts.most_common(1)[0]
+            if best_cnt < 2:
+                break
+
+            new_id = len(self.vocab)
+            new_tok = self.vocab[a] + self.vocab[b]
+            self.vocab.append(new_tok)
+            self.token_to_id[new_tok] = new_id
+            self.merges.append((a, b, new_id))
+
+            # apply the merge to every distinct piece
+            for entry in corpus:
+                ids = entry[0]
+                if len(ids) < 2:
+                    continue
+                i, out = 0, []
+                while i < len(ids):
+                    if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
+                        out.append(new_id)
+                        i += 2
+                    else:
+                        out.append(ids[i])
+                        i += 1
+                entry[0][:] = out
+
+        self._build_ranks()
+
+    # ---- encode / decode ----------------------------------------------
+    def _encode_piece(self, piece: str) -> list[int]:
+        cached = self._cache.get(piece)
+        if cached is not None:
+            return cached
+
+        fb = self.token_to_id.get(" ", 0)
+        ids = [self.token_to_id.get(c, fb) for c in piece]
+        # repeatedly apply the lowest-rank merge present (GPT-2 algorithm)
+        while len(ids) > 1:
+            best_rank, best_pos, best_new = None, -1, -1
+            for i in range(len(ids) - 1):
+                r = self._ranks.get((ids[i], ids[i + 1]))
+                if r is not None and (best_rank is None or r[0] < best_rank):
+                    best_rank, best_pos, best_new = r[0], i, r[1]
+            if best_rank is None:
+                break
+            a, b = ids[best_pos], ids[best_pos + 1]
+            i, out = 0, []
+            while i < len(ids):
+                if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
+                    out.append(best_new)
+                    i += 2
+                else:
+                    out.append(ids[i])
+                    i += 1
+            ids = out
+
+        if len(self._cache) < 200_000:
+            self._cache[piece] = ids
+        return ids
+
+    def encode(self, s: str) -> list[int]:
+        out: list[int] = []
+        for piece in self._split_pieces(s):
+            out.extend(self._encode_piece(piece))
+        return out
+
+    def decode(self, ids) -> str:
+        return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else "?"
+                       for i in ids)
+
+    # ---- (de)serialization ---------------------------------------------
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "vocab": self.vocab, "merges": self.merges}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BPETokenizer":
+        tok = cls()
+        tok.vocab = list(d["vocab"])
+        tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
+        tok.merges = [tuple(m) for m in d.get("merges", [])]
+        tok._build_ranks()
+        return tok
+
+
+def tokenizer_from_dict(d: dict):
+    if d.get("kind") == "bpe":
+        return BPETokenizer.from_dict(d)
+    return CharTokenizer.from_dict(d)
 
 
 # ===================================================================
@@ -45,7 +236,11 @@ class RMSNorm(nn.Module):
 # -------------------------------------------------------------------
 
 class Attention(nn.Module):
-    """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache."""
+    """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
+
+    Uses torch.nn.functional.scaled_dot_product_attention (Flash / memory-
+    efficient kernels when available) instead of a hand-rolled softmax.
+    """
 
     def __init__(self, d_model: int, n_heads: int,
                  n_kv_heads: int | None = None,
@@ -91,7 +286,6 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
         B, T, _ = x.shape
-        end_pos = start_pos + T
 
         q = self.W_q(x).view(B, T, self.n_heads,    self.head_dim)
         k = self.W_k(x).view(B, T, self.n_kv_heads,  self.head_dim)
@@ -118,17 +312,21 @@ class Attention(nn.Module):
             self.kv_cache = (k, v)
 
         S = k.shape[2]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # Flash / memory-efficient attention via PyTorch SDPA
+        if T == S:
+            # full sequence (training or seed pass) — standard causal mask
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif T == 1:
+            # incremental decoding — the single query may attend to all keys
+            out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # general case (chunked decoding with cache)
+            q_pos = torch.arange(start_pos, start_pos + T, device=x.device)
+            k_pos = torch.arange(S, device=x.device)
+            keep = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)         # True = attend
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
 
-        # Causal mask — query at absolute position *p* may attend to keys at ≤ *p*
-        q_pos = torch.arange(start_pos, end_pos,   device=x.device).unsqueeze(1)   # (T, 1)
-        k_pos = torch.arange(S,                     device=x.device).unsqueeze(0)   # (1, S)
-        mask  = k_pos > q_pos                                           # (T, S) True = masked
-        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        attn = torch.softmax(scores.float(), dim=-1).type_as(q)
-        out  = torch.matmul(attn, v)                                    # (B, nh, T, hd)
-        out  = out.transpose(1, 2).contiguous().view(B, T, -1)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.W_o(out)
 
     def reset_cache(self):
@@ -183,6 +381,8 @@ class ModernTransformer(nn.Module):
     • RoPE     (Rotary Pos. Emb.)  — generalises to unseen lengths
     • SwiGLU   activation          — better than plain ReLU / GELU
     • Multi-Head Attn w/ opt. GQA  — flexible efficiency
+    • Flash Attention (SDPA)       — fused, memory-efficient kernels
+    • Weight tying (emb = head)    — fewer params, better generalisation
     • No bias in linear layers     — modern practice
     • KV-cache for fast generation — O(1) per token after prompt
     • Configurable depth (n_layers)
@@ -217,6 +417,10 @@ class ModernTransformer(nn.Module):
         # Modern weight init (GPT-2 / LLaMA style)
         self.apply(self._init_weights)
 
+        # Weight tying: output head shares the embedding matrix
+        # (GPT-2 / LLaMA practice — fewer parameters, better generalisation)
+        self.head.weight = self.embedding.weight
+
     @staticmethod
     def _init_weights(module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -228,11 +432,16 @@ class ModernTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
+        """Returns logits for ALL positions: (B, T, vocab_size).
+
+        Training uses every position (dense next-token loss, nanoGPT-style);
+        generation simply takes the last position: logits[:, -1, :].
+        """
         h = self.embedding(x)
         for layer in self.layers:
             h = layer(h, start_pos, use_cache)
         h = self.final_norm(h)
-        return self.head(h[:, -1, :])          # next-token prediction from last position
+        return self.head(h)
 
     def reset_cache(self):
         for layer in self.layers:
@@ -247,10 +456,13 @@ class ModernTransformer(nn.Module):
 # ===================================================================
 
 class CharDataset(Dataset):
-    """Sliding-window character-level dataset.
+    """Sliding-window token-level dataset.
 
     Stores the full encoded text as a single tensor and produces
-    (input_seq, next_char) samples on the fly.
+    (input_seq, target_seq) samples on the fly, where target_seq is
+    input_seq shifted by one — so the loss is computed over EVERY
+    position of the window (dense next-token prediction), not just
+    the last one. This makes training ~seq_length× more sample-efficient.
     """
 
     def __init__(self, encoded: torch.Tensor, seq_length: int):
@@ -262,7 +474,7 @@ class CharDataset(Dataset):
 
     def __getitem__(self, idx: int):
         x = self.data[idx : idx + self.seq_length]
-        y = self.data[idx + self.seq_length]
+        y = self.data[idx + 1 : idx + self.seq_length + 1]
         return x, y
 
 
@@ -314,24 +526,54 @@ class AuraLiteEngine:
         self.optimizer   = None
         self.scheduler   = None
         self.scaler      = None
-        self.chars: list[str]         = []
-        self.char_to_idx: dict         = {}
-        self.idx_to_char: dict         = {}
+        self.tokenizer   = None              # CharTokenizer | BPETokenizer
         self.vocab_size  = 0
-        self.params_used: dict         = {}     # remember last training params
+        self.params_used: dict = {}          # remember last training params
+        self.last_val_loss: float | None = None
 
     # ---- Tokenisation -----------------------------------------------
     def encode(self, s: str) -> list[int]:
-        fallback = self.char_to_idx.get(" ", 0)
-        return [self.char_to_idx.get(c, fallback) for c in s]
+        if self.tokenizer is None:
+            raise ValueError("No tokenizer — train or load a model first!")
+        return self.tokenizer.encode(s)
 
     def decode(self, ids) -> str:
-        return "".join(self.idx_to_char.get(int(i), "?") for i in ids)
+        if self.tokenizer is None:
+            raise ValueError("No tokenizer — train or load a model first!")
+        return self.tokenizer.decode(ids)
+
+    # ---- Validation ----------------------------------------------------
+    @torch.no_grad()
+    def _evaluate(self, loader, criterion, max_batches: int = 50) -> float:
+        self.model.eval()
+        total, n = 0.0, 0
+        for i, (xb, yb) in enumerate(loader):
+            if i >= max_batches:
+                break
+            xb = xb.to(self.device, non_blocking=True)
+            yb = yb.to(self.device, non_blocking=True)
+            out = self.model(xb)
+            total += criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1)).item()
+            n += 1
+        self.model.train()
+        return total / max(1, n)
 
     # ---- Training ----------------------------------------------------
     def train(self, training_text: str, params: dict,
               progress_callback=None, stop_event=None):
+        """Train (or continue training) the model.
 
+        progress_callback(epoch, total_epochs, train_loss, val_loss_or_None)
+
+        params (beyond architecture/optimizer):
+          tokenizer        : "char" (default) or "bpe"
+          bpe_vocab_size   : target BPE vocab (default 512)
+          val_split        : fraction of text held out for validation (default 0.1)
+          use_compile      : try torch.compile for the training loop (default False)
+          autosave_every   : autosave checkpoint every N epochs, 0 = off
+          autosave_path    : where to autosave (default "aura_autosave.pt")
+          continue_training: keep existing model/tokenizer and fine-tune (default False)
+        """
         seq_length = params.get("seq_length", 64)
         d_model    = params.get("d_model", 128)
         d_ff       = params.get("d_ff", 256)
@@ -345,25 +587,48 @@ class AuraLiteEngine:
         grad_clip  = params.get("grad_clip", 1.0)
         weight_decay = params.get("weight_decay", 0.01)
 
+        tok_kind     = params.get("tokenizer", "char")
+        bpe_vocab    = params.get("bpe_vocab_size", 512)
+        val_split    = params.get("val_split", 0.1)
+        use_compile  = params.get("use_compile", False)
+        autosave_every = params.get("autosave_every", 0)
+        autosave_path  = params.get("autosave_path", "aura_autosave.pt")
+        continue_training = params.get("continue_training", False)
+
         self.params_used = dict(params)
 
-        # ---- Vocabulary -----------------------------------------------
-        self.chars = sorted(list(set(training_text)))
-        self.vocab_size = len(self.chars)
-        self.char_to_idx = {ch: i for i, ch in enumerate(self.chars)}
-        self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
+        resuming = bool(continue_training and self.model is not None
+                        and self.tokenizer is not None)
+
+        # ---- Tokenizer ------------------------------------------------
+        if not resuming:
+            if tok_kind == "bpe":
+                self.tokenizer = BPETokenizer()
+                # train merges on a capped sample for speed on huge files
+                sample = training_text[:2_000_000]
+                self.tokenizer.train(sample, vocab_size=bpe_vocab)
+                # make sure every char of the full text is representable
+                missing = sorted(set(training_text) - set(self.tokenizer.vocab))
+                for ch in missing:
+                    self.tokenizer.token_to_id[ch] = len(self.tokenizer.vocab)
+                    self.tokenizer.vocab.append(ch)
+            else:
+                self.tokenizer = CharTokenizer()
+                self.tokenizer.train(training_text)
+            self.vocab_size = self.tokenizer.vocab_size
 
         # ---- Model ----------------------------------------------------
-        self.model = ModernTransformer(
-            vocab_size=self.vocab_size,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_ff=d_ff,
-            max_seq_len=4096,
-            n_kv_heads=n_kv_heads,
-            dropout=dropout,
-        ).to(self.device)
+        if not resuming:
+            self.model = ModernTransformer(
+                vocab_size=self.vocab_size,
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                d_ff=d_ff,
+                max_seq_len=4096,
+                n_kv_heads=n_kv_heads,
+                dropout=dropout,
+            ).to(self.device)
 
         self.optimizer = optim.AdamW(
             self.model.parameters(), lr=lr,
@@ -377,7 +642,14 @@ class AuraLiteEngine:
 
         # ---- Dataset / DataLoader ------------------------------------
         encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
-        dataset = CharDataset(encoded, seq_length)
+
+        n_val = int(len(encoded) * val_split) if val_split > 0 else 0
+        if n_val <= seq_length + 1:
+            n_val = 0
+        train_data = encoded[: len(encoded) - n_val] if n_val else encoded
+        val_data   = encoded[len(encoded) - n_val - seq_length:] if n_val else None
+
+        dataset = CharDataset(train_data, seq_length)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
@@ -397,14 +669,27 @@ class AuraLiteEngine:
             loader_kwargs["prefetch_factor"] = 2
 
         loader = DataLoader(dataset, **loader_kwargs)
+        val_loader = (DataLoader(CharDataset(val_data, seq_length),
+                                 batch_size=batch_size, shuffle=False)
+                      if val_data is not None else None)
+
         total_steps  = epochs * len(loader)
         warmup_steps = min(200, total_steps // 10)
         self.scheduler = CosineWarmupScheduler(
             self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
         )
 
+        # ---- torch.compile (optional, speeds up the training loop) ----
+        train_model = self.model
+        if use_compile:
+            try:
+                train_model = torch.compile(self.model)
+            except Exception:
+                train_model = self.model   # graceful fallback
+
         # ---- Epoch loop -----------------------------------------------
         self.model.train()
+        self.last_val_loss = None
         for epoch in range(epochs):
             if stop_event and stop_event.is_set():
                 break
@@ -421,9 +706,14 @@ class AuraLiteEngine:
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
 
+                self.optimizer.zero_grad(set_to_none=True)
+
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    output = self.model(xb)
-                    loss   = criterion(output, yb)
+                    output = train_model(xb)                      # (B, T, vocab)
+                    loss   = criterion(
+                        output.reshape(-1, output.size(-1)),      # (B·T, vocab)
+                        yb.reshape(-1),                           # (B·T,)
+                    )
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -438,14 +728,26 @@ class AuraLiteEngine:
             if stopped_mid:
                 break
 
+            val_loss = None
+            if val_loader is not None:
+                val_loss = self._evaluate(val_loader, criterion)
+                self.last_val_loss = val_loss
+
+            if autosave_every and (epoch + 1) % autosave_every == 0:
+                try:
+                    self.save_model(autosave_path)
+                except Exception:
+                    pass   # autosave must never kill training
+
             if progress_callback and seen_batches > 0:
                 avg_loss = running_loss / seen_batches
-                progress_callback(epoch + 1, epochs, avg_loss)
+                progress_callback(epoch + 1, epochs, avg_loss, val_loss)
 
     # ---- Generation ---------------------------------------------------
     def generate(self, start_str: str, length: int = 50,
                  temperature: float = 0.8,
-                 top_k: int = 50, top_p: float = 0.9) -> str:
+                 top_k: int = 50, top_p: float = 0.9,
+                 repetition_penalty: float = 1.0) -> str:
 
         if self.model is None:
             raise ValueError("Train or load a model first!")
@@ -453,32 +755,49 @@ class AuraLiteEngine:
         self.model.eval()
         self.model.reset_cache()
 
-        seed_ids = self.encode(start_str)
-        result: list[str] = list(start_str)
+        ids = self.encode(start_str)
+        if not ids:
+            ids = [0]
+        result_ids: list[int] = list(ids)
 
         with torch.no_grad():
-            # --- Process full seed in one pass (no padding needed) ------
-            ids_tensor = torch.tensor([seed_ids], dtype=torch.long).to(self.device)
-            logits = self.model(ids_tensor, start_pos=0, use_cache=True)
-            result.append(self._sample_token(logits[0], temperature, top_k, top_p))
+            # --- Process full seed in one pass --------------------------
+            t = torch.tensor([ids], dtype=torch.long).to(self.device)
+            logits = self.model(t, start_pos=0, use_cache=True)
+            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                     repetition_penalty, result_ids)
+            result_ids.append(nxt)
 
             # --- Generate remaining tokens one-by-one (KV-cache) --------
-            for i in range(length - 1):
-                last_id = self.encode(result[-1])
-                ids_tensor = torch.tensor([[last_id[0]]], dtype=torch.long).to(self.device)
-                logits = self.model(
-                    ids_tensor,
-                    start_pos=len(seed_ids) + i,
-                    use_cache=True,
-                )
-                result.append(self._sample_token(logits[0], temperature, top_k, top_p))
+            for _ in range(length - 1):
+                pos = len(result_ids) - 1
+                if pos >= self.model.max_seq_len - 1:
+                    break   # context limit reached
+                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
+                logits = self.model(t, start_pos=pos, use_cache=True)
+                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                         repetition_penalty, result_ids)
+                result_ids.append(nxt)
 
         self.model.reset_cache()
-        return "".join(result)
+        return self.decode(result_ids)
 
     def _sample_token(self, logits: torch.Tensor,
-                      temperature: float, top_k: int, top_p: float) -> str:
-        """Sample a single token with temperature, top-k, and top-p (nucleus)."""
+                      temperature: float, top_k: int, top_p: float,
+                      repetition_penalty: float = 1.0,
+                      recent_ids: list[int] | None = None) -> int:
+        """Sample a single token id with temperature, repetition penalty,
+        top-k, and top-p (nucleus) filtering."""
+        logits = logits.float().clone()
+
+        # Repetition penalty (CTRL-style): discourage recently used tokens
+        if repetition_penalty and repetition_penalty != 1.0 and recent_ids:
+            for tid in set(recent_ids[-64:]):
+                if logits[tid] > 0:
+                    logits[tid] /= repetition_penalty
+                else:
+                    logits[tid] *= repetition_penalty
+
         logits = logits / max(temperature, 1e-8)
 
         # Top-k filtering
@@ -495,9 +814,8 @@ class AuraLiteEngine:
             remove[0]  = False
             logits = logits.scatter(0, sorted_idx[remove], float("-inf"))
 
-        probs   = torch.softmax(logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1).item()
-        return self.idx_to_char[next_id]
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).item()
 
     # ---- Save / Load --------------------------------------------------
     def save_model(self, path: str):
@@ -506,9 +824,7 @@ class AuraLiteEngine:
         checkpoint = {
             "model_state":  self.model.state_dict(),
             "vocab_size":   self.vocab_size,
-            "chars":        self.chars,
-            "char_to_idx":  self.char_to_idx,
-            "idx_to_char":  {int(k): v for k, v in self.idx_to_char.items()},
+            "tokenizer":    self.tokenizer.to_dict() if self.tokenizer else None,
             "params_used":  self.params_used,
             # Store all architecture fields explicitly
             "d_model":      self.model.d_model,
@@ -524,11 +840,16 @@ class AuraLiteEngine:
     def load_model(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        self.chars        = checkpoint["chars"]
-        self.vocab_size   = checkpoint["vocab_size"]
-        self.char_to_idx  = checkpoint["char_to_idx"]
-        self.idx_to_char  = {int(k): v for k, v in checkpoint["idx_to_char"].items()}
-        self.params_used  = checkpoint.get("params_used", {})
+        if checkpoint.get("tokenizer"):
+            self.tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
+        elif "chars" in checkpoint:
+            # backward compatibility with old char-level checkpoints
+            self.tokenizer = CharTokenizer.from_dict({"vocab": checkpoint["chars"]})
+        else:
+            raise ValueError("Checkpoint has no tokenizer information.")
+
+        self.vocab_size  = checkpoint["vocab_size"]
+        self.params_used = checkpoint.get("params_used", {})
 
         self.model = ModernTransformer(
             vocab_size  = self.vocab_size,
