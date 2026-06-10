@@ -6,6 +6,8 @@
 - **PyTorch Engine**: Transitioned from NumPy to PyTorch for professional-grade tensor operations and optimization.
 - **Transformer Architecture**: A decoder-only transformer featuring a custom Self-Attention mechanism and Layer Normalization.
 - **Hardware Acceleration**: Automatic detection and usage of **NVIDIA CUDA** (GPU) for training and generation, with a seamless fallback to **CPU**.
+- **Full CPU Multithreading**: Automatically configures PyTorch (and the OpenMP/MKL backends) to use **all available CPU cores**, and trains with a multithreaded `DataLoader` for maximum throughput on CPU-only machines.
+- **Mini-Batch Training**: Training is performed in shuffled mini-batches via PyTorch `DataLoader` (configurable **Batch Size**), which scales to large text files with low memory usage.
 - **Advanced GUI**: A comprehensive control panel built with `tkinter` that allows real-time interaction with the model.
 - **Hyperparameter Tuning**: Full control over the AI's "brain" directly from the interface:
   - **Learning Rate**: Controls how fast the model adapts to new data.
@@ -13,6 +15,7 @@
   - **Model Dimension (D_Model)**: Sets the size of the internal vector representations.
   - **Feed-Forward Dimension (D_FF)**: Controls the capacity of the processing layers.
   - **Context Window (Seq Length)**: Defines how many previous characters the AI considers when predicting the next one.
+  - **Batch Size**: Number of samples processed per optimizer step. Larger values use more memory but better utilize multiple CPU cores / the GPU.
 - **Custom Training**: Upload any `.txt` file to teach the AI specific styles, languages, or fictional worlds.
 - **Interruptible Training**: Ability to stop training at any point and preserve the learned weights for immediate testing.
 
@@ -50,10 +53,10 @@
    - Click **"Generate Text"** and watch the AI create content based on its training.
 
 ## 🔨 Compiling to .exe (Windows)
-To bundle the application into a single portable executable:
+To bundle the application into a portable application folder:
 1. Run the provided `build_exe.bat` file.
-2. The script will automatically install `PyInstaller` and bundle the PyTorch environment.
-3. The final executable will be located in the `dist/` folder as `AuraLite_AI_CUDA.exe`.
+2. The script will automatically install `PyInstaller` and bundle the PyTorch environment using **`--onedir`** mode (faster startup and easier to update than a single-file build).
+3. The final build will be located in `dist/AuraLite_AI_CUDA/`. Launch it via `dist/AuraLite_AI_CUDA/AuraLite_AI_CUDA.exe` (distribute the whole folder).
 
 ## ⚠️ Hardware Compatibility Note
 - **CUDA Acceleration**: Requires an NVIDIA GPU with Compute Capability 5.0 or higher.
