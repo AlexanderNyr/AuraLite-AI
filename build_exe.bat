@@ -19,14 +19,15 @@ echo This might take some time as PyTorch is large...
 python -m pip install torch numpy pyinstaller
 
 echo.
-echo [+] Starting compilation...
-python -m PyInstaller --onefile --noconsole --name "AuraLite_AI_CUDA" gui_app.py
+echo [+] Starting compilation (--onedir)...
+python -m PyInstaller --onedir --noconsole --name "AuraLite_AI_CUDA" gui_app.py
 
 if %errorlevel% equ 0 (
     echo.
     echo ====================================================
     echo [OK] Build successful!
-    echo Your file is in: \dist\AuraLite_AI_CUDA.exe
+    echo Your app folder is in: \dist\AuraLite_AI_CUDA\
+    echo Run: \dist\AuraLite_AI_CUDA\AuraLite_AI_CUDA.exe
     echo ====================================================
 ) else (
     echo.
