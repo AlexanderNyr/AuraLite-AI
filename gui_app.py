@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from model_engine import AuraLiteEngine
 import threading
+import multiprocessing
 import os
 
 class AIApp:
@@ -27,7 +28,10 @@ class AIApp:
         header = ttk.Label(main_frame, text="🌟 AuraLite AI - CUDA Edition", style="Header.TLabel")
         header.pack(pady=(0, 10))
         
-        device_text = "GPU: CUDA" if self.engine.device.type == 'cuda' else "CPU: Only"
+        if self.engine.device.type == 'cuda':
+            device_text = "GPU: CUDA"
+        else:
+            device_text = f"CPU: Only ({self.engine.num_threads} threads)"
         device_label = ttk.Label(main_frame, text=f"Hardware Acceleration: {device_text}", font=("Segoe UI", 9, "italic"))
         device_label.pack(pady=(0, 20))
 
@@ -43,6 +47,7 @@ class AIApp:
             'd_model': tk.StringVar(value="64"),
             'd_ff': tk.StringVar(value="128"),
             'seq_length': tk.StringVar(value="16"),
+            'batch_size': tk.StringVar(value="64"),
         }
 
         labels = [
@@ -51,6 +56,7 @@ class AIApp:
             ("Model Dim (D_Model):", 'd_model'),
             ("FF Dim (D_FF):", 'd_ff'),
             ("Context Window (Seq):", 'seq_length'),
+            ("Batch Size:", 'batch_size'),
         ]
 
         for i, (text, key) in enumerate(labels):
@@ -135,6 +141,7 @@ class AIApp:
                 'd_model': int(self.params['d_model'].get()),
                 'd_ff': int(self.params['d_ff'].get()),
                 'seq_length': int(self.params['seq_length'].get()),
+                'batch_size': int(self.params['batch_size'].get()),
             }
         except ValueError:
             messagebox.showerror("Params Error", "Please enter valid numbers in settings!")
@@ -199,6 +206,9 @@ class AIApp:
         self.result_text.insert(tk.END, text)
 
 if __name__ == "__main__":
+    # Required so DataLoader workers don't relaunch the GUI when the app is
+    # frozen with PyInstaller (Windows uses the 'spawn' start method).
+    multiprocessing.freeze_support()
     root = tk.Tk()
     app = AIApp(root)
     root.mainloop()
