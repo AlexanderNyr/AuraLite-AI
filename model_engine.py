@@ -1,7 +1,30 @@
+import os
+
+# ---------------------------------------------------------------------------
+# CPU multithreading: use all available cores.
+# These environment variables must be set BEFORE importing torch/numpy so the
+# underlying OpenMP / MKL backends pick them up.
+# ---------------------------------------------------------------------------
+_CPU_COUNT = os.cpu_count() or 1
+os.environ.setdefault("OMP_NUM_THREADS", str(_CPU_COUNT))
+os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_COUNT))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_CPU_COUNT))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_COUNT))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
+
+# Tell PyTorch to use all CPU cores for intra-op and inter-op parallelism.
+try:
+    torch.set_num_threads(_CPU_COUNT)
+    # inter-op must be > 0; guard in case it was already configured.
+    torch.set_num_interop_threads(max(1, _CPU_COUNT))
+except (RuntimeError, ValueError):
+    # set_num_interop_threads raises if called after parallel work has started.
+    pass
 
 class MiniTransformer(nn.Module):
     def __init__(self, vocab_size, seq_length, d_model, d_ff):
@@ -60,9 +83,32 @@ class MiniTransformer(nn.Module):
         # Output head (last token)
         return self.head(x[:, -1, :])
 
+class CharDataset(Dataset):
+    """Sliding-window character dataset.
+
+    Stores the full encoded text once as a single tensor and produces
+    (input_seq, next_char) samples on the fly. This keeps memory low and lets
+    the DataLoader fetch/collate batches across multiple worker threads.
+    """
+
+    def __init__(self, encoded, seq_length):
+        # encoded: 1D LongTensor of token ids for the whole text
+        self.data = encoded
+        self.seq_length = seq_length
+
+    def __len__(self):
+        return max(0, len(self.data) - self.seq_length)
+
+    def __getitem__(self, idx):
+        x = self.data[idx:idx + self.seq_length]
+        y = self.data[idx + self.seq_length]
+        return x, y
+
+
 class AuraLiteEngine:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_threads = torch.get_num_threads()
         self.model = None
         self.optimizer = None
         self.chars = []
@@ -79,6 +125,7 @@ class AuraLiteEngine:
         d_ff = params.get('d_ff', 64)
         lr = params.get('lr', 0.01)
         epochs = params.get('epochs', 300)
+        batch_size = params.get('batch_size', 64)
 
         # Vocab
         self.chars = sorted(list(set(training_text)))
@@ -91,28 +138,62 @@ class AuraLiteEngine:
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
 
-        # Data prep
-        X_data, Y_data = [], []
-        for i in range(len(training_text) - seq_length):
-            X_data.append(self.encode(training_text[i:i+seq_length]))
-            Y_data.append(self.char_to_idx[training_text[i+seq_length]])
-        
-        X = torch.tensor(X_data, dtype=torch.long).to(self.device)
-        Y = torch.tensor(Y_data, dtype=torch.long).to(self.device)
+        # Encode the whole text once (single CPU tensor); the Dataset slices it.
+        encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
+        dataset = CharDataset(encoded, seq_length)
+        if len(dataset) == 0:
+            raise ValueError("Training text is too short for the chosen Context Window (seq_length).")
+
+        # Multithreaded data loading. Pinning memory speeds up the host->GPU copy
+        # when CUDA is available. Workers are only worth spawning for larger data.
+        use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
+        num_workers = self.num_threads if use_workers else 0
+        loader_kwargs = dict(
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            drop_last=False,
+            pin_memory=(self.device.type == 'cuda'),
+        )
+        if num_workers > 0:
+            loader_kwargs['persistent_workers'] = True
+            loader_kwargs['prefetch_factor'] = 2
+
+        loader = DataLoader(dataset, **loader_kwargs)
+        total_batches = len(loader)
 
         self.model.train()
         for epoch in range(epochs):
             if stop_event and stop_event.is_set():
                 break
-                
-            self.optimizer.zero_grad()
-            output = self.model(X)
-            loss = criterion(output, Y)
-            loss.backward()
-            self.optimizer.step()
+
+            running_loss = 0.0
+            seen_batches = 0
+            stopped_mid_epoch = False
+
+            for xb, yb in loader:
+                if stop_event and stop_event.is_set():
+                    stopped_mid_epoch = True
+                    break
+
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+
+                self.optimizer.zero_grad()
+                output = self.model(xb)
+                loss = criterion(output, yb)
+                loss.backward()
+                self.optimizer.step()
+
+                running_loss += loss.item()
+                seen_batches += 1
+
+            if stopped_mid_epoch:
+                break
 
             if progress_callback:
-                progress_callback(epoch + 1, epochs, loss.item())
+                avg_loss = running_loss / max(1, seen_batches)
+                progress_callback(epoch + 1, epochs, avg_loss)
 
     def generate(self, start_str, length=50):
         if self.model is None:
