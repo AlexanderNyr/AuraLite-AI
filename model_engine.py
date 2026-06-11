@@ -480,16 +480,30 @@ class Attention(nn.Module):
 # -------------------------------------------------------------------
 
 class FeedForward(nn.Module):
-    """SwiGLU Feed-Forward Network — standard in LLaMA / Qwen / Mistral."""
+    """SwiGLU Feed-Forward Network — standard in LLaMA / Qwen / Mistral.
+
+    IMPROVED (v2.1+):
+    - Optional LoRA adapters on gate / up / down projections. When `lora`
+      is set (an nn.ModuleDict via enable_lora()), the low-rank deltas are
+      actually applied during the forward pass.
+    """
 
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
         self.gate = nn.Linear(d_model, d_ff, bias=False)
         self.up   = nn.Linear(d_model, d_ff, bias=False)
         self.down = nn.Linear(d_ff, d_model, bias=False)
+        # LoRA adapters (None until enable_lora is called on the parent model)
+        self.lora: nn.ModuleDict | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        if self.lora is None:
+            return self.down(F.silu(self.gate(x)) * self.up(x))
+        # LoRA path: add low-rank deltas to each projection
+        g = self.gate(x) + self.lora["gate"](x)
+        u = self.up(x)   + self.lora["up"](x)
+        h = F.silu(g) * u
+        return self.down(h) + self.lora["down"](h)
 
 
 # -------------------------------------------------------------------
@@ -574,7 +588,7 @@ class ModernTransformer(nn.Module):
         self.head.weight = self.embedding.weight
 
         # LoRA adapters (initially None, enabled via enable_lora())
-        self.lora_adapters: list[nn.ModuleList] | None = None
+        self.lora_adapters: list | None = None
         self.lora_rank = 0
 
     @staticmethod
@@ -611,39 +625,51 @@ class ModernTransformer(nn.Module):
 
     # ---- LoRA Support ------------------------------------------------
     def enable_lora(self, rank: int = 8, target_modules: list[str] | None = None):
-        """Enable LoRA adapters on linear layers.
+        """Enable LoRA adapters on the FFN linear layers.
+
+        Freezes the whole base model and adds trainable low-rank adapters
+        that are actually applied in FeedForward.forward(). The adapters are
+        registered as submodules (`self.lora_adapters`) so they move with
+        `.to(device)` and are saved/loaded via the state dict.
 
         Args:
             rank: LoRA rank (default 8)
-            target_modules: Which layers to apply to (default: all linear layers in FFN)
+            target_modules: Names of FFN projections to adapt
+                            (default: ["gate", "up", "down"]).
         """
         if target_modules is None:
-            target_modules = ["ffn.gate", "ffn.up", "ffn.down"]
+            target_modules = ["gate", "up", "down"]
 
         self.lora_rank = rank
-        self.lora_adapters = nn.ModuleList()
+        # plain list (NOT nn.ModuleList) so the adapters are registered only
+        # once — via layer.ffn.lora — and don't appear twice in state_dict.
+        self.lora_adapters = []
 
-        # Freeze base model
+        # Freeze every base-model parameter
         for param in self.parameters():
             param.requires_grad = False
 
         for layer in self.layers:
+            # nn.ModuleDict keys must NOT contain dots — use the plain
+            # projection name ("gate"/"up"/"down").
             layer_lora = nn.ModuleDict()
-            for mod_path in target_modules:
-                parts = mod_path.split(".")
-                mod = layer
-                for part in parts:
-                    mod = getattr(mod, part)
+            for name in target_modules:
+                mod = getattr(layer.ffn, name, None)
                 if isinstance(mod, nn.Linear):
                     lora = LoRALayer(mod.in_features, mod.out_features, rank)
-                    layer_lora[mod_path] = lora
-                    mod.requires_grad = True  # unfreeze LoRA params
+                    # LoRA params are created with requires_grad=True by default
+                    layer_lora[name] = lora
+            # wire the adapters into the FFN so forward() actually uses them
+            # (this also registers them as proper submodules of the model)
+            layer.ffn.lora = layer_lora
             self.lora_adapters.append(layer_lora)
 
     def disable_lora(self):
         """Disable LoRA and restore full training."""
         self.lora_rank = 0
         self.lora_adapters = None
+        for layer in self.layers:
+            layer.ffn.lora = None
         for param in self.parameters():
             param.requires_grad = True
 
@@ -926,12 +952,32 @@ class AuraLiteEngine:
         )
 
         # ---- torch.compile (optional, speeds up the training loop) ----
+        # NOTE: torch.compile() returns lazily — Dynamo/Inductor errors (e.g. a
+        # missing C compiler / Triton, or a backend that resolves to None) only
+        # surface on the FIRST forward call. So we must wrap a trial forward pass,
+        # not just the compile() call, and fall back to eager mode on ANY failure.
         train_model = self.model
         if use_compile:
+            compiled = None
             try:
-                train_model = torch.compile(self.model)
-            except Exception:
-                train_model = self.model   # graceful fallback
+                compiled = torch.compile(self.model)
+                # Trial forward to force compilation now and catch backend errors
+                sample_len = min(seq_length, len(train_data) - 1)
+                probe = torch.zeros((1, max(1, sample_len)),
+                                    dtype=torch.long, device=self.device)
+                with torch.no_grad():
+                    _ = compiled(probe)
+                if compiled is None:
+                    raise RuntimeError("torch.compile returned None")
+                train_model = compiled
+            except Exception as e:
+                # graceful fallback — training continues in plain eager mode
+                print(f"[AuraLite] torch.compile disabled (falling back to eager): {e}")
+                train_model = self.model
+                try:
+                    torch._dynamo.reset()
+                except Exception:
+                    pass
 
         # ---- Epoch loop -----------------------------------------------
         self.model.train()
@@ -1238,16 +1284,16 @@ class AuraLiteEngine:
             dropout     = checkpoint.get("dropout", 0.0),
             use_alibi   = checkpoint.get("use_alibi", False),
         ).to(self.device)
-        self.model.load_state_dict(checkpoint["model_state"])
 
-        # Restore LoRA state if present
+        # Re-create LoRA adapters BEFORE loading the state dict so their
+        # parameters exist as keys in the model (they are registered via
+        # layer.ffn.lora and therefore live inside model_state).
         lora_rank = checkpoint.get("lora_rank", 0)
         if lora_rank > 0:
             self.model.enable_lora(rank=lora_rank)
-            # Load LoRA weights if they exist
-            if "lora_state" in checkpoint:
-                self.model.lora_adapters.load_state_dict(checkpoint["lora_state"])
 
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.to(self.device)
         self.model.eval()
 
     # ---- Config Management (NEW) --------------------------------------

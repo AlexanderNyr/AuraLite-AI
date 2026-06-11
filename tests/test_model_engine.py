@@ -247,6 +247,33 @@ class TestModernTransformer:
         assert model.lora_rank == 0
         assert model.lora_adapters is None
         assert all(p.requires_grad for p in model.parameters())
+        # FFN adapters must be detached so forward uses the plain path again
+        assert all(layer.ffn.lora is None for layer in model.layers)
+
+    def test_lora_affects_forward(self, device):
+        """Regression: LoRA adapters must actually change the output."""
+        model = ModernTransformer(
+            vocab_size=50, d_model=64, n_heads=4, n_layers=2, d_ff=128,
+        ).to(device)
+        x = torch.randint(0, 50, (2, 16), device=device)
+        out_before = model(x).clone()
+        model.enable_lora(rank=8)
+        # lora_B starts at zero (output unchanged); make it non-zero
+        for ld in model.lora_adapters:
+            for k in ld:
+                torch.nn.init.normal_(ld[k].lora_B, std=0.1)
+        out_after = model(x)
+        assert not torch.allclose(out_before, out_after)
+
+    def test_lora_no_duplicate_state(self, device):
+        """Regression: LoRA params registered exactly once in state_dict."""
+        model = ModernTransformer(
+            vocab_size=50, d_model=64, n_heads=4, n_layers=2, d_ff=128,
+        ).to(device)
+        model.enable_lora(rank=4)
+        lora_keys = [k for k in model.state_dict() if "lora" in k]
+        # 2 layers * 3 projections (gate/up/down) * 2 params (A,B) = 12
+        assert len(lora_keys) == 12
 
 
 # ======================================================================
@@ -402,6 +429,51 @@ class TestAuraLiteEngine:
         engine.train(small_text, params)
         assert engine.model.lora_rank == 4
 
+    def test_lora_save_load_roundtrip(self, small_text, tiny_params):
+        """Regression: a LoRA checkpoint must save and load without errors."""
+        engine = AuraLiteEngine()
+        params = dict(tiny_params)
+        params["lora_rank"] = 4
+        params["epochs"] = 1
+        engine.train(small_text, params)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            path = f.name
+        try:
+            engine.save_model(path)
+            engine2 = AuraLiteEngine()
+            engine2.load_model(path)
+            assert engine2.model.lora_rank == 4
+            result = engine2.generate("hello ", length=10)
+            assert isinstance(result, str)
+        finally:
+            os.unlink(path)
+
+    def test_compile_fallback_on_broken_backend(self, small_text, tiny_params):
+        """Regression: a failing torch.compile backend must fall back to eager
+        instead of crashing training (the 'backend resolved to None' error)."""
+        import model_engine
+        engine = AuraLiteEngine()
+        params = dict(tiny_params)
+        params["use_compile"] = True
+        params["epochs"] = 1
+
+        real_compile = torch.compile
+
+        def broken_compile(model, *a, **k):
+            class _Bad:
+                def __call__(self, *args, **kw):
+                    raise RuntimeError("backend resolved to None (simulated)")
+            return _Bad()
+
+        torch.compile = broken_compile
+        try:
+            engine.train(small_text, params)  # must NOT raise
+            assert engine.model is not None
+            assert isinstance(engine.generate("hello ", length=5), str)
+        finally:
+            torch.compile = real_compile
+
     def test_alibi_training(self, small_text, tiny_params):
         engine = AuraLiteEngine()
         params = dict(tiny_params)
@@ -414,7 +486,6 @@ class TestAuraLiteEngine:
         engine = AuraLiteEngine()
         params = dict(tiny_params)
         params["epochs"] = 50  # Long training
-        stop_event = torch.Event() if hasattr(torch, 'Event') else None
 
         # We'll stop after a few epochs
         import threading

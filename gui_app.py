@@ -379,12 +379,12 @@ class AIApp:
         self.len_scale.configure(command=self._update_len_display)
 
         # NEW: Batch generation
-        batch_row = ttk.Frame(seed_frame)
-        batch_row.pack(fill=tk.X, pady=2)
+        self.batch_row = ttk.Frame(seed_frame)
+        self.batch_row.pack(fill=tk.X, pady=2)
         self.batch_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(batch_row, text="Batch mode (multiple prompts)",
+        ttk.Checkbutton(self.batch_row, text="Batch mode (multiple prompts)",
                         variable=self.batch_var).pack(side=tk.LEFT, padx=4)
-        self.batch_entry = ttk.Entry(batch_row, font=("Segoe UI", 10))
+        self.batch_entry = ttk.Entry(self.batch_row, font=("Segoe UI", 10))
         self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         self.batch_entry.insert(0, "Prompt 1 | Prompt 2 | Prompt 3")
         self.batch_entry.pack_forget()  # Hidden by default
@@ -776,9 +776,12 @@ class AIApp:
                     seed, length, temperature, top_k, top_p,
                     repetition_penalty=rep_pen
                 ):
+                    # tkinter is NOT thread-safe: marshal the widget update
+                    # onto the main loop via root.after instead of calling
+                    # root.update() directly from this worker thread.
                     self.root.after(0, lambda t=token_text:
-                        self.result_text.insert(tk.END, t))
-                    self.root.update()  # force UI update
+                        (self.result_text.insert(tk.END, t),
+                         self.result_text.see(tk.END)))
                 self.root.after(0, lambda: self.result_text.insert(
                     tk.END, "\n\n✅ Generation complete."))
             except Exception as e:
@@ -978,9 +981,11 @@ class AIApp:
 # ======================================================================
 
 def _toggle_batch_entry(self, *_):
+    # NOTE: batch_entry's master is self.batch_row, so it must be re-packed
+    # inside that same frame. Using `before=self.gen_btn` (a child of a
+    # different frame) raised a TclError — fixed by packing within batch_row.
     if self.batch_var.get():
-        self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4,
-                              before=self.gen_btn)
+        self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
     else:
         self.batch_entry.pack_forget()
 

@@ -1,5 +1,24 @@
 # 🚀 Changelog — AuraLite AI v2.0 → v2.1
 
+## 🐛 Bug Fixes (v2.1.1)
+
+| # | Severity | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | 🔴 Critical | **LoRA crashed** on enable — `nn.ModuleDict` keys can't contain dots (`"ffn.gate"`) in modern PyTorch → `KeyError` | Use plain projection names (`gate`/`up`/`down`) as dict keys |
+| 2 | 🔴 Critical | **LoRA was a no-op** — adapters were created but never applied in the forward pass | `FeedForward.forward()` now adds the low-rank deltas; adapters wired via `layer.ffn.lora` |
+| 3 | 🔴 Critical | **LoRA freeze ineffective** — `mod.requires_grad = True` on an `nn.Linear` doesn't touch its params | Base model fully frozen; only `LoRALayer` params (created with `requires_grad=True`) train |
+| 4 | 🔴 Critical | **LoRA save/load broken** — `load_state_dict` ran before `enable_lora`, and the `lora_state` key never existed | `enable_lora()` is now called before `load_state_dict`; adapters live inside `model_state` (no duplicates) |
+| 5 | 🔴 Critical | **`torch.compile` "None" error crashed training** — the `try/except` only wrapped the `compile()` call, not the forward pass where Dynamo/Inductor errors surface | Trial forward pass forces compilation; ANY failure falls back to eager mode with a log message |
+| 6 | 🟡 Major | **`eval.py` used `max_seq_len` (4096)** as the eval window instead of the trained `seq_length` → `inf` perplexity on normal files + very slow | Uses `engine.params_used["seq_length"]` |
+| 7 | 🟡 Major | **GUI batch toggle crashed** — `pack(before=self.gen_btn)` across different parent frames raises `TclError` | Re-pack `batch_entry` inside its own `batch_row` |
+| 8 | 🟡 Major | **GUI streaming froze/crashed** — `root.update()` called from a worker thread (tkinter is not thread-safe) | Removed; UI updates marshalled via `root.after()` |
+| 9 | ⚪ Minor | Dead `torch.Event()` line in tests | Removed |
+
+All 56 unit tests pass (52 original + 4 new regression tests for LoRA forward effect, no-duplicate state, save/load roundtrip, and compile fallback).
+
+---
+
+
 ## NEW Features
 
 ### Core (model_engine.py)

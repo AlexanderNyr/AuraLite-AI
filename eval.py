@@ -24,7 +24,7 @@ def compute_perplexity(engine: AuraLiteEngine, text: str, batch_size: int = 32) 
     if not ids:
         return float("inf")
 
-    seq_length = engine.model.max_seq_len if hasattr(engine.model, 'max_seq_len') else 64
+    seq_length = engine.params_used.get("seq_length", 64)
     encoded = torch.tensor(ids, dtype=torch.long).to(engine.device)
 
     n_samples = max(0, len(encoded) - seq_length)
@@ -66,7 +66,7 @@ def compute_bpc(engine: AuraLiteEngine, text: str, batch_size: int = 32) -> floa
     if not ids:
         return float("inf")
 
-    seq_length = engine.model.max_seq_len if hasattr(engine.model, 'max_seq_len') else 64
+    seq_length = engine.params_used.get("seq_length", 64)
     encoded = torch.tensor(ids, dtype=torch.long).to(engine.device)
 
     n_samples = max(0, len(encoded) - seq_length)
