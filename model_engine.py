@@ -311,6 +311,154 @@ class BPETokenizer:
         return tok
 
 
+# ===================================================================
+#  Auto-recommendation helpers
+# ===================================================================
+
+def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
+                      d_ff: int, n_heads: int,
+                      n_kv_heads: int | None = None) -> int:
+    """Rough parameter count for a LLaMA-style decoder-only transformer.
+
+    Mirrors `ModernTransformer` (weight tying => embedding/head counted once).
+    Accurate to within ~3% of `model.count_parameters()` for typical configs.
+    """
+    n_kv = n_kv_heads if (n_kv_heads and n_kv_heads > 0) else n_heads
+    head_dim = d_model // max(1, n_heads)
+
+    embed = vocab_size * d_model        # tied with output head
+
+    # Per layer:
+    #   attn: W_q (d_model * n_heads*head_dim)
+    #         W_k (d_model * n_kv*head_dim)
+    #         W_v (d_model * n_kv*head_dim)
+    #         W_o (n_heads*head_dim * d_model)
+    attn = (d_model * n_heads * head_dim          # Q
+            + d_model * n_kv * head_dim * 2       # K + V
+            + n_heads * head_dim * d_model)       # O
+    # SwiGLU FFN: gate + up + down (all bias-free)
+    ffn  = 3 * d_model * d_ff
+    # RMSNorm has `d_model` params, two per block + one final
+    norms_per_layer = 2 * d_model
+
+    per_layer = attn + ffn + norms_per_layer
+    final_norm = d_model
+    return embed + n_layers * per_layer + final_norm
+
+
+def recommend_epochs(n_tokens: int, n_params: int,
+                     batch_size: int, seq_length: int,
+                     tokens_per_param: float = 20.0,
+                     min_epochs: int = 5,
+                     max_epochs: int = 500) -> int:
+    """Recommend a sensible number of training epochs.
+
+    Strategy (tiered, more realistic than pure Chinchilla which assumes
+    you can throw arbitrarily many tokens at the model):
+
+      * For HUGE datasets (>= 10× model capacity in tokens) → 3–10 epochs
+        is enough to see everything ~enough times.
+      * For MEDIUM datasets → aim for Chinchilla-ish 20 tokens/param
+        of total exposure, but capped sensibly.
+      * For TINY datasets → enough passes to over-fit / memorise, but
+        capped at a reasonable wall-clock budget (≈ 100 epochs by default).
+
+    Args:
+        n_tokens:        size of the training corpus after tokenisation
+        n_params:        total model parameters
+        batch_size:      training batch size (currently unused — kept for API)
+        seq_length:      context window
+        tokens_per_param: target tokens-to-param ratio (default 20)
+        min_epochs:      lower clamp
+        max_epochs:      upper clamp (hard ceiling, normally not reached)
+
+    Returns:
+        recommended epoch count
+    """
+    if n_tokens <= seq_length:
+        return min_epochs
+
+    # How big is the dataset compared to model capacity?
+    # ratio < 1  → dataset smaller than the model can memorise comfortably
+    # ratio = 1  → ~Chinchilla optimal (one pass = 20 tok/param)
+    # ratio > 1  → plenty of data, few passes needed
+    target = tokens_per_param * n_params
+    ratio = n_tokens / max(1, target)
+
+    import math
+    if ratio >= 10:
+        # Huge dataset: 3 passes is plenty.
+        epochs = 3
+    elif ratio >= 1:
+        # Comfortable: 3-15 passes, scaling down with dataset size.
+        # ratio=10 → 3 epochs ; ratio=1 → 15 epochs (smooth log interp)
+        epochs = int(round(15 - 12 * (math.log10(ratio) / 1.0)))
+    else:
+        # Small dataset: pure Chinchilla says epochs = 1/ratio, which
+        # explodes for tiny files (1KB on a 1M-param model → 6000 epochs).
+        # Instead use logarithmic saturation:
+        #   ratio=0.5  → ~25 epochs
+        #   ratio=0.1  → ~50 epochs
+        #   ratio=0.01 → ~80 epochs
+        #   ratio→0    → 100 epochs (asymptote)
+        # Formula: 100 - 100 / (1 + (-log10(ratio))**1.5 * k)
+        log_inv = -math.log10(max(ratio, 1e-9))           # 0 .. ~9
+        # Map log_inv in [0, 4] to epochs in [15, 100] smoothly:
+        # at ratio=1   (log_inv=0)   → 15 epochs (continuity with branch above)
+        # at ratio=0.1 (log_inv=1)   → ~50
+        # at ratio=0.01(log_inv=2)   → ~75
+        # at ratio=1e-4(log_inv=4)   → ~95
+        epochs = int(round(15 + 85 * (1 - 1 / (1 + 0.6 * log_inv ** 1.3))))
+
+    return int(max(min_epochs, min(max_epochs, epochs)))
+
+
+def recommend_gen_length(seed_str: str,
+                         tokenizer,
+                         max_seq_len: int = 4096,
+                         multiplier: float = 8.0,
+                         hard_min: int = 30,
+                         hard_max: int = 800) -> int:
+    """Recommend a generation length (in tokens) for a given seed.
+
+    Aims for `multiplier` times the seed length so short prompts still
+    produce meaningful output. Bounded by [hard_min, hard_max] AND by the
+    model's max context window.
+
+    Examples (multiplier=8):
+        seed_tokens=1   → 30   (hard_min)
+        seed_tokens=5   → 40
+        seed_tokens=10  → 80
+        seed_tokens=20  → 160
+        seed_tokens=50  → 400
+        seed_tokens=200 → 800  (hard_max)
+
+    Args:
+        seed_str:   the prompt the user typed
+        tokenizer:  trained CharTokenizer/BPETokenizer (None = use chars)
+        max_seq_len: model.max_seq_len (we never exceed it)
+        multiplier: how much longer than the seed the output should be
+        hard_min/hard_max: absolute clamps
+
+    Returns:
+        recommended generation length (in tokens)
+    """
+    if tokenizer is not None:
+        try:
+            seed_tokens = len(tokenizer.encode(seed_str)) if seed_str else 0
+        except Exception:
+            seed_tokens = len(seed_str)
+    else:
+        seed_tokens = len(seed_str)
+
+    seed_tokens = max(1, seed_tokens)
+    raw = int(round(seed_tokens * multiplier))
+    raw = max(hard_min, min(hard_max, raw))
+    # Leave at least 2 tokens of headroom in the context window
+    headroom = max(1, max_seq_len - seed_tokens - 2)
+    return max(1, min(raw, headroom))
+
+
 def tokenizer_from_dict(d: dict):
     if d.get("kind") == "bpe":
         return BPETokenizer.from_dict(d)
@@ -805,19 +953,25 @@ class AuraLiteEngine:
 
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
-    def _evaluate(self, loader, criterion, max_batches: int = 50) -> float:
+    def _evaluate(self, loader, criterion, max_batches: int = 50) -> float | None:
+        """Returns mean cross-entropy on `loader`, or None if loader is empty."""
         self.model.eval()
         total, n = 0.0, 0
-        for i, (xb, yb) in enumerate(loader):
-            if i >= max_batches:
-                break
-            xb = xb.to(self.device, non_blocking=True)
-            yb = yb.to(self.device, non_blocking=True)
-            out = self.model(xb)
-            total += criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1)).item()
-            n += 1
-        self.model.train()
-        return total / max(1, n)
+        try:
+            for i, (xb, yb) in enumerate(loader):
+                if i >= max_batches:
+                    break
+                xb = xb.to(self.device, non_blocking=True)
+                yb = yb.to(self.device, non_blocking=True)
+                out = self.model(xb)
+                loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
+                total += loss.item()
+                n += 1
+        finally:
+            self.model.train()
+        if n == 0:
+            return None
+        return total / n
 
     # ---- Training ----------------------------------------------------
     def train(self, training_text: str, params: dict,
@@ -914,11 +1068,44 @@ class AuraLiteEngine:
         # ---- Dataset / DataLoader ------------------------------------
         encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
 
-        n_val = int(len(encoded) * val_split) if val_split > 0 else 0
-        if n_val <= seq_length + 1:
-            n_val = 0
-        train_data = encoded[: len(encoded) - n_val] if n_val else encoded
-        val_data   = encoded[len(encoded) - n_val - seq_length:] if n_val else None
+        # ---- Train / validation split -------------------------------------
+        # Goal: both train and val slices must produce at least one full
+        # (x, y) window. CharDataset of length L gives max(0, L - seq_length)
+        # samples, so each slice needs L >= seq_length + 1.
+        total_tokens = len(encoded)
+        n_val_target = int(total_tokens * val_split) if val_split > 0 else 0
+
+        # Minimum tokens we need overall:
+        #   train slice: seq_length + 1
+        #   val slice  : seq_length + 1  (=> at least 1 val sample)
+        min_train_tokens = seq_length + 1
+        min_val_tokens   = seq_length + 1
+
+        val_data = None
+        train_data = encoded
+
+        if val_split > 0:
+            if total_tokens < min_train_tokens + min_val_tokens:
+                print(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
+                      f"encoding, need at least {min_train_tokens + min_val_tokens} "
+                      f"for seq_length={seq_length} with validation. "
+                      f"Validation DISABLED for this run.")
+            else:
+                # Take at least min_val_tokens; honour val_split but never starve train.
+                val_tokens = max(min_val_tokens, n_val_target + seq_length)
+                # Ensure train still has min_train_tokens left.
+                max_val_tokens = total_tokens - min_train_tokens
+                val_tokens = min(val_tokens, max_val_tokens)
+
+                split_at   = total_tokens - val_tokens
+                train_data = encoded[:split_at]
+                val_data   = encoded[split_at:]
+
+                n_val_samples = max(0, len(val_data) - seq_length)
+                n_train_samples = max(0, len(train_data) - seq_length)
+                print(f"[AuraLite] Split: {len(train_data)} train tokens "
+                      f"({n_train_samples} samples), {len(val_data)} val tokens "
+                      f"({n_val_samples} samples), seq_length={seq_length}")
 
         dataset = CharDataset(train_data, seq_length)
         if len(dataset) == 0:
@@ -941,9 +1128,22 @@ class AuraLiteEngine:
             loader_kwargs["prefetch_factor"] = 2
 
         loader = DataLoader(dataset, **loader_kwargs)
-        val_loader = (DataLoader(CharDataset(val_data, seq_length),
-                                 batch_size=batch_size, shuffle=False)
-                      if val_data is not None else None)
+
+        val_loader = None
+        if val_data is not None:
+            val_ds = CharDataset(val_data, seq_length)
+            if len(val_ds) > 0:
+                # Use a batch size that's guaranteed not to drop everything;
+                # never larger than the val set itself.
+                val_bs = max(1, min(batch_size, len(val_ds)))
+                val_loader = DataLoader(val_ds, batch_size=val_bs,
+                                        shuffle=False, drop_last=False)
+                print(f"[AuraLite] Validation loader: {len(val_ds)} samples, "
+                      f"batch_size={val_bs}, {len(val_loader)} batches")
+            else:
+                print(f"[AuraLite] WARNING: val dataset is empty after windowing "
+                      f"(val_data has {len(val_data)} tokens, need > {seq_length}). "
+                      f"Validation DISABLED.")
 
         total_steps  = epochs * len(loader)
         warmup_steps = min(200, total_steps // 10)

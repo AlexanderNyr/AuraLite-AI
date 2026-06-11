@@ -1,9 +1,15 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from model_engine import AuraLiteEngine, validate_params, ParamValidationError
+from model_engine import (
+    AuraLiteEngine, validate_params, ParamValidationError,
+    estimate_n_params, recommend_epochs, recommend_gen_length,
+)
 import threading
 import multiprocessing
 import os
+import sys
+import io
+import time
 import json
 
 try:
@@ -49,6 +55,124 @@ CONFIG_PRESETS = {
 }
 
 
+class ConsoleRedirector(io.TextIOBase):
+    """Thread-safe redirector that forwards writes to a Tk Text widget.
+
+    Also keeps writing to the original stream (so logs are still visible
+    in the real terminal if launched from one), and buffers lines so that
+    they are flushed to the widget via root.after (Tk is not thread-safe).
+
+    Lines are colourised based on a simple keyword heuristic
+    (ERROR / WARNING / NOTE / OK / etc).
+    """
+
+    # (keyword substring, tag name) — first match wins, case-insensitive.
+    LEVEL_RULES = [
+        ("traceback",     "error"),
+        ("error",         "error"),
+        ("exception",     "error"),
+        ("critical",      "error"),
+        ("fail",          "error"),
+        ("warning",       "warn"),
+        ("warn:",         "warn"),
+        ("deprecat",      "warn"),
+        ("note:",         "info"),
+        ("info:",         "info"),
+        ("[auralite]",    "engine"),
+        ("epoch",         "epoch"),
+        ("✅",             "ok"),
+        ("🛑",             "warn"),
+        ("complete",      "ok"),
+        ("finished",      "ok"),
+        ("disabled",      "warn"),
+    ]
+
+    def __init__(self, widget: tk.Text, root: tk.Tk, original):
+        super().__init__()
+        self.widget   = widget
+        self.root     = root
+        self.original = original
+        self._lock    = threading.Lock()
+        self._buffer  = ""           # line-level buffer for accurate tagging
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        # Mirror to the original stream so terminal users still see output.
+        try:
+            if self.original is not None:
+                self.original.write(s)
+        except Exception:
+            pass
+        # Buffer until newline so we can colour each whole line.
+        self._buffer += s
+        if "\n" in self._buffer:
+            lines = self._buffer.split("\n")
+            # Last chunk may be a partial line — keep it buffered.
+            self._buffer = lines.pop()
+            for line in lines:
+                self._schedule(line + "\n")
+        return len(s)
+
+    def _schedule(self, line: str):
+        tag = self._classify(line)
+        try:
+            self.root.after(0, self._append, line, tag)
+        except Exception:
+            pass  # window may be closing
+
+    @classmethod
+    def _classify(cls, line: str) -> str | None:
+        low = line.lower()
+        for needle, tag in cls.LEVEL_RULES:
+            if needle in low:
+                return tag
+        return None
+
+    def _append(self, s: str, tag: str | None):
+        with self._lock:
+            try:
+                self.widget.config(state=tk.NORMAL)
+                if tag:
+                    self.widget.insert(tk.END, s, tag)
+                else:
+                    self.widget.insert(tk.END, s)
+                # Cap at ~5000 lines so the widget stays responsive.
+                line_count = int(self.widget.index("end-1c").split(".")[0])
+                if line_count > 5000:
+                    self.widget.delete("1.0", f"{line_count - 5000}.0")
+                self.widget.see(tk.END)
+                self.widget.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass  # widget destroyed
+
+    def flush(self):
+        # Flush any trailing partial line.
+        if self._buffer:
+            tail, self._buffer = self._buffer, ""
+            self._schedule(tail)
+        try:
+            if self.original is not None:
+                self.original.flush()
+        except Exception:
+            pass
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as a compact human-readable string."""
+    if seconds is None or seconds < 0 or seconds != seconds:  # NaN check
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}h {m:02d}m {s:02d}s"
+
+
 class AIApp:
     def __init__(self, root):
         self.root = root
@@ -62,6 +186,11 @@ class AIApp:
         self.selected_file_path = None
         self.stop_event = threading.Event()
         self.loss_history = []  # [(epoch, train_loss, val_loss), ...]
+
+        # ETA tracking
+        self.train_start_time: float | None = None
+        self.epoch_times: list[float] = []   # seconds per completed epoch
+        self._last_epoch_ts: float | None = None
 
         # ---- Styles ----------------------------------------------------
         style = ttk.Style()
@@ -103,17 +232,32 @@ class AIApp:
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.tab_train = ttk.Frame(self.notebook, padding="12")
-        self.tab_gen   = ttk.Frame(self.notebook, padding="12")
-        self.tab_model = ttk.Frame(self.notebook, padding="12")
+        self.tab_train   = ttk.Frame(self.notebook, padding="12")
+        self.tab_gen     = ttk.Frame(self.notebook, padding="12")
+        self.tab_model   = ttk.Frame(self.notebook, padding="12")
+        self.tab_console = ttk.Frame(self.notebook, padding="12")
 
-        self.notebook.add(self.tab_train, text=" 🏋️  Training ")
-        self.notebook.add(self.tab_gen,   text=" ✨  Generation ")
-        self.notebook.add(self.tab_model, text=" 💾  Model ")
+        self.notebook.add(self.tab_train,   text=" 🏋️  Training ")
+        self.notebook.add(self.tab_gen,     text=" ✨  Generation ")
+        self.notebook.add(self.tab_model,   text=" 💾  Model ")
+        self.notebook.add(self.tab_console, text=" 🖥️  Console ")
 
         self._build_training_tab()
         self._build_generation_tab()
         self._build_model_tab()
+        self._build_console_tab()
+
+        # Hook stdout/stderr into the console tab. Do it AFTER the widget
+        # exists. Keep references so we can restore them on shutdown.
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = ConsoleRedirector(self.console_text, self.root, self._orig_stdout)
+        sys.stderr = ConsoleRedirector(self.console_text, self.root, self._orig_stderr)
+        print(f"[AuraLite] Console attached. Device: {self.engine.device}, "
+              f"threads: {self.engine.num_threads}")
+
+        # Restore original streams on window close.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ==================================================================
     #  TAB 1 — Training
@@ -177,6 +321,19 @@ class AIApp:
             ttk.Entry(grid, textvariable=self.params[key],
                       width=10).grid(row=row, column=col + 1,
                                       sticky=tk.W, padx=5, pady=3)
+
+        # ---- Auto-recommend epochs --------------------------------------
+        auto_row = ttk.Frame(hp_frame)
+        auto_row.pack(fill=tk.X, pady=(6, 0))
+
+        ttk.Button(auto_row, text="🎯 Auto-recommend Epochs",
+                   command=self._auto_epochs).pack(side=tk.LEFT, padx=4)
+        ttk.Label(auto_row,
+                  text="(needs a selected file — uses ~20 tokens/param heuristic)",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
+        self.auto_epochs_hint = ttk.Label(auto_row, text="", style="Sub.TLabel",
+                                          foreground="#0a6")
+        self.auto_epochs_hint.pack(side=tk.LEFT, padx=8)
 
         # ---- Tokenizer & options ----------------------------------------
         tok_frame = ttk.LabelFrame(tab, text="  🔤  Tokenizer & Options  ",
@@ -374,9 +531,12 @@ class AIApp:
                                    orient=tk.HORIZONTAL)
         self.len_scale.set(100)
         self.len_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        self.len_display = ttk.Label(len_row, text="100")
+        self.len_display = ttk.Label(len_row, text="100", width=5)
         self.len_display.pack(side=tk.LEFT, padx=4)
         self.len_scale.configure(command=self._update_len_display)
+
+        ttk.Button(len_row, text="🎯 Auto",
+                   command=self._auto_gen_length, width=8).pack(side=tk.LEFT, padx=4)
 
         # NEW: Batch generation
         self.batch_row = ttk.Frame(seed_frame)
@@ -404,9 +564,55 @@ class AIApp:
         out_frame = ttk.LabelFrame(tab, text="  📄  Output  ", padding="6")
         out_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.result_text = tk.Text(out_frame, height=10,
-                                   font=("Consolas", 11), wrap=tk.WORD)
-        self.result_text.pack(fill=tk.BOTH, expand=True)
+        # Toolbar above the result widget
+        out_toolbar = ttk.Frame(out_frame)
+        out_toolbar.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(out_toolbar, text="Generated text",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(out_toolbar, text="🗑 Clear",
+                   command=self._clear_result).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(out_toolbar, text="💾 Save…",
+                   command=self._save_result).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(out_toolbar, text="➕ Append to file…",
+                   command=self._append_result).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(out_toolbar, text="📋 Copy",
+                   command=self._copy_result).pack(side=tk.RIGHT, padx=2)
+
+        # Text + scrollbar
+        text_wrap = ttk.Frame(out_frame)
+        text_wrap.pack(fill=tk.BOTH, expand=True)
+
+        res_ysb = ttk.Scrollbar(text_wrap, orient=tk.VERTICAL)
+        self.result_text = tk.Text(text_wrap, height=10,
+                                   font=("Consolas", 11), wrap=tk.WORD,
+                                   yscrollcommand=res_ysb.set,
+                                   undo=True)
+        res_ysb.config(command=self.result_text.yview)
+        res_ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Right-click context menu on the result widget
+        self._result_menu = tk.Menu(self.root, tearoff=0)
+        self._result_menu.add_command(label="Copy selection",
+                                      command=self._copy_selection_result)
+        self._result_menu.add_command(label="Copy all",
+                                      command=self._copy_result)
+        self._result_menu.add_separator()
+        self._result_menu.add_command(label="Save to file…",
+                                      command=self._save_result)
+        self._result_menu.add_command(label="Append to file…",
+                                      command=self._append_result)
+        self._result_menu.add_separator()
+        self._result_menu.add_command(label="Clear",
+                                      command=self._clear_result)
+        # bind right click (Button-3 on Linux/Win, Button-2 on macOS)
+        self.result_text.bind("<Button-3>", self._show_result_menu)
+        self.result_text.bind("<Button-2>", self._show_result_menu)
+        # Ctrl/Cmd+S to save
+        self.result_text.bind("<Control-s>", lambda e: (self._save_result(), "break"))
+        self.result_text.bind("<Command-s>", lambda e: (self._save_result(), "break"))
 
     # ==================================================================
     #  TAB 3 — Model
@@ -439,6 +645,113 @@ class AIApp:
         self.model_info = tk.Text(info_frame, font=("Consolas", 10),
                                   state=tk.DISABLED, wrap=tk.WORD)
         self.model_info.pack(fill=tk.BOTH, expand=True)
+
+    # ==================================================================
+    #  TAB 4 — Console
+    # ==================================================================
+    def _build_console_tab(self):
+        tab = self.tab_console
+
+        # Toolbar: clear + copy + autoscroll toggle
+        toolbar = ttk.Frame(tab)
+        toolbar.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(toolbar, text="🖥️ Live stdout / stderr from the engine",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(toolbar, text="🗑 Clear",
+                   command=self._clear_console).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(toolbar, text="📋 Copy All",
+                   command=self._copy_console).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(toolbar, text="💾 Save to file…",
+                   command=self._save_console).pack(side=tk.RIGHT, padx=2)
+
+        # Output area with scrollbar
+        out_frame = ttk.LabelFrame(tab, text="  📜  Output  ", padding="4")
+        out_frame.pack(fill=tk.BOTH, expand=True)
+
+        ysb = ttk.Scrollbar(out_frame, orient=tk.VERTICAL)
+        self.console_text = tk.Text(
+            out_frame,
+            font=("Consolas", 10),
+            bg="#1e1e1e", fg="#dcdcdc",
+            insertbackground="#dcdcdc",
+            wrap=tk.NONE,
+            state=tk.DISABLED,
+            yscrollcommand=ysb.set,
+        )
+        ysb.config(command=self.console_text.yview)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # ---- Colour tags ----------------------------------------------
+        # VS-Code-ish palette on a dark background.
+        self.console_text.tag_configure("error",  foreground="#f48771",
+                                        font=("Consolas", 10, "bold"))
+        self.console_text.tag_configure("warn",   foreground="#dcdcaa")
+        self.console_text.tag_configure("info",   foreground="#9cdcfe")
+        self.console_text.tag_configure("ok",     foreground="#6a9955",
+                                        font=("Consolas", 10, "bold"))
+        self.console_text.tag_configure("engine", foreground="#c586c0")
+        self.console_text.tag_configure("epoch",  foreground="#4ec9b0")
+
+        # Legend strip
+        legend = ttk.Frame(tab)
+        legend.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(legend, text="Legend:", style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
+        for txt, color in [
+            ("[AuraLite]", "#c586c0"),
+            ("epoch",      "#4ec9b0"),
+            ("INFO",       "#9cdcfe"),
+            ("WARNING",    "#dcdcaa"),
+            ("ERROR",      "#f48771"),
+            ("✅ done",     "#6a9955"),
+        ]:
+            tk.Label(legend, text=txt, fg=color, bg="#f5f6f7",
+                     font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=6)
+
+    def _clear_console(self):
+        self.console_text.config(state=tk.NORMAL)
+        self.console_text.delete("1.0", tk.END)
+        self.console_text.config(state=tk.DISABLED)
+
+    def _copy_console(self):
+        try:
+            text = self.console_text.get("1.0", tk.END)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.status_label.config(text="Status: Console copied to clipboard ✅")
+        except tk.TclError:
+            pass
+
+    def _save_console(self):
+        path = filedialog.asksaveasfilename(
+            title="Save console log",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.console_text.get("1.0", tk.END))
+            messagebox.showinfo("Saved", f"Console log saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _on_close(self):
+        """Restore stdout/stderr and close the window cleanly."""
+        try:
+            sys.stdout = self._orig_stdout
+            sys.stderr = self._orig_stderr
+        except Exception:
+            pass
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _refresh_model_info(self):
         m = self.engine.model
@@ -487,23 +800,29 @@ class AIApp:
         """Update matplotlib loss plot with new data."""
         if not HAS_MATPLOTLIB or not self.loss_history:
             return
-        epochs = [x[0] for x in self.loss_history]
+        epochs       = [x[0] for x in self.loss_history]
         train_losses = [x[1] for x in self.loss_history]
-        val_losses = [x[2] for x in self.loss_history if x[2] is not None]
-        val_epochs = [x[0] for x in self.loss_history if x[2] is not None]
+        val_pairs    = [(x[0], x[2]) for x in self.loss_history if x[2] is not None]
+        val_epochs   = [p[0] for p in val_pairs]
+        val_losses   = [p[1] for p in val_pairs]
 
         self.ax.clear()
         self.ax.plot(epochs, train_losses, 'b-o', markersize=3,
-                     label="Train Loss", linewidth=1)
+                     label="Train Loss", linewidth=1.2)
         if val_losses:
-            self.ax.plot(val_epochs, val_losses, 'r-s', markersize=3,
-                         label="Val Loss", linewidth=1)
+            # A single val point would be invisible as a line — force markers.
+            self.ax.plot(val_epochs, val_losses, 'r-s', markersize=5,
+                         label="Val Loss", linewidth=1.2)
+            title = "Training & Validation Loss"
+        else:
+            title = "Training Loss (validation disabled — text too short or val_split=0)"
         self.ax.set_xlabel("Epoch")
         self.ax.set_ylabel("Loss")
-        self.ax.set_title("Training Loss")
-        self.ax.legend()
+        self.ax.set_title(title, fontsize=10)
+        self.ax.legend(loc="best")
         self.ax.grid(True, alpha=0.3)
-        self.canvas.draw()
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
 
     # ==================================================================
     #  Callbacks
@@ -536,6 +855,90 @@ class AIApp:
         self.status_label.config(
             text=f"Status: Preset '{preset_name}' applied ✅")
 
+    # ---- Auto-recommend Epochs ------------------------------------------
+    def _auto_epochs(self):
+        """Pick a reasonable number of epochs based on dataset & model size.
+
+        Reads current architecture fields, estimates total params, peeks at
+        the selected training file to get an approximate token count, and
+        plugs both into `recommend_epochs`. The user can always tweak the
+        result manually afterwards.
+        """
+        if not self.selected_file_path:
+            messagebox.showinfo(
+                "No file",
+                "Select a training .txt file first — auto-recommendation needs "
+                "to know how big your dataset is.")
+            return
+
+        try:
+            d_model    = int(self.params["d_model"].get())
+            d_ff       = int(self.params["d_ff"].get())
+            n_heads    = int(self.params["n_heads"].get())
+            n_layers   = int(self.params["n_layers"].get())
+            seq_length = int(self.params["seq_length"].get())
+            batch_size = int(self.params["batch_size"].get())
+            n_kv_heads = int(self.n_kv_heads_var.get()) or None
+            bpe_vocab  = int(self.bpe_vocab_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid params",
+                "Some hyperparameter fields contain non-numeric values.")
+            return
+
+        tok_kind = self.tok_var.get()
+
+        # Approximate vocab + token count without doing a full BPE pass:
+        # for char-level we count unique chars; for BPE the trained vocab
+        # caps at bpe_vocab; raw token count ≈ chars / 3 (typical English).
+        try:
+            with open(self.selected_file_path, "r", encoding="utf-8",
+                      errors="ignore") as f:
+                text_sample = f.read()
+        except Exception as e:
+            messagebox.showerror("File Error", f"Could not read file:\n{e}")
+            return
+
+        n_chars = len(text_sample)
+        if tok_kind == "bpe":
+            vocab = min(bpe_vocab, max(2, len(set(text_sample))))
+            n_tokens = max(seq_length + 2, int(n_chars / 3.0))   # rough BPE estimate
+        else:
+            vocab = max(2, len(set(text_sample)))
+            n_tokens = n_chars
+
+        n_params = estimate_n_params(vocab, d_model, n_layers, d_ff,
+                                     n_heads, n_kv_heads)
+        epochs = recommend_epochs(n_tokens, n_params, batch_size, seq_length)
+
+        self.params["epochs"].set(str(epochs))
+        hint = (f"~{n_params/1e6:.2f}M params · ~{n_tokens:,} tokens "
+                f"· vocab≈{vocab} → {epochs} epochs")
+        self.auto_epochs_hint.config(text=hint)
+        self.status_label.config(text=f"Status: Auto-set Epochs = {epochs} ✅")
+        print(f"[AuraLite] Auto-recommend: {hint}")
+
+    # ---- Auto-recommend Generation Length -------------------------------
+    def _auto_gen_length(self):
+        """Pick a generation length based on the seed and the model's context."""
+        seed = self.seed_entry.get()
+        tokenizer = self.engine.tokenizer
+        max_seq_len = (self.engine.model.max_seq_len
+                       if self.engine.model is not None else 4096)
+
+        length = recommend_gen_length(seed, tokenizer, max_seq_len=max_seq_len)
+        # Keep the slider in its own range; bump the upper bound if needed.
+        try:
+            slider_max = float(self.len_scale.cget("to"))
+            if length > slider_max:
+                self.len_scale.configure(to=max(slider_max, length))
+        except tk.TclError:
+            pass
+        self.len_scale.set(length)
+        self._update_len_display(length)
+        print(f"[AuraLite] Auto-recommend gen length: {length} tokens "
+              f"(seed≈{len(seed)} chars, max_seq_len={max_seq_len})")
+
     # ------------------------------------------------------------------
     def select_file(self):
         file_path = filedialog.askopenfilename(
@@ -561,15 +964,38 @@ class AIApp:
         percent = (current / total) * 100
         self.progress_var.set(percent)
         lr = self.engine.scheduler.get_lr() if self.engine.scheduler else 0
+
+        # ---- ETA computation ----------------------------------------------
+        now = time.time()
+        if self._last_epoch_ts is not None:
+            self.epoch_times.append(now - self._last_epoch_ts)
+            # Keep a rolling window of the most recent 20 epochs for stability.
+            if len(self.epoch_times) > 20:
+                self.epoch_times = self.epoch_times[-20:]
+        self._last_epoch_ts = now
+
+        elapsed = (now - self.train_start_time) if self.train_start_time else 0.0
+        remaining_epochs = max(0, total - current)
+        eta_str = "—"
+        speed_str = ""
+        if self.epoch_times:
+            avg_epoch = sum(self.epoch_times) / len(self.epoch_times)
+            eta_seconds = avg_epoch * remaining_epochs
+            eta_str = _fmt_duration(eta_seconds)
+            speed_str = f"  |  {avg_epoch:.2f}s/epoch"
+
         val_part = f"  |  Val: {val_loss:.4f}" if val_loss is not None else ""
         self.status_label.config(
             text=f"Epoch {current}/{total}  |  Loss: {loss:.4f}{val_part}"
-                 f"  |  LR: {lr:.6f}"
+                 f"  |  LR: {lr:.6f}{speed_str}"
+                 f"  |  Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta_str}"
         )
+
         vtxt = f"{val_loss:.4f}" if val_loss is not None else None
         self.loss_history.append((current, loss, val_loss))
         self._append_loss_line(
-            f"epoch {current:>4}/{total}   train {loss:.4f}   val {vtxt or '  —  '}")
+            f"epoch {current:>4}/{total}   train {loss:.4f}   val {vtxt or '  —  '}"
+            f"   eta {eta_str}")
         self._update_loss_plot()
 
     # ------------------------------------------------------------------
@@ -639,6 +1065,10 @@ class AIApp:
 
         self.stop_event.clear()
         self.loss_history = []
+        # Reset ETA tracking
+        self.train_start_time = time.time()
+        self.epoch_times = []
+        self._last_epoch_ts = self.train_start_time
         self.train_btn.config(state=tk.DISABLED)
         self.file_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)
@@ -663,13 +1093,17 @@ class AIApp:
                     progress_callback=self.update_progress,
                     stop_event=self.stop_event,
                 )
+                total_time = (time.time() - self.train_start_time
+                              if self.train_start_time else 0.0)
+                total_str = _fmt_duration(total_time)
                 if self.stop_event.is_set():
-                    self.root.after(0, lambda: self.status_label.config(
-                        text="Status: Stopped. 🛑 Weights preserved — "
-                             "you can generate or save."))
+                    msg = (f"Status: Stopped. 🛑 Weights preserved — "
+                           f"you can generate or save.  |  Total: {total_str}")
+                    print(f"[AuraLite] Training stopped after {total_str}.")
                 else:
-                    self.root.after(0, lambda: self.status_label.config(
-                        text="Status: Training complete! ✅"))
+                    msg = f"Status: Training complete! ✅  |  Total: {total_str}"
+                    print(f"[AuraLite] Training finished in {total_str}.")
+                self.root.after(0, lambda m=msg: self.status_label.config(text=m))
                 # Whether finished or stopped mid-way, the model holds
                 # learned weights — enable generation and saving.
                 if self.engine.model is not None:
@@ -843,6 +1277,94 @@ class AIApp:
     def _display_result(self, text):
         self.result_text.delete("1.0", tk.END)
         self.result_text.insert(tk.END, text)
+
+    # ---- Output toolbar handlers --------------------------------------
+    def _get_result_text(self) -> str:
+        # strip the trailing newline tkinter always appends
+        return self.result_text.get("1.0", "end-1c")
+
+    def _copy_result(self):
+        text = self._get_result_text()
+        if not text.strip():
+            self.status_label.config(text="Status: Output is empty — nothing to copy.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()  # ensure clipboard persists after focus change
+            n = len(text)
+            self.status_label.config(
+                text=f"Status: Copied {n:,} characters to clipboard ✅")
+        except tk.TclError as e:
+            messagebox.showerror("Copy Error", str(e))
+
+    def _copy_selection_result(self):
+        try:
+            sel = self.result_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return self._copy_result()  # nothing selected → copy all
+        if not sel:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(sel)
+        self.root.update()
+        self.status_label.config(
+            text=f"Status: Copied selection ({len(sel):,} chars) ✅")
+
+    def _clear_result(self):
+        self.result_text.delete("1.0", tk.END)
+
+    def _save_result(self):
+        text = self._get_result_text()
+        if not text.strip():
+            messagebox.showinfo("Empty", "Nothing to save — output is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save generated text",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("Markdown", "*.md"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.status_label.config(
+                text=f"Status: Saved output ✅ ({os.path.basename(path)})")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _append_result(self):
+        text = self._get_result_text()
+        if not text.strip():
+            messagebox.showinfo("Empty", "Nothing to append — output is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Append generated text to file (existing file will be appended)",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("Markdown", "*.md"),
+                       ("All files", "*.*")],
+            confirmoverwrite=False,
+        )
+        if not path:
+            return
+        try:
+            sep = "\n\n" + "=" * 50 + "\n"
+            with open(path, "a", encoding="utf-8") as f:
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    f.write(sep)
+                f.write(text)
+            self.status_label.config(
+                text=f"Status: Appended output ✅ ({os.path.basename(path)})")
+        except Exception as e:
+            messagebox.showerror("Append Error", str(e))
+
+    def _show_result_menu(self, event):
+        try:
+            self._result_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._result_menu.grab_release()
 
     # ------------------------------------------------------------------
     def save_model(self):
