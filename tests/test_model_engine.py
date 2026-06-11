@@ -46,6 +46,43 @@ def tiny_params():
     }
 
 
+class TinyAlphabetTokenizer:
+    kind = "char"
+
+    def __init__(self, vocab: str = " abcdefghijklmnopqrstuvwxyz"):
+        self.vocab = list(vocab)
+        self.token_to_id = {ch: i for i, ch in enumerate(self.vocab)}
+
+    def encode(self, s: str) -> list[int]:
+        return [self.token_to_id.get(ch, 0) for ch in s]
+
+    def decode(self, ids) -> str:
+        return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else "?"
+                       for i in ids)
+
+
+class NextTokenIsCurrentPlusOne(torch.nn.Module):
+    """Deterministic fake LM for generation-path tests."""
+
+    def __init__(self, vocab_size: int, max_seq_len: int = 16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+        self.seed_lengths = []
+
+    def reset_cache(self):
+        pass
+
+    def forward(self, x, start_pos: int = 0, use_cache: bool = False):
+        if start_pos == 0:
+            self.seed_lengths.append(int(x.shape[1]))
+        b, t = x.shape
+        logits = torch.full((b, t, self.vocab_size), -1e9, device=x.device)
+        next_ids = (x + 1) % self.vocab_size
+        logits.scatter_(2, next_ids.unsqueeze(-1), 0.0)
+        return logits
+
+
 # ======================================================================
 #  Tokenizer Tests
 # ======================================================================
@@ -168,6 +205,15 @@ class TestAttention:
         x = torch.randn(2, 16, 64, device=device)
         out = attn(x)
         assert out.shape == (2, 16, 64)
+
+    def test_alibi_bias_is_hard_causal(self, device):
+        attn = Attention(d_model=64, n_heads=4, max_seq_len=128,
+                         use_alibi=True).to(device)
+        bias = attn._get_alibi_bias(q_len=2, k_len=5, device=device, start_pos=3)
+        # Query positions are 3 and 4, so key 4 is future for the first query only.
+        assert torch.isneginf(bias[:, 0, 4]).all()
+        assert torch.isfinite(bias[:, 0, :4]).all()
+        assert torch.isfinite(bias[:, 1, :5]).all()
 
 
 class TestFeedForward:
@@ -298,6 +344,14 @@ class TestCharDataset:
         ds = CharDataset(data, seq_length=5)
         assert len(ds) == 0
 
+    def test_precomputed_window_views(self):
+        data = torch.arange(20)
+        ds = CharDataset(data, seq_length=5)
+        assert ds.x.shape == (15, 5)
+        assert ds.y.shape == (15, 5)
+        assert torch.equal(ds.x[0], torch.arange(0, 5))
+        assert torch.equal(ds.y[0], torch.arange(1, 6))
+
 
 # ======================================================================
 #  Scheduler Tests
@@ -322,6 +376,23 @@ class TestCosineWarmupScheduler:
             scheduler.step()
         lr = scheduler.get_lr()
         assert abs(lr - 0.01) < 1e-5
+
+    def test_state_roundtrip(self):
+        optimizer = torch.optim.SGD([torch.randn(10, requires_grad=True)], lr=0.1)
+        scheduler = CosineWarmupScheduler(optimizer, warmup_steps=10,
+                                          max_steps=100, min_lr=0.01)
+        for _ in range(17):
+            scheduler.step()
+        state = scheduler.state_dict()
+
+        optimizer2 = torch.optim.SGD([torch.randn(10, requires_grad=True)], lr=0.1)
+        scheduler2 = CosineWarmupScheduler(optimizer2, warmup_steps=1,
+                                           max_steps=1, min_lr=0.0)
+        scheduler2.load_state_dict(state)
+        assert scheduler2.step_count == scheduler.step_count
+        assert scheduler2.warmup_steps == scheduler.warmup_steps
+        assert scheduler2.max_steps == scheduler.max_steps
+        assert abs(scheduler2.get_lr() - scheduler.get_lr()) < 1e-8
 
 
 # ======================================================================
@@ -411,6 +482,53 @@ class TestAuraLiteEngine:
             assert loaded == params
         finally:
             os.unlink(path)
+
+    def test_checkpoint_saves_training_state(self, small_text, tiny_params):
+        engine = AuraLiteEngine()
+        params = dict(tiny_params)
+        params["epochs"] = 1
+        engine.train(small_text, params)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            path = f.name
+        try:
+            engine.save_model(path)
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            assert ckpt["optimizer_state"] is not None
+            assert ckpt["scheduler_state"] is not None
+
+            engine2 = AuraLiteEngine()
+            engine2.load_model(path)
+            assert engine2._resume_optimizer_state is not None
+            assert engine2._resume_scheduler_state is not None
+        finally:
+            os.unlink(path)
+
+    def test_generate_truncates_long_prompt_to_context(self):
+        engine = AuraLiteEngine()
+        tok = TinyAlphabetTokenizer()
+        engine.tokenizer = tok
+        engine.vocab_size = len(tok.vocab)
+        engine.model = NextTokenIsCurrentPlusOne(engine.vocab_size, max_seq_len=5)
+
+        result = engine.generate("abcdefg", length=1, temperature=1.0, top_k=1, top_p=1.0)
+        # Prompt is truncated to the last 4 tokens so the first seed pass fits.
+        assert engine.model.seed_lengths == [4]
+        # Output still preserves the original user prompt, only the model context is truncated.
+        assert result == "abcdefgh"
+
+    def test_generate_batch_mixed_prompt_lengths(self):
+        engine = AuraLiteEngine()
+        tok = TinyAlphabetTokenizer()
+        engine.tokenizer = tok
+        engine.vocab_size = len(tok.vocab)
+        engine.model = NextTokenIsCurrentPlusOne(engine.vocab_size, max_seq_len=16)
+
+        results = engine.generate_batch(
+            ["ab", "abcd"], length=1,
+            temperature=1.0, top_k=1, top_p=1.0,
+        )
+        assert results == ["abc", "abcde"]
 
     def test_gradient_accumulation(self, small_text, tiny_params):
         engine = AuraLiteEngine()

@@ -13,7 +13,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_COUNT))
 import json
 import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -492,6 +492,7 @@ class Attention(nn.Module):
 
     IMPROVED (v2.1+):
     - ALiBi (Attention with Linear Biases) support for better length extrapolation
+    - ALiBi path now keeps a *hard* causal mask (future tokens are forbidden)
     """
 
     def __init__(self, d_model: int, n_heads: int,
@@ -524,13 +525,9 @@ class Attention(nn.Module):
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def _get_alibi_slopes(self) -> torch.Tensor:
-        """Compute ALiBi slopes: 2^(-8/n), 2^(-16/n), ... for n heads."""
+        """Compute monotonic ALiBi slopes, one per attention head."""
         n = self.n_heads
-        # NeMo convention: use 2^(-8/n) for the first head
-        start = 2 ** (-2 ** -(math.log2(n) - 3))
-        # Simpler: standard ALiBi slopes
-        slopes = 2 ** (-8 * torch.arange(1, n + 1).float() / n)
-        return slopes
+        return 2 ** (-8 * torch.arange(1, n + 1).float() / n)
 
     # ---- RoPE --------------------------------------------------------
     def _apply_rope(self, x: torch.Tensor, start_pos: int, seq_len: int) -> torch.Tensor:
@@ -549,18 +546,31 @@ class Attention(nn.Module):
         out_x1 = x0 * sin + x1 * cos
         return torch.stack([out_x0, out_x1], dim=-1).flatten(-2).type_as(x)
 
-    # ---- ALiBi bias --------------------------------------------------
-    def _get_alibi_bias(self, q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
-        """Create ALiBi causal attention bias of shape (n_heads, q_len, k_len)."""
-        # Relative positions: q_pos - k_pos  (negative or zero for causal)
-        q_pos = torch.arange(q_len, device=device)
+    def _get_causal_keep_mask(self, q_len: int, k_len: int,
+                              device: torch.device, start_pos: int = 0) -> torch.Tensor:
+        """Boolean causal keep-mask for SDPA (True = allowed)."""
+        q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
         k_pos = torch.arange(k_len, device=device)
-        rel_pos = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)  # (q_len, k_len)
-        # causal mask: only allow current and past positions
-        rel_pos = rel_pos.clamp(max=0)  # zero out future positions
-        # Apply slopes: (n_heads, 1, 1) * (1, q_len, k_len)
-        alibi_bias = self.alibi_slopes.unsqueeze(-1).unsqueeze(-1) * rel_pos
-        return alibi_bias  # (n_heads, q_len, k_len)
+        return k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+    # ---- ALiBi bias --------------------------------------------------
+    def _get_alibi_bias(self, q_len: int, k_len: int,
+                        device: torch.device, start_pos: int = 0) -> torch.Tensor:
+        """Create an ALiBi attention bias with a hard causal mask.
+
+        Returned shape: (n_heads, q_len, k_len). Past/current positions get a
+        finite ALiBi bias, future positions are set to -inf and therefore
+        cannot be attended to. This fixes the old behaviour where ALiBi merely
+        penalised the future instead of forbidding it.
+        """
+        q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
+        k_pos = torch.arange(k_len, device=device)
+        rel_pos = k_pos.unsqueeze(0) - q_pos.unsqueeze(1)  # <= 0 for allowed keys
+        future = rel_pos > 0
+
+        bias = self.alibi_slopes[:, None, None] * rel_pos.to(torch.float32)
+        bias = bias.masked_fill(future.unsqueeze(0), float("-inf"))
+        return bias
 
     # ---- Forward -----------------------------------------------------
     def forward(self, x: torch.Tensor,
@@ -593,30 +603,18 @@ class Attention(nn.Module):
 
         S = k.shape[2]
         # Flash / memory-efficient attention via PyTorch SDPA
-        if T == S:
-            # full sequence (training or seed pass) — standard causal mask
-            if self.use_alibi:
-                alibi = self._get_alibi_bias(T, S, x.device)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=alibi)
-            else:
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.use_alibi:
+            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif T == S and start_pos == 0:
+            # full sequence (training or seed pass) — use the fused causal path
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         elif T == 1:
-            # incremental decoding — the single query may attend to all keys
-            if self.use_alibi:
-                alibi = self._get_alibi_bias(1, S, x.device)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=alibi)
-            else:
-                out = F.scaled_dot_product_attention(q, k, v)
+            # incremental decoding — the single query may attend to all cached keys
+            out = F.scaled_dot_product_attention(q, k, v)
         else:
-            # general case (chunked decoding with cache)
-            if self.use_alibi:
-                alibi = self._get_alibi_bias(T, S, x.device)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=alibi)
-            else:
-                q_pos = torch.arange(start_pos, start_pos + T, device=x.device)
-                k_pos = torch.arange(S, device=x.device)
-                keep = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.W_o(out)
@@ -849,26 +847,31 @@ class LoRALayer(nn.Module):
 # ===================================================================
 
 class CharDataset(Dataset):
-    """Sliding-window token-level dataset.
+    """Sliding-window token-level dataset backed by one in-memory LongTensor.
 
-    Stores the full encoded text as a single tensor and produces
-    (input_seq, target_seq) samples on the fly, where target_seq is
-    input_seq shifted by one — so the loss is computed over EVERY
-    position of the window (dense next-token prediction), not just
-    the last one. This makes training ~seq_length× more sample-efficient.
+    The full corpus is tokenised exactly once before training and stored as a
+    single `torch.LongTensor`. We then create window *views* via `unfold()` so
+    the DataLoader reads pre-tokenised tensors instead of repeatedly slicing raw
+    Python text/list data on the hot path.
     """
 
     def __init__(self, encoded: torch.Tensor, seq_length: int):
-        self.data = encoded
+        self.data = encoded.contiguous()
         self.seq_length = seq_length
 
+        if len(self.data) <= self.seq_length:
+            self.x = self.data.new_empty((0, self.seq_length))
+            self.y = self.data.new_empty((0, self.seq_length))
+        else:
+            windows = self.data.unfold(0, self.seq_length + 1, 1)
+            self.x = windows[:, :-1]
+            self.y = windows[:, 1:]
+
     def __len__(self):
-        return max(0, len(self.data) - self.seq_length)
+        return self.x.shape[0]
 
     def __getitem__(self, idx: int):
-        x = self.data[idx : idx + self.seq_length]
-        y = self.data[idx + 1 : idx + self.seq_length + 1]
-        return x, y
+        return self.x[idx], self.y[idx]
 
 
 # ===================================================================
@@ -904,6 +907,27 @@ class CosineWarmupScheduler:
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 
+    def state_dict(self) -> dict:
+        return {
+            "warmup_steps": self.warmup_steps,
+            "max_steps": self.max_steps,
+            "min_lr": self.min_lr,
+            "base_lrs": list(self.base_lrs),
+            "step_count": self.step_count,
+            "current_lrs": [pg["lr"] for pg in self.optimizer.param_groups],
+        }
+
+    def load_state_dict(self, state: dict):
+        self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
+        self.max_steps = state.get("max_steps", self.max_steps)
+        self.min_lr = state.get("min_lr", self.min_lr)
+        self.base_lrs = list(state.get("base_lrs", self.base_lrs))
+        self.step_count = int(state.get("step_count", self.step_count))
+        current_lrs = state.get("current_lrs")
+        if current_lrs is not None:
+            for pg, lr in zip(self.optimizer.param_groups, current_lrs):
+                pg["lr"] = lr
+
 
 # ===================================================================
 #  Engine
@@ -931,6 +955,9 @@ class AuraLiteEngine:
         self.vocab_size  = 0
         self.params_used: dict = {}          # remember last training params
         self.last_val_loss: float | None = None
+        self._resume_optimizer_state = None
+        self._resume_scheduler_state = None
+        self._resume_scaler_state = None
 
         # CUDA performance tuning
         if self.device.type == "cuda":
@@ -950,6 +977,64 @@ class AuraLiteEngine:
         if self.tokenizer is None:
             raise ValueError("No tokenizer — train or load a model first!")
         return self.tokenizer.decode(ids)
+
+    @staticmethod
+    def _move_optimizer_state_to_device(optimizer, device: torch.device):
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    def _prepare_prompt_ids(self, start_str: str,
+                            reserve_generation_slot: bool = True) -> list[int]:
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+
+        ids = self.encode(start_str)
+        if not ids:
+            ids = [0]
+
+        max_prompt_tokens = self.model.max_seq_len - (1 if reserve_generation_slot else 0)
+        max_prompt_tokens = max(1, max_prompt_tokens)
+        if len(ids) > max_prompt_tokens:
+            ids = ids[-max_prompt_tokens:]
+        return ids
+
+    def _generate_ids(self, ids: list[int], length: int = 50,
+                      temperature: float = 0.8,
+                      top_k: int = 50, top_p: float = 0.9,
+                      repetition_penalty: float = 1.0) -> list[int]:
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+
+        self.model.eval()
+        self.model.reset_cache()
+
+        result_ids: list[int] = list(ids)
+        if length <= 0:
+            return result_ids
+
+        with torch.no_grad():
+            # --- Process full seed in one pass --------------------------
+            t = torch.tensor([ids], dtype=torch.long).to(self.device)
+            logits = self.model(t, start_pos=0, use_cache=True)
+            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                     repetition_penalty, result_ids)
+            result_ids.append(nxt)
+
+            # --- Generate remaining tokens one-by-one (KV-cache) --------
+            for _ in range(length - 1):
+                pos = len(result_ids) - 1
+                if pos >= self.model.max_seq_len - 1:
+                    break   # context limit reached
+                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
+                logits = self.model(t, start_pos=pos, use_cache=True)
+                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                         repetition_penalty, result_ids)
+                result_ids.append(nxt)
+
+        self.model.reset_cache()
+        return result_ids
 
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
@@ -1020,11 +1105,34 @@ class AuraLiteEngine:
         accumulation_steps = params.get("accumulation_steps", 1)
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
+        resume_training_state = params.get("resume_training_state", True)
 
         self.params_used = dict(params)
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
+
+        optimizer_state_to_restore = None
+        scheduler_state_to_restore = None
+        scaler_state_to_restore = None
+        if resuming and resume_training_state:
+            if self.optimizer is not None:
+                optimizer_state_to_restore = self.optimizer.state_dict()
+            elif self._resume_optimizer_state is not None:
+                optimizer_state_to_restore = self._resume_optimizer_state
+
+            if self.scheduler is not None:
+                scheduler_state_to_restore = self.scheduler.state_dict()
+            elif self._resume_scheduler_state is not None:
+                scheduler_state_to_restore = self._resume_scheduler_state
+
+            if self.scaler is not None:
+                try:
+                    scaler_state_to_restore = self.scaler.state_dict()
+                except Exception:
+                    scaler_state_to_restore = None
+            elif self._resume_scaler_state is not None:
+                scaler_state_to_restore = self._resume_scaler_state
 
         # ---- Tokenizer ------------------------------------------------
         if not resuming:
@@ -1059,14 +1167,30 @@ class AuraLiteEngine:
             self.model.parameters(), lr=lr,
             weight_decay=weight_decay, betas=(0.9, 0.95),
         )
+        if optimizer_state_to_restore is not None:
+            try:
+                self.optimizer.load_state_dict(optimizer_state_to_restore)
+                self._move_optimizer_state_to_device(self.optimizer, self.device)
+                print("[AuraLite] Restored optimizer state.")
+            except Exception as e:
+                print(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
         criterion = nn.CrossEntropyLoss()
 
         # Mixed precision (CUDA only)
         use_amp = self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        if scaler_state_to_restore is not None:
+            try:
+                self.scaler.load_state_dict(scaler_state_to_restore)
+                print("[AuraLite] Restored AMP scaler state.")
+            except Exception as e:
+                print(f"[AuraLite] WARNING: could not restore AMP scaler state: {e}")
 
         # ---- Dataset / DataLoader ------------------------------------
         encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
+        encoded_bytes = encoded.numel() * encoded.element_size()
+        print(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
+              f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
 
         # ---- Train / validation split -------------------------------------
         # Goal: both train and val slices must produce at least one full
@@ -1150,6 +1274,19 @@ class AuraLiteEngine:
         self.scheduler = CosineWarmupScheduler(
             self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
         )
+        if scheduler_state_to_restore is not None:
+            try:
+                self.scheduler.load_state_dict(scheduler_state_to_restore)
+                # If we continue beyond the original planned run, extend the
+                # cosine schedule so it does not instantly collapse at the old
+                # max_steps boundary.
+                self.scheduler.max_steps = max(
+                    self.scheduler.max_steps,
+                    self.scheduler.step_count + total_steps,
+                )
+                print("[AuraLite] Restored scheduler state.")
+            except Exception as e:
+                print(f"[AuraLite] WARNING: could not restore scheduler state: {e}")
 
         # ---- torch.compile (optional, speeds up the training loop) ----
         # NOTE: torch.compile() returns lazily — Dynamo/Inductor errors (e.g. a
@@ -1255,38 +1392,13 @@ class AuraLiteEngine:
                  top_k: int = 50, top_p: float = 0.9,
                  repetition_penalty: float = 1.0) -> str:
 
-        if self.model is None:
-            raise ValueError("Train or load a model first!")
-
-        self.model.eval()
-        self.model.reset_cache()
-
-        ids = self.encode(start_str)
-        if not ids:
-            ids = [0]
-        result_ids: list[int] = list(ids)
-
-        with torch.no_grad():
-            # --- Process full seed in one pass --------------------------
-            t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self.model(t, start_pos=0, use_cache=True)
-            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids)
-            result_ids.append(nxt)
-
-            # --- Generate remaining tokens one-by-one (KV-cache) --------
-            for _ in range(length - 1):
-                pos = len(result_ids) - 1
-                if pos >= self.model.max_seq_len - 1:
-                    break   # context limit reached
-                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self.model(t, start_pos=pos, use_cache=True)
-                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids)
-                result_ids.append(nxt)
-
-        self.model.reset_cache()
-        return self.decode(result_ids)
+        ids = self._prepare_prompt_ids(start_str)
+        used_prompt = self.decode(ids)
+        result_ids = self._generate_ids(
+            ids, length, temperature, top_k, top_p,
+            repetition_penalty=repetition_penalty)
+        generated_full = self.decode(result_ids)
+        return start_str + generated_full[len(used_prompt):]
 
     # ---- Thinking Mode (two-pass generation) ---------------------------
     def generate_with_thinking(self, start_str: str, length: int = 50,
@@ -1326,13 +1438,15 @@ class AuraLiteEngine:
         if web_context:
             think_prompt = f"{web_context}\n{start_str}"
 
-        draft_full = self.generate(
-            think_prompt, thinking_length,
+        think_ids = self._prepare_prompt_ids(think_prompt)
+        think_prompt_used = self.decode(think_ids)
+        draft_full = self.decode(self._generate_ids(
+            think_ids, thinking_length,
             temperature=thinking_temperature,
             top_k=top_k, top_p=top_p,
-            repetition_penalty=repetition_penalty)
+            repetition_penalty=repetition_penalty))
         # Keep only the newly generated part as the "thoughts"
-        thinking_text = draft_full[len(think_prompt):].strip()
+        thinking_text = draft_full[len(think_prompt_used):].strip()
 
         # ---- Pass 2: final answer conditioned on the draft -------------
         ctx_parts = []
@@ -1342,18 +1456,15 @@ class AuraLiteEngine:
             ctx_parts.append(thinking_text)
         ctx_parts.append(start_str)
 
-        # Budget: keep the conditioning within the context window
-        max_chars = max(len(start_str) + 8, self.model.max_seq_len * 4)
         final_prompt = "\n".join(ctx_parts)
-        if len(final_prompt) > max_chars:
-            final_prompt = final_prompt[-max_chars:]
-
-        final_full = self.generate(
-            final_prompt, length,
+        final_ids = self._prepare_prompt_ids(final_prompt)
+        final_prompt_used = self.decode(final_ids)
+        final_full = self.decode(self._generate_ids(
+            final_ids, length,
             temperature=temperature,
             top_k=top_k, top_p=top_p,
-            repetition_penalty=repetition_penalty)
-        final_text = start_str + final_full[len(final_prompt):]
+            repetition_penalty=repetition_penalty))
+        final_text = start_str + final_full[len(final_prompt_used):]
 
         return thinking_text, final_text
 
@@ -1369,13 +1480,14 @@ class AuraLiteEngine:
         if self.model is None:
             raise ValueError("Train or load a model first!")
 
+        ids = self._prepare_prompt_ids(start_str)
+
         self.model.eval()
         self.model.reset_cache()
 
-        ids = self.encode(start_str)
-        if not ids:
-            ids = [0]
         result_ids: list[int] = list(ids)
+        if length <= 0:
+            return
 
         with torch.no_grad():
             # Process seed
@@ -1400,41 +1512,27 @@ class AuraLiteEngine:
 
         self.model.reset_cache()
 
-    # ---- Batch Generation (NEW) ---------------------------------------
-    def generate_batch(self, prompts: list[str], length: int = 50,
-                       temperature: float = 0.8,
-                       top_k: int = 50, top_p: float = 0.9,
-                       repetition_penalty: float = 1.0) -> list[str]:
-        """Generate text for multiple prompts in parallel.
-
-        Batches all prompts, pads to max length, runs single forward pass,
-        then generates token-by-token for each sequence.
-        """
+    def _generate_batch_group(self, batch_ids: list[list[int]], length: int = 50,
+                              temperature: float = 0.8,
+                              top_k: int = 50, top_p: float = 0.9,
+                              repetition_penalty: float = 1.0) -> list[list[int]]:
+        """Generate in parallel for prompts that already have the same length."""
         if self.model is None:
             raise ValueError("Train or load a model first!")
+        if not batch_ids:
+            return []
 
-        self.model.eval()
         self.model.reset_cache()
+        result_ids = [list(ids) for ids in batch_ids]
+        batch = torch.tensor(batch_ids, dtype=torch.long).to(self.device)
+        B = len(batch_ids)
 
-        # Encode all prompts
-        all_ids = [self.encode(p) for p in prompts]
-        max_len = max(len(ids) for ids in all_ids)
-
-        # Pad to same length
-        padded_ids = []
-        for ids in all_ids:
-            pad_len = max_len - len(ids)
-            padded_ids.append(ids + [0] * pad_len)
-
-        batch = torch.tensor(padded_ids, dtype=torch.long).to(self.device)
-        B = len(prompts)
-
-        result_ids = [list(ids) for ids in all_ids]
+        if length <= 0:
+            return result_ids
 
         with torch.no_grad():
-            # Process full prompts in one pass
             logits = self.model(batch, start_pos=0, use_cache=True)
-            last_logits = logits[:, -1, :]  # (B, vocab)
+            last_logits = logits[:, -1, :]
 
             next_tokens = []
             for b in range(B):
@@ -1443,14 +1541,12 @@ class AuraLiteEngine:
                 result_ids[b].append(nxt)
                 next_tokens.append(nxt)
 
-            # Generate remaining tokens one-by-one
             for _ in range(length - 1):
-                pos = max(len(rids) for rids in result_ids) - 1
+                pos = len(result_ids[0]) - 1
                 if pos >= self.model.max_seq_len - 1:
                     break
 
-                next_input = torch.tensor([[nt] for nt in next_tokens],
-                                          dtype=torch.long).to(self.device)
+                next_input = torch.tensor(next_tokens, dtype=torch.long).unsqueeze(1).to(self.device)
                 logits = self.model(next_input, start_pos=pos, use_cache=True)
 
                 next_tokens = []
@@ -1461,7 +1557,46 @@ class AuraLiteEngine:
                     next_tokens.append(nxt)
 
         self.model.reset_cache()
-        return [self.decode(rids) for rids in result_ids]
+        return result_ids
+
+    # ---- Batch Generation (NEW) ---------------------------------------
+    def generate_batch(self, prompts: list[str], length: int = 50,
+                       temperature: float = 0.8,
+                       top_k: int = 50, top_p: float = 0.9,
+                       repetition_penalty: float = 1.0) -> list[str]:
+        """Generate text for multiple prompts in parallel.
+
+        Prompts are first truncated to the model context limit and then grouped
+        by prompt length. Each equal-length group is generated as a true batch.
+        This fixes the old mixed-length padding bug where shorter prompts were
+        sampled from the logits of a padding token.
+        """
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+        if not prompts:
+            return []
+
+        self.model.eval()
+
+        grouped: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+        for idx, prompt in enumerate(prompts):
+            ids = self._prepare_prompt_ids(prompt)
+            grouped[len(ids)].append((idx, ids))
+
+        results: list[str | None] = [None] * len(prompts)
+        for prompt_len in sorted(grouped.keys(), reverse=True):
+            batch_group = grouped[prompt_len]
+            batch_ids = [ids for _, ids in batch_group]
+            generated_ids = self._generate_batch_group(
+                batch_ids, length, temperature, top_k, top_p,
+                repetition_penalty=repetition_penalty)
+            for (orig_idx, used_ids), out_ids in zip(batch_group, generated_ids):
+                used_prompt = self.decode(used_ids)
+                out_text = self.decode(out_ids)
+                results[orig_idx] = prompts[orig_idx] + out_text[len(used_prompt):]
+
+        self.model.reset_cache()
+        return [r if r is not None else "" for r in results]
 
     def _sample_token(self, logits: torch.Tensor,
                       temperature: float, top_k: int, top_p: float,
@@ -1512,6 +1647,9 @@ class AuraLiteEngine:
             raise ValueError("No model to save!")
         checkpoint = {
             "model_state":  self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict() if self.optimizer is not None else None,
+            "scheduler_state": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scaler_state": self.scaler.state_dict() if self.scaler is not None else None,
             "vocab_size":   self.vocab_size,
             "tokenizer":    self.tokenizer.to_dict() if self.tokenizer else None,
             "params_used":  self.params_used,
@@ -1564,6 +1702,15 @@ class AuraLiteEngine:
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
         self.model.eval()
+
+        # Stash training state so a later `continue_training=True` call can
+        # resume optimizer / scheduler / scaler state as well.
+        self._resume_optimizer_state = checkpoint.get("optimizer_state")
+        self._resume_scheduler_state = checkpoint.get("scheduler_state")
+        self._resume_scaler_state = checkpoint.get("scaler_state")
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
 
     # ---- Config Management (NEW) --------------------------------------
     def save_config(self, path: str, params: dict):
