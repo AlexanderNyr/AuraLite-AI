@@ -4,6 +4,7 @@ from model_engine import (
     AuraLiteEngine, validate_params, ParamValidationError,
     estimate_n_params, recommend_epochs, recommend_gen_length,
 )
+from web_tools import build_web_context
 import threading
 import multiprocessing
 import os
@@ -559,6 +560,30 @@ class AIApp:
             text="Streaming output (token-by-token)",
             variable=self.stream_var)
         self.stream_cb.pack(pady=2)
+
+        # NEW: Thinking mode + Web search
+        smart_row = ttk.Frame(seed_frame)
+        smart_row.pack(fill=tk.X, pady=2)
+
+        self.thinking_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(smart_row,
+            text="🧠 Thinking mode (two-pass draft → answer)",
+            variable=self.thinking_var).pack(side=tk.LEFT, padx=4)
+
+        self.websearch_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(smart_row,
+            text="🌐 Web search (DuckDuckGo)",
+            variable=self.websearch_var,
+            command=self._toggle_web_query).pack(side=tk.LEFT, padx=12)
+
+        self.web_query_row = ttk.Frame(seed_frame)
+        ttk.Label(self.web_query_row,
+                  text="Search query (empty = use seed):").pack(
+            side=tk.LEFT, padx=4)
+        self.web_query_entry = ttk.Entry(self.web_query_row,
+                                         font=("Segoe UI", 10))
+        self.web_query_entry.pack(side=tk.LEFT, fill=tk.X,
+                                  expand=True, padx=4)
 
         # --- Output ---
         out_frame = ttk.LabelFrame(tab, text="  📄  Output  ", padding="6")
@@ -1134,10 +1159,40 @@ class AIApp:
         self.stop_btn.config(state=tk.DISABLED)
 
     # ------------------------------------------------------------------
+    def _toggle_web_query(self, *_):
+        """Show / hide the web-search query row."""
+        if self.websearch_var.get():
+            self.web_query_row.pack(fill=tk.X, pady=2)
+        else:
+            self.web_query_row.pack_forget()
+
+    def _fetch_web_context(self, seed: str) -> str:
+        """Run a web search (blocking — call from a worker thread).
+
+        Returns formatted snippet context, or '' on failure / no results.
+        """
+        query = self.web_query_entry.get().strip() or seed
+        try:
+            ctx = build_web_context(query, max_results=4)
+            if ctx:
+                print(f"🌐 Web search OK: {len(ctx)} chars of context "
+                      f"for query '{query}'")
+            else:
+                print(f"🌐 Web search: no results for '{query}'")
+            return ctx
+        except Exception as e:
+            print(f"⚠️ Web search failed ({e}) — generating without it.")
+            return ""
+
     def generate_text(self):
         # Handle batch mode
         if self.batch_var.get():
             self._generate_batch()
+            return
+
+        # Thinking / web-search mode has its own pipeline
+        if self.thinking_var.get() or self.websearch_var.get():
+            self._generate_thinking()
             return
 
         # Handle streaming mode
@@ -1172,6 +1227,75 @@ class AIApp:
                                            temperature, top_k, top_p,
                                            repetition_penalty=rep_pen)
                 self.root.after(0, self._display_result, res)
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Gen Error", f"Error during generation:\n{e}"))
+            finally:
+                self.root.after(0, lambda: self.gen_btn.config(
+                    state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # NEW: Thinking mode (+ optional web search) generation
+    def _generate_thinking(self):
+        seed = self.seed_entry.get()
+        length = int(self.len_scale.get())
+        try:
+            temperature = float(self.temp_var.get())
+            top_k = int(self.topk_var.get())
+            top_p = float(self.topp_var.get())
+            rep_pen = float(self.rep_var.get())
+        except ValueError:
+            messagebox.showwarning("Warning",
+                                   "Invalid generation settings!")
+            return
+
+        if not seed:
+            messagebox.showwarning("Warning",
+                                   "Please enter a seed phrase.")
+            return
+
+        use_web = self.websearch_var.get()
+        use_thinking = self.thinking_var.get()
+
+        self.result_text.delete("1.0", tk.END)
+        steps = []
+        if use_web:
+            steps.append("🌐 searching the web")
+        if use_thinking:
+            steps.append("🧠 thinking")
+        steps.append("✍️ generating")
+        self.result_text.insert(tk.END, " → ".join(steps) + " …\n")
+        self.gen_btn.config(state=tk.DISABLED)
+
+        def run():
+            try:
+                web_ctx = self._fetch_web_context(seed) if use_web else ""
+
+                if use_thinking:
+                    thoughts, final = self.engine.generate_with_thinking(
+                        seed, length, temperature, top_k, top_p,
+                        repetition_penalty=rep_pen,
+                        web_context=web_ctx or None)
+                else:
+                    # Web search only: prepend context, generate once
+                    prompt = f"{web_ctx}\n{seed}" if web_ctx else seed
+                    full = self.engine.generate(
+                        prompt, length, temperature, top_k, top_p,
+                        repetition_penalty=rep_pen)
+                    thoughts = ""
+                    final = seed + full[len(prompt):]
+
+                parts = []
+                if web_ctx:
+                    parts.append("🌐 WEB CONTEXT\n──────────────\n"
+                                 + web_ctx)
+                if thoughts:
+                    parts.append("🧠 THINKING (draft pass)\n"
+                                 "──────────────\n" + thoughts)
+                parts.append("✅ ANSWER\n──────────────\n" + final)
+                self.root.after(0, self._display_result,
+                                "\n\n".join(parts))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror(
                     "Gen Error", f"Error during generation:\n{e}"))

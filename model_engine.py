@@ -1288,6 +1288,75 @@ class AuraLiteEngine:
         self.model.reset_cache()
         return self.decode(result_ids)
 
+    # ---- Thinking Mode (two-pass generation) ---------------------------
+    def generate_with_thinking(self, start_str: str, length: int = 50,
+                               temperature: float = 0.8,
+                               top_k: int = 50, top_p: float = 0.9,
+                               repetition_penalty: float = 1.0,
+                               thinking_length: int | None = None,
+                               thinking_temperature: float | None = None,
+                               web_context: str | None = None
+                               ) -> tuple[str, str]:
+        """Two-pass 'thinking' generation.
+
+        Pass 1 ("thinking"): the model free-writes a draft continuation of
+        the prompt at a slightly higher temperature — an exploration pass.
+
+        Pass 2 ("answer"): the draft (and optional web-search context) is
+        prepended to the prompt as extra conditioning, and the model
+        generates the final output at the requested settings.
+
+        Returns (thinking_text, final_text).
+
+        Note: this is an inference-time technique. The small model is not
+        trained to reason, but conditioning the second pass on its own
+        draft (self-conditioning) plus retrieved web snippets typically
+        yields more on-topic continuations.
+        """
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+
+        if thinking_length is None:
+            thinking_length = max(16, length // 2)
+        if thinking_temperature is None:
+            thinking_temperature = min(2.0, temperature + 0.2)
+
+        # ---- Pass 1: exploration draft ---------------------------------
+        think_prompt = start_str
+        if web_context:
+            think_prompt = f"{web_context}\n{start_str}"
+
+        draft_full = self.generate(
+            think_prompt, thinking_length,
+            temperature=thinking_temperature,
+            top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty)
+        # Keep only the newly generated part as the "thoughts"
+        thinking_text = draft_full[len(think_prompt):].strip()
+
+        # ---- Pass 2: final answer conditioned on the draft -------------
+        ctx_parts = []
+        if web_context:
+            ctx_parts.append(web_context)
+        if thinking_text:
+            ctx_parts.append(thinking_text)
+        ctx_parts.append(start_str)
+
+        # Budget: keep the conditioning within the context window
+        max_chars = max(len(start_str) + 8, self.model.max_seq_len * 4)
+        final_prompt = "\n".join(ctx_parts)
+        if len(final_prompt) > max_chars:
+            final_prompt = final_prompt[-max_chars:]
+
+        final_full = self.generate(
+            final_prompt, length,
+            temperature=temperature,
+            top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty)
+        final_text = start_str + final_full[len(final_prompt):]
+
+        return thinking_text, final_text
+
     # ---- Streaming Generation (NEW) -----------------------------------
     def generate_streaming(self, start_str: str, length: int = 50,
                            temperature: float = 0.8,
