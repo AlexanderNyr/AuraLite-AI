@@ -88,6 +88,7 @@ def validate_params(params: dict) -> list[str]:
     val_split = params.get("val_split", 0.1)
     accumulation_steps = params.get("accumulation_steps", 1)
     use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
+    use_ddp = params.get("use_ddp", False)
 
     if d_model <= 0:
         errors.append(f"d_model must be > 0, got {d_model}")
@@ -1108,7 +1109,7 @@ class GGUFModelProxy:
             from llama_cpp import Llama
         except Exception as e:  # pragma: no cover - depends on optional package
             raise GGUFNotAvailableError(
-                "Для загрузки .gguf установите llama-cpp-python: "
+                "To load .gguf install llama-cpp-python: "
                 "pip install llama-cpp-python"
             ) from e
 
@@ -1190,13 +1191,13 @@ class GGUFModelProxy:
             stream=stream,
         )
 
-    def create_chat_completion(self, prompt: str, *, max_tokens: int = 50,
+    def create_chat_completion(self, messages: list[dict], *, max_tokens: int = 50,
                                temperature: float = 0.8, top_k: int = 50,
                                top_p: float = 0.9, repeat_penalty: float = 1.0,
                                min_p: float = 0.0, stream: bool = False):
         """Use llama.cpp chat formatting for instruction/chat GGUF models."""
         return self.llama.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=max(0, int(max_tokens)),
             temperature=max(float(temperature), 0.0),
             top_k=max(0, int(top_k)),
@@ -1336,8 +1337,13 @@ class AuraLiteEngine:
         if self.is_gguf_model():
             # GGUF chat completion
             if self.model.use_chat_completion:
+                # Pass the conversation history as structured messages
+                if isinstance(history, ChatHistory):
+                    chat_messages = history.to_list()
+                else:
+                    chat_messages = messages
                 result = self.model.create_chat_completion(
-                    prompt,  # actually the last user message, but we already formatted
+                    messages=chat_messages,
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_k=top_k,
@@ -1378,9 +1384,9 @@ class AuraLiteEngine:
                 ids, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p=min_p
             )
-            full_text = self.decode(result_ids)
-            # Return only the newly generated part
-            return full_text[len(prompt):].strip()
+            # Return only the newly generated part (token-based slice)
+            generated_ids = result_ids[len(ids):]
+            return self.decode(generated_ids).strip()
 
     def generate_chat_streaming(
         self,
@@ -1955,11 +1961,11 @@ class AuraLiteEngine:
         autosave_every = params.get("autosave_every", 0)
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
-                accumulation_steps = params.get("accumulation_steps", 1)
-                use_alibi    = params.get("use_alibi", False)
-                lora_rank    = params.get("lora_rank", 0)
-                resume_training_state = params.get("resume_training_state", True)
-                use_ddp      = params.get("use_ddp", False)
+        accumulation_steps = params.get("accumulation_steps", 1)
+        use_alibi    = params.get("use_alibi", False)
+        lora_rank    = params.get("lora_rank", 0)
+        resume_training_state = params.get("resume_training_state", True)
+        use_ddp      = params.get("use_ddp", False)
 
         # NEW: RoPE scaling
         rope_scaling = params.get("rope_scaling", None)
@@ -2634,6 +2640,8 @@ class AuraLiteEngine:
             "max_seq_len":  self.model.max_seq_len,
             "use_alibi":    self.model.use_alibi,
             "lora_rank":    self.model.lora_rank,
+            "rope_scaling": getattr(self.model, 'rope_scaling', None),
+            "use_gradient_checkpointing": getattr(self.model, 'use_gradient_checkpointing', False),
         }
         torch.save(checkpoint, path)
 
@@ -2688,6 +2696,8 @@ class AuraLiteEngine:
             n_kv_heads  = checkpoint.get("n_kv_heads"),
             dropout     = checkpoint.get("dropout", 0.0),
             use_alibi   = checkpoint.get("use_alibi", False),
+            use_gradient_checkpointing = checkpoint.get("use_gradient_checkpointing", False),
+            rope_scaling = checkpoint.get("rope_scaling", None),
         ).to(self.device)
 
         # Re-create LoRA adapters BEFORE loading the state dict so their

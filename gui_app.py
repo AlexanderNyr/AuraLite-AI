@@ -61,7 +61,7 @@ CONFIG_PRESETS = {
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": True,
-        "rope_scaling": {"type": "yarn", "factor": 4.0},  # 4x контекст
+        "rope_scaling": {"type": "yarn", "factor": 4.0},  # 4x context
     },
     "Large (powerful GPU)": {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
@@ -478,7 +478,7 @@ class AIApp:
                   width=4).pack(side=tk.LEFT, padx=2)
 
         self.checkpoint_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row1b, text="Gradient Checkpointing (экономия VRAM)",
+        ttk.Checkbutton(row1b, text="Gradient Checkpointing (VRAM saving)",
                         variable=self.checkpoint_var).pack(side=tk.LEFT, padx=12)
 
         # NEW: Multi-GPU (DDP) toggle — v2.3
@@ -795,7 +795,7 @@ class AIApp:
                                   padding="12")
         hf_frame.pack(fill=tk.X, pady=(12, 8))
 
-        ttk.Label(hf_frame, text="Название модели (HF Hub) или путь к уже скачанной папке:").pack(anchor=tk.W)
+        ttk.Label(hf_frame, text="Model name (HF Hub) or path to local folder:").pack(anchor=tk.W)
         self.hf_model_var = tk.StringVar(value="Qwen/Qwen2-0.5B-Instruct")
         hf_entry = ttk.Entry(hf_frame, textvariable=self.hf_model_var, font=("Segoe UI", 10))
         hf_entry.pack(fill=tk.X, pady=2)
@@ -804,11 +804,11 @@ class AIApp:
         browse_row = ttk.Frame(hf_frame)
         browse_row.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Button(browse_row, text="📁 Выбрать локальную папку (уже скачанную модель)",
+        ttk.Button(browse_row, text="📁 Browse local folder (already downloaded model)",
                    command=self._browse_local_hf_model).pack(side=tk.LEFT)
 
         self.hf_local_only_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(browse_row, text="Только локальные файлы (оффлайн, без интернета)",
+        ttk.Checkbutton(browse_row, text="Use local files only (offline, no internet)",
                         variable=self.hf_local_only_var).pack(side=tk.LEFT, padx=12)
 
         hf_opts = ttk.Frame(hf_frame)
@@ -1501,6 +1501,9 @@ class AIApp:
         ysb.pack(side=tk.RIGHT, fill=tk.Y)
         self.eval_result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
+        self.eval_status = ttk.Label(tab, text="Ready", style="Sub.TLabel")
+        self.eval_status.pack(anchor=tk.W, pady=4)
+
     def _add_eval_task(self, task: str):
         current = self.eval_tasks_var.get().strip()
         if current:
@@ -1529,8 +1532,7 @@ class AIApp:
         self.eval_run_btn.config(state=tk.DISABLED)
         self.eval_result_text.delete("1.0", tk.END)
         self.eval_result_text.insert(tk.END, f"Evaluating on {tasks}...\n\n")
-        self.eval_status = ttk.Label(self.tab_eval, text="Status: Running evaluation...")
-        self.eval_status.pack(pady=4)
+        self.eval_status.config(text="Status: Running evaluation...")
 
         def run():
             try:
@@ -1679,6 +1681,13 @@ class AIApp:
             messagebox.showinfo("Saved", f"Console log saved to:\n{path}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
+
+    def _toggle_batch_entry(self, *_):
+        """Show / hide the batch entry based on the batch mode checkbox."""
+        if self.batch_var.get():
+            self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        else:
+            self.batch_entry.pack_forget()
 
     def _on_close(self):
         """Restore stdout/stderr and close the window cleanly."""
@@ -2638,7 +2647,6 @@ class AIApp:
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("Markdown", "*.md"),
                        ("All files", "*.*")],
-            confirmoverwrite=False,
         )
         if not path:
             return
@@ -3210,22 +3218,6 @@ class AIApp:
 # ======================================================================
 #  Show/hide batch entry based on checkbox
 # ======================================================================
-
-def _toggle_batch_entry(self, *_):
-    # NOTE: batch_entry's master is self.batch_row, so it must be re-packed
-    # inside that same frame. Using `before=self.gen_btn` (a child of a
-    # different frame) raised a TclError — fixed by packing within batch_row.
-    if self.batch_var.get():
-        self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-    else:
-        self.batch_entry.pack_forget()
-
-
-# Monkey-patch the method into the class
-AIApp._toggle_batch_entry = _toggle_batch_entry
-
-# Bind after creation — need to modify __init__ slightly
-# Actually, let's just do it in the main block
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
