@@ -15,7 +15,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Any
 
 import torch
 import torch.nn as nn
@@ -929,6 +929,171 @@ class CosineWarmupScheduler:
                 pg["lr"] = lr
 
 
+
+# ===================================================================
+#  GGUF / llama.cpp backend (inference-only)
+# ===================================================================
+
+class GGUFNotAvailableError(ImportError):
+    """Raised when llama-cpp-python is required but not installed."""
+    pass
+
+
+class GGUFTokenizerProxy:
+    """Tokenizer adapter around llama.cpp's native GGUF tokenizer."""
+
+    kind = "gguf"
+
+    def __init__(self, llama):
+        self.llama = llama
+
+    @property
+    def vocab_size(self) -> int:
+        try:
+            n_vocab = getattr(self.llama, "n_vocab", None)
+            return int(n_vocab() if callable(n_vocab) else n_vocab)
+        except Exception:
+            return 0
+
+    def encode(self, s: str) -> list[int]:
+        data = s.encode("utf-8", errors="ignore")
+        try:
+            return list(self.llama.tokenize(data, add_bos=False, special=True))
+        except TypeError:
+            return list(self.llama.tokenize(data, add_bos=False))
+
+    def decode(self, ids) -> str:
+        try:
+            data = self.llama.detokenize([int(i) for i in ids])
+            return data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+        except Exception:
+            return ""
+
+    def train(self, text: str, vocab_size: int | None = None):
+        raise RuntimeError("GGUF tokenizer is loaded from the model and cannot be trained.")
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind}
+
+
+class GGUFModelProxy:
+    """Small adapter that exposes a llama-cpp-python GGUF model through the
+    subset of attributes AuraLite's GUI expects.
+
+    GGUF models are quantized inference artifacts. They can be loaded and used
+    for generation/streaming/batch prompting, but they cannot be trained or
+    saved as AuraLite `.pt` checkpoints.
+    """
+
+    backend = "gguf"
+
+    def __init__(self, path: str, *, n_ctx: int = 4096,
+                 n_threads: int | None = None, n_gpu_layers: int = -1,
+                 seed: int = -1, chat_format: str | None = None,
+                 use_chat_completion: bool = False,
+                 n_batch: int = 512, use_mmap: bool = True,
+                 use_mlock: bool = False,
+                 verbose: bool = False, extra_kwargs: dict[str, Any] | None = None):
+        try:
+            from llama_cpp import Llama
+        except Exception as e:  # pragma: no cover - depends on optional package
+            raise GGUFNotAvailableError(
+                "Для загрузки .gguf установите llama-cpp-python: "
+                "pip install llama-cpp-python"
+            ) from e
+
+        self.path = str(path)
+        self.max_seq_len = int(n_ctx)
+        self.n_threads = n_threads
+        self.n_gpu_layers = int(n_gpu_layers)
+        self.seed = int(seed)
+        self.chat_format = chat_format
+        self.use_chat_completion = bool(use_chat_completion)
+        self.n_batch = int(n_batch)
+        self.use_mmap = bool(use_mmap)
+        self.use_mlock = bool(use_mlock)
+        self.verbose = bool(verbose)
+
+        kwargs: dict[str, Any] = {
+            "model_path": self.path,
+            "n_ctx": self.max_seq_len,
+            "n_gpu_layers": self.n_gpu_layers,
+            "seed": self.seed,
+            "n_batch": self.n_batch,
+            "use_mmap": self.use_mmap,
+            "use_mlock": self.use_mlock,
+            "verbose": self.verbose,
+        }
+        if n_threads:
+            kwargs["n_threads"] = int(n_threads)
+        if chat_format:
+            kwargs["chat_format"] = chat_format
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+
+        self.llama = Llama(**kwargs)
+        self.tokenizer = GGUFTokenizerProxy(self.llama)
+        self.metadata = getattr(self.llama, "metadata", {}) or {}
+
+    def eval(self):
+        return self
+
+    def reset_cache(self):
+        # llama-cpp-python keeps KV-cache internally per completion; reset if the
+        # installed version exposes a method, otherwise each call is still safe.
+        reset = getattr(self.llama, "reset", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception:
+                pass
+
+    def count_parameters(self) -> int:
+        for key in ("general.parameter_count",):
+            val = self.metadata.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    def count_trainable_parameters(self) -> int:
+        return 0
+
+    @property
+    def vocab_size(self) -> int:
+        return self.tokenizer.vocab_size
+
+    def create_completion(self, prompt: str, *, max_tokens: int = 50,
+                          temperature: float = 0.8, top_k: int = 50,
+                          top_p: float = 0.9, repeat_penalty: float = 1.0,
+                          stream: bool = False):
+        return self.llama.create_completion(
+            prompt=prompt,
+            max_tokens=max(0, int(max_tokens)),
+            temperature=max(float(temperature), 0.0),
+            top_k=max(0, int(top_k)),
+            top_p=float(top_p),
+            repeat_penalty=float(repeat_penalty),
+            stream=stream,
+        )
+
+    def create_chat_completion(self, prompt: str, *, max_tokens: int = 50,
+                               temperature: float = 0.8, top_k: int = 50,
+                               top_p: float = 0.9, repeat_penalty: float = 1.0,
+                               stream: bool = False):
+        """Use llama.cpp chat formatting for instruction/chat GGUF models."""
+        return self.llama.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max(0, int(max_tokens)),
+            temperature=max(float(temperature), 0.0),
+            top_k=max(0, int(top_k)),
+            top_p=float(top_p),
+            repeat_penalty=float(repeat_penalty),
+            stream=stream,
+        )
+
 # ===================================================================
 #  Engine
 # ===================================================================
@@ -947,13 +1112,15 @@ class AuraLiteEngine:
     def __init__(self):
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_threads = torch.get_num_threads()
-        self.model: ModernTransformer | None = None
+        self.model: ModernTransformer | GGUFModelProxy | None = None
+        self.backend     = "torch"           # "torch" or "gguf"
+        self.gguf_path: str | None = None
         self.optimizer   = None
         self.scheduler   = None
         self.scaler      = None
-        self.tokenizer   = None              # CharTokenizer | BPETokenizer
+        self.tokenizer   = None              # CharTokenizer | BPETokenizer | GGUFTokenizerProxy
         self.vocab_size  = 0
-        self.params_used: dict = {}          # remember last training params
+        self.params_used: dict = {}          # remember last training/load params
         self.last_val_loss: float | None = None
         self._resume_optimizer_state = None
         self._resume_scheduler_state = None
@@ -966,6 +1133,100 @@ class AuraLiteEngine:
                 torch.backends.cuda.matmul.allow_tf32 = True
             except AttributeError:
                 pass  # older PyTorch versions
+
+    def is_gguf_model(self) -> bool:
+        return self.backend == "gguf" or isinstance(self.model, GGUFModelProxy)
+
+    def load_gguf_model(self, path: str, *, n_ctx: int = 4096,
+                        n_threads: int | None = None,
+                        n_gpu_layers: int | None = None,
+                        seed: int = -1, chat_format: str | None = None,
+                        use_chat_completion: bool = False,
+                        n_batch: int = 512, use_mmap: bool = True,
+                        use_mlock: bool = False, verbose: bool = False,
+                        extra_kwargs: dict[str, Any] | None = None):
+        """Load a `.gguf` model through llama.cpp for inference.
+
+        Args:
+            path: Path to a GGUF file.
+            n_ctx: Context window used by llama.cpp.
+            n_threads: CPU threads; defaults to AuraLite's detected thread count.
+            n_gpu_layers: Layers to offload to GPU. Default `-1` asks llama.cpp
+                to offload as much as possible (if a compatible build/GPU exists).
+            seed/chat_format/verbose/extra_kwargs: forwarded to llama_cpp.Llama.
+            use_chat_completion: use llama.cpp chat templates / chat completion API.
+            n_batch/use_mmap/use_mlock: common llama.cpp loading knobs.
+        """
+        if n_gpu_layers is None:
+            n_gpu_layers = -1
+        if n_threads is None:
+            n_threads = self.num_threads
+
+        model = GGUFModelProxy(
+            path, n_ctx=n_ctx, n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers, seed=seed,
+            chat_format=chat_format,
+            use_chat_completion=use_chat_completion,
+            n_batch=n_batch, use_mmap=use_mmap,
+            use_mlock=use_mlock, verbose=verbose,
+            extra_kwargs=extra_kwargs,
+        )
+        self.model = model
+        self.backend = "gguf"
+        self.gguf_path = str(path)
+        self.tokenizer = model.tokenizer
+        self.vocab_size = model.vocab_size
+        self.params_used = {
+            "backend": "gguf",
+            "path": str(path),
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+            "n_gpu_layers": n_gpu_layers,
+            "seed": seed,
+            "chat_format": chat_format,
+            "use_chat_completion": use_chat_completion,
+            "n_batch": n_batch,
+            "use_mmap": use_mmap,
+            "use_mlock": use_mlock,
+        }
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+        self._resume_optimizer_state = None
+        self._resume_scheduler_state = None
+        self._resume_scaler_state = None
+        chat = ", chat=on" if use_chat_completion else ""
+        print(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
+              f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
+              f"batch={n_batch}{chat})")
+
+    def _gguf_generate_text(self, prompt: str, length: int = 50,
+                            temperature: float = 0.8,
+                            top_k: int = 50, top_p: float = 0.9,
+                            repetition_penalty: float = 1.0) -> str:
+        if not isinstance(self.model, GGUFModelProxy):
+            raise ValueError("No GGUF model loaded.")
+        if self.model.use_chat_completion:
+            out = self.model.create_chat_completion(
+                prompt, max_tokens=length, temperature=temperature,
+                top_k=top_k, top_p=top_p,
+                repeat_penalty=repetition_penalty, stream=False,
+            )
+            try:
+                suffix = out["choices"][0].get("message", {}).get("content", "")
+            except Exception:
+                suffix = ""
+        else:
+            out = self.model.create_completion(
+                prompt, max_tokens=length, temperature=temperature,
+                top_k=top_k, top_p=top_p,
+                repeat_penalty=repetition_penalty, stream=False,
+            )
+            try:
+                suffix = out["choices"][0].get("text", "")
+            except Exception:
+                suffix = ""
+        return prompt + suffix
 
     # ---- Tokenisation -----------------------------------------------
     def encode(self, s: str) -> list[int]:
@@ -1078,6 +1339,12 @@ class AuraLiteEngine:
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
         # ---- Validate parameters --------------------------------------
+        if self.is_gguf_model() and params.get("continue_training", False):
+            raise ValueError(
+                ".gguf models are inference-only in AuraLite. "
+                "Uncheck 'Continue training current model' to train a new AuraLite .pt model."
+            )
+
         errors = validate_params(params)
         if errors:
             raise ParamValidationError("\n".join(errors))
@@ -1147,6 +1414,8 @@ class AuraLiteEngine:
 
         # ---- Model ----------------------------------------------------
         if not resuming:
+            self.backend = "torch"
+            self.gguf_path = None
             self.model = ModernTransformer(
                 vocab_size=self.vocab_size,
                 d_model=d_model,
@@ -1392,6 +1661,12 @@ class AuraLiteEngine:
                  top_k: int = 50, top_p: float = 0.9,
                  repetition_penalty: float = 1.0) -> str:
 
+        if self.is_gguf_model():
+            return self._gguf_generate_text(
+                start_str, length, temperature, top_k, top_p,
+                repetition_penalty=repetition_penalty,
+            )
+
         ids = self._prepare_prompt_ids(start_str)
         used_prompt = self.decode(ids)
         result_ids = self._generate_ids(
@@ -1432,6 +1707,29 @@ class AuraLiteEngine:
             thinking_length = max(16, length // 2)
         if thinking_temperature is None:
             thinking_temperature = min(2.0, temperature + 0.2)
+
+        if self.is_gguf_model():
+            think_prompt = f"{web_context}\n{start_str}" if web_context else start_str
+            draft_full = self._gguf_generate_text(
+                think_prompt, thinking_length,
+                thinking_temperature, top_k, top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            thinking_text = draft_full[len(think_prompt):].strip()
+
+            ctx_parts = []
+            if web_context:
+                ctx_parts.append(web_context)
+            if thinking_text:
+                ctx_parts.append(thinking_text)
+            ctx_parts.append(start_str)
+            final_prompt = "\n".join(ctx_parts)
+            final_full = self._gguf_generate_text(
+                final_prompt, length, temperature, top_k, top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            final_text = start_str + final_full[len(final_prompt):]
+            return thinking_text, final_text
 
         # ---- Pass 1: exploration draft ---------------------------------
         think_prompt = start_str
@@ -1479,6 +1777,37 @@ class AuraLiteEngine:
         """
         if self.model is None:
             raise ValueError("Train or load a model first!")
+
+        if self.is_gguf_model():
+            if not isinstance(self.model, GGUFModelProxy):
+                return
+            if self.model.use_chat_completion:
+                stream = self.model.create_chat_completion(
+                    start_str, max_tokens=length, temperature=temperature,
+                    top_k=top_k, top_p=top_p,
+                    repeat_penalty=repetition_penalty, stream=True,
+                )
+                for chunk in stream:
+                    try:
+                        text = chunk["choices"][0].get("delta", {}).get("content", "")
+                    except Exception:
+                        text = ""
+                    if text:
+                        yield text
+            else:
+                stream = self.model.create_completion(
+                    start_str, max_tokens=length, temperature=temperature,
+                    top_k=top_k, top_p=top_p,
+                    repeat_penalty=repetition_penalty, stream=True,
+                )
+                for chunk in stream:
+                    try:
+                        text = chunk["choices"][0].get("text", "")
+                    except Exception:
+                        text = ""
+                    if text:
+                        yield text
+            return
 
         ids = self._prepare_prompt_ids(start_str)
 
@@ -1576,6 +1905,11 @@ class AuraLiteEngine:
         if not prompts:
             return []
 
+        if self.is_gguf_model():
+            return [self.generate(p, length, temperature, top_k, top_p,
+                                  repetition_penalty=repetition_penalty)
+                    for p in prompts]
+
         self.model.eval()
 
         grouped: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
@@ -1645,6 +1979,12 @@ class AuraLiteEngine:
     def save_model(self, path: str):
         if self.model is None:
             raise ValueError("No model to save!")
+        if self.is_gguf_model():
+            raise ValueError(
+                "Loaded .gguf models are inference-only external files and "
+                "cannot be saved as AuraLite .pt checkpoints. Copy the .gguf "
+                "file itself if you need to move it."
+            )
         checkpoint = {
             "model_state":  self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict() if self.optimizer is not None else None,
@@ -1667,6 +2007,33 @@ class AuraLiteEngine:
         torch.save(checkpoint, path)
 
     def load_model(self, path: str):
+        if str(path).lower().endswith(".gguf"):
+            # Optional advanced knobs without complicating the GUI:
+            #   AURALITE_GGUF_N_CTX=8192
+            #   AURALITE_GGUF_N_GPU_LAYERS=-1
+            #   AURALITE_GGUF_N_THREADS=8
+            #   AURALITE_GGUF_CHAT_FORMAT=llama-2
+            #   AURALITE_GGUF_USE_CHAT=1
+            #   AURALITE_GGUF_N_BATCH=512
+            n_ctx = int(os.environ.get("AURALITE_GGUF_N_CTX", "4096"))
+            n_gpu_layers = int(os.environ.get("AURALITE_GGUF_N_GPU_LAYERS", "-1"))
+            n_threads_env = os.environ.get("AURALITE_GGUF_N_THREADS")
+            n_threads = int(n_threads_env) if n_threads_env else None
+            chat_format = os.environ.get("AURALITE_GGUF_CHAT_FORMAT") or None
+            use_chat = os.environ.get("AURALITE_GGUF_USE_CHAT", "0").lower() in {"1", "true", "yes", "on"}
+            n_batch = int(os.environ.get("AURALITE_GGUF_N_BATCH", "512"))
+            use_mmap = os.environ.get("AURALITE_GGUF_USE_MMAP", "1").lower() not in {"0", "false", "no", "off"}
+            use_mlock = os.environ.get("AURALITE_GGUF_USE_MLOCK", "0").lower() in {"1", "true", "yes", "on"}
+            self.load_gguf_model(
+                path, n_ctx=n_ctx, n_threads=n_threads,
+                n_gpu_layers=n_gpu_layers, chat_format=chat_format,
+                use_chat_completion=use_chat, n_batch=n_batch,
+                use_mmap=use_mmap, use_mlock=use_mlock,
+            )
+            return
+
+        self.backend = "torch"
+        self.gguf_path = None
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         if checkpoint.get("tokenizer"):

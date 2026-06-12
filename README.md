@@ -4,6 +4,7 @@
 
 ## 🚀 Key Features
 - **PyTorch Engine**: Professional-grade tensor operations, autograd and optimization.
+- **GGUF / llama.cpp Inference**: Load `.gguf` models directly (quantized Llama/Mistral/Qwen/etc.) via `llama-cpp-python` for generation, streaming, batch prompts, Thinking Mode and web-context prompting.
 - **Modern Transformer Architecture (LLaMA-style)**: A decoder-only transformer with **RMSNorm** (pre-norm), **RoPE** (Rotary Position Embeddings), **SwiGLU** feed-forward, optional **GQA** (Grouped-Query Attention), **weight tying** (embedding = output head) and a **KV-cache** for fast generation.
 - **Flash Attention**: Uses PyTorch `scaled_dot_product_attention` (fused / memory-efficient kernels) instead of a hand-rolled softmax.
 - **BPE Tokenizer (built-in)**: A self-contained mini-BPE trained on your corpus (configurable vocab size), switchable to classic character-level tokenization. BPE dramatically improves text quality — the model learns sub-words instead of single letters.
@@ -29,7 +30,8 @@
 - **Tabbed GUI**: Three clean tabs — 🏋️ Training (hyperparameters, tokenizer options, loss history), ✨ Generation (sampling + prompt + output), 💾 Model (save / load + full model info).
 - **🧠 Thinking Mode (NEW)**: Two-pass generation — the model first free-writes a higher-temperature *draft* ("thoughts"), then the final answer is generated conditioned on that draft (self-conditioning). No retraining needed; works with any existing checkpoint. The GUI shows the thinking block and the final answer separately.
 - **🌐 Web Search / mini-RAG (NEW)**: Optional DuckDuckGo search (no API key, stdlib-only) — top result snippets are injected into the prompt as retrieval context before generation. Can be combined with Thinking Mode. If the search fails (offline), generation gracefully continues without it.
-- **Custom Training**: Upload any `.txt` file to teach the AI specific styles, languages, or fictional worlds.
+- **Custom Training**: Upload any `.txt` file to teach the built-in AuraLite `.pt` model specific styles, languages, or fictional worlds.
+- **External GGUF Models**: Open `.gguf` files from the Model tab and use them immediately for inference. GGUF files are inference-only in AuraLite; train/fine-tune with AuraLite’s native `.pt` checkpoints.
 - **Interruptible Training**: Ability to stop training at any point and preserve the learned weights for immediate testing.
 
 ## 🛠 Technical Specifications
@@ -51,18 +53,25 @@
    ```bash
    pip install -r requirements.txt
    ```
-   (or simply `pip install torch numpy`)
+   (or for native AuraLite training only: `pip install torch numpy`; `.gguf` loading additionally needs `llama-cpp-python`.)
 
 ## 📖 How to Use
 1. **Launch the App**:
    ```bash
    python gui_app.py
    ```
-2. **Configure & Train**:
+2. **Use an existing `.gguf` model (optional)**:
+   - Open the **💾 Model** tab.
+   - Click **Load Model** and choose a `.gguf` file.
+   - Go to **✨ Generation** and prompt it. Streaming, batch mode, Thinking Mode and Web Search work with GGUF too.
+   - A GGUF options dialog lets you set `n_ctx`, GPU layers, CPU threads, `n_batch`, chat format, chat-completion mode, mmap and mlock.
+   - Note: `.gguf` files are quantized llama.cpp inference models; AuraLite does not train or re-save them as `.pt`.
+   - The same GGUF defaults can be set via environment variables before launch: `AURALITE_GGUF_N_CTX`, `AURALITE_GGUF_N_GPU_LAYERS`, `AURALITE_GGUF_N_THREADS`, `AURALITE_GGUF_N_BATCH`, `AURALITE_GGUF_CHAT_FORMAT`, `AURALITE_GGUF_USE_CHAT`, `AURALITE_GGUF_USE_MMAP`, `AURALITE_GGUF_USE_MLOCK`.
+3. **Configure & Train a native AuraLite model**:
    - Adjust the **Hyperparameters** to suit your hardware and dataset.
    - Click **"Select .txt File"** and provide your training data.
    - Click **"Start Training"**. Monitor the **Loss** value; a decreasing loss indicates the AI is learning.
-3. **Generate Text**:
+4. **Generate Text**:
    - Enter a **Seed phrase** to give the AI a starting point.
    - Set the desired **Length** of the output.
    - Click **"Generate Text"** and watch the AI create content based on its training.

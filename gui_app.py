@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 from model_engine import (
     AuraLiteEngine, validate_params, ParamValidationError,
     estimate_n_params, recommend_epochs, recommend_gen_length,
+    GGUFNotAvailableError,
 )
 from web_tools import build_web_context
 import threading
@@ -783,6 +784,28 @@ class AIApp:
         lines = []
         if m is None:
             lines.append("No model in memory.")
+        elif self.engine.is_gguf_model():
+            tok = self.engine.tokenizer
+            n_params = m.count_parameters() if hasattr(m, "count_parameters") else 0
+            lines.append("Backend         : GGUF / llama.cpp")
+            lines.append(f"File            : {getattr(m, 'path', '—')}")
+            lines.append(f"Parameters      : {n_params:,}" if n_params else "Parameters      : —")
+            lines.append(f"Vocab size      : {self.engine.vocab_size or '—'}")
+            lines.append(f"Tokenizer       : {tok.kind if tok else 'gguf'}")
+            lines.append(f"max_seq_len     : {getattr(m, 'max_seq_len', '—')}")
+            lines.append(f"threads         : {getattr(m, 'n_threads', '—')}")
+            lines.append(f"GPU layers      : {getattr(m, 'n_gpu_layers', '—')}")
+            lines.append(f"Batch           : {getattr(m, 'n_batch', '—')}")
+            lines.append(f"mmap / mlock    : {getattr(m, 'use_mmap', '—')} / {getattr(m, 'use_mlock', '—')}")
+            lines.append(f"Chat completion : {'Yes' if getattr(m, 'use_chat_completion', False) else 'No'}")
+            lines.append(f"Chat format     : {getattr(m, 'chat_format', None) or 'auto/default'}")
+            lines.append("Training        : not supported for .gguf (inference-only)")
+            meta = getattr(m, "metadata", {}) or {}
+            if meta:
+                lines.append("")
+                lines.append("GGUF metadata:")
+                for k in sorted(meta)[:40]:
+                    lines.append(f"  {k} = {meta[k]}")
         else:
             tok = self.engine.tokenizer
             lines.append(f"Parameters      : {m.count_parameters():,}")
@@ -1076,6 +1099,14 @@ class AIApp:
                 "«Continue training» is checked, but there is no model "
                 "in memory — a new one will be created.")
             params["continue_training"] = False
+
+        if params["continue_training"] and self.engine.is_gguf_model():
+            messagebox.showwarning(
+                "GGUF is inference-only",
+                ".gguf models cannot be continued/trained in AuraLite. "
+                "Uncheck «Continue training current model» to train a new native .pt model."
+            )
+            return
 
         if params["autosave_every"] > 0:
             base = os.path.splitext(self.selected_file_path)[0]
@@ -1492,6 +1523,13 @@ class AIApp:
 
     # ------------------------------------------------------------------
     def save_model(self):
+        if self.engine.is_gguf_model():
+            messagebox.showinfo(
+                "GGUF",
+                ".gguf is an external inference-only model file. It cannot be "
+                "saved as an AuraLite .pt checkpoint; keep/copy the original .gguf file."
+            )
+            return
         path = filedialog.asksaveasfilename(
             title="Save Model",
             defaultextension=".pt",
@@ -1508,24 +1546,128 @@ class AIApp:
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
+    def _ask_gguf_options(self, path: str) -> dict | None:
+        """Modal dialog for llama.cpp / GGUF loading options."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("GGUF / llama.cpp options")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        outer = ttk.Frame(dlg, padding="12")
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(outer, text=f"Model: {os.path.basename(path)}",
+                  font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        n_ctx_var = tk.StringVar(value=os.environ.get("AURALITE_GGUF_N_CTX", "4096"))
+        gpu_var = tk.StringVar(value=os.environ.get("AURALITE_GGUF_N_GPU_LAYERS", "-1"))
+        threads_var = tk.StringVar(value=os.environ.get("AURALITE_GGUF_N_THREADS", str(self.engine.num_threads)))
+        batch_var = tk.StringVar(value=os.environ.get("AURALITE_GGUF_N_BATCH", "512"))
+        chat_format_var = tk.StringVar(value=os.environ.get("AURALITE_GGUF_CHAT_FORMAT", ""))
+        use_chat_var = tk.BooleanVar(
+            value=os.environ.get("AURALITE_GGUF_USE_CHAT", "0").lower() in {"1", "true", "yes", "on"})
+        mmap_var = tk.BooleanVar(
+            value=os.environ.get("AURALITE_GGUF_USE_MMAP", "1").lower() not in {"0", "false", "no", "off"})
+        mlock_var = tk.BooleanVar(
+            value=os.environ.get("AURALITE_GGUF_USE_MLOCK", "0").lower() in {"1", "true", "yes", "on"})
+
+        rows = [
+            ("Context (n_ctx):", n_ctx_var, "Max tokens in context; larger = more RAM/VRAM"),
+            ("GPU layers:", gpu_var, "-1 = offload as much as llama.cpp can; 0 = CPU only"),
+            ("CPU threads:", threads_var, "Usually number of physical/logical CPU cores"),
+            ("Batch (n_batch):", batch_var, "Prompt processing batch size"),
+            ("Chat format:", chat_format_var, "Optional: llama-2, chatml, mistral-instruct, ..."),
+        ]
+        for i, (label, var, hint) in enumerate(rows, start=1):
+            ttk.Label(outer, text=label).grid(row=i, column=0, sticky=tk.W, padx=(0, 8), pady=3)
+            ttk.Entry(outer, textvariable=var, width=18).grid(row=i, column=1, sticky=tk.W, pady=3)
+            ttk.Label(outer, text=hint, style="Sub.TLabel").grid(row=i, column=2, sticky=tk.W, padx=(8, 0), pady=3)
+
+        opts_row = ttk.Frame(outer)
+        opts_row.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(8, 2))
+        ttk.Checkbutton(opts_row, text="Use chat completion / template",
+                        variable=use_chat_var).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(opts_row, text="mmap", variable=mmap_var).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(opts_row, text="mlock", variable=mlock_var).pack(side=tk.LEFT)
+
+        ttk.Label(outer,
+                  text="Note: GGUF is inference-only here. Training/fine-tuning uses AuraLite .pt models.",
+                  style="Sub.TLabel", foreground="#a60").grid(
+            row=7, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+
+        result = {"value": None}
+
+        def on_ok():
+            try:
+                result["value"] = {
+                    "n_ctx": int(n_ctx_var.get()),
+                    "n_gpu_layers": int(gpu_var.get()),
+                    "n_threads": int(threads_var.get()) if threads_var.get().strip() else None,
+                    "n_batch": int(batch_var.get()),
+                    "chat_format": chat_format_var.get().strip() or None,
+                    "use_chat_completion": bool(use_chat_var.get()),
+                    "use_mmap": bool(mmap_var.get()),
+                    "use_mlock": bool(mlock_var.get()),
+                }
+            except ValueError:
+                messagebox.showerror("GGUF options", "n_ctx, GPU layers, threads and batch must be integers.", parent=dlg)
+                return
+            dlg.destroy()
+
+        def on_cancel():
+            result["value"] = None
+            dlg.destroy()
+
+        btns = ttk.Frame(outer)
+        btns.grid(row=8, column=0, columnspan=3, sticky=tk.E, pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Load GGUF", command=on_ok).pack(side=tk.RIGHT, padx=4)
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dlg.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dlg.winfo_height()) // 2)
+        dlg.geometry(f"+{x}+{y}")
+        self.root.wait_window(dlg)
+        return result["value"]
+
     def load_model(self):
         path = filedialog.askopenfilename(
             title="Load Model",
-            filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")],
+            filetypes=[
+                ("Supported models", "*.pt *.gguf"),
+                ("AuraLite / PyTorch", "*.pt"),
+                ("GGUF / llama.cpp", "*.gguf"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
         try:
-            self.engine.load_model(path)
+            if path.lower().endswith(".gguf"):
+                opts = self._ask_gguf_options(path)
+                if opts is None:
+                    return
+                self.status_label.config(text=f"Status: Loading GGUF… ({os.path.basename(path)})")
+                self.root.update_idletasks()
+                self.engine.load_gguf_model(path, **opts)
+            else:
+                self.engine.load_model(path)
             self.is_trained = True
             self.gen_btn.config(state=tk.NORMAL)
-            self.save_btn.config(state=tk.NORMAL)
+            self.save_btn.config(state=tk.DISABLED if self.engine.is_gguf_model() else tk.NORMAL)
             n = self.engine.model.count_parameters()
-            self.param_label.config(text=f"Parameters: {n:,}")
+            self.param_label.config(text=f"Parameters: {n:,}" if n else "Parameters: —")
             self.model_file_label.config(
                 text=f"Loaded: {os.path.basename(path)}", foreground="black")
-            self.status_label.config(
-                text=f"Status: Model loaded ✅  ({os.path.basename(path)})")
+            if self.engine.is_gguf_model():
+                self.status_label.config(
+                    text=f"Status: GGUF model loaded ✅  ({os.path.basename(path)})")
+            else:
+                self.status_label.config(
+                    text=f"Status: Model loaded ✅  ({os.path.basename(path)})")
             # Fill GUI fields from stored params
             p = self.engine.params_used
             for key in ("lr", "epochs", "d_model", "d_ff", "n_heads",
@@ -1540,6 +1682,11 @@ class AIApp:
             if "n_kv_heads" in p and p["n_kv_heads"] is not None:
                 self.n_kv_heads_var.set(str(p["n_kv_heads"]))
             self._refresh_model_info()
+        except GGUFNotAvailableError as e:
+            messagebox.showerror(
+                "GGUF support is not installed",
+                f"{e}\n\nInstall it with:\n  pip install llama-cpp-python"
+            )
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
