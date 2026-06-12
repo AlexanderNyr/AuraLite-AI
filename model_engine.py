@@ -1077,13 +1077,14 @@ class GGUFModelProxy:
     def create_completion(self, prompt: str, *, max_tokens: int = 50,
                           temperature: float = 0.8, top_k: int = 50,
                           top_p: float = 0.9, repeat_penalty: float = 1.0,
-                          stream: bool = False):
+                          min_p: float = 0.0, stream: bool = False):
         return self.llama.create_completion(
             prompt=prompt,
             max_tokens=max(0, int(max_tokens)),
             temperature=max(float(temperature), 0.0),
             top_k=max(0, int(top_k)),
             top_p=float(top_p),
+            min_p=float(min_p),
             repeat_penalty=float(repeat_penalty),
             stream=stream,
         )
@@ -1091,7 +1092,7 @@ class GGUFModelProxy:
     def create_chat_completion(self, prompt: str, *, max_tokens: int = 50,
                                temperature: float = 0.8, top_k: int = 50,
                                top_p: float = 0.9, repeat_penalty: float = 1.0,
-                               stream: bool = False):
+                               min_p: float = 0.0, stream: bool = False):
         """Use llama.cpp chat formatting for instruction/chat GGUF models."""
         return self.llama.create_chat_completion(
             messages=[{"role": "user", "content": prompt}],
@@ -1099,6 +1100,7 @@ class GGUFModelProxy:
             temperature=max(float(temperature), 0.0),
             top_k=max(0, int(top_k)),
             top_p=float(top_p),
+            min_p=float(min_p),
             repeat_penalty=float(repeat_penalty),
             stream=stream,
         )
@@ -1393,13 +1395,14 @@ class AuraLiteEngine:
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
-                            repetition_penalty: float = 1.0) -> str:
+                            repetition_penalty: float = 1.0,
+                            min_p: float = 0.0) -> str:
         if not isinstance(self.model, GGUFModelProxy):
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
             out = self.model.create_chat_completion(
                 prompt, max_tokens=length, temperature=temperature,
-                top_k=top_k, top_p=top_p,
+                top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, stream=False,
             )
             try:
@@ -1409,7 +1412,7 @@ class AuraLiteEngine:
         else:
             out = self.model.create_completion(
                 prompt, max_tokens=length, temperature=temperature,
-                top_k=top_k, top_p=top_p,
+                top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, stream=False,
             )
             try:
@@ -1454,7 +1457,8 @@ class AuraLiteEngine:
     def _generate_ids(self, ids: list[int], length: int = 50,
                       temperature: float = 0.8,
                       top_k: int = 50, top_p: float = 0.9,
-                      repetition_penalty: float = 1.0) -> list[int]:
+                      repetition_penalty: float = 1.0,
+                      min_p: float = 0.0) -> list[int]:
         if self.model is None:
             raise ValueError("Train or load a model first!")
 
@@ -1470,7 +1474,7 @@ class AuraLiteEngine:
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
             logits = self.model(t, start_pos=0, use_cache=True)
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids)
+                                     repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
 
             # --- Generate remaining tokens one-by-one (KV-cache) --------
@@ -1481,7 +1485,7 @@ class AuraLiteEngine:
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
                 logits = self.model(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids)
+                                         repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
 
         self.model.reset_cache()
@@ -1849,30 +1853,33 @@ class AuraLiteEngine:
     def generate(self, start_str: str, length: int = 50,
                  temperature: float = 0.8,
                  top_k: int = 50, top_p: float = 0.9,
-                 repetition_penalty: float = 1.0) -> str:
+                 repetition_penalty: float = 1.0,
+                 min_p: float = 0.0) -> str:
 
         if self.is_gguf_model():
             return self._gguf_generate_text(
                 start_str, length, temperature, top_k, top_p,
-                repetition_penalty=repetition_penalty,
+                repetition_penalty=repetition_penalty, min_p=min_p,
             )
 
         if self.is_hf_model():
             # HF models use token count directly as max_new_tokens
-            return self.hf_proxy.generate(
-                start_str,
-                max_new_tokens=length,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-            )
+            kwargs = {
+                "max_new_tokens": length,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0.0:
+                kwargs["min_p"] = min_p
+            return self.hf_proxy.generate(start_str, **kwargs)
 
         ids = self._prepare_prompt_ids(start_str)
         used_prompt = self.decode(ids)
         result_ids = self._generate_ids(
             ids, length, temperature, top_k, top_p,
-            repetition_penalty=repetition_penalty)
+            repetition_penalty=repetition_penalty, min_p=min_p)
         generated_full = self.decode(result_ids)
         return start_str + generated_full[len(used_prompt):]
 
@@ -1883,7 +1890,8 @@ class AuraLiteEngine:
                                repetition_penalty: float = 1.0,
                                thinking_length: int | None = None,
                                thinking_temperature: float | None = None,
-                               web_context: str | None = None
+                               web_context: str | None = None,
+                               min_p: float = 0.0
                                ) -> tuple[str, str]:
         """Two-pass 'thinking' generation.
 
@@ -1971,7 +1979,8 @@ class AuraLiteEngine:
     def generate_streaming(self, start_str: str, length: int = 50,
                            temperature: float = 0.8,
                            top_k: int = 50, top_p: float = 0.9,
-                           repetition_penalty: float = 1.0) -> Iterator[str]:
+                           repetition_penalty: float = 1.0,
+                           min_p: float = 0.0) -> Iterator[str]:
         """Generate text token-by-token, yielding each new token as it's produced.
 
         Yields individual decoded tokens so the GUI can update in real-time.
@@ -1985,7 +1994,7 @@ class AuraLiteEngine:
             if self.model.use_chat_completion:
                 stream = self.model.create_chat_completion(
                     start_str, max_tokens=length, temperature=temperature,
-                    top_k=top_k, top_p=top_p,
+                    top_k=top_k, top_p=top_p, min_p=min_p,
                     repeat_penalty=repetition_penalty, stream=True,
                 )
                 for chunk in stream:
@@ -1998,7 +2007,7 @@ class AuraLiteEngine:
             else:
                 stream = self.model.create_completion(
                     start_str, max_tokens=length, temperature=temperature,
-                    top_k=top_k, top_p=top_p,
+                    top_k=top_k, top_p=top_p, min_p=min_p,
                     repeat_penalty=repetition_penalty, stream=True,
                 )
                 for chunk in stream:
@@ -2024,7 +2033,7 @@ class AuraLiteEngine:
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
             logits = self.model(t, start_pos=0, use_cache=True)
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids)
+                                     repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
             yield self.decode([nxt])
 
@@ -2036,7 +2045,7 @@ class AuraLiteEngine:
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
                 logits = self.model(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids)
+                                         repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
                 yield self.decode([nxt])
 
@@ -2045,7 +2054,8 @@ class AuraLiteEngine:
     def _generate_batch_group(self, batch_ids: list[list[int]], length: int = 50,
                               temperature: float = 0.8,
                               top_k: int = 50, top_p: float = 0.9,
-                              repetition_penalty: float = 1.0) -> list[list[int]]:
+                              repetition_penalty: float = 1.0,
+                              min_p: float = 0.0) -> list[list[int]]:
         """Generate in parallel for prompts that already have the same length."""
         if self.model is None:
             raise ValueError("Train or load a model first!")
@@ -2067,7 +2077,7 @@ class AuraLiteEngine:
             next_tokens = []
             for b in range(B):
                 nxt = self._sample_token(last_logits[b], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids[b])
+                                         repetition_penalty, result_ids[b], min_p=min_p)
                 result_ids[b].append(nxt)
                 next_tokens.append(nxt)
 
@@ -2082,7 +2092,7 @@ class AuraLiteEngine:
                 next_tokens = []
                 for b in range(B):
                     nxt = self._sample_token(logits[b, 0], temperature, top_k, top_p,
-                                             repetition_penalty, result_ids[b])
+                                             repetition_penalty, result_ids[b], min_p=min_p)
                     result_ids[b].append(nxt)
                     next_tokens.append(nxt)
 
@@ -2093,7 +2103,8 @@ class AuraLiteEngine:
     def generate_batch(self, prompts: list[str], length: int = 50,
                        temperature: float = 0.8,
                        top_k: int = 50, top_p: float = 0.9,
-                       repetition_penalty: float = 1.0) -> list[str]:
+                       repetition_penalty: float = 1.0,
+                       min_p: float = 0.0) -> list[str]:
         """Generate text for multiple prompts in parallel.
 
         Prompts are first truncated to the model context limit and then grouped
@@ -2108,7 +2119,7 @@ class AuraLiteEngine:
 
         if self.is_gguf_model():
             return [self.generate(p, length, temperature, top_k, top_p,
-                                  repetition_penalty=repetition_penalty)
+                                  repetition_penalty=repetition_penalty, min_p=min_p)
                     for p in prompts]
 
         self.model.eval()
@@ -2124,7 +2135,7 @@ class AuraLiteEngine:
             batch_ids = [ids for _, ids in batch_group]
             generated_ids = self._generate_batch_group(
                 batch_ids, length, temperature, top_k, top_p,
-                repetition_penalty=repetition_penalty)
+                repetition_penalty=repetition_penalty, min_p=min_p)
             for (orig_idx, used_ids), out_ids in zip(batch_group, generated_ids):
                 used_prompt = self.decode(used_ids)
                 out_text = self.decode(out_ids)
@@ -2136,7 +2147,8 @@ class AuraLiteEngine:
     def _sample_token(self, logits: torch.Tensor,
                       temperature: float, top_k: int, top_p: float,
                       repetition_penalty: float = 1.0,
-                      recent_ids: list[int] | None = None) -> int:
+                      recent_ids: list[int] | None = None,
+                      min_p: float = 0.0) -> int:
         """Sample a single token id with temperature, repetition penalty,
         top-k, and top-p (nucleus) filtering.
 
@@ -2159,6 +2171,13 @@ class AuraLiteEngine:
         if 0 < top_k < self.vocab_size:
             kth_val = torch.topk(logits, min(top_k, self.vocab_size))[0][-1]
             logits = logits.masked_fill(logits < kth_val, float("-inf"))
+
+        # Min-P filtering (applied before Top-P)
+        if min_p and 0.0 < min_p < 1.0:
+            probs = torch.softmax(logits, dim=-1)
+            max_prob = torch.max(probs).item()
+            limit = min_p * max_prob
+            logits = logits.masked_fill(probs < limit, float("-inf"))
 
         # Top-p (nucleus) filtering
         if 0.0 < top_p < 1.0:

@@ -527,8 +527,15 @@ class AIApp:
         ttk.Entry(srow, textvariable=self.rep_var,
                   width=6).grid(row=1, column=1, sticky=tk.W, padx=4,
                                 pady=(6, 0))
+        ttk.Label(srow, text="Min-P:").grid(row=1, column=2,
+                                            sticky=tk.W, padx=(14, 4),
+                                            pady=(6, 0))
+        self.minp_var = tk.StringVar(value="0.0")
+        ttk.Entry(srow, textvariable=self.minp_var,
+                  width=6).grid(row=1, column=3, sticky=tk.W, padx=4,
+                                pady=(6, 0))
         ttk.Label(srow, text="(1.0 = off, 1.1–1.3 fights loops)",
-                  style="Sub.TLabel").grid(row=1, column=2, columnspan=4,
+                  style="Sub.TLabel").grid(row=1, column=4, columnspan=3,
                                            sticky=tk.W, pady=(6, 0))
 
         # --- Seed + length ---
@@ -1872,6 +1879,7 @@ class AIApp:
             top_k = int(self.topk_var.get())
             top_p = float(self.topp_var.get())
             rep_pen = float(self.rep_var.get())
+            min_p = float(self.minp_var.get())
         except ValueError:
             messagebox.showwarning("Warning",
                                    "Invalid generation settings!")
@@ -1890,7 +1898,8 @@ class AIApp:
             try:
                 res = self.engine.generate(seed, length,
                                            temperature, top_k, top_p,
-                                           repetition_penalty=rep_pen)
+                                           repetition_penalty=rep_pen,
+                                           min_p=min_p)
                 self.root.after(0, self._display_result, res)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror(
@@ -1910,6 +1919,7 @@ class AIApp:
             top_k = int(self.topk_var.get())
             top_p = float(self.topp_var.get())
             rep_pen = float(self.rep_var.get())
+            min_p = float(self.minp_var.get())
         except ValueError:
             messagebox.showwarning("Warning",
                                    "Invalid generation settings!")
@@ -1941,13 +1951,13 @@ class AIApp:
                     thoughts, final = self.engine.generate_with_thinking(
                         seed, length, temperature, top_k, top_p,
                         repetition_penalty=rep_pen,
-                        web_context=web_ctx or None)
+                        web_context=web_ctx or None, min_p=min_p)
                 else:
                     # Web search only: prepend context, generate once
                     prompt = f"{web_ctx}\n{seed}" if web_ctx else seed
                     full = self.engine.generate(
                         prompt, length, temperature, top_k, top_p,
-                        repetition_penalty=rep_pen)
+                        repetition_penalty=rep_pen, min_p=min_p)
                     thoughts = ""
                     final = seed + full[len(prompt):]
 
@@ -1979,6 +1989,7 @@ class AIApp:
             top_k = int(self.topk_var.get())
             top_p = float(self.topp_var.get())
             rep_pen = float(self.rep_var.get())
+            min_p = float(self.minp_var.get())
         except ValueError:
             messagebox.showwarning("Warning",
                                    "Invalid generation settings!")
@@ -1997,7 +2008,7 @@ class AIApp:
             try:
                 for token_text in self.engine.generate_streaming(
                     seed, length, temperature, top_k, top_p,
-                    repetition_penalty=rep_pen
+                    repetition_penalty=rep_pen, min_p=min_p
                 ):
                     # tkinter is NOT thread-safe: marshal the widget update
                     # onto the main loop via root.after instead of calling
@@ -2034,6 +2045,7 @@ class AIApp:
             top_k = int(self.topk_var.get())
             top_p = float(self.topp_var.get())
             rep_pen = float(self.rep_var.get())
+            min_p = float(self.minp_var.get())
         except ValueError:
             messagebox.showwarning("Warning", "Invalid generation settings!")
             return
@@ -2046,7 +2058,7 @@ class AIApp:
             try:
                 results = self.engine.generate_batch(
                     prompts, length, temperature, top_k, top_p,
-                    repetition_penalty=rep_pen
+                    repetition_penalty=rep_pen, min_p=min_p
                 )
                 for i, (prompt, result) in enumerate(zip(prompts, results)):
                     self.root.after(0, lambda p=prompt, r=result, idx=i:
