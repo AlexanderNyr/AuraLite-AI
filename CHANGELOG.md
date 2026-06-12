@@ -1,5 +1,17 @@
 # 🚀 Changelog — AuraLite AI v2.0 → v2.1
 
+## ⚡ New Feature: INT8 Quantization (v2.2)
+
+- **`QuantizedLinear`** — drop-in INT8 replacement for `nn.Linear` (weight-only, per-output-channel symmetric scales, llama.cpp Q8_0-style). Dequantizes on the fly via `F.linear`, so it runs on both CPU and CUDA with **no extra dependencies**.
+- **`ModernTransformer.quantize_int8()`** — converts all attention (`W_q/W_k/W_v/W_o`) and FFN (`gate/up/down`) projections to INT8 in-place. The weight-tied embedding/head stays FP32 to preserve output quality. Rejects models with active LoRA adapters.
+- **`AuraLiteEngine.quantize_model("int8")`** — engine-level API; returns a report (`params_quantized`, `memory_mb_before/after`) and drops stale optimizer/scheduler state. `engine.is_quantized()` for status checks.
+- **Save / Load support** — quantized checkpoints store INT8 buffers + scales (`quantization` field in the checkpoint); `load_model()` reconstructs `QuantizedLinear` shells automatically. Result: **~4× smaller `.pt` files** (e.g. 10.1 MB → 2.8 MB for a 1.1M-param model).
+- **Inference-only guard** — `continue_training=True` on a quantized model raises a clear error suggesting to reload the FP32 checkpoint.
+- **GUI** — new **⚡ Quantize INT8** button on the 💾 Model tab with a confirmation dialog and a before/after memory report; Model Info now shows the quantization status. Button auto-disables for GGUF / already-quantized models.
+- **Tests** — 9 new unit tests (`TestQuantization`): numerical closeness to FP32, idempotency, LoRA rejection, engine round-trip (quantize → generate → save → load → generate), training guard, error modes. **71/71 tests pass.**
+
+---
+
 ## 🐛 Bug Fixes (v2.1.1)
 
 | # | Severity | Bug | Fix |

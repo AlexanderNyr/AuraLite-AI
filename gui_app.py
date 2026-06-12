@@ -682,6 +682,11 @@ class AIApp:
                                    command=self.load_model)
         self.load_btn.pack(side=tk.LEFT, padx=6)
 
+        self.quant_btn = ttk.Button(btn_row, text="⚡ Quantize INT8",
+                                    command=self.quantize_model,
+                                    state=tk.DISABLED)
+        self.quant_btn.pack(side=tk.LEFT, padx=6)
+
         self.model_file_label = ttk.Label(io_frame, text="No model loaded",
                                           foreground="gray")
         self.model_file_label.pack(pady=2)
@@ -846,6 +851,13 @@ class AIApp:
             lines.append(f"max_seq_len     : {m.max_seq_len}")
             lines.append(f"dropout         : {m.dropout}")
             lines.append(f"ALiBi           : {'Yes ✅' if m.use_alibi else 'No'}")
+            quant = getattr(m, "quantization", "none")
+            if quant != "none":
+                lines.append(f"Quantization    : {quant.upper()} ⚡ "
+                             f"({m.count_quantized_parameters():,} int8 weights, "
+                             f"~{m.estimate_memory_mb():.1f} MB, inference-only)")
+            else:
+                lines.append("Quantization    : No (FP32)")
             lines.append(f"device          : {self.engine.device}")
             if self.engine.last_val_loss is not None:
                 lines.append(f"last val loss   : {self.engine.last_val_loss:.4f}")
@@ -1196,6 +1208,7 @@ class AIApp:
                         state=tk.NORMAL))
                     self.root.after(0, lambda: self.save_btn.config(
                         state=tk.NORMAL))
+                    self.root.after(0, self._update_quant_btn)
                     n = self.engine.model.count_parameters()
                     self.root.after(0, lambda c=n: self.param_label.config(
                         text=f"Parameters: {c:,}"))
@@ -1574,6 +1587,50 @@ class AIApp:
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
+    def quantize_model(self):
+        """Quantize the in-memory native model to INT8 (weight-only)."""
+        if self.engine.model is None:
+            messagebox.showinfo("Quantize", "Train or load a model first.")
+            return
+        if self.engine.is_gguf_model():
+            messagebox.showinfo(
+                "Quantize",
+                ".gguf models are already quantized by llama.cpp.\n"
+                "Quantization applies only to native AuraLite .pt models.")
+            return
+        if self.engine.is_quantized():
+            messagebox.showinfo("Quantize", "Model is already INT8-quantized.")
+            return
+        if not messagebox.askyesno(
+                "Quantize to INT8",
+                "Quantize all attention + FFN weights to INT8?\n\n"
+                "• ~4x smaller checkpoints and memory footprint\n"
+                "• Minimal quality loss (weight-only, per-channel)\n"
+                "• The model becomes INFERENCE-ONLY — further training\n"
+                "  will require reloading the FP32 checkpoint.\n\n"
+                "Tip: save the FP32 model first if you plan to fine-tune later."):
+            return
+        try:
+            report = self.engine.quantize_model("int8")
+            self.quant_btn.config(state=tk.DISABLED)
+            self._refresh_model_info()
+            messagebox.showinfo(
+                "Quantized ✅",
+                f"INT8 weights : {report['params_quantized']:,} / "
+                f"{report['params_total']:,}\n"
+                f"Memory       : {report['memory_mb_before']:.1f} MB → "
+                f"{report['memory_mb_after']:.1f} MB\n\n"
+                "Use 💾 Save Model to store the compact .pt checkpoint.")
+        except Exception as e:
+            messagebox.showerror("Quantize Error", str(e))
+
+    def _update_quant_btn(self):
+        """Enable ⚡ Quantize only for native, not-yet-quantized models."""
+        ok = (self.engine.model is not None
+              and not self.engine.is_gguf_model()
+              and not self.engine.is_quantized())
+        self.quant_btn.config(state=tk.NORMAL if ok else tk.DISABLED)
+
     def _ask_gguf_options(self, path: str) -> dict | None:
         """Modal dialog for llama.cpp / GGUF loading options."""
         dlg = tk.Toplevel(self.root)
@@ -1686,6 +1743,7 @@ class AIApp:
             self.is_trained = True
             self.gen_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.DISABLED if self.engine.is_gguf_model() else tk.NORMAL)
+            self._update_quant_btn()
             n = self.engine.model.count_parameters()
             self.param_label.config(text=f"Parameters: {n:,}" if n else "Parameters: —")
             self.model_file_label.config(

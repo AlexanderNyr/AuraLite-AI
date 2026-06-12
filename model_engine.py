@@ -502,6 +502,67 @@ class RMSNorm(nn.Module):
 
 # -------------------------------------------------------------------
 
+class QuantizedLinear(nn.Module):
+    """INT8 weight-only quantized drop-in replacement for nn.Linear.
+
+    Weights are stored as int8 with a per-output-channel symmetric scale
+    (the same scheme used by llama.cpp Q8_0 and bitsandbytes int8).
+    On forward the weights are dequantized to the activation dtype and a
+    regular F.linear is performed, so it works on both CPU and CUDA with
+    no extra dependencies.
+
+    Memory: 4x smaller than FP32 (1 byte/weight + one fp32 scale per row).
+    Quality: typically < 0.1 perplexity degradation for weight-only INT8.
+    Quantized layers are inference-only (no gradients flow to the weights).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.register_buffer(
+            "weight_int8",
+            torch.zeros(out_features, in_features, dtype=torch.int8),
+            persistent=True,
+        )
+        self.register_buffer(
+            "scale",
+            torch.ones(out_features, dtype=torch.float32),
+            persistent=True,
+        )
+        if bias:
+            self.register_buffer("bias", torch.zeros(out_features), persistent=True)
+        else:
+            self.bias = None
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> "QuantizedLinear":
+        """Quantize an existing nn.Linear into a QuantizedLinear."""
+        q = cls(linear.in_features, linear.out_features,
+                bias=linear.bias is not None)
+        with torch.no_grad():
+            w = linear.weight.detach().float().cpu()
+            # per-output-channel symmetric scale: max|w| / 127
+            scale = w.abs().amax(dim=1).clamp(min=1e-8) / 127.0
+            q.weight_int8.copy_(
+                torch.round(w / scale[:, None]).clamp_(-127, 127).to(torch.int8))
+            q.scale.copy_(scale)
+            if linear.bias is not None:
+                q.bias.copy_(linear.bias.detach().float().cpu())
+        return q
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = (self.weight_int8.to(torch.float32) * self.scale[:, None]).to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w, b)
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, "
+                f"out_features={self.out_features}, quant=int8")
+
+
+# -------------------------------------------------------------------
+
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -755,6 +816,9 @@ class ModernTransformer(nn.Module):
         self.lora_adapters: list | None = None
         self.lora_rank = 0
 
+        # Quantization state ("none" or "int8")
+        self.quantization = "none"
+
     @staticmethod
     def _init_weights(module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -782,7 +846,11 @@ class ModernTransformer(nn.Module):
             layer.attn.reset_cache()
 
     def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        n = sum(p.numel() for p in self.parameters())
+        # quantized weights live in buffers, not parameters
+        n += sum(m.weight_int8.numel() for m in self.modules()
+                 if isinstance(m, QuantizedLinear))
+        return n
 
     def count_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -836,6 +904,55 @@ class ModernTransformer(nn.Module):
             layer.ffn.lora = None
         for param in self.parameters():
             param.requires_grad = True
+
+    # ---- Quantization Support (NEW) -----------------------------------
+    def quantize_int8(self):
+        """Quantize all attention + FFN linear layers to INT8 (in-place).
+
+        Weight-only, per-channel symmetric INT8. The embedding / output head
+        stays in FP32 (it is weight-tied and tiny relative to the rest, and
+        keeping it full precision preserves output quality).
+
+        After quantization the model is **inference-only** — to keep
+        training, save a checkpoint first and reload the FP32 version.
+        Works on CPU and CUDA. Returns self for chaining.
+        """
+        if self.quantization == "int8":
+            return self  # already quantized
+        if self.lora_rank > 0:
+            raise ValueError(
+                "Cannot quantize a model with active LoRA adapters. "
+                "Merge or disable LoRA first (disable_lora()).")
+
+        device = next(self.parameters()).device
+        for layer in self.layers:
+            attn, ffn = layer.attn, layer.ffn
+            for parent, name in ((attn, "W_q"), (attn, "W_k"),
+                                 (attn, "W_v"), (attn, "W_o"),
+                                 (ffn, "gate"), (ffn, "up"), (ffn, "down")):
+                mod = getattr(parent, name)
+                if isinstance(mod, nn.Linear):
+                    setattr(parent, name, QuantizedLinear.from_linear(mod))
+
+        self.quantization = "int8"
+        self.to(device)
+        self.eval()
+        return self
+
+    def count_quantized_parameters(self) -> int:
+        """Number of weights stored as INT8."""
+        return sum(m.weight_int8.numel() for m in self.modules()
+                   if isinstance(m, QuantizedLinear))
+
+    def estimate_memory_mb(self) -> float:
+        """Approximate in-memory size of all weights (MB)."""
+        total = 0
+        for p in self.parameters():
+            total += p.numel() * p.element_size()
+        for b in self.buffers():
+            total += b.numel() * b.element_size()
+        # weight tying: embedding == head, counted once by parameters()
+        return total / (1024 ** 2)
 
 
 class LoRALayer(nn.Module):
@@ -1371,6 +1488,12 @@ class AuraLiteEngine:
             raise ValueError(
                 ".gguf models are inference-only in AuraLite. "
                 "Uncheck 'Continue training current model' to train a new AuraLite .pt model."
+            )
+        if (params.get("continue_training", False) and self.model is not None
+                and getattr(self.model, "quantization", "none") != "none"):
+            raise ValueError(
+                "The current model is INT8-quantized and inference-only. "
+                "Load the original FP32 .pt checkpoint to continue training."
             )
 
         errors = validate_params(params)
@@ -2058,6 +2181,61 @@ class AuraLiteEngine:
         probs = torch.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).item()
 
+    # ---- Quantization (NEW) --------------------------------------------
+    def quantize_model(self, mode: str = "int8") -> dict:
+        """Quantize the in-memory native model for faster / lighter inference.
+
+        Args:
+            mode: only "int8" is currently supported (weight-only,
+                  per-channel symmetric — llama.cpp Q8_0-style).
+
+        Returns a small report dict:
+            {"params_quantized", "params_total", "memory_mb_before",
+             "memory_mb_after"}
+
+        Notes:
+            * GGUF models are already quantized — raises ValueError.
+            * The quantized model is inference-only; `continue_training`
+              will be rejected. Save the FP32 checkpoint first if you may
+              want to fine-tune later.
+            * A quantized model can be saved/loaded as a .pt checkpoint
+              (the INT8 weights + scales are stored, ~4x smaller).
+        """
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+        if self.is_gguf_model():
+            raise ValueError(
+                ".gguf models are already quantized (llama.cpp). "
+                "Quantization applies only to native AuraLite .pt models.")
+        if mode != "int8":
+            raise ValueError(f"Unsupported quantization mode: {mode!r} "
+                             "(only 'int8' is available)")
+        if getattr(self.model, "quantization", "none") == "int8":
+            raise ValueError("Model is already INT8-quantized.")
+
+        mem_before = self.model.estimate_memory_mb()
+        self.model.quantize_int8()
+        mem_after = self.model.estimate_memory_mb()
+
+        # Optimizer state refers to tensors that no longer exist — drop it.
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+        self._resume_optimizer_state = None
+        self._resume_scheduler_state = None
+        self._resume_scaler_state = None
+
+        return {
+            "params_quantized": self.model.count_quantized_parameters(),
+            "params_total":     self.model.count_parameters(),
+            "memory_mb_before": mem_before,
+            "memory_mb_after":  mem_after,
+        }
+
+    def is_quantized(self) -> bool:
+        return (self.model is not None
+                and getattr(self.model, "quantization", "none") != "none")
+
     # ---- Save / Load --------------------------------------------------
     def save_model(self, path: str):
         if self.model is None:
@@ -2086,6 +2264,7 @@ class AuraLiteEngine:
             "max_seq_len":  self.model.max_seq_len,
             "use_alibi":    self.model.use_alibi,
             "lora_rank":    self.model.lora_rank,
+            "quantization": getattr(self.model, "quantization", "none"),
         }
         torch.save(checkpoint, path)
 
@@ -2148,6 +2327,21 @@ class AuraLiteEngine:
         lora_rank = checkpoint.get("lora_rank", 0)
         if lora_rank > 0:
             self.model.enable_lora(rank=lora_rank)
+
+        # Quantized checkpoints store INT8 buffers instead of FP32 weights —
+        # swap in empty QuantizedLinear shells so the state dict keys match.
+        if checkpoint.get("quantization", "none") == "int8":
+            for layer in self.model.layers:
+                attn, ffn = layer.attn, layer.ffn
+                for parent, name in ((attn, "W_q"), (attn, "W_k"),
+                                     (attn, "W_v"), (attn, "W_o"),
+                                     (ffn, "gate"), (ffn, "up"), (ffn, "down")):
+                    mod = getattr(parent, name)
+                    if isinstance(mod, nn.Linear):
+                        setattr(parent, name, QuantizedLinear(
+                            mod.in_features, mod.out_features,
+                            bias=mod.bias is not None))
+            self.model.quantization = "int8"
 
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
