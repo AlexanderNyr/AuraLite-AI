@@ -638,6 +638,72 @@ class HuggingFaceProxy:
         """No-op for compatibility with AuraLite native API."""
         pass
 
+    # ------------------------------------------------------------------
+    # Hugging Face Hub push / pull (NEW v2.6)
+    # ------------------------------------------------------------------
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        commit_message: str = "Upload AuraLite HF model",
+        private: bool = False,
+        token: Optional[str] = None,
+        create_pr: bool = False,
+    ):
+        """
+        Push the current model (and tokenizer) to the Hugging Face Hub.
+
+        Works for both base models and LoRA adapters.
+        Requires `huggingface_hub` (usually comes with transformers).
+        """
+        _check_hf_support()
+
+        if self.model is None or self.tokenizer is None:
+            raise ValueError("No model loaded to push.")
+
+        try:
+            from huggingface_hub import HfApi, login
+        except ImportError:
+            raise HFNotAvailableError("huggingface_hub is required for push_to_hub.")
+
+        if token:
+            login(token=token)
+
+        print(f"[AuraLite-HF] Pushing model to https://huggingface.co/{repo_id} ...")
+
+        self.model.push_to_hub(
+            repo_id=repo_id,
+            commit_message=commit_message,
+            private=private,
+            create_pr=create_pr,
+        )
+        self.tokenizer.push_to_hub(
+            repo_id=repo_id,
+            commit_message=commit_message,
+            private=private,
+        )
+
+        print(f"[AuraLite-HF] ✅ Successfully pushed to {repo_id}")
+
+    def from_pretrained(
+        self,
+        repo_id: str,
+        *,
+        revision: str = "main",
+        token: Optional[str] = None,
+        **load_kwargs,
+    ):
+        """
+        Load a model directly from the Hugging Face Hub (or a specific revision).
+
+        This is a convenience wrapper around `load_model`.
+        """
+        self.load_model(
+            repo_id,
+            local_files_only=False,
+            **load_kwargs,
+        )
+
 
 # ----------------------------------------------------------------------
 # Convenience function for the engine

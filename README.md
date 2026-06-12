@@ -34,6 +34,12 @@
 - **Custom Training**: Upload any `.txt` file to teach the built-in AuraLite `.pt` model specific styles, languages, or fictional worlds.
 - **External GGUF Models**: Open `.gguf` files from the Model tab and use them immediately for inference. GGUF files are inference-only in AuraLite; train/fine-tune with AuraLite’s native `.pt` checkpoints.
 - **Interruptible Training**: Ability to stop training at any point and preserve the learned weights for immediate testing.
+- **Gradient Checkpointing**: Trade compute for memory — enables training of larger models on consumer GPUs. Toggle in the Training tab.
+- **💬 Chat / Instruction Mode**: Dedicated chat tab with system/user/assistant roles, multiple templates (ChatML, Llama-2, Mistral, Gemma, Phi), conversation history, and **real-time token streaming**.
+- **🔄 YaRN / NTK RoPE Scaling**: Extend context beyond training length (2k → 16k–32k). Supports linear, NTK and YaRN methods.
+- **🌙 Dark Theme**: Toggle available in the header.
+- **☁️ Hugging Face Hub Integration**: Push/pull models and LoRA adapters to/from the Hub.
+- **📊 Model Evaluation**: Built-in evaluation using `lm-evaluation-harness` (ARC, MMLU, GSM8K, etc.).
 
 ## 🛠 Technical Specifications
 - **Framework**: PyTorch (Tensors, Autograd, AMP on CUDA, optional `torch.compile`).

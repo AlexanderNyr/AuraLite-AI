@@ -10,12 +10,18 @@ os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_COUNT))
 os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_CPU_COUNT))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_COUNT))
 
+# -----------------------------------------------------------------------
+# Distributed training (DDP) support — v2.3
+# -----------------------------------------------------------------------
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 import json
 import math
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Iterator, Any
+from typing import Callable, Iterator, Any, List, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -32,6 +38,22 @@ except ImportError:
     HFNotAvailableError = Exception
     create_hf_proxy = None
     HAS_HF_SUPPORT = False
+
+# Chat interface (NEW v2.3)
+try:
+    from chat_interface import (
+        ChatMessage, ChatHistory, apply_chat_template,
+        CHAT_TEMPLATES, get_stop_tokens, build_chat_prompt
+    )
+    HAS_CHAT_SUPPORT = True
+except ImportError:
+    HAS_CHAT_SUPPORT = False
+    ChatMessage = None
+    ChatHistory = None
+    apply_chat_template = None
+    CHAT_TEMPLATES = {}
+    get_stop_tokens = lambda x: []
+    build_chat_prompt = None
 
 try:
     torch.set_num_threads(_CPU_COUNT)
@@ -65,6 +87,7 @@ def validate_params(params: dict) -> list[str]:
     bpe_vocab_size = params.get("bpe_vocab_size", 512)
     val_split = params.get("val_split", 0.1)
     accumulation_steps = params.get("accumulation_steps", 1)
+    use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
 
     if d_model <= 0:
         errors.append(f"d_model must be > 0, got {d_model}")
@@ -95,6 +118,14 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"val_split must be in (0, 1), got {val_split}")
     if accumulation_steps < 1:
         errors.append(f"accumulation_steps must be >= 1, got {accumulation_steps}")
+
+    # Gradient checkpointing validation
+    if use_gradient_checkpointing and not isinstance(use_gradient_checkpointing, bool):
+        errors.append("use_gradient_checkpointing must be a boolean")
+
+    # DDP validation
+    if use_ddp and not torch.cuda.is_available():
+        errors.append("Multi-GPU (DDP) requires CUDA")
 
     return errors
 
@@ -507,13 +538,15 @@ class Attention(nn.Module):
     def __init__(self, d_model: int, n_heads: int,
                  n_kv_heads: int | None = None,
                  max_seq_len: int = 4096,
-                 use_alibi: bool = False):
+                 use_alibi: bool = False,
+                 rope_scaling: dict | None = None):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.n_kv_heads = n_kv_heads or n_heads
         self.n_rep = self.n_heads // self.n_kv_heads
         self.use_alibi = use_alibi
+        self.rope_scaling = rope_scaling or {}  # {'type': 'yarn'|'ntk'|'linear', 'factor': float}
 
         self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
@@ -521,17 +554,38 @@ class Attention(nn.Module):
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
 
         # Pre-compute RoPE cos / sin as persistent buffers (move with .to(device))
-        freqs = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        t = torch.arange(max_seq_len).float()
-        angles = torch.outer(t, freqs)                              # (max_seq_len, head_dim//2)
-        self.register_buffer("rope_cos", angles.cos(), persistent=True)
-        self.register_buffer("rope_sin", angles.sin(), persistent=True)
+        self.max_seq_len = max_seq_len
+        self._build_rope_buffers(max_seq_len)
 
         # ALiBi slopes (one per head)
         if use_alibi:
             self.register_buffer("alibi_slopes", self._get_alibi_slopes(), persistent=True)
 
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _build_rope_buffers(self, seq_len: int):
+        """Build RoPE cos/sin buffers, applying scaling if configured."""
+        base = 10000.0
+        scaling = self.rope_scaling or {}
+        scale_type = scaling.get("type", "none")
+        factor = scaling.get("factor", 1.0)
+
+        if scale_type == "ntk":
+            # NTK scaling: change base frequency
+            base = base * (factor ** (self.head_dim / (self.head_dim - 2)))
+        elif scale_type == "linear":
+            # Simple linear scaling of positions
+            pass  # handled in _apply_rope
+        elif scale_type == "yarn":
+            # YaRN: more sophisticated, we approximate with adjusted base + extrapolation
+            # For simplicity we use a hybrid approach (real YaRN is more complex)
+            base = base * (factor ** 0.25)
+
+        freqs = 1.0 / (base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(seq_len).float()
+        angles = torch.outer(t, freqs)
+        self.register_buffer("rope_cos", angles.cos(), persistent=True)
+        self.register_buffer("rope_sin", angles.sin(), persistent=True)
 
     def _get_alibi_slopes(self) -> torch.Tensor:
         """Compute monotonic ALiBi slopes, one per attention head."""
@@ -540,16 +594,35 @@ class Attention(nn.Module):
 
     # ---- RoPE --------------------------------------------------------
     def _apply_rope(self, x: torch.Tensor, start_pos: int, seq_len: int) -> torch.Tensor:
-        """Apply Rotary Position Embeddings to a (*, seq_len, head_dim) tensor."""
-        cos = self.rope_cos[start_pos:start_pos + seq_len]  # (T, hd//2)
-        sin = self.rope_sin[start_pos:start_pos + seq_len]
+        """Apply Rotary Position Embeddings to a (*, seq_len, head_dim) tensor.
+
+        Supports:
+        - Standard RoPE
+        - Linear position scaling
+        - NTK / YaRN style (via adjusted base in _build_rope_buffers)
+        """
+        scaling = self.rope_scaling or {}
+        scale_type = scaling.get("type", "none")
+        factor = scaling.get("factor", 1.0)
+
+        if scale_type == "linear" and factor != 1.0:
+            # Linear scaling: stretch positions
+            pos = torch.arange(start_pos, start_pos + seq_len, device=x.device).float() / factor
+            # Recompute angles on the fly for scaled positions (simple but correct)
+            base = 10000.0
+            freqs = 1.0 / (base ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim))
+            angles = torch.outer(pos, freqs)
+            cos = angles.cos()[None, :, None, :]
+            sin = angles.sin()[None, :, None, :]
+        else:
+            cos = self.rope_cos[start_pos:start_pos + seq_len]  # (T, hd//2)
+            sin = self.rope_sin[start_pos:start_pos + seq_len]
+            cos = cos[None, :, None, :]
+            sin = sin[None, :, None, :]
 
         # x → (..., T, hd//2, 2)
         x_pairs = x.float().reshape(*x.shape[:-1], -1, 2)
         x0, x1 = x_pairs[..., 0], x_pairs[..., 1]
-
-        cos = cos[None, :, None, :]   # (1, T, 1, hd//2)
-        sin = sin[None, :, None, :]
 
         out_x0 = x0 * cos - x1 * sin
         out_x1 = x0 * sin + x1 * cos
@@ -664,24 +737,43 @@ class FeedForward(nn.Module):
 # -------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: RMSNorm → Attention → RMSNorm → SwiGLU FFN."""
+    """Pre-norm Transformer block: RMSNorm → Attention → RMSNorm → SwiGLU FFN.
+
+    IMPROVED (v2.3+):
+    - Optional gradient checkpointing for memory-efficient training
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
                  n_kv_heads: int | None, max_seq_len: int,
-                 dropout: float = 0.0, use_alibi: bool = False):
+                 dropout: float = 0.0, use_alibi: bool = False,
+                 use_checkpoint: bool = False,
+                 rope_scaling: dict | None = None):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
-                                   use_alibi=use_alibi)
+                                   use_alibi=use_alibi,
+                                   rope_scaling=rope_scaling)
         self.ffn_norm  = RMSNorm(d_model)
         self.ffn       = FeedForward(d_model, d_ff)
         self.dropout   = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.use_checkpoint = use_checkpoint
 
-    def forward(self, x: torch.Tensor,
-                start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor,
+                      start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
+        """Internal forward pass (used by checkpointing)."""
         x = x + self.dropout(self.attn(self.attn_norm(x), start_pos, use_cache))
         x = x + self.dropout(self.ffn(self.ffn_norm(x)))
         return x
+
+    def forward(self, x: torch.Tensor,
+                start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
+        if self.use_checkpoint and self.training and not use_cache:
+            # Gradient checkpointing: trade compute for memory
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, start_pos, use_cache,
+                use_reentrant=False
+            )
+        return self._forward_impl(x, start_pos, use_cache)
 
 
 # ===================================================================
@@ -704,6 +796,9 @@ class ModernTransformer(nn.Module):
     IMPROVED (v2.1+):
     • Optional ALiBi for better length extrapolation
     • LoRA adapter support
+
+    IMPROVED (v2.3+):
+    • Gradient checkpointing support (use_gradient_checkpointing)
     """
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int,
@@ -711,7 +806,9 @@ class ModernTransformer(nn.Module):
                  max_seq_len: int = 4096,
                  n_kv_heads: int | None = None,
                  dropout: float = 0.0,
-                 use_alibi: bool = False):
+                 use_alibi: bool = False,
+                 use_gradient_checkpointing: bool = False,
+                 rope_scaling: dict | None = None):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         if n_kv_heads is not None:
@@ -725,11 +822,15 @@ class ModernTransformer(nn.Module):
         self.max_seq_len = max_seq_len
         self.dropout     = dropout
         self.use_alibi   = use_alibi
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.rope_scaling = rope_scaling or {}
 
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.layers      = nn.ModuleList([
             TransformerBlock(d_model, n_heads, d_ff, n_kv_heads, max_seq_len, dropout,
-                             use_alibi=use_alibi)
+                             use_alibi=use_alibi,
+                             use_checkpoint=use_gradient_checkpointing,
+                             rope_scaling=rope_scaling)
             for _ in range(n_layers)
         ])
         self.final_norm  = RMSNorm(d_model)
@@ -1139,6 +1240,15 @@ class AuraLiteEngine:
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
 
+        # DDP (DistributedDataParallel) support — v2.3
+        self.is_distributed = False
+        self.local_rank = 0
+        self.world_size = 1
+        self._ddp_model = None
+
+        # Auto-detect distributed environment (torchrun / torch.distributed.launch)
+        self._try_init_distributed_from_env()
+
         # CUDA performance tuning
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
@@ -1147,11 +1257,232 @@ class AuraLiteEngine:
             except AttributeError:
                 pass  # older PyTorch versions
 
+    def _try_init_distributed_from_env(self):
+        """Initialize DDP if running under torchrun or torch.distributed.launch."""
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            try:
+                rank = int(os.environ["RANK"])
+                world_size = int(os.environ["WORLD_SIZE"])
+                local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+
+                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo",
+                                        rank=rank, world_size=world_size)
+
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(local_rank)
+                    self.device = torch.device(f"cuda:{local_rank}")
+
+                self.is_distributed = True
+                self.local_rank = local_rank
+                self.world_size = world_size
+
+                print(f"[AuraLite] DDP initialized: rank={rank}, world_size={world_size}, "
+                      f"local_rank={local_rank}, device={self.device}")
+            except Exception as e:
+                print(f"[AuraLite] WARNING: Failed to initialize DDP: {e}")
+                self.is_distributed = False
+
     def is_gguf_model(self) -> bool:
         return self.backend == "gguf" or isinstance(self.model, GGUFModelProxy)
 
     def is_hf_model(self) -> bool:
         return self.backend == "huggingface" or isinstance(self.model, HuggingFaceProxy)
+
+    # ===================================================================
+    #  Chat / Instruction Mode (NEW v2.3)
+    # ===================================================================
+
+    def generate_chat(
+        self,
+        messages: List[Dict[str, str]] | "ChatHistory",
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        min_p: float = 0.0,
+        chat_template: str = "chatml",
+        system_prompt: Optional[str] = None,
+        stop_tokens: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Generate a response in chat/instruction mode.
+
+        Args:
+            messages: List of {"role": "...", "content": "..."} or ChatHistory
+            max_new_tokens: how many tokens to generate
+            chat_template: one of CHAT_TEMPLATES keys
+            system_prompt: optional system message to prepend
+
+        Returns:
+            Generated assistant response (without the prompt).
+        """
+        if not HAS_CHAT_SUPPORT:
+            raise RuntimeError("chat_interface.py is required for chat mode.")
+
+        # Convert to ChatHistory if needed
+        if isinstance(messages, list):
+            history = ChatHistory.from_list(messages)
+        else:
+            history = messages
+
+        # Add system prompt if provided
+        if system_prompt and not any(m.role == "system" for m in history.messages):
+            history.messages.insert(0, ChatMessage(role="system", content=system_prompt))
+
+        prompt = apply_chat_template(history, template_name=chat_template, add_generation_prompt=True)
+
+        # Generate
+        if self.is_gguf_model():
+            # GGUF chat completion
+            if self.model.use_chat_completion:
+                result = self.model.create_chat_completion(
+                    prompt,  # actually the last user message, but we already formatted
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repeat_penalty=repetition_penalty,
+                    min_p=min_p,
+                    stream=False,
+                )
+                try:
+                    return result["choices"][0]["message"]["content"]
+                except Exception:
+                    return ""
+            else:
+                # Fallback to regular completion with formatted prompt
+                full = self._gguf_generate_text(
+                    prompt, max_new_tokens, temperature, top_k, top_p,
+                    repetition_penalty, min_p
+                )
+                return full[len(prompt):].strip()
+
+        elif self.is_hf_model():
+            # HF models usually have their own chat template
+            kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0:
+                kwargs["min_p"] = min_p
+            return self.hf_proxy.generate(prompt, **kwargs)
+
+        else:
+            # Native AuraLite model
+            ids = self.encode(prompt)
+            result_ids = self._generate_ids(
+                ids, max_new_tokens, temperature, top_k, top_p,
+                repetition_penalty, min_p=min_p
+            )
+            full_text = self.decode(result_ids)
+            # Return only the newly generated part
+            return full_text[len(prompt):].strip()
+
+    def generate_chat_streaming(
+        self,
+        messages: List[Dict[str, str]] | "ChatHistory",
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        min_p: float = 0.0,
+        chat_template: str = "chatml",
+        system_prompt: Optional[str] = None,
+    ) -> Iterator[str]:
+        """
+        Streaming version of generate_chat — yields tokens one by one.
+
+        Works with native AuraLite and GGUF (when streaming is supported).
+        """
+        if not HAS_CHAT_SUPPORT:
+            raise RuntimeError("chat_interface.py is required for chat mode.")
+
+        if isinstance(messages, list):
+            history = ChatHistory.from_list(messages)
+        else:
+            history = messages
+
+        if system_prompt and not any(m.role == "system" for m in history.messages):
+            history.messages.insert(0, ChatMessage(role="system", content=system_prompt))
+
+        prompt = apply_chat_template(history, template_name=chat_template, add_generation_prompt=True)
+
+        if self.is_gguf_model():
+            if self.model.use_chat_completion:
+                stream = self.model.create_chat_completion(
+                    prompt,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repeat_penalty=repetition_penalty,
+                    min_p=min_p,
+                    stream=True,
+                )
+                for chunk in stream:
+                    try:
+                        delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                        if delta:
+                            yield delta
+                    except Exception:
+                        continue
+            else:
+                # Fallback: non-streaming
+                full = self.generate_chat(
+                    messages, max_new_tokens, temperature, top_k, top_p,
+                    repetition_penalty, min_p, chat_template, system_prompt
+                )
+                yield full
+            return
+
+        if self.is_hf_model():
+            # HF streaming (if supported by the proxy)
+            try:
+                for token in self.hf_proxy.generate_streaming(prompt, max_new_tokens=max_new_tokens,
+                                                               temperature=temperature, top_p=top_p):
+                    yield token
+            except Exception:
+                # Fallback
+                result = self.hf_proxy.generate(prompt, max_new_tokens=max_new_tokens,
+                                                temperature=temperature, top_p=top_p)
+                yield result
+            return
+
+        # Native AuraLite streaming
+        ids = self.encode(prompt)
+        self.model.eval()
+        self.model.reset_cache()
+
+        result_ids = list(ids)
+        if max_new_tokens <= 0:
+            return
+
+        with torch.no_grad():
+            # Process prompt
+            t = torch.tensor([ids], dtype=torch.long).to(self.device)
+            logits = self.model(t, start_pos=0, use_cache=True)
+            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                     repetition_penalty, result_ids, min_p=min_p)
+            result_ids.append(nxt)
+            yield self.decode([nxt])
+
+            for _ in range(max_new_tokens - 1):
+                pos = len(result_ids) - 1
+                if pos >= self.model.max_seq_len - 1:
+                    break
+                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
+                logits = self.model(t, start_pos=pos, use_cache=True)
+                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
+                                         repetition_penalty, result_ids, min_p=min_p)
+                result_ids.append(nxt)
+                yield self.decode([nxt])
+
+        self.model.reset_cache()
 
     def load_gguf_model(self, path: str, *, n_ctx: int = 4096,
                         n_threads: int | None = None,
@@ -1392,6 +1723,67 @@ class AuraLiteEngine:
             raise ValueError("Load the base Hugging Face model first")
         self.hf_proxy.load_lora_adapter(adapter_path)
 
+    # ===================================================================
+    #  Hugging Face Hub integration (NEW v2.6)
+    # ===================================================================
+
+    def push_hf_model_to_hub(
+        self,
+        repo_id: str,
+        commit_message: str = "Upload from AuraLite",
+        private: bool = False,
+        token: Optional[str] = None,
+    ):
+        """Push current HF model to the Hub."""
+        if not self.is_hf_model():
+            raise ValueError("Only Hugging Face models can be pushed to the Hub.")
+        self.hf_proxy.push_to_hub(
+            repo_id=repo_id,
+            commit_message=commit_message,
+            private=private,
+            token=token,
+        )
+
+    def load_hf_model_from_hub(
+        self,
+        repo_id: str,
+        **kwargs,
+    ):
+        """Load a model directly from the Hugging Face Hub."""
+        self.load_hf_model(repo_id, **kwargs)
+
+    # ===================================================================
+    #  Evaluation (NEW v2.7)
+    # ===================================================================
+
+    def evaluate_model(
+        self,
+        tasks: List[str] | str = "arc_easy",
+        num_fewshot: int = 0,
+        batch_size: int = 1,
+        limit: Optional[int] = None,
+        progress_callback=None,
+    ):
+        """
+        Evaluate the current model using lm-evaluation-harness.
+
+        Returns a dictionary with results.
+        """
+        from evaluation import EvaluationEngine, LMEvalNotAvailableError
+
+        try:
+            eval_engine = EvaluationEngine(self)
+            results = eval_engine.evaluate(
+                tasks=tasks,
+                num_fewshot=num_fewshot,
+                batch_size=batch_size,
+                limit=limit,
+                progress_callback=progress_callback,
+            )
+            return results
+        except LMEvalNotAvailableError as e:
+            raise e
+
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
@@ -1563,10 +1955,14 @@ class AuraLiteEngine:
         autosave_every = params.get("autosave_every", 0)
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
-        accumulation_steps = params.get("accumulation_steps", 1)
-        use_alibi    = params.get("use_alibi", False)
-        lora_rank    = params.get("lora_rank", 0)
-        resume_training_state = params.get("resume_training_state", True)
+                accumulation_steps = params.get("accumulation_steps", 1)
+                use_alibi    = params.get("use_alibi", False)
+                lora_rank    = params.get("lora_rank", 0)
+                resume_training_state = params.get("resume_training_state", True)
+                use_ddp      = params.get("use_ddp", False)
+
+        # NEW: RoPE scaling
+        rope_scaling = params.get("rope_scaling", None)
 
         self.params_used = dict(params)
 
@@ -1610,6 +2006,9 @@ class AuraLiteEngine:
         if not resuming:
             self.backend = "torch"
             self.gguf_path = None
+
+            use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
+
             self.model = ModernTransformer(
                 vocab_size=self.vocab_size,
                 d_model=d_model,
@@ -1620,7 +2019,16 @@ class AuraLiteEngine:
                 n_kv_heads=n_kv_heads,
                 dropout=dropout,
                 use_alibi=use_alibi,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                rope_scaling=rope_scaling,
             ).to(self.device)
+
+            # Wrap with DDP if distributed
+            if self.is_distributed:
+                self._ddp_model = DDP(self.model, device_ids=[self.local_rank] if torch.cuda.is_available() else None)
+                print(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
+            else:
+                self._ddp_model = None
 
             # LoRA setup
             if lora_rank > 0:
@@ -1780,8 +2188,11 @@ class AuraLiteEngine:
                     pass
 
         # ---- Epoch loop -----------------------------------------------
-        self.model.train()
+        # Use DDP-wrapped model if available
+        train_model = self._ddp_model if self._ddp_model is not None else self.model
+        train_model.train()
         self.last_val_loss = None
+
         for epoch in range(epochs):
             if stop_event and stop_event.is_set():
                 break

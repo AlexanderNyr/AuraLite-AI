@@ -1,10 +1,12 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from model_engine import (
     AuraLiteEngine, validate_params, ParamValidationError,
     estimate_n_params, recommend_epochs, recommend_gen_length,
     GGUFNotAvailableError,
     HFNotAvailableError,
+    HAS_CHAT_SUPPORT,
+    CHAT_TEMPLATES,
 )
 from web_tools import build_web_context
 try:
@@ -44,26 +46,36 @@ CONFIG_PRESETS = {
         "d_model": 64, "d_ff": 128, "n_heads": 2, "n_layers": 2,
         "seq_length": 32, "batch_size": 16, "lr": 0.001, "epochs": 200,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "use_gradient_checkpointing": False,
+        "rope_scaling": None,
     },
     "Small (default)": {
         "d_model": 128, "d_ff": 256, "n_heads": 4, "n_layers": 4,
         "seq_length": 64, "batch_size": 32, "lr": 0.0003, "epochs": 100,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "use_gradient_checkpointing": False,
+        "rope_scaling": None,
     },
     "Medium (GPU recommended)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "use_gradient_checkpointing": True,
+        "rope_scaling": {"type": "yarn", "factor": 4.0},  # 4x контекст
     },
     "Large (powerful GPU)": {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
         "seq_length": 256, "batch_size": 32, "lr": 0.0001, "epochs": 30,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "use_gradient_checkpointing": True,
+        "rope_scaling": {"type": "yarn", "factor": 8.0},
     },
     "GQA-efficient (Medium)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 2,
+        "use_gradient_checkpointing": True,
+        "rope_scaling": {"type": "ntk", "factor": 4.0},
     },
 }
 
@@ -189,10 +201,13 @@ def _fmt_duration(seconds: float) -> str:
 class AIApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AuraLite AI v2.1 — Modern Transformer Edition")
+        self.root.title("AuraLite AI v2.3 — Modern Transformer Edition")
         self.root.geometry("920x840")
         self.root.minsize(820, 700)
         self.root.configure(bg="#f5f6f7")
+
+        # Dark theme toggle (NEW v2.5)
+        self.dark_mode = tk.BooleanVar(value=False)
 
         self.engine = AuraLiteEngine()
         self.is_trained = False
@@ -206,16 +221,7 @@ class AIApp:
         self._last_epoch_ts: float | None = None
 
         # ---- Styles ----------------------------------------------------
-        style = ttk.Style()
-        style.configure("TButton", font=("Segoe UI", 10))
-        style.configure("TLabel", font=("Segoe UI", 10), background="#f5f6f7")
-        style.configure("Header.TLabel",
-                         font=("Segoe UI", 16, "bold"), background="#f5f6f7")
-        style.configure("Sub.TLabel",
-                         font=("Segoe UI", 9, "italic"), background="#f5f6f7")
-        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
-                        padding=(14, 6))
+        self._apply_theme(light=True)
 
         # ---- Header ------------------------------------------------------
         main_frame = ttk.Frame(root, padding="12")
@@ -247,20 +253,29 @@ class AIApp:
 
         self.tab_train   = ttk.Frame(self.notebook, padding="12")
         self.tab_gen     = ttk.Frame(self.notebook, padding="12")
+        self.tab_chat    = ttk.Frame(self.notebook, padding="12")
         self.tab_model   = ttk.Frame(self.notebook, padding="12")
         self.tab_quant   = ttk.Frame(self.notebook, padding="12")
+        self.tab_eval    = ttk.Frame(self.notebook, padding="12")
+        self.tab_export  = ttk.Frame(self.notebook, padding="12")
         self.tab_console = ttk.Frame(self.notebook, padding="12")
 
         self.notebook.add(self.tab_train,   text=" 🏋️  Training ")
         self.notebook.add(self.tab_gen,     text=" ✨  Generation ")
+        self.notebook.add(self.tab_chat,    text=" 💬  Chat ")
         self.notebook.add(self.tab_model,   text=" 💾  Model ")
         self.notebook.add(self.tab_quant,   text=" ⚡  Quantization ")
+        self.notebook.add(self.tab_eval,    text=" 📊  Evaluation ")
+        self.notebook.add(self.tab_export,  text=" 📦  Export ")
         self.notebook.add(self.tab_console, text=" 🖥️  Console ")
 
         self._build_training_tab()
         self._build_generation_tab()
+        self._build_chat_tab()
         self._build_model_tab()
         self._build_quantization_tab()
+        self._build_evaluation_tab()
+        self._build_export_tab()
         self._build_console_tab()
 
         # Hook stdout/stderr into the console tab. Do it AFTER the widget
@@ -272,8 +287,69 @@ class AIApp:
         print(f"[AuraLite] Console attached. Device: {self.engine.device}, "
               f"threads: {self.engine.num_threads}")
 
+        # Dark mode toggle in header
+        theme_btn = ttk.Checkbutton(info_row, text="🌙 Dark", variable=self.dark_mode,
+                                    command=self._toggle_dark_mode)
+        theme_btn.pack(side=tk.RIGHT, padx=8)
+
         # Restore original streams on window close.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ==================================================================
+    #  Theme handling (NEW v2.5)
+    # ==================================================================
+    def _apply_theme(self, light: bool = True):
+        """Apply light or dark theme to the entire application."""
+        style = ttk.Style()
+
+        if light:
+            # Light theme (original)
+            bg = "#f5f6f7"
+            fg = "#000000"
+            entry_bg = "#ffffff"
+            text_bg = "#ffffff"
+            console_bg = "#1e1e1e"
+            console_fg = "#dcdcdc"
+        else:
+            # Dark theme
+            bg = "#2b2b2b"
+            fg = "#eeeeee"
+            entry_bg = "#3c3f41"
+            text_bg = "#2b2b2b"
+            console_bg = "#1e1e1e"
+            console_fg = "#dcdcdc"
+
+        self.root.configure(bg=bg)
+
+        # ttk styles
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", font=("Segoe UI", 10), background=bg, foreground=fg)
+        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), background=bg, foreground=fg)
+        style.configure("Sub.TLabel", font=("Segoe UI", 9, "italic"), background=bg, foreground=fg)
+        style.configure("TLabelframe", background=bg)
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), background=bg, foreground=fg)
+        style.configure("TNotebook", background=bg)
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 6))
+        style.configure("TButton", font=("Segoe UI", 10))
+        style.configure("TEntry", fieldbackground=entry_bg, foreground=fg)
+        style.configure("TCombobox", fieldbackground=entry_bg, foreground=fg)
+
+        # Text widgets that need manual styling
+        for widget_name in ["result_text", "model_info", "q_result_text", "console_text", "chat_text", "loss_text"]:
+            if hasattr(self, widget_name):
+                w = getattr(self, widget_name)
+                try:
+                    if "console" in widget_name:
+                        w.configure(bg=console_bg, fg=console_fg, insertbackground=console_fg)
+                    else:
+                        w.configure(bg=text_bg, fg=fg, insertbackground=fg)
+                except tk.TclError:
+                    pass
+
+    def _toggle_dark_mode(self):
+        """Toggle between light and dark theme."""
+        is_dark = self.dark_mode.get()
+        self._apply_theme(light=not is_dark)
 
     # ==================================================================
     #  TAB 1 — Training
@@ -400,6 +476,30 @@ class AIApp:
         self.lora_var = tk.StringVar(value="0")
         ttk.Entry(row1b, textvariable=self.lora_var,
                   width=4).pack(side=tk.LEFT, padx=2)
+
+        self.checkpoint_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1b, text="Gradient Checkpointing (экономия VRAM)",
+                        variable=self.checkpoint_var).pack(side=tk.LEFT, padx=12)
+
+        # NEW: Multi-GPU (DDP) toggle — v2.3
+        self.ddp_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1b, text="Multi-GPU (DDP)",
+                        variable=self.ddp_var).pack(side=tk.LEFT, padx=12)
+
+        # NEW: RoPE Scaling (v2.4)
+        rope_row = ttk.Frame(tok_frame)
+        rope_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(rope_row, text="RoPE Scaling:").pack(side=tk.LEFT, padx=4)
+        self.rope_type_var = tk.StringVar(value="none")
+        rope_combo = ttk.Combobox(rope_row, textvariable=self.rope_type_var,
+                                  values=["none", "linear", "ntk", "yarn"],
+                                  state="readonly", width=10)
+        rope_combo.pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(rope_row, text="Factor:").pack(side=tk.LEFT, padx=(12, 4))
+        self.rope_factor_var = tk.StringVar(value="1.0")
+        ttk.Entry(rope_row, textvariable=self.rope_factor_var, width=6).pack(side=tk.LEFT, padx=2)
 
         row2 = ttk.Frame(tok_frame)
         row2.pack(fill=tk.X, pady=2)
@@ -583,6 +683,9 @@ class AIApp:
             variable=self.stream_var)
         self.stream_cb.pack(pady=2)
 
+        # Chat streaming toggle (in generation tab for reference)
+        self.chat_stream_var = tk.BooleanVar(value=True)
+
         # NEW: Thinking mode + Web search
         smart_row = ttk.Frame(seed_frame)
         smart_row.pack(fill=tk.X, pady=2)
@@ -751,6 +854,18 @@ class AIApp:
         self.hf_finetune_btn = ttk.Button(hf_btn_row, text="🚀 Fine-tune (LoRA/QLoRA)",
                                           command=self._finetune_hf_from_gui, state=tk.DISABLED)
         self.hf_finetune_btn.pack(side=tk.LEFT, padx=4)
+
+        # NEW: Hub push/pull buttons
+        hub_row = ttk.Frame(hf_btn_row)
+        hub_row.pack(fill=tk.X, pady=(8, 0))
+
+        self.hf_push_btn = ttk.Button(hub_row, text="☁️ Push to Hub",
+                                      command=self._push_hf_to_hub, state=tk.DISABLED)
+        self.hf_push_btn.pack(side=tk.LEFT, padx=4)
+
+        self.hf_pull_btn = ttk.Button(hub_row, text="📥 Load from Hub",
+                                      command=self._load_hf_from_hub)
+        self.hf_pull_btn.pack(side=tk.LEFT, padx=4)
 
         ttk.Label(hf_frame,
                   text="Tip: Use small models first (0.5B–3B). 4-bit + LoRA lets you fine-tune on consumer GPUs.",
@@ -1312,6 +1427,166 @@ class AIApp:
         self.q_result_text.delete("1.0", tk.END)
 
     # ==================================================================
+    #  TAB — Evaluation (NEW v2.7)
+    # ==================================================================
+    def _build_evaluation_tab(self):
+        tab = self.tab_eval
+
+        try:
+            from evaluation import HAS_LM_EVAL
+        except ImportError:
+            HAS_LM_EVAL = False
+
+        if not HAS_LM_EVAL:
+            ttk.Label(tab,
+                      text="⚠ lm-evaluation-harness not installed.\n"
+                           "Install with: pip install lm-eval",
+                      font=("Segoe UI", 12, "bold")).pack(pady=40)
+            return
+
+        # ---- Task Selection ----
+        task_frame = ttk.LabelFrame(tab, text="  📋  Tasks  ", padding="10")
+        task_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(task_frame, text="Tasks (comma separated):").pack(anchor=tk.W)
+        self.eval_tasks_var = tk.StringVar(value="arc_easy,hellaswag,winogrande")
+        ttk.Entry(task_frame, textvariable=self.eval_tasks_var, width=60).pack(fill=tk.X, pady=4)
+
+        # Common tasks
+        common_frame = ttk.Frame(task_frame)
+        common_frame.pack(fill=tk.X, pady=4)
+        for task in ["arc_easy", "arc_challenge", "hellaswag", "winogrande", "gsm8k", "mmlu"]:
+            ttk.Button(common_frame, text=task,
+                       command=lambda t=task: self._add_eval_task(t)).pack(side=tk.LEFT, padx=2)
+
+        # ---- Options ----
+        opt_frame = ttk.LabelFrame(tab, text="  ⚙️  Options  ", padding="8")
+        opt_frame.pack(fill=tk.X, pady=(0, 8))
+
+        row = ttk.Frame(opt_frame)
+        row.pack(fill=tk.X)
+
+        ttk.Label(row, text="Few-shot:").pack(side=tk.LEFT, padx=4)
+        self.eval_fewshot_var = tk.StringVar(value="0")
+        ttk.Entry(row, textvariable=self.eval_fewshot_var, width=5).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(row, text="Batch size:").pack(side=tk.LEFT, padx=(16, 4))
+        self.eval_batch_var = tk.StringVar(value="1")
+        ttk.Entry(row, textvariable=self.eval_batch_var, width=5).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(row, text="Limit (optional):").pack(side=tk.LEFT, padx=(16, 4))
+        self.eval_limit_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.eval_limit_var, width=8).pack(side=tk.LEFT, padx=4)
+
+        # ---- Run Button ----
+        run_frame = ttk.Frame(tab)
+        run_frame.pack(fill=tk.X, pady=8)
+
+        self.eval_run_btn = ttk.Button(run_frame, text="🚀 Run Evaluation",
+                                       command=self._run_evaluation, state=tk.DISABLED)
+        self.eval_run_btn.pack(side=tk.LEFT, padx=4)
+
+        self.eval_save_btn = ttk.Button(run_frame, text="💾 Save Results",
+                                        command=self._save_eval_results, state=tk.DISABLED)
+        self.eval_save_btn.pack(side=tk.LEFT, padx=4)
+
+        # ---- Results ----
+        res_frame = ttk.LabelFrame(tab, text="  📊  Results  ", padding="8")
+        res_frame.pack(fill=tk.BOTH, expand=True)
+
+        ysb = ttk.Scrollbar(res_frame, orient=tk.VERTICAL)
+        self.eval_result_text = tk.Text(res_frame, font=("Consolas", 10),
+                                        yscrollcommand=ysb.set, wrap=tk.WORD)
+        ysb.config(command=self.eval_result_text.yview)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.eval_result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _add_eval_task(self, task: str):
+        current = self.eval_tasks_var.get().strip()
+        if current:
+            self.eval_tasks_var.set(current + "," + task)
+        else:
+            self.eval_tasks_var.set(task)
+
+    def _run_evaluation(self):
+        if not self.engine.model:
+            messagebox.showwarning("No Model", "Load or train a model first.")
+            return
+
+        tasks = [t.strip() for t in self.eval_tasks_var.get().split(",") if t.strip()]
+        if not tasks:
+            messagebox.showwarning("No Tasks", "Please specify at least one task.")
+            return
+
+        try:
+            fewshot = int(self.eval_fewshot_var.get())
+            batch_size = int(self.eval_batch_var.get())
+            limit = int(self.eval_limit_var.get()) if self.eval_limit_var.get().strip() else None
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Few-shot, batch size and limit must be integers.")
+            return
+
+        self.eval_run_btn.config(state=tk.DISABLED)
+        self.eval_result_text.delete("1.0", tk.END)
+        self.eval_result_text.insert(tk.END, f"Evaluating on {tasks}...\n\n")
+        self.eval_status = ttk.Label(self.tab_eval, text="Status: Running evaluation...")
+        self.eval_status.pack(pady=4)
+
+        def run():
+            try:
+                results = self.engine.evaluate_model(
+                    tasks=tasks,
+                    num_fewshot=fewshot,
+                    batch_size=batch_size,
+                    limit=limit,
+                )
+
+                def update_ui():
+                    self.eval_result_text.delete("1.0", tk.END)
+                    if "results" in results:
+                        for task_name, metrics in results["results"].items():
+                            self.eval_result_text.insert(tk.END, f"=== {task_name} ===\n")
+                            for k, v in metrics.items():
+                                if isinstance(v, (int, float)):
+                                    self.eval_result_text.insert(tk.END, f"  {k}: {v:.4f}\n")
+                                else:
+                                    self.eval_result_text.insert(tk.END, f"  {k}: {v}\n")
+                            self.eval_result_text.insert(tk.END, "\n")
+                    else:
+                        self.eval_result_text.insert(tk.END, str(results))
+
+                    self.eval_save_btn.config(state=tk.NORMAL)
+                    if hasattr(self, "eval_status"):
+                        self.eval_status.config(text="Status: Evaluation complete ✅")
+
+                self.root.after(0, update_ui)
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Evaluation Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.eval_run_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _save_eval_results(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Evaluation Results",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            # We store the last results in a simple way
+            # For a more robust solution we could keep self.last_eval_results
+            text = self.eval_result_text.get("1.0", "end-1c")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            messagebox.showinfo("Saved", f"Results saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    # ==================================================================
     #  TAB 5 — Console
     # ==================================================================
     def _build_console_tab(self):
@@ -1536,6 +1811,15 @@ class AIApp:
         for key, value in preset.items():
             if key == "n_kv_heads":
                 self.n_kv_heads_var.set(str(value))
+            elif key == "use_gradient_checkpointing":
+                self.checkpoint_var.set(bool(value))
+            elif key == "rope_scaling":
+                if value and isinstance(value, dict):
+                    self.rope_type_var.set(value.get("type", "none") or "none")
+                    self.rope_factor_var.set(str(value.get("factor", 1.0)))
+                else:
+                    self.rope_type_var.set("none")
+                    self.rope_factor_var.set("1.0")
             else:
                 if key in self.params:
                     self.params[key].set(str(value))
@@ -1717,6 +2001,14 @@ class AIApp:
                 "accumulation_steps": int(self.accum_var.get()) or 1,
                 "use_alibi":         bool(self.alibi_var.get()),
                 "lora_rank":         int(self.lora_var.get()) or 0,
+                "use_gradient_checkpointing": bool(self.checkpoint_var.get()),
+                # NEW: RoPE scaling
+                "rope_scaling": {
+                    "type": self.rope_type_var.get() if self.rope_type_var.get() != "none" else None,
+                    "factor": float(self.rope_factor_var.get()) if self.rope_type_var.get() != "none" else 1.0,
+                } if self.rope_type_var.get() != "none" else None,
+                # NEW: Multi-GPU (DDP) — v2.3
+                "use_ddp": bool(self.ddp_var.get()),
             }
         except ValueError:
             messagebox.showerror("Params Error",
@@ -2075,6 +2367,206 @@ class AIApp:
 
         threading.Thread(target=run, daemon=True).start()
 
+    # ==================================================================
+    #  TAB — Chat (NEW v2.3)
+    # ==================================================================
+    def _build_chat_tab(self):
+        tab = self.tab_chat
+
+        if not HAS_CHAT_SUPPORT:
+            ttk.Label(tab,
+                      text="⚠ Chat interface not available (chat_interface.py missing).",
+                      font=("Segoe UI", 12, "bold")).pack(pady=40)
+            return
+
+        # ---- Chat Template Selection ----
+        template_frame = ttk.LabelFrame(tab, text="  💬  Chat Template  ", padding="8")
+        template_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(template_frame, text="Template:").pack(side=tk.LEFT, padx=4)
+        self.chat_template_var = tk.StringVar(value="chatml")
+        templates = list(CHAT_TEMPLATES.keys()) if 'CHAT_TEMPLATES' in globals() else ["chatml", "llama2", "mistral", "simple"]
+        self.chat_template_combo = ttk.Combobox(
+            template_frame, textvariable=self.chat_template_var,
+            values=templates, state="readonly", width=18
+        )
+        self.chat_template_combo.pack(side=tk.LEFT, padx=4)
+
+        self.chat_system_var = tk.StringVar(value="You are a helpful assistant.")
+        ttk.Label(template_frame, text="System prompt:").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Entry(template_frame, textvariable=self.chat_system_var,
+                  width=40).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        # ---- Chat History ----
+        history_frame = ttk.LabelFrame(tab, text="  📜  Conversation  ", padding="8")
+        history_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        # Chat display
+        chat_display_frame = ttk.Frame(history_frame)
+        chat_display_frame.pack(fill=tk.BOTH, expand=True)
+
+        ysb = ttk.Scrollbar(chat_display_frame, orient=tk.VERTICAL)
+        self.chat_text = tk.Text(
+            chat_display_frame,
+            font=("Segoe UI", 11),
+            wrap=tk.WORD,
+            yscrollcommand=ysb.set,
+            state=tk.DISABLED,
+            bg="#f8f9fa",
+        )
+        ysb.config(command=self.chat_text.yview)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Color tags
+        self.chat_text.tag_configure("user", foreground="#0066cc", font=("Segoe UI", 11, "bold"))
+        self.chat_text.tag_configure("assistant", foreground="#228B22")
+        self.chat_text.tag_configure("system", foreground="#666666", font=("Segoe UI", 10, "italic"))
+
+        # Input area
+        input_frame = ttk.Frame(history_frame)
+        input_frame.pack(fill=tk.X, pady=(8, 0))
+
+        self.chat_input = ttk.Entry(input_frame, font=("Segoe UI", 11))
+        self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.chat_input.bind("<Return>", lambda e: self._send_chat_message())
+
+        self.chat_send_btn = ttk.Button(input_frame, text="Send", command=self._send_chat_message)
+        self.chat_send_btn.pack(side=tk.LEFT, padx=2)
+
+        self.chat_stream_cb = ttk.Checkbutton(input_frame, text="Stream",
+                                              variable=tk.BooleanVar(value=True))
+        self.chat_stream_cb.pack(side=tk.LEFT, padx=4)
+
+        self.chat_clear_btn = ttk.Button(input_frame, text="Clear History", command=self._clear_chat_history)
+        self.chat_clear_btn.pack(side=tk.LEFT, padx=2)
+
+        # Status
+        self.chat_status = ttk.Label(tab, text="Chat ready. Load a model to start.", style="Sub.TLabel")
+        self.chat_status.pack(anchor=tk.W, pady=4)
+
+        # Initialize chat history
+        self.chat_history = []
+
+    def _send_chat_message(self):
+        if not self.engine.model:
+            messagebox.showwarning("No Model", "Please load or train a model first.")
+            return
+
+        user_msg = self.chat_input.get().strip()
+        if not user_msg:
+            return
+
+        self.chat_input.delete(0, tk.END)
+
+        # Add user message to history
+        self.chat_history.append({"role": "user", "content": user_msg})
+
+        # Update display
+        self._append_chat_message("user", user_msg)
+
+        # Generate response
+        self.chat_send_btn.config(state=tk.DISABLED)
+        self.chat_status.config(text="Generating response...")
+
+        use_stream = getattr(self, 'chat_stream_cb', None) and self.chat_stream_cb.instate(['selected'])
+
+        def run():
+            try:
+                template = self.chat_template_var.get()
+                system_prompt = self.chat_system_var.get().strip() or None
+
+                if use_stream:
+                    # Streaming mode
+                    response_parts = []
+                    for token in self.engine.generate_chat_streaming(
+                        self.chat_history,
+                        max_new_tokens=256,
+                        temperature=0.7,
+                        top_k=40,
+                        top_p=0.9,
+                        repetition_penalty=1.1,
+                        chat_template=template,
+                        system_prompt=system_prompt,
+                    ):
+                        response_parts.append(token)
+                        # Update UI live
+                        self.root.after(0, lambda t=token: self._append_chat_token(t))
+
+                    full_response = "".join(response_parts).strip()
+                    if full_response:
+                        # Replace the streaming tokens with final message
+                        self.root.after(0, lambda: self._finalize_chat_response(full_response))
+                    else:
+                        self.root.after(0, lambda: self._append_chat_message("assistant", "[No response]"))
+                else:
+                    # Non-streaming
+                    response = self.engine.generate_chat(
+                        self.chat_history,
+                        max_new_tokens=256,
+                        temperature=0.7,
+                        top_k=40,
+                        top_p=0.9,
+                        repetition_penalty=1.1,
+                        chat_template=template,
+                        system_prompt=system_prompt,
+                    )
+
+                    if response:
+                        self.chat_history.append({"role": "assistant", "content": response})
+                        self.root.after(0, lambda: self._append_chat_message("assistant", response))
+                    else:
+                        self.root.after(0, lambda: self._append_chat_message("assistant", "[No response generated]"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Chat Error", str(e)))
+            finally:
+                self.root.after(0, lambda: (
+                    self.chat_send_btn.config(state=tk.NORMAL),
+                    self.chat_status.config(text="Ready")
+                ))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _append_chat_token(self, token: str):
+        """Append a single token during streaming."""
+        self.chat_text.config(state=tk.NORMAL)
+        self.chat_text.insert(tk.END, token)
+        self.chat_text.see(tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+
+    def _finalize_chat_response(self, full_response: str):
+        """Clean up after streaming and store the final response."""
+        self.chat_text.config(state=tk.NORMAL)
+        self.chat_text.insert(tk.END, "\n\n")
+        self.chat_text.config(state=tk.DISABLED)
+
+        # Make sure we have the response in history
+        if self.chat_history and self.chat_history[-1]["role"] == "assistant":
+            self.chat_history[-1]["content"] = full_response
+        else:
+            self.chat_history.append({"role": "assistant", "content": full_response})
+
+    def _append_chat_message(self, role: str, content: str):
+        self.chat_text.config(state=tk.NORMAL)
+        if role == "user":
+            self.chat_text.insert(tk.END, "👤 You: ", "user")
+            self.chat_text.insert(tk.END, content + "\n\n")
+        elif role == "assistant":
+            self.chat_text.insert(tk.END, "🤖 Assistant: ", "assistant")
+            self.chat_text.insert(tk.END, content + "\n\n")
+        else:
+            self.chat_text.insert(tk.END, f"[{role}] {content}\n\n", role)
+        self.chat_text.see(tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+
+    def _clear_chat_history(self):
+        self.chat_history.clear()
+        self.chat_text.config(state=tk.NORMAL)
+        self.chat_text.delete("1.0", tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+        self.chat_status.config(text="Chat history cleared.")
+
     def _display_result(self, text):
         self.result_text.delete("1.0", tk.END)
         self.result_text.insert(tk.END, text)
@@ -2390,6 +2882,7 @@ class AIApp:
                     self.hf_save_lora_btn.config(state=tk.NORMAL if self.engine.is_hf_model() and getattr(self.engine.hf_proxy, 'is_peft', False) else tk.DISABLED)
                     self.hf_load_lora_btn.config(state=tk.NORMAL)
                     self.hf_finetune_btn.config(state=tk.NORMAL)
+                    self.hf_push_btn.config(state=tk.NORMAL)
 
                     n = self.engine.model.count_parameters()
                     self.param_label.config(text=f"Parameters: {n:,}")
@@ -2463,6 +2956,107 @@ class AIApp:
             self._refresh_model_info()
         except Exception as e:
             messagebox.showerror("Load LoRA Error", str(e))
+
+    # ==================================================================
+    #  NEW: Hugging Face Hub push/pull GUI handlers (v2.6)
+    # ==================================================================
+
+    def _push_hf_to_hub(self):
+        if not self.engine.is_hf_model():
+            messagebox.showwarning("No HF model", "Load a Hugging Face model first.")
+            return
+
+        repo_id = tk.simpledialog.askstring(
+            "Push to Hub",
+            "Enter repository ID (e.g. username/model-name):",
+            parent=self.root
+        )
+        if not repo_id:
+            return
+
+        private = messagebox.askyesno("Private?", "Make repository private?", parent=self.root)
+
+        self.hf_push_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"Status: Pushing to {repo_id}...")
+
+        def run():
+            try:
+                self.engine.push_hf_model_to_hub(
+                    repo_id=repo_id,
+                    commit_message="Uploaded from AuraLite AI",
+                    private=private
+                )
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Success", f"Model successfully pushed to:\nhttps://huggingface.co/{repo_id}"
+                ))
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"Status: Pushed to {repo_id} ✅"
+                ))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Push Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.hf_push_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load_hf_from_hub(self):
+        repo_id = tk.simpledialog.askstring(
+            "Load from Hub",
+            "Enter repository ID or model name:",
+            parent=self.root
+        )
+        if not repo_id:
+            return
+
+        load_4bit = self.hf_4bit_var.get()
+        load_8bit = self.hf_8bit_var.get()
+        apply_lora = self.hf_apply_lora_var.get()
+
+        try:
+            lora_rank = int(self.hf_lora_rank_var.get())
+        except ValueError:
+            lora_rank = 16
+
+        self.status_label.config(text=f"Status: Loading {repo_id} from Hub...")
+        self.hf_load_btn.config(state=tk.DISABLED)
+
+        def run():
+            try:
+                self.engine.load_hf_model(
+                    repo_id,
+                    load_in_4bit=load_4bit,
+                    load_in_8bit=load_8bit,
+                    apply_lora=apply_lora,
+                    lora_rank=lora_rank,
+                    local_files_only=False,
+                    verbose=True,
+                )
+
+                def update_ui():
+                    self.gen_btn.config(state=tk.NORMAL)
+                    self.hf_apply_lora_btn.config(state=tk.NORMAL)
+                    self.hf_save_lora_btn.config(state=tk.NORMAL)
+                    self.hf_load_lora_btn.config(state=tk.NORMAL)
+                    self.hf_finetune_btn.config(state=tk.NORMAL)
+                    self.hf_push_btn.config(state=tk.NORMAL)
+
+                    n = self.engine.model.count_parameters()
+                    self.param_label.config(text=f"Parameters: {n:,}")
+                    self.model_file_label.config(text=f"HF: {repo_id}", foreground="black")
+                    self.status_label.config(text=f"Status: Loaded from Hub ✅ ({repo_id})")
+                    self._refresh_model_info()
+                    self.train_btn.config(state=tk.DISABLED)
+                    if HAS_QUANTIZATION:
+                        self._update_quant_buttons()
+
+                self.root.after(0, update_ui)
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("HF Hub Load Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _finetune_hf_from_gui(self):
         if not self.engine.is_hf_model():
