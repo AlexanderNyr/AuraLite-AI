@@ -24,6 +24,15 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
+# Optional Hugging Face + LoRA/QLoRA support
+try:
+    from hf_integration import HuggingFaceProxy, HFNotAvailableError, create_hf_proxy, HAS_HF_SUPPORT
+except ImportError:
+    HuggingFaceProxy = None
+    HFNotAvailableError = Exception
+    create_hf_proxy = None
+    HAS_HF_SUPPORT = False
+
 try:
     torch.set_num_threads(_CPU_COUNT)
     torch.set_num_interop_threads(max(1, _CPU_COUNT))
@@ -1112,13 +1121,15 @@ class AuraLiteEngine:
     def __init__(self):
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_threads = torch.get_num_threads()
-        self.model: ModernTransformer | GGUFModelProxy | None = None
-        self.backend     = "torch"           # "torch" or "gguf"
+        self.model: ModernTransformer | GGUFModelProxy | HuggingFaceProxy | None = None
+        self.backend     = "torch"           # "torch", "gguf", or "huggingface"
         self.gguf_path: str | None = None
+        self.hf_path: str | None = None
+        self.hf_proxy: HuggingFaceProxy | None = None
         self.optimizer   = None
         self.scheduler   = None
         self.scaler      = None
-        self.tokenizer   = None              # CharTokenizer | BPETokenizer | GGUFTokenizerProxy
+        self.tokenizer   = None              # CharTokenizer | BPETokenizer | GGUFTokenizerProxy | HF tokenizer
         self.vocab_size  = 0
         self.params_used: dict = {}          # remember last training/load params
         self.last_val_loss: float | None = None
@@ -1136,6 +1147,9 @@ class AuraLiteEngine:
 
     def is_gguf_model(self) -> bool:
         return self.backend == "gguf" or isinstance(self.model, GGUFModelProxy)
+
+    def is_hf_model(self) -> bool:
+        return self.backend == "huggingface" or isinstance(self.model, HuggingFaceProxy)
 
     def load_gguf_model(self, path: str, *, n_ctx: int = 4096,
                         n_threads: int | None = None,
@@ -1199,6 +1213,182 @@ class AuraLiteEngine:
         print(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
               f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
               f"batch={n_batch}{chat})")
+
+    # ===================================================================
+    #  NEW: Hugging Face + LoRA / QLoRA support (any model)
+    # ===================================================================
+
+    def load_hf_model(
+        self,
+        model_name_or_path: str,
+        *,
+        load_in_4bit: bool = False,
+        load_in_8bit: bool = False,
+        torch_dtype: str | None = None,
+        device_map: str = "auto",
+        max_seq_len: int = 4096,
+        apply_lora: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: list[str] | None = None,
+        local_files_only: bool = False,
+        verbose: bool = True,
+    ):
+        """
+        Load ANY Hugging Face causal language model (Llama, Mistral, Qwen, Gemma, Phi, etc.)
+
+        Fully supports **already downloaded / local models**:
+
+        - Pass a local path (e.g. ~/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct/...)
+        - Set `local_files_only=True` for completely offline loading (no internet).
+
+        Supports:
+        - Full precision, FP16, BF16
+        - 4-bit (QLoRA ready) and 8-bit quantization via bitsandbytes
+        - Automatic application of LoRA adapters
+
+        After loading you can:
+        - Generate text
+        - Fine-tune with LoRA/QLoRA using `finetune_hf()`
+        - Save only the tiny LoRA adapter
+        """
+        if not HAS_HF_SUPPORT:
+            raise HFNotAvailableError(
+                "Hugging Face + LoRA/QLoRA support is not available.\n"
+                "Install extra dependencies:\n"
+                "  pip install transformers peft accelerate bitsandbytes sentencepiece"
+            )
+
+        if self.hf_proxy is None:
+            self.hf_proxy = create_hf_proxy()
+
+        dtype = None
+        if torch_dtype:
+            dtype = getattr(torch, torch_dtype, torch.float16)
+
+        self.hf_proxy.load_model(
+            model_name_or_path,
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+            torch_dtype=dtype,
+            device_map=device_map,
+            max_seq_len=max_seq_len,
+            local_files_only=local_files_only,
+            verbose=verbose,
+        )
+
+        if apply_lora:
+            self.hf_proxy.apply_lora(
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+                target_modules=lora_target_modules,
+                verbose=verbose,
+            )
+
+        # Wire into engine
+        self.model = self.hf_proxy
+        self.backend = "huggingface"
+        self.hf_path = model_name_or_path
+        self.tokenizer = self.hf_proxy.tokenizer
+        self.vocab_size = getattr(self.hf_proxy.tokenizer, "vocab_size", 0)
+
+        self.params_used = {
+            "backend": "huggingface",
+            "model": model_name_or_path,
+            "load_in_4bit": load_in_4bit,
+            "load_in_8bit": load_in_8bit,
+            "lora_applied": apply_lora,
+            "lora_rank": lora_rank if apply_lora else 0,
+            "local_files_only": local_files_only,
+        }
+
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+
+        mode = "LOCAL (offline)" if local_files_only else "Hub"
+        print(f"[AuraLite] Loaded Hugging Face model ({mode}): {model_name_or_path}")
+        if apply_lora:
+            print(f"[AuraLite] LoRA applied (rank={lora_rank}) — ready for QLoRA fine-tuning")
+
+    def apply_lora_to_hf(
+        self,
+        rank: int = 16,
+        alpha: int = 32,
+        dropout: float = 0.05,
+        target_modules: list[str] | None = None,
+    ):
+        """Apply LoRA to a loaded HF model (for QLoRA fine-tuning)."""
+        if not self.is_hf_model():
+            raise ValueError("Load a Hugging Face model first with load_hf_model()")
+        self.hf_proxy.apply_lora(rank=rank, alpha=alpha, dropout=dropout,
+                                 target_modules=target_modules)
+        self.params_used["lora_applied"] = True
+        self.params_used["lora_rank"] = rank
+
+    def finetune_hf(
+        self,
+        texts: list[str] | str,
+        output_dir: str = "hf_lora_adapter",
+        epochs: int = 3,
+        learning_rate: float = 2e-4,
+        batch_size: int = 4,
+        max_length: int = 512,
+        gradient_accumulation_steps: int = 4,
+        progress_callback: Callable | None = None,
+        stop_event=None,
+    ):
+        """
+        Fine-tune a loaded Hugging Face model using LoRA / QLoRA.
+
+        - If the model was loaded with load_in_4bit=True → this is QLoRA
+        - If LoRA was not applied yet, it will be applied automatically (rank 16)
+        - Uses Hugging Face Trainer under the hood (best experience)
+
+        Args:
+            texts: list of strings or a single long text (will be split)
+            output_dir: where to save the LoRA adapter
+        """
+        if not self.is_hf_model():
+            raise ValueError("Load a Hugging Face model first with load_hf_model()")
+
+        if isinstance(texts, str):
+            # Split into reasonable chunks
+            texts = [t.strip() for t in texts.split("\n\n") if len(t.strip()) > 50]
+            if not texts:
+                texts = [texts]  # fallback
+
+        if not self.hf_proxy.is_peft:
+            print("[AuraLite] No LoRA adapter found — applying default LoRA for fine-tuning...")
+            self.hf_proxy.apply_lora(rank=16)
+
+        print(f"[AuraLite] Starting LoRA/QLoRA fine-tuning on {len(texts)} examples...")
+
+        return self.hf_proxy.finetune(
+            texts,
+            output_dir=output_dir,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            max_length=max_length,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+        )
+
+    def save_hf_lora(self, path: str):
+        """Save only the LoRA adapter (tiny file, ~few MB)."""
+        if not self.is_hf_model():
+            raise ValueError("No Hugging Face model loaded")
+        self.hf_proxy.save_lora_adapter(path)
+
+    def load_hf_lora(self, adapter_path: str):
+        """Load a saved LoRA adapter on top of the current base HF model."""
+        if not self.is_hf_model():
+            raise ValueError("Load the base Hugging Face model first")
+        self.hf_proxy.load_lora_adapter(adapter_path)
 
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
@@ -1664,6 +1854,17 @@ class AuraLiteEngine:
         if self.is_gguf_model():
             return self._gguf_generate_text(
                 start_str, length, temperature, top_k, top_p,
+                repetition_penalty=repetition_penalty,
+            )
+
+        if self.is_hf_model():
+            # HF models use token count directly as max_new_tokens
+            return self.hf_proxy.generate(
+                start_str,
+                max_new_tokens=length,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 repetition_penalty=repetition_penalty,
             )
 

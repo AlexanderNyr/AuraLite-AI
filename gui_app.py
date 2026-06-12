@@ -4,6 +4,7 @@ from model_engine import (
     AuraLiteEngine, validate_params, ParamValidationError,
     estimate_n_params, recommend_epochs, recommend_gen_length,
     GGUFNotAvailableError,
+    HFNotAvailableError,
 )
 from web_tools import build_web_context
 try:
@@ -676,6 +677,77 @@ class AIApp:
         self.model_file_label = ttk.Label(io_frame, text="No model loaded",
                                           foreground="gray")
         self.model_file_label.pack(pady=2)
+
+        # ==================================================================
+        #  NEW: Hugging Face + LoRA / QLoRA section (any model)
+        # ==================================================================
+        hf_frame = ttk.LabelFrame(tab, text="  🤗  Hugging Face — Any Model + LoRA / QLoRA  ",
+                                  padding="12")
+        hf_frame.pack(fill=tk.X, pady=(12, 8))
+
+        ttk.Label(hf_frame, text="Название модели (HF Hub) или путь к уже скачанной папке:").pack(anchor=tk.W)
+        self.hf_model_var = tk.StringVar(value="Qwen/Qwen2-0.5B-Instruct")
+        hf_entry = ttk.Entry(hf_frame, textvariable=self.hf_model_var, font=("Segoe UI", 10))
+        hf_entry.pack(fill=tk.X, pady=2)
+
+        # NEW: Browse button for already downloaded local models
+        browse_row = ttk.Frame(hf_frame)
+        browse_row.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Button(browse_row, text="📁 Выбрать локальную папку (уже скачанную модель)",
+                   command=self._browse_local_hf_model).pack(side=tk.LEFT)
+
+        self.hf_local_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(browse_row, text="Только локальные файлы (оффлайн, без интернета)",
+                        variable=self.hf_local_only_var).pack(side=tk.LEFT, padx=12)
+
+        hf_opts = ttk.Frame(hf_frame)
+        hf_opts.pack(fill=tk.X, pady=4)
+
+        self.hf_4bit_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(hf_opts, text="Load in 4-bit (QLoRA — best for fine-tuning)",
+                        variable=self.hf_4bit_var).pack(side=tk.LEFT)
+
+        self.hf_8bit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(hf_opts, text="8-bit", variable=self.hf_8bit_var).pack(side=tk.LEFT, padx=12)
+
+        self.hf_apply_lora_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(hf_opts, text="Apply LoRA on load", variable=self.hf_apply_lora_var).pack(side=tk.LEFT)
+
+        lora_row = ttk.Frame(hf_frame)
+        lora_row.pack(fill=tk.X, pady=2)
+        ttk.Label(lora_row, text="LoRA rank:").pack(side=tk.LEFT)
+        self.hf_lora_rank_var = tk.StringVar(value="16")
+        ttk.Entry(lora_row, textvariable=self.hf_lora_rank_var, width=5).pack(side=tk.LEFT, padx=4)
+        ttk.Label(lora_row, text="(8–64 typical; higher = more capacity)").pack(side=tk.LEFT, padx=6)
+
+        hf_btn_row = ttk.Frame(hf_frame)
+        hf_btn_row.pack(fill=tk.X, pady=6)
+
+        self.hf_load_btn = ttk.Button(hf_btn_row, text="📥 Load HF Model",
+                                      command=self._load_hf_model)
+        self.hf_load_btn.pack(side=tk.LEFT, padx=4)
+
+        self.hf_apply_lora_btn = ttk.Button(hf_btn_row, text="🔧 Apply LoRA (for fine-tune)",
+                                            command=self._apply_lora_to_hf, state=tk.DISABLED)
+        self.hf_apply_lora_btn.pack(side=tk.LEFT, padx=4)
+
+        self.hf_save_lora_btn = ttk.Button(hf_btn_row, text="💾 Save LoRA Adapter",
+                                           command=self._save_hf_lora, state=tk.DISABLED)
+        self.hf_save_lora_btn.pack(side=tk.LEFT, padx=4)
+
+        self.hf_load_lora_btn = ttk.Button(hf_btn_row, text="📂 Load LoRA Adapter",
+                                           command=self._load_hf_lora, state=tk.DISABLED)
+        self.hf_load_lora_btn.pack(side=tk.LEFT, padx=4)
+
+        # Fine-tune button (works on loaded HF model)
+        self.hf_finetune_btn = ttk.Button(hf_btn_row, text="🚀 Fine-tune (LoRA/QLoRA)",
+                                          command=self._finetune_hf_from_gui, state=tk.DISABLED)
+        self.hf_finetune_btn.pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(hf_frame,
+                  text="Tip: Use small models first (0.5B–3B). 4-bit + LoRA lets you fine-tune on consumer GPUs.",
+                  style="Sub.TLabel", foreground="#666").pack(anchor=tk.W, pady=(4, 0))
 
         # --- Model info ---
         info_frame = ttk.LabelFrame(tab, text="  ℹ️  Model Info  ", padding="6")
@@ -2253,6 +2325,202 @@ class AIApp:
             )
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
+
+    # ==================================================================
+    #  NEW: Hugging Face + LoRA/QLoRA GUI methods
+    # ==================================================================
+
+    def _browse_local_hf_model(self):
+        """Open folder dialog to select an already downloaded HF model directory."""
+        folder = filedialog.askdirectory(
+            title="Выбери папку со скачанной моделью Hugging Face (должна содержать config.json)"
+        )
+        if folder:
+            self.hf_model_var.set(folder)
+            self.hf_local_only_var.set(True)   # автоматически включаем оффлайн-режим
+            self.status_label.config(text=f"Status: Выбрана локальная модель: {os.path.basename(folder)}")
+
+    def _load_hf_model(self):
+        model_name = self.hf_model_var.get().strip()
+        if not model_name:
+            messagebox.showwarning("No model", "Please enter a Hugging Face model name or select a local folder")
+            return
+
+        load_4bit = self.hf_4bit_var.get()
+        load_8bit = self.hf_8bit_var.get()
+        apply_lora = self.hf_apply_lora_var.get()
+        local_only = self.hf_local_only_var.get()
+
+        try:
+            lora_rank = int(self.hf_lora_rank_var.get())
+        except ValueError:
+            lora_rank = 16
+
+        self.hf_load_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"Status: Loading HF model {model_name}…")
+        self.root.update_idletasks()
+
+        def run():
+            try:
+                self.engine.load_hf_model(
+                    model_name,
+                    load_in_4bit=load_4bit,
+                    load_in_8bit=load_8bit,
+                    apply_lora=apply_lora,
+                    lora_rank=lora_rank,
+                    local_files_only=local_only,
+                    verbose=True,
+                )
+
+                def update_ui():
+                    self.gen_btn.config(state=tk.NORMAL)
+                    self.hf_apply_lora_btn.config(state=tk.NORMAL)
+                    self.hf_save_lora_btn.config(state=tk.NORMAL if self.engine.is_hf_model() and getattr(self.engine.hf_proxy, 'is_peft', False) else tk.DISABLED)
+                    self.hf_load_lora_btn.config(state=tk.NORMAL)
+                    self.hf_finetune_btn.config(state=tk.NORMAL)
+
+                    n = self.engine.model.count_parameters()
+                    self.param_label.config(text=f"Parameters: {n:,}")
+                    self.model_file_label.config(text=f"HF: {model_name}", foreground="black")
+                    self.status_label.config(text=f"Status: HF model loaded ✅ ({model_name})")
+                    self._refresh_model_info()
+
+                    # Disable native training buttons for HF models
+                    self.train_btn.config(state=tk.DISABLED)
+                    if HAS_QUANTIZATION:
+                        self._update_quant_buttons()
+
+                self.root.after(0, update_ui)
+
+            except HFNotAvailableError as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "HF support missing",
+                    f"{e}\n\nRun: pip install -r requirements.txt"
+                ))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("HF Load Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _apply_lora_to_hf(self):
+        if not self.engine.is_hf_model():
+            messagebox.showwarning("No HF model", "Load a Hugging Face model first.")
+            return
+
+        try:
+            rank = int(self.hf_lora_rank_var.get())
+        except ValueError:
+            rank = 16
+
+        try:
+            self.engine.apply_lora_to_hf(rank=rank)
+            self.hf_save_lora_btn.config(state=tk.NORMAL)
+            self.hf_finetune_btn.config(state=tk.NORMAL)
+            self.status_label.config(text=f"Status: LoRA (rank {rank}) applied ✅")
+            self._refresh_model_info()
+        except Exception as e:
+            messagebox.showerror("LoRA Error", str(e))
+
+    def _save_hf_lora(self):
+        if not self.engine.is_hf_model():
+            return
+        path = filedialog.asksaveasdirectory(title="Choose folder to save LoRA adapter")
+        if not path:
+            return
+        try:
+            self.engine.save_hf_lora(path)
+            messagebox.showinfo("Saved", f"LoRA adapter saved to:\n{path}")
+            self.status_label.config(text=f"Status: LoRA adapter saved ✅")
+        except Exception as e:
+            messagebox.showerror("Save LoRA Error", str(e))
+
+    def _load_hf_lora(self):
+        if not self.engine.is_hf_model():
+            messagebox.showwarning("No base model", "Load the base HF model first, then load adapter.")
+            return
+        path = filedialog.askdirectory(title="Select folder with saved LoRA adapter")
+        if not path:
+            return
+        try:
+            self.engine.load_hf_lora(path)
+            self.hf_save_lora_btn.config(state=tk.NORMAL)
+            self.hf_finetune_btn.config(state=tk.NORMAL)
+            self.status_label.config(text="Status: LoRA adapter loaded ✅")
+            self._refresh_model_info()
+        except Exception as e:
+            messagebox.showerror("Load LoRA Error", str(e))
+
+    def _finetune_hf_from_gui(self):
+        if not self.engine.is_hf_model():
+            messagebox.showwarning("No HF model", "Load a Hugging Face model first (preferably in 4-bit).")
+            return
+
+        # Ask for training text
+        if self.selected_file_path:
+            use_training = messagebox.askyesno(
+                "Training data",
+                "Use the currently selected .txt file for fine-tuning?"
+            )
+            if use_training:
+                try:
+                    with open(self.selected_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
+                    texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
+                except Exception as e:
+                    messagebox.showerror("File Error", str(e))
+                    return
+            else:
+                texts = None
+        else:
+            texts = None
+
+        if not texts:
+            # Ask user to select a file or use a small example
+            path = filedialog.askopenfilename(title="Select .txt file for fine-tuning",
+                                              filetypes=[("Text", "*.txt"), ("All", "*.*")])
+            if not path:
+                messagebox.showinfo("Info", "Fine-tuning cancelled.")
+                return
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
+            except Exception as e:
+                messagebox.showerror("File Error", str(e))
+                return
+
+        if not texts:
+            messagebox.showwarning("No data", "Not enough text for fine-tuning.")
+            return
+
+        self.hf_finetune_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="Status: Fine-tuning with LoRA/QLoRA… (see console)")
+
+        def run():
+            try:
+                out_dir = self.engine.finetune_hf(
+                    texts,
+                    output_dir="hf_lora_finetuned",
+                    epochs=3,
+                    learning_rate=2e-4,
+                    batch_size=2,                    # small for consumer GPUs
+                    max_length=512,
+                    gradient_accumulation_steps=8,
+                )
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Fine-tuning complete",
+                    f"LoRA adapter saved to:\n{out_dir}\n\nYou can now load it with 'Load LoRA Adapter'."
+                ))
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"Status: Fine-tuning complete ✅ Adapter in {out_dir}"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Fine-tune Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.hf_finetune_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
 
     # NEW: Save / Load config
     def save_config(self):
