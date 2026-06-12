@@ -150,6 +150,10 @@ class HuggingFaceProxy:
 
         self.model_name_or_path = model_name_or_path
         self.max_seq_len = max_seq_len
+        self.is_quantized = False
+
+        if load_in_4bit and load_in_8bit:
+            raise ValueError("Choose either 4-bit or 8-bit loading, not both at once.")
 
         is_local = local_files_only or os.path.isdir(model_name_or_path)
 
@@ -168,9 +172,11 @@ class HuggingFaceProxy:
 
         if load_in_4bit or load_in_8bit:
             if not torch.cuda.is_available():
-                print("[AuraLite-HF] WARNING: 4/8-bit quantization requires CUDA. Falling back to fp16/cpu.")
+                print("[AuraLite-HF] WARNING: 4/8-bit quantization requires CUDA. Falling back to full-precision CPU loading.")
+                load_in_4bit = False
+                load_in_8bit = False
             else:
-                compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                compute_dtype = torch.float16
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=load_in_4bit,
                     load_in_8bit=load_in_8bit,
@@ -186,8 +192,10 @@ class HuggingFaceProxy:
         if torch_dtype is None:
             if load_in_4bit or load_in_8bit:
                 torch_dtype = torch.float16
-            else:
+            elif torch.cuda.is_available():
                 torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            else:
+                torch_dtype = torch.float32
 
         load_kwargs["torch_dtype"] = torch_dtype
 
@@ -335,6 +343,7 @@ class HuggingFaceProxy:
             raise ValueError("Model not loaded")
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        do_sample = bool(do_sample and temperature > 0)
 
         with torch.no_grad():
             outputs = self.model.generate(

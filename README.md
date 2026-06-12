@@ -51,7 +51,7 @@
 ## 📦 Installation & Setup
 
 ### Prerequisites
-- **Python 3.8+** (Recommended)
+- **Python 3.10+** (Recommended)
 - **NVIDIA GPU** (Optional, for CUDA acceleration. Requires CUDA Toolkit installed).
 
 ### Manual Installation

@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import numpy as np
 
 # Optional Hugging Face + LoRA/QLoRA support
@@ -92,7 +92,9 @@ def validate_params(params: dict) -> list[str]:
 
     if d_model <= 0:
         errors.append(f"d_model must be > 0, got {d_model}")
-    if d_model % n_heads != 0:
+    if n_heads <= 0:
+        errors.append(f"n_heads must be >= 1, got {n_heads}")
+    elif d_model % n_heads != 0:
         errors.append(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
     if n_kv_heads is not None and n_kv_heads > 0:
         if n_heads % n_kv_heads != 0:
@@ -109,6 +111,8 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"lr must be > 0, got {lr}")
     if epochs < 1:
         errors.append(f"epochs must be >= 1, got {epochs}")
+    if params.get("n_layers", 4) < 1:
+        errors.append(f"n_layers must be >= 1, got {params.get('n_layers', 4)}")
     if not (0.0 <= dropout < 1.0):
         errors.append(f"dropout must be in [0, 1), got {dropout}")
     if grad_clip <= 0:
@@ -1375,11 +1379,12 @@ class AuraLiteEngine:
             }
             if min_p > 0:
                 kwargs["min_p"] = min_p
-            return self.hf_proxy.generate(prompt, **kwargs)
+            full = self.hf_proxy.generate(prompt, **kwargs)
+            return full[len(prompt):].strip() if full.startswith(prompt) else full.strip()
 
         else:
             # Native AuraLite model
-            ids = self.encode(prompt)
+            ids = self._prepare_prompt_ids(prompt)
             result_ids = self._generate_ids(
                 ids, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p=min_p
@@ -1421,7 +1426,7 @@ class AuraLiteEngine:
         if self.is_gguf_model():
             if self.model.use_chat_completion:
                 stream = self.model.create_chat_completion(
-                    prompt,
+                    history.to_list(),
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_k=top_k,
@@ -1448,19 +1453,26 @@ class AuraLiteEngine:
 
         if self.is_hf_model():
             # HF streaming (if supported by the proxy)
+            kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0:
+                kwargs["min_p"] = min_p
             try:
-                for token in self.hf_proxy.generate_streaming(prompt, max_new_tokens=max_new_tokens,
-                                                               temperature=temperature, top_p=top_p):
+                for token in self.hf_proxy.generate_streaming(prompt, **kwargs):
                     yield token
             except Exception:
                 # Fallback
-                result = self.hf_proxy.generate(prompt, max_new_tokens=max_new_tokens,
-                                                temperature=temperature, top_p=top_p)
-                yield result
+                result = self.hf_proxy.generate(prompt, **kwargs)
+                yield result[len(prompt):] if result.startswith(prompt) else result
             return
 
         # Native AuraLite streaming
-        ids = self.encode(prompt)
+        ids = self._prepare_prompt_ids(prompt)
         self.model.eval()
         self.model.reset_cache()
 
@@ -1527,6 +1539,8 @@ class AuraLiteEngine:
         self.model = model
         self.backend = "gguf"
         self.gguf_path = str(path)
+        self.hf_path = None
+        self._ddp_model = None
         self.tokenizer = model.tokenizer
         self.vocab_size = model.vocab_size
         self.params_used = {
@@ -1629,7 +1643,9 @@ class AuraLiteEngine:
         # Wire into engine
         self.model = self.hf_proxy
         self.backend = "huggingface"
+        self.gguf_path = None
         self.hf_path = model_name_or_path
+        self._ddp_model = None
         self.tokenizer = self.hf_proxy.tokenizer
         self.vocab_size = getattr(self.hf_proxy.tokenizer, "vocab_size", 0)
 
@@ -1790,6 +1806,11 @@ class AuraLiteEngine:
         except LMEvalNotAvailableError as e:
             raise e
 
+    @staticmethod
+    def _gguf_prompt_messages(prompt: str) -> list[dict[str, str]]:
+        """Wrap a raw prompt into a minimal chat message list for GGUF chat APIs."""
+        return [{"role": "user", "content": prompt}]
+
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
@@ -1799,7 +1820,8 @@ class AuraLiteEngine:
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
             out = self.model.create_chat_completion(
-                prompt, max_tokens=length, temperature=temperature,
+                self._gguf_prompt_messages(prompt),
+                max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, stream=False,
             )
@@ -1936,6 +1958,11 @@ class AuraLiteEngine:
                 ".gguf models are inference-only in AuraLite. "
                 "Uncheck 'Continue training current model' to train a new AuraLite .pt model."
             )
+        if self.is_hf_model() and params.get("continue_training", False):
+            raise ValueError(
+                "Hugging Face models should be fine-tuned via finetune_hf() / LoRA, not through native AuraLite training. "
+                "Uncheck 'Continue training current model' to train a new native AuraLite .pt model."
+            )
 
         errors = validate_params(params)
         if errors:
@@ -1969,6 +1996,18 @@ class AuraLiteEngine:
 
         # NEW: RoPE scaling
         rope_scaling = params.get("rope_scaling", None)
+
+        if use_ddp and not self.is_distributed:
+            raise ValueError(
+                "use_ddp=True, but no distributed process group is active. "
+                "Launch AuraLite with torchrun (or torch.distributed.launch) to use DDP."
+            )
+        if self.is_distributed and self.world_size > 1 and not use_ddp:
+            raise ValueError(
+                "AuraLite detected a distributed launch (world_size > 1), but use_ddp is disabled. "
+                "Either enable Multi-GPU (DDP) or run a single process."
+            )
+        ddp_active = bool(use_ddp and self.is_distributed)
 
         self.params_used = dict(params)
 
@@ -2012,6 +2051,7 @@ class AuraLiteEngine:
         if not resuming:
             self.backend = "torch"
             self.gguf_path = None
+            self.hf_path = None
 
             use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
 
@@ -2021,7 +2061,7 @@ class AuraLiteEngine:
                 n_heads=n_heads,
                 n_layers=n_layers,
                 d_ff=d_ff,
-                max_seq_len=4096,
+                max_seq_len=seq_length,
                 n_kv_heads=n_kv_heads,
                 dropout=dropout,
                 use_alibi=use_alibi,
@@ -2029,16 +2069,11 @@ class AuraLiteEngine:
                 rope_scaling=rope_scaling,
             ).to(self.device)
 
-            # Wrap with DDP if distributed
-            if self.is_distributed:
-                self._ddp_model = DDP(self.model, device_ids=[self.local_rank] if torch.cuda.is_available() else None)
-                print(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
-            else:
-                self._ddp_model = None
-
-            # LoRA setup
+            # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank)
+
+        self._ddp_model = None
 
         self.optimizer = optim.AdamW(
             self.model.parameters(), lr=lr,
@@ -2117,9 +2152,17 @@ class AuraLiteEngine:
         # IMPROVED: better worker count heuristic
         use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
         num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
+        train_sampler = None
+        if ddp_active:
+            train_sampler = DistributedSampler(
+                dataset, num_replicas=self.world_size,
+                rank=dist.get_rank(), shuffle=True, drop_last=False
+            )
+
         loader_kwargs: dict = dict(
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             num_workers=num_workers,
             drop_last=False,
             pin_memory=(self.device.type == "cuda"),
@@ -2193,13 +2236,22 @@ class AuraLiteEngine:
                 except Exception:
                     pass
 
+        if ddp_active:
+            self._ddp_model = DDP(
+                train_model,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+            )
+            print(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
+
         # ---- Epoch loop -----------------------------------------------
         # Use DDP-wrapped model if available
-        train_model = self._ddp_model if self._ddp_model is not None else self.model
+        train_model = self._ddp_model if self._ddp_model is not None else train_model
         train_model.train()
         self.last_val_loss = None
 
         for epoch in range(epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             if stop_event and stop_event.is_set():
                 break
 
@@ -2256,13 +2308,13 @@ class AuraLiteEngine:
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
 
-            if autosave_every and (epoch + 1) % autosave_every == 0:
+            if autosave_every and (epoch + 1) % autosave_every == 0 and (not ddp_active or dist.get_rank() == 0):
                 try:
                     self.save_model(autosave_path)
                 except Exception:
                     pass   # autosave must never kill training
 
-            if progress_callback and seen_batches > 0:
+            if progress_callback and seen_batches > 0 and (not ddp_active or dist.get_rank() == 0):
                 avg_loss = running_loss / seen_batches
                 progress_callback(epoch + 1, epochs, avg_loss, val_loss)
 
@@ -2340,6 +2392,7 @@ class AuraLiteEngine:
                 think_prompt, thinking_length,
                 thinking_temperature, top_k, top_p,
                 repetition_penalty=repetition_penalty,
+                min_p=min_p,
             )
             thinking_text = draft_full[len(think_prompt):].strip()
 
@@ -2353,9 +2406,44 @@ class AuraLiteEngine:
             final_full = self._gguf_generate_text(
                 final_prompt, length, temperature, top_k, top_p,
                 repetition_penalty=repetition_penalty,
+                min_p=min_p,
             )
             final_text = start_str + final_full[len(final_prompt):]
             return thinking_text, final_text
+
+        if self.is_hf_model():
+            think_prompt = f"{web_context}\n{start_str}" if web_context else start_str
+            think_kwargs = {
+                "max_new_tokens": thinking_length,
+                "temperature": thinking_temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0:
+                think_kwargs["min_p"] = min_p
+            draft_full = self.hf_proxy.generate(think_prompt, **think_kwargs)
+            thinking_text = (draft_full[len(think_prompt):] if draft_full.startswith(think_prompt) else draft_full).strip()
+
+            ctx_parts = []
+            if web_context:
+                ctx_parts.append(web_context)
+            if thinking_text:
+                ctx_parts.append(thinking_text)
+            ctx_parts.append(start_str)
+            final_prompt = "\n".join(ctx_parts)
+            final_kwargs = {
+                "max_new_tokens": length,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0:
+                final_kwargs["min_p"] = min_p
+            final_full = self.hf_proxy.generate(final_prompt, **final_kwargs)
+            continuation = final_full[len(final_prompt):] if final_full.startswith(final_prompt) else final_full
+            return thinking_text, start_str + continuation
 
         # ---- Pass 1: exploration draft ---------------------------------
         think_prompt = start_str
@@ -2368,7 +2456,7 @@ class AuraLiteEngine:
             think_ids, thinking_length,
             temperature=thinking_temperature,
             top_k=top_k, top_p=top_p,
-            repetition_penalty=repetition_penalty))
+            repetition_penalty=repetition_penalty, min_p=min_p))
         # Keep only the newly generated part as the "thoughts"
         thinking_text = draft_full[len(think_prompt_used):].strip()
 
@@ -2387,7 +2475,7 @@ class AuraLiteEngine:
             final_ids, length,
             temperature=temperature,
             top_k=top_k, top_p=top_p,
-            repetition_penalty=repetition_penalty))
+            repetition_penalty=repetition_penalty, min_p=min_p))
         final_text = start_str + final_full[len(final_prompt_used):]
 
         return thinking_text, final_text
@@ -2410,7 +2498,8 @@ class AuraLiteEngine:
                 return
             if self.model.use_chat_completion:
                 stream = self.model.create_chat_completion(
-                    start_str, max_tokens=length, temperature=temperature,
+                    self._gguf_prompt_messages(start_str),
+                    max_tokens=length, temperature=temperature,
                     top_k=top_k, top_p=top_p, min_p=min_p,
                     repeat_penalty=repetition_penalty, stream=True,
                 )
@@ -2434,6 +2523,24 @@ class AuraLiteEngine:
                         text = ""
                     if text:
                         yield text
+            return
+
+        if self.is_hf_model():
+            kwargs = {
+                "max_new_tokens": length,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if min_p > 0:
+                kwargs["min_p"] = min_p
+            try:
+                for token in self.hf_proxy.generate_streaming(start_str, **kwargs):
+                    yield token
+            except Exception:
+                full = self.hf_proxy.generate(start_str, **kwargs)
+                yield full[len(start_str):] if full.startswith(start_str) else full
             return
 
         ids = self._prepare_prompt_ids(start_str)
@@ -2534,7 +2641,7 @@ class AuraLiteEngine:
         if not prompts:
             return []
 
-        if self.is_gguf_model():
+        if self.is_gguf_model() or self.is_hf_model():
             return [self.generate(p, length, temperature, top_k, top_p,
                                   repetition_penalty=repetition_penalty, min_p=min_p)
                     for p in prompts]
@@ -2622,6 +2729,11 @@ class AuraLiteEngine:
                 "cannot be saved as AuraLite .pt checkpoints. Copy the .gguf "
                 "file itself if you need to move it."
             )
+        if self.is_hf_model():
+            raise ValueError(
+                "Hugging Face models are managed through the HF/PEFT workflow. "
+                "Save LoRA adapters with save_hf_lora() or use push_to_hub()/save_pretrained() instead."
+            )
         checkpoint = {
             "model_state":  self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict() if self.optimizer is not None else None,
@@ -2673,6 +2785,8 @@ class AuraLiteEngine:
 
         self.backend = "torch"
         self.gguf_path = None
+        self.hf_path = None
+        self._ddp_model = None
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         if checkpoint.get("tokenizer"):
@@ -2743,6 +2857,10 @@ class AuraLiteEngine:
             raise ValueError(
                 "GGUF models are already quantized externally. "
                 "Quantization only works on native AuraLite .pt models.")
+        if self.is_hf_model():
+            raise ValueError(
+                "Hugging Face models should be quantized with their native tooling or bitsandbytes. "
+                "AuraLite quantization only works on native AuraLite .pt models.")
 
         from quantization import (QuantizationEngine, QuantConfig,
                                   QuantMethod, BitWidth)

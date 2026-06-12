@@ -20,6 +20,7 @@ try:
     HAS_LM_EVAL = True
 except ImportError:
     HAS_LM_EVAL = False
+    LM = object  # placeholder so the module can still be imported cleanly
 
 
 class LMEvalNotAvailableError(ImportError):
@@ -150,8 +151,13 @@ class EvaluationEngine:
             tokenizer = self.engine.hf_proxy.tokenizer
             from lm_eval.models.huggingface import HFLM
             lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
+        elif self.engine.is_gguf_model():
+            raise NotImplementedError(
+                "GGUF evaluation via lm-evaluation-harness is not implemented in AuraLite yet. "
+                "Use a native AuraLite or Hugging Face model for evaluation."
+            )
         else:
-            # Native or GGUF → use our wrapper
+            # Native AuraLite → use our wrapper
             lm = AuraLiteLM(self.engine, batch_size=batch_size)
 
         print(f"[AuraLite-Eval] Evaluating on tasks: {tasks}")

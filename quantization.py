@@ -215,6 +215,8 @@ def _get_calibration_inputs(text: str, tokenizer, seq_length: int,
                             ) -> list[torch.Tensor]:
     """Prepare calibration input tensors from text."""
     ids = tokenizer.encode(text)
+    if not ids:
+        return []
     if len(ids) < seq_length + 1:
         ids = ids * ((seq_length + 1) // len(ids) + 1)
     inputs = []
@@ -260,6 +262,8 @@ class PackedLinear(nn.Module):
                              torch.ones(out_features, n_groups, dtype=torch.float16))
         self.register_buffer("zeros",
                              torch.zeros(out_features, n_groups, dtype=torch.float16))
+        self.register_buffer("input_scale",
+                             torch.ones(in_features, dtype=torch.float16))
         if bias:
             self.bias_param = nn.Parameter(torch.zeros(out_features))
         else:
@@ -324,6 +328,8 @@ class PackedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self._dequantize().to(x.dtype)
+        scale = self.input_scale.to(device=x.device, dtype=x.dtype)
+        x = x / scale
         out = F.linear(x, weight)
         if self.bias_param is not None:
             out = out + self.bias_param
@@ -459,6 +465,7 @@ class QuantizationEngine:
             original_size_mb=_model_size_mb(model),
             original_params=_count_params(model),
         )
+        self.last_result = result
 
         cb = progress_callback or (lambda s, t, m: None)
 
@@ -880,7 +887,7 @@ class QuantizationEngine:
             packed = PackedLinear(in_features, out_features,
                                  bits=bits, group_size=group_size,
                                  bias=linear.bias is not None)
-            packed.pack_weights(W, scales, zeros)
+            packed.pack_weights(W_q, scales, zeros)
             if linear.bias is not None:
                 packed.bias_param = nn.Parameter(linear.bias.data.clone())
             packed = packed.to(device)
@@ -1040,6 +1047,7 @@ class QuantizationEngine:
                                  bits=bits, group_size=group_size,
                                  bias=linear.bias is not None)
             packed.pack_weights(W_scaled, scales, zeros)
+            packed.input_scale.copy_(scale_factor.detach().to(dtype=packed.input_scale.dtype, device=packed.input_scale.device))
             if linear.bias is not None:
                 packed.bias_param = nn.Parameter(linear.bias.data.clone())
             packed = packed.to(device)

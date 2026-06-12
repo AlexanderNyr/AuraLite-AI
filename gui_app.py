@@ -1159,7 +1159,8 @@ class AIApp:
     def _update_quant_buttons(self):
         """Enable/disable quantization buttons based on current state."""
         has_model = (self.engine.model is not None and
-                     not self.engine.is_gguf_model())
+                     not self.engine.is_gguf_model() and
+                     not self.engine.is_hf_model())
         self.q_quantize_btn.config(
             state=tk.NORMAL if has_model else tk.DISABLED)
         self.q_compare_btn.config(
@@ -1542,6 +1543,7 @@ class AIApp:
                     batch_size=batch_size,
                     limit=limit,
                 )
+                self.last_eval_results = results
 
                 def update_ui():
                     self.eval_result_text.delete("1.0", tk.END)
@@ -1579,11 +1581,13 @@ class AIApp:
         if not path:
             return
         try:
-            # We store the last results in a simple way
-            # For a more robust solution we could keep self.last_eval_results
-            text = self.eval_result_text.get("1.0", "end-1c")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
+            if getattr(self, "last_eval_results", None) is not None:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.last_eval_results, f, indent=2, ensure_ascii=False)
+            else:
+                text = self.eval_result_text.get("1.0", "end-1c")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
             messagebox.showinfo("Saved", f"Results saved to {path}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
@@ -1729,6 +1733,22 @@ class AIApp:
                 lines.append("GGUF metadata:")
                 for k in sorted(meta)[:40]:
                     lines.append(f"  {k} = {meta[k]}")
+        elif self.engine.is_hf_model():
+            tok = self.engine.tokenizer
+            info = self.engine.hf_proxy.get_info() if self.engine.hf_proxy else {}
+            lines.append("Backend         : Hugging Face / transformers")
+            lines.append(f"Model           : {info.get('model', self.engine.hf_path or '—')}")
+            lines.append(f"Parameters      : {m.count_parameters():,}")
+            lines.append(f"Trainable       : {m.count_trainable_parameters():,}")
+            lines.append(f"Vocab size      : {self.engine.vocab_size or '—'}")
+            lines.append(f"Tokenizer       : {type(tok).__name__ if tok else '—'}")
+            lines.append(f"max_seq_len     : {info.get('max_seq_len', getattr(m, 'max_seq_len', '—'))}")
+            lines.append(f"device          : {info.get('device', self.engine.device)}")
+            lines.append(f"Quantized       : {'Yes' if info.get('is_quantized') else 'No'}")
+            lines.append(f"LoRA / PEFT     : {'Yes' if info.get('is_peft') else 'No'}")
+            if info.get('lora_config'):
+                lines.append(f"LoRA config     : {info['lora_config']}")
+            lines.append("Training        : use the HF / LoRA fine-tuning tools in the Model tab")
         else:
             tok = self.engine.tokenizer
             lines.append(f"Parameters      : {m.count_parameters():,}")
@@ -2044,6 +2064,14 @@ class AIApp:
             messagebox.showwarning(
                 "GGUF is inference-only",
                 ".gguf models cannot be continued/trained in AuraLite. "
+                "Uncheck «Continue training current model» to train a new native .pt model."
+            )
+            return
+
+        if params["continue_training"] and self.engine.is_hf_model():
+            messagebox.showwarning(
+                "Hugging Face models use LoRA / QLoRA fine-tuning",
+                "Loaded Hugging Face models should be fine-tuned from the Model tab. "
                 "Uncheck «Continue training current model» to train a new native .pt model."
             )
             return
@@ -2443,8 +2471,9 @@ class AIApp:
         self.chat_send_btn = ttk.Button(input_frame, text="Send", command=self._send_chat_message)
         self.chat_send_btn.pack(side=tk.LEFT, padx=2)
 
+        self.chat_stream_var = tk.BooleanVar(value=True)
         self.chat_stream_cb = ttk.Checkbutton(input_frame, text="Stream",
-                                              variable=tk.BooleanVar(value=True))
+                                              variable=self.chat_stream_var)
         self.chat_stream_cb.pack(side=tk.LEFT, padx=4)
 
         self.chat_clear_btn = ttk.Button(input_frame, text="Clear History", command=self._clear_chat_history)
@@ -2478,7 +2507,7 @@ class AIApp:
         self.chat_send_btn.config(state=tk.DISABLED)
         self.chat_status.config(text="Generating response...")
 
-        use_stream = getattr(self, 'chat_stream_cb', None) and self.chat_stream_cb.instate(['selected'])
+        use_stream = bool(getattr(self, 'chat_stream_var', None) and self.chat_stream_var.get())
 
         def run():
             try:
@@ -2488,6 +2517,7 @@ class AIApp:
                 if use_stream:
                     # Streaming mode
                     response_parts = []
+                    self.root.after(0, lambda: self._begin_chat_stream())
                     for token in self.engine.generate_chat_streaming(
                         self.chat_history,
                         max_new_tokens=256,
@@ -2542,6 +2572,12 @@ class AIApp:
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.insert(tk.END, token)
         self.chat_text.see(tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+
+    def _begin_chat_stream(self):
+        """Insert the assistant prefix before streaming tokens arrive."""
+        self.chat_text.config(state=tk.NORMAL)
+        self.chat_text.insert(tk.END, "🤖 Assistant: ", "assistant")
         self.chat_text.config(state=tk.DISABLED)
 
     def _finalize_chat_response(self, full_response: str):
@@ -2674,6 +2710,13 @@ class AIApp:
                 "GGUF",
                 ".gguf is an external inference-only model file. It cannot be "
                 "saved as an AuraLite .pt checkpoint; keep/copy the original .gguf file."
+            )
+            return
+        if self.engine.is_hf_model():
+            messagebox.showinfo(
+                "Hugging Face",
+                "Hugging Face models are managed separately. Save adapters via 'Save LoRA Adapter' "
+                "or use the Hub / save_pretrained workflow instead of AuraLite .pt saving."
             )
             return
         path = filedialog.asksaveasfilename(
@@ -2863,6 +2906,10 @@ class AIApp:
         apply_lora = self.hf_apply_lora_var.get()
         local_only = self.hf_local_only_var.get()
 
+        if load_4bit and load_8bit:
+            messagebox.showwarning("Invalid options", "Choose either 4-bit or 8-bit loading, not both.")
+            return
+
         try:
             lora_rank = int(self.hf_lora_rank_var.get())
         except ValueError:
@@ -2886,6 +2933,7 @@ class AIApp:
 
                 def update_ui():
                     self.gen_btn.config(state=tk.NORMAL)
+                    self.save_btn.config(state=tk.DISABLED)
                     self.hf_apply_lora_btn.config(state=tk.NORMAL)
                     self.hf_save_lora_btn.config(state=tk.NORMAL if self.engine.is_hf_model() and getattr(self.engine.hf_proxy, 'is_peft', False) else tk.DISABLED)
                     self.hf_load_lora_btn.config(state=tk.NORMAL)
@@ -2898,7 +2946,7 @@ class AIApp:
                     self.status_label.config(text=f"Status: HF model loaded ✅ ({model_name})")
                     self._refresh_model_info()
 
-                    # Disable native training buttons for HF models
+                    # Disable native training / saving buttons for HF models
                     self.train_btn.config(state=tk.DISABLED)
                     if HAS_QUANTIZATION:
                         self._update_quant_buttons()
@@ -3020,6 +3068,10 @@ class AIApp:
         load_8bit = self.hf_8bit_var.get()
         apply_lora = self.hf_apply_lora_var.get()
 
+        if load_4bit and load_8bit:
+            messagebox.showwarning("Invalid options", "Choose either 4-bit or 8-bit loading, not both.")
+            return
+
         try:
             lora_rank = int(self.hf_lora_rank_var.get())
         except ValueError:
@@ -3042,6 +3094,7 @@ class AIApp:
 
                 def update_ui():
                     self.gen_btn.config(state=tk.NORMAL)
+                    self.save_btn.config(state=tk.DISABLED)
                     self.hf_apply_lora_btn.config(state=tk.NORMAL)
                     self.hf_save_lora_btn.config(state=tk.NORMAL)
                     self.hf_load_lora_btn.config(state=tk.NORMAL)
@@ -3167,6 +3220,12 @@ class AIApp:
                 "accumulation_steps": int(self.accum_var.get()) or 1,
                 "use_alibi": bool(self.alibi_var.get()),
                 "lora_rank": int(self.lora_var.get()) or 0,
+                "use_gradient_checkpointing": bool(self.checkpoint_var.get()),
+                "use_ddp": bool(self.ddp_var.get()),
+                "rope_scaling": {
+                    "type": self.rope_type_var.get() if self.rope_type_var.get() != "none" else None,
+                    "factor": float(self.rope_factor_var.get()) if self.rope_type_var.get() != "none" else 1.0,
+                } if self.rope_type_var.get() != "none" else None,
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
@@ -3207,6 +3266,16 @@ class AIApp:
                 self.compile_var.set(config["use_compile"])
             if "use_alibi" in config:
                 self.alibi_var.set(config["use_alibi"])
+            if "use_gradient_checkpointing" in config:
+                self.checkpoint_var.set(bool(config["use_gradient_checkpointing"]))
+            if "use_ddp" in config:
+                self.ddp_var.set(bool(config["use_ddp"]))
+            if "rope_scaling" in config and config["rope_scaling"]:
+                self.rope_type_var.set(config["rope_scaling"].get("type", "none") or "none")
+                self.rope_factor_var.set(str(config["rope_scaling"].get("factor", 1.0)))
+            elif "rope_scaling" in config:
+                self.rope_type_var.set("none")
+                self.rope_factor_var.set("1.0")
             self.status_label.config(
                 text=f"Status: Config loaded ✅ ({os.path.basename(path)})")
             messagebox.showinfo("Config Loaded",
