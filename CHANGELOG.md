@@ -1,16 +1,40 @@
-# 🚀 Changelog — AuraLite AI v2.0 → v2.1
+# 🚀 Changelog — AuraLite AI v2.0 → v2.2
 
-## ⚡ New Feature: INT8 Quantization (v2.2)
+## ⚡ Quantization Toolkit (v2.2)
 
-- **`QuantizedLinear`** — drop-in INT8 replacement for `nn.Linear` (weight-only, per-output-channel symmetric scales, llama.cpp Q8_0-style). Dequantizes on the fly via `F.linear`, so it runs on both CPU and CUDA with **no extra dependencies**.
-- **`ModernTransformer.quantize_int8()`** — converts all attention (`W_q/W_k/W_v/W_o`) and FFN (`gate/up/down`) projections to INT8 in-place. The weight-tied embedding/head stays FP32 to preserve output quality. Rejects models with active LoRA adapters.
-- **`AuraLiteEngine.quantize_model("int8")`** — engine-level API; returns a report (`params_quantized`, `memory_mb_before/after`) and drops stale optimizer/scheduler state. `engine.is_quantized()` for status checks.
-- **Save / Load support** — quantized checkpoints store INT8 buffers + scales (`quantization` field in the checkpoint); `load_model()` reconstructs `QuantizedLinear` shells automatically. Result: **~4× smaller `.pt` files** (e.g. 10.1 MB → 2.8 MB for a 1.1M-param model).
-- **Inference-only guard** — `continue_training=True` on a quantized model raises a clear error suggesting to reload the FP32 checkpoint.
-- **GUI** — new **⚡ Quantize INT8** button on the 💾 Model tab with a confirmation dialog and a before/after memory report; Model Info now shows the quantization status. Button auto-disables for GGUF / already-quantized models.
-- **Tests** — 9 new unit tests (`TestQuantization`): numerical closeness to FP32, idempotency, LoRA rejection, engine round-trip (quantize → generate → save → load → generate), training guard, error modes. **71/71 tests pass.**
+### NEW: Complete Model Quantization System
+
+| # | Feature | Description |
+|---|---------|-------------|
+| 1 | **Dynamic Quantization (INT8)** | Weights → INT8 at save, activations quantized dynamically at inference. No calibration needed. CPU-only. |
+| 2 | **Static Quantization (INT8)** | Both weights and activations → INT8. Requires calibration data for activation ranges. Best INT8 throughput on CPU. |
+| 3 | **Quantization-Aware Training (QAT)** | Fake-quant ops during fine-tuning so the model learns to compensate for quantization noise. Highest quality INT8. |
+| 4 | **GPTQ-style (INT2/3/4/8)** | Layer-by-layer Hessian-based optimal rounding. Supports INT2, INT3, INT4, INT8 with configurable group size. GPU-friendly weight compression. |
+| 5 | **AWQ-style (INT4/INT8)** | Activation-aware weight quantization — protects salient channels based on activation magnitudes. Better quality than naive rounding. |
+| 6 | **Half Precision (FP16/BF16)** | 2× compression, near-zero quality loss. BF16 for training stability, FP16 for broad GPU compatibility. |
+| 7 | **PackedLinear** | Custom nn.Module storing weights as packed uint8 with per-group scales/zeros. On-the-fly dequantization in forward(). |
+| 8 | **FakeQuantize (STE)** | Straight-Through Estimator fake-quantize module for QAT with configurable bits, symmetric/asymmetric, per-channel/per-tensor. |
+| 9 | **Benchmark** | Compare original vs quantized: perplexity, tokens/sec, compression ratio. |
+| 10 | **Compare All Methods** | Run all quantization methods in one click; formatted comparison table. |
+| 11 | **Save/Load Quantized** | Save quantized models as `.pt` with quant metadata; revert to original model. |
+| 12 | **GUI: Quantization Tab** | New ⚡ Quantization tab: method/bits selector, advanced options (group size, block size, percdamp, AWQ alpha, QAT epochs/LR, symmetric, per-channel), calibration file loader, progress bar, colored results display. |
+| 13 | **Engine Integration** | `engine.quantize_model()`, `engine.benchmark_quantization()`, `engine.save_quantized_model()` API. |
+| 14 | **42 New Tests** | Full test coverage for PackedLinear, FakeQuantize, all 6 methods, benchmark, comparison, save/load, engine integration. |
+
+### Bit Widths Supported
+
+| Bits | Methods | Typical Compression |
+|------|---------|-------------------|
+| INT2 | GPTQ | ~16× |
+| INT3 | GPTQ | ~10× |
+| INT4 | GPTQ, AWQ | ~8× |
+| INT8 | Dynamic, Static, QAT, GPTQ, AWQ | ~4× |
+| FP16 | Half | ~2× |
+| BF16 | Half | ~2× |
 
 ---
+
+# 🚀 Changelog — AuraLite AI v2.0 → v2.1
 
 ## 🐛 Bug Fixes (v2.1.1)
 

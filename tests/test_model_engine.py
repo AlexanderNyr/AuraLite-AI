@@ -15,7 +15,7 @@ from model_engine import (
     RMSNorm, Attention, FeedForward, TransformerBlock,
     ModernTransformer, CharDataset, CosineWarmupScheduler,
     AuraLiteEngine, validate_params, ParamValidationError,
-    LoRALayer, QuantizedLinear,
+    LoRALayer,
 )
 
 
@@ -696,106 +696,6 @@ class TestLoRALayer:
     def test_scaling(self, device):
         lora = LoRALayer(in_features=64, out_features=32, rank=8, alpha=16).to(device)
         assert lora.scaling == 2.0  # alpha/rank = 16/8 = 2
-
-
-# ======================================================================
-#  Quantization (INT8)
-# ======================================================================
-
-class TestQuantization:
-    def test_quantized_linear_close_to_fp32(self):
-        torch.manual_seed(0)
-        lin = torch.nn.Linear(64, 32, bias=False)
-        q = QuantizedLinear.from_linear(lin)
-        x = torch.randn(4, 64)
-        ref = lin(x)
-        out = q(x)
-        # INT8 per-channel weight-only: relative error should be tiny
-        rel_err = (out - ref).abs().max() / ref.abs().max().clamp(min=1e-6)
-        assert rel_err < 0.05
-        assert q.weight_int8.dtype == torch.int8
-
-    def test_quantized_linear_with_bias(self):
-        lin = torch.nn.Linear(16, 8, bias=True)
-        q = QuantizedLinear.from_linear(lin)
-        x = torch.randn(2, 16)
-        assert torch.allclose(q(x), lin(x), atol=0.1)
-
-    def test_model_quantize_int8(self):
-        model = ModernTransformer(vocab_size=50, d_model=32, n_heads=4,
-                                  n_layers=2, d_ff=64, max_seq_len=64)
-        n_before = model.count_parameters()
-        model.quantize_int8()
-        assert model.quantization == "int8"
-        assert model.count_quantized_parameters() > 0
-        # parameter count is preserved (int8 weights counted via buffers)
-        assert model.count_parameters() == n_before
-        # all attn/ffn projections replaced
-        for layer in model.layers:
-            assert isinstance(layer.attn.W_q, QuantizedLinear)
-            assert isinstance(layer.ffn.down, QuantizedLinear)
-        # forward still works
-        x = torch.randint(0, 50, (2, 16))
-        logits = model(x)
-        assert logits.shape == (2, 16, 50)
-        assert torch.isfinite(logits).all()
-
-    def test_quantize_idempotent(self):
-        model = ModernTransformer(vocab_size=20, d_model=16, n_heads=2,
-                                  n_layers=1, d_ff=32, max_seq_len=32)
-        model.quantize_int8()
-        model.quantize_int8()  # no-op, must not raise
-        assert model.quantization == "int8"
-
-    def test_quantize_rejects_lora(self):
-        model = ModernTransformer(vocab_size=20, d_model=16, n_heads=2,
-                                  n_layers=1, d_ff=32, max_seq_len=32)
-        model.enable_lora(rank=4)
-        with pytest.raises(ValueError):
-            model.quantize_int8()
-
-    def test_engine_quantize_generate_save_load(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, dict(tiny_params))
-        report = engine.quantize_model("int8")
-        assert report["params_quantized"] > 0
-        assert report["memory_mb_after"] < report["memory_mb_before"]
-        assert engine.is_quantized()
-
-        out = engine.generate("hello ", length=20)
-        assert isinstance(out, str) and len(out) > 0
-
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            path = f.name
-        try:
-            engine.save_model(path)
-            engine2 = AuraLiteEngine()
-            engine2.load_model(path)
-            assert engine2.is_quantized()
-            out2 = engine2.generate("hello ", length=20)
-            assert isinstance(out2, str) and len(out2) > 0
-        finally:
-            os.unlink(path)
-
-    def test_engine_quantize_blocks_continue_training(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, dict(tiny_params))
-        engine.quantize_model("int8")
-        params = dict(tiny_params)
-        params["continue_training"] = True
-        with pytest.raises(ValueError):
-            engine.train(small_text, params)
-
-    def test_engine_quantize_requires_model(self):
-        engine = AuraLiteEngine()
-        with pytest.raises(ValueError):
-            engine.quantize_model("int8")
-
-    def test_engine_quantize_bad_mode(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, dict(tiny_params))
-        with pytest.raises(ValueError):
-            engine.quantize_model("int4")
 
 
 # ======================================================================

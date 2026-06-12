@@ -30,18 +30,6 @@ try:
 except (RuntimeError, ValueError):
     pass
 
-# Keep full float32 quality, but let PyTorch choose the fastest high-precision
-# matmul kernels available on the current CPU/GPU backend.
-try:
-    torch.set_float32_matmul_precision("high")
-except Exception:
-    pass
-
-try:
-    torch.backends.mkldnn.enabled = True
-except Exception:
-    pass
-
 
 # ===================================================================
 #  Parameter Validation
@@ -68,8 +56,6 @@ def validate_params(params: dict) -> list[str]:
     bpe_vocab_size = params.get("bpe_vocab_size", 512)
     val_split = params.get("val_split", 0.1)
     accumulation_steps = params.get("accumulation_steps", 1)
-    sample_stride = params.get("sample_stride", 1)
-    val_interval = params.get("val_interval", 1)
 
     if d_model <= 0:
         errors.append(f"d_model must be > 0, got {d_model}")
@@ -100,10 +86,6 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"val_split must be in (0, 1), got {val_split}")
     if accumulation_steps < 1:
         errors.append(f"accumulation_steps must be >= 1, got {accumulation_steps}")
-    if sample_stride < 1:
-        errors.append(f"sample_stride must be >= 1, got {sample_stride}")
-    if val_interval < 0:
-        errors.append(f"val_interval must be >= 0, got {val_interval}")
 
     return errors
 
@@ -502,67 +484,6 @@ class RMSNorm(nn.Module):
 
 # -------------------------------------------------------------------
 
-class QuantizedLinear(nn.Module):
-    """INT8 weight-only quantized drop-in replacement for nn.Linear.
-
-    Weights are stored as int8 with a per-output-channel symmetric scale
-    (the same scheme used by llama.cpp Q8_0 and bitsandbytes int8).
-    On forward the weights are dequantized to the activation dtype and a
-    regular F.linear is performed, so it works on both CPU and CUDA with
-    no extra dependencies.
-
-    Memory: 4x smaller than FP32 (1 byte/weight + one fp32 scale per row).
-    Quality: typically < 0.1 perplexity degradation for weight-only INT8.
-    Quantized layers are inference-only (no gradients flow to the weights).
-    """
-
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
-        super().__init__()
-        self.in_features  = in_features
-        self.out_features = out_features
-        self.register_buffer(
-            "weight_int8",
-            torch.zeros(out_features, in_features, dtype=torch.int8),
-            persistent=True,
-        )
-        self.register_buffer(
-            "scale",
-            torch.ones(out_features, dtype=torch.float32),
-            persistent=True,
-        )
-        if bias:
-            self.register_buffer("bias", torch.zeros(out_features), persistent=True)
-        else:
-            self.bias = None
-
-    @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "QuantizedLinear":
-        """Quantize an existing nn.Linear into a QuantizedLinear."""
-        q = cls(linear.in_features, linear.out_features,
-                bias=linear.bias is not None)
-        with torch.no_grad():
-            w = linear.weight.detach().float().cpu()
-            # per-output-channel symmetric scale: max|w| / 127
-            scale = w.abs().amax(dim=1).clamp(min=1e-8) / 127.0
-            q.weight_int8.copy_(
-                torch.round(w / scale[:, None]).clamp_(-127, 127).to(torch.int8))
-            q.scale.copy_(scale)
-            if linear.bias is not None:
-                q.bias.copy_(linear.bias.detach().float().cpu())
-        return q
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = (self.weight_int8.to(torch.float32) * self.scale[:, None]).to(x.dtype)
-        b = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, b)
-
-    def extra_repr(self) -> str:
-        return (f"in_features={self.in_features}, "
-                f"out_features={self.out_features}, quant=int8")
-
-
-# -------------------------------------------------------------------
-
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -816,9 +737,6 @@ class ModernTransformer(nn.Module):
         self.lora_adapters: list | None = None
         self.lora_rank = 0
 
-        # Quantization state ("none" or "int8")
-        self.quantization = "none"
-
     @staticmethod
     def _init_weights(module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -846,11 +764,7 @@ class ModernTransformer(nn.Module):
             layer.attn.reset_cache()
 
     def count_parameters(self) -> int:
-        n = sum(p.numel() for p in self.parameters())
-        # quantized weights live in buffers, not parameters
-        n += sum(m.weight_int8.numel() for m in self.modules()
-                 if isinstance(m, QuantizedLinear))
-        return n
+        return sum(p.numel() for p in self.parameters())
 
     def count_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -905,55 +819,6 @@ class ModernTransformer(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
 
-    # ---- Quantization Support (NEW) -----------------------------------
-    def quantize_int8(self):
-        """Quantize all attention + FFN linear layers to INT8 (in-place).
-
-        Weight-only, per-channel symmetric INT8. The embedding / output head
-        stays in FP32 (it is weight-tied and tiny relative to the rest, and
-        keeping it full precision preserves output quality).
-
-        After quantization the model is **inference-only** — to keep
-        training, save a checkpoint first and reload the FP32 version.
-        Works on CPU and CUDA. Returns self for chaining.
-        """
-        if self.quantization == "int8":
-            return self  # already quantized
-        if self.lora_rank > 0:
-            raise ValueError(
-                "Cannot quantize a model with active LoRA adapters. "
-                "Merge or disable LoRA first (disable_lora()).")
-
-        device = next(self.parameters()).device
-        for layer in self.layers:
-            attn, ffn = layer.attn, layer.ffn
-            for parent, name in ((attn, "W_q"), (attn, "W_k"),
-                                 (attn, "W_v"), (attn, "W_o"),
-                                 (ffn, "gate"), (ffn, "up"), (ffn, "down")):
-                mod = getattr(parent, name)
-                if isinstance(mod, nn.Linear):
-                    setattr(parent, name, QuantizedLinear.from_linear(mod))
-
-        self.quantization = "int8"
-        self.to(device)
-        self.eval()
-        return self
-
-    def count_quantized_parameters(self) -> int:
-        """Number of weights stored as INT8."""
-        return sum(m.weight_int8.numel() for m in self.modules()
-                   if isinstance(m, QuantizedLinear))
-
-    def estimate_memory_mb(self) -> float:
-        """Approximate in-memory size of all weights (MB)."""
-        total = 0
-        for p in self.parameters():
-            total += p.numel() * p.element_size()
-        for b in self.buffers():
-            total += b.numel() * b.element_size()
-        # weight tying: embedding == head, counted once by parameters()
-        return total / (1024 ** 2)
-
 
 class LoRALayer(nn.Module):
     """LoRA (Low-Rank Adaptation) adapter for a linear layer.
@@ -982,30 +847,23 @@ class LoRALayer(nn.Module):
 # ===================================================================
 
 class CharDataset(Dataset):
-    """Token-level block dataset backed by one in-memory LongTensor.
+    """Sliding-window token-level dataset backed by one in-memory LongTensor.
 
     The full corpus is tokenised exactly once before training and stored as a
     single `torch.LongTensor`. We then create window *views* via `unfold()` so
     the DataLoader reads pre-tokenised tensors instead of repeatedly slicing raw
     Python text/list data on the hot path.
-
-    `stride=1` preserves the original exhaustive sliding-window behaviour.
-    Larger strides are much faster on CPU. With dense next-token loss, a stride
-    near `seq_length` is the standard non-overlapping LM-block setup: each token
-    is still trained through the loss, but the same token is not repeated in
-    dozens of nearly identical shifted windows every epoch.
     """
 
-    def __init__(self, encoded: torch.Tensor, seq_length: int, stride: int = 1):
+    def __init__(self, encoded: torch.Tensor, seq_length: int):
         self.data = encoded.contiguous()
-        self.seq_length = int(seq_length)
-        self.stride = max(1, int(stride))
+        self.seq_length = seq_length
 
         if len(self.data) <= self.seq_length:
             self.x = self.data.new_empty((0, self.seq_length))
             self.y = self.data.new_empty((0, self.seq_length))
         else:
-            windows = self.data.unfold(0, self.seq_length + 1, self.stride)
+            windows = self.data.unfold(0, self.seq_length + 1, 1)
             self.x = windows[:, :-1]
             self.y = windows[:, 1:]
 
@@ -1477,9 +1335,6 @@ class AuraLiteEngine:
           autosave_path    : where to autosave (default "aura_autosave.pt")
           continue_training: keep existing model/tokenizer and fine-tune (default False)
           accumulation_steps: gradient accumulation (default 1, no accumulation)
-          sample_stride    : training-window stride; 1 = exact old behaviour,
-                             seq_length = fast non-overlapping CPU blocks
-          val_interval     : run validation every N epochs; 0 = disabled
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
@@ -1488,12 +1343,6 @@ class AuraLiteEngine:
             raise ValueError(
                 ".gguf models are inference-only in AuraLite. "
                 "Uncheck 'Continue training current model' to train a new AuraLite .pt model."
-            )
-        if (params.get("continue_training", False) and self.model is not None
-                and getattr(self.model, "quantization", "none") != "none"):
-            raise ValueError(
-                "The current model is INT8-quantized and inference-only. "
-                "Load the original FP32 .pt checkpoint to continue training."
             )
 
         errors = validate_params(params)
@@ -1521,22 +1370,11 @@ class AuraLiteEngine:
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
         accumulation_steps = params.get("accumulation_steps", 1)
-        sample_stride = int(params.get("sample_stride", 1))
-        val_interval = int(params.get("val_interval", 1))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
         resume_training_state = params.get("resume_training_state", True)
 
-        sample_stride = max(1, sample_stride)
-        if sample_stride > seq_length:
-            print(f"[AuraLite] WARNING: sample_stride={sample_stride} is larger than "
-                  f"seq_length={seq_length}; clamping to seq_length so tokens are not skipped.")
-            sample_stride = seq_length
-        val_interval = max(0, val_interval)
-
         self.params_used = dict(params)
-        self.params_used["sample_stride"] = sample_stride
-        self.params_used["val_interval"] = val_interval
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
@@ -1594,29 +1432,10 @@ class AuraLiteEngine:
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank)
 
-        optim_params = [p for p in self.model.parameters() if p.requires_grad]
-        if not optim_params:
-            raise ValueError("No trainable parameters found for the optimizer.")
-
-        adamw_kwargs = dict(
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.95),
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), lr=lr,
+            weight_decay=weight_decay, betas=(0.9, 0.95),
         )
-        # foreach usually speeds up AdamW parameter updates on CPU; fused is a
-        # safe CUDA fast path. Fall back automatically if a PyTorch build does
-        # not support the requested variant.
-        if self.device.type == "cpu":
-            adamw_kwargs["foreach"] = True
-        elif self.device.type == "cuda":
-            adamw_kwargs["fused"] = True
-
-        try:
-            self.optimizer = optim.AdamW(optim_params, **adamw_kwargs)
-        except (TypeError, RuntimeError):
-            adamw_kwargs.pop("foreach", None)
-            adamw_kwargs.pop("fused", None)
-            self.optimizer = optim.AdamW(optim_params, **adamw_kwargs)
         if optimizer_state_to_restore is not None:
             try:
                 self.optimizer.load_state_dict(optimizer_state_to_restore)
@@ -1658,7 +1477,7 @@ class AuraLiteEngine:
         val_data = None
         train_data = encoded
 
-        if val_split > 0 and val_interval != 0:
+        if val_split > 0:
             if total_tokens < min_train_tokens + min_val_tokens:
                 print(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
                       f"encoding, need at least {min_train_tokens + min_val_tokens} "
@@ -1681,32 +1500,15 @@ class AuraLiteEngine:
                       f"({n_train_samples} samples), {len(val_data)} val tokens "
                       f"({n_val_samples} samples), seq_length={seq_length}")
 
-        dataset = CharDataset(train_data, seq_length, stride=sample_stride)
+        dataset = CharDataset(train_data, seq_length)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
             )
 
-        if sample_stride > 1:
-            exhaustive = max(1, len(train_data) - seq_length)
-            approx_speedup = exhaustive / max(1, len(dataset))
-            print(f"[AuraLite] CPU-friendly training windows: stride={sample_stride} "
-                  f"=> {len(dataset):,} samples instead of {exhaustive:,} "
-                  f"(~{approx_speedup:.1f}× fewer batches per epoch).")
-        else:
-            print(f"[AuraLite] Training windows: stride=1, {len(dataset):,} samples "
-                  f"(exhaustive sliding windows).")
-
-        # The dataset is already a single in-memory tensor and __getitem__ is a
-        # cheap view. On CPU, DataLoader worker processes usually compete with
-        # PyTorch's own BLAS/OpenMP threads and can make training slower. Keep
-        # workers for CUDA prefetching, but default to zero workers on CPU.
-        if self.device.type == "cpu":
-            num_workers = 0
-        else:
-            use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
-            num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
-
+        # IMPROVED: better worker count heuristic
+        use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
+        num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
         loader_kwargs: dict = dict(
             batch_size=batch_size,
             shuffle=True,
@@ -1722,9 +1524,7 @@ class AuraLiteEngine:
 
         val_loader = None
         if val_data is not None:
-            # Keep validation exhaustive (stride=1) so val_loss stays comparable
-            # across different training strides. Use val_interval to reduce cost.
-            val_ds = CharDataset(val_data, seq_length, stride=1)
+            val_ds = CharDataset(val_data, seq_length)
             if len(val_ds) > 0:
                 # Use a batch size that's guaranteed not to drop everything;
                 # never larger than the val set itself.
@@ -1738,8 +1538,7 @@ class AuraLiteEngine:
                       f"(val_data has {len(val_data)} tokens, need > {seq_length}). "
                       f"Validation DISABLED.")
 
-        steps_per_epoch = math.ceil(len(loader) / max(1, accumulation_steps))
-        total_steps  = epochs * steps_per_epoch
+        total_steps  = epochs * len(loader)
         warmup_steps = min(200, total_steps // 10)
         self.scheduler = CosineWarmupScheduler(
             self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
@@ -1842,12 +1641,7 @@ class AuraLiteEngine:
                 self.scheduler.step()
 
             val_loss = None
-            should_validate = (
-                val_loader is not None
-                and val_interval > 0
-                and ((epoch + 1) % val_interval == 0 or (epoch + 1) == epochs)
-            )
-            if should_validate:
+            if val_loader is not None:
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
 
@@ -2181,61 +1975,6 @@ class AuraLiteEngine:
         probs = torch.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).item()
 
-    # ---- Quantization (NEW) --------------------------------------------
-    def quantize_model(self, mode: str = "int8") -> dict:
-        """Quantize the in-memory native model for faster / lighter inference.
-
-        Args:
-            mode: only "int8" is currently supported (weight-only,
-                  per-channel symmetric — llama.cpp Q8_0-style).
-
-        Returns a small report dict:
-            {"params_quantized", "params_total", "memory_mb_before",
-             "memory_mb_after"}
-
-        Notes:
-            * GGUF models are already quantized — raises ValueError.
-            * The quantized model is inference-only; `continue_training`
-              will be rejected. Save the FP32 checkpoint first if you may
-              want to fine-tune later.
-            * A quantized model can be saved/loaded as a .pt checkpoint
-              (the INT8 weights + scales are stored, ~4x smaller).
-        """
-        if self.model is None:
-            raise ValueError("Train or load a model first!")
-        if self.is_gguf_model():
-            raise ValueError(
-                ".gguf models are already quantized (llama.cpp). "
-                "Quantization applies only to native AuraLite .pt models.")
-        if mode != "int8":
-            raise ValueError(f"Unsupported quantization mode: {mode!r} "
-                             "(only 'int8' is available)")
-        if getattr(self.model, "quantization", "none") == "int8":
-            raise ValueError("Model is already INT8-quantized.")
-
-        mem_before = self.model.estimate_memory_mb()
-        self.model.quantize_int8()
-        mem_after = self.model.estimate_memory_mb()
-
-        # Optimizer state refers to tensors that no longer exist — drop it.
-        self.optimizer = None
-        self.scheduler = None
-        self.scaler = None
-        self._resume_optimizer_state = None
-        self._resume_scheduler_state = None
-        self._resume_scaler_state = None
-
-        return {
-            "params_quantized": self.model.count_quantized_parameters(),
-            "params_total":     self.model.count_parameters(),
-            "memory_mb_before": mem_before,
-            "memory_mb_after":  mem_after,
-        }
-
-    def is_quantized(self) -> bool:
-        return (self.model is not None
-                and getattr(self.model, "quantization", "none") != "none")
-
     # ---- Save / Load --------------------------------------------------
     def save_model(self, path: str):
         if self.model is None:
@@ -2264,7 +2003,6 @@ class AuraLiteEngine:
             "max_seq_len":  self.model.max_seq_len,
             "use_alibi":    self.model.use_alibi,
             "lora_rank":    self.model.lora_rank,
-            "quantization": getattr(self.model, "quantization", "none"),
         }
         torch.save(checkpoint, path)
 
@@ -2328,21 +2066,6 @@ class AuraLiteEngine:
         if lora_rank > 0:
             self.model.enable_lora(rank=lora_rank)
 
-        # Quantized checkpoints store INT8 buffers instead of FP32 weights —
-        # swap in empty QuantizedLinear shells so the state dict keys match.
-        if checkpoint.get("quantization", "none") == "int8":
-            for layer in self.model.layers:
-                attn, ffn = layer.attn, layer.ffn
-                for parent, name in ((attn, "W_q"), (attn, "W_k"),
-                                     (attn, "W_v"), (attn, "W_o"),
-                                     (ffn, "gate"), (ffn, "up"), (ffn, "down")):
-                    mod = getattr(parent, name)
-                    if isinstance(mod, nn.Linear):
-                        setattr(parent, name, QuantizedLinear(
-                            mod.in_features, mod.out_features,
-                            bias=mod.bias is not None))
-            self.model.quantization = "int8"
-
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
         self.model.eval()
@@ -2355,6 +2078,83 @@ class AuraLiteEngine:
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
+
+    # ---- Quantization Integration (NEW v2.2) ---------------------------
+    def quantize_model(self, method: str = "dynamic", bits: str = "int8",
+                       calibration_text: str = "",
+                       progress_callback=None,
+                       **kwargs) -> "tuple[Any, Any]":
+        """Quantize the current model.
+
+        Args:
+            method: "dynamic", "static", "qat", "gptq", "awq", "half"
+            bits: "int2", "int3", "int4", "int8", "fp16", "bf16"
+            calibration_text: text for calibration (needed for static/gptq/awq/qat)
+            progress_callback(step, total, message): optional
+            **kwargs: extra QuantConfig fields
+
+        Returns:
+            (quantized_model, QuantResult)
+        """
+        if self.model is None:
+            raise ValueError("No model to quantize — train or load a model first!")
+        if self.is_gguf_model():
+            raise ValueError(
+                "GGUF models are already quantized externally. "
+                "Quantization only works on native AuraLite .pt models.")
+
+        from quantization import (QuantizationEngine, QuantConfig,
+                                  QuantMethod, BitWidth)
+
+        config = QuantConfig(
+            method=QuantMethod(method),
+            bits=BitWidth(bits),
+            calibration_text=calibration_text,
+            **kwargs,
+        )
+
+        engine = QuantizationEngine()
+        q_model, result = engine.quantize(
+            self.model, config,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            progress_callback=progress_callback,
+        )
+
+        if not result.errors:
+            self.model = q_model
+            print(f"[AuraLite] Quantization complete: {result.method} {result.bits} "
+                  f"({result.original_size_mb:.2f} → {result.quantized_size_mb:.2f} MB, "
+                  f"{result.compression_ratio:.2f}×)")
+
+        return q_model, result
+
+    def benchmark_quantization(self, original_model, quantized_model,
+                               text: str, seq_length: int = 64,
+                               progress_callback=None):
+        """Benchmark original vs quantized model."""
+        from quantization import QuantizationEngine
+        engine = QuantizationEngine()
+        return engine.benchmark(
+            original_model, quantized_model,
+            self.tokenizer, text, self.device,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+        )
+
+    def save_quantized_model(self, path: str, config=None, result=None):
+        """Save the quantized model."""
+        if self.model is None:
+            raise ValueError("No model to save!")
+        from quantization import QuantizationEngine, QuantConfig
+        if config is None:
+            config = QuantConfig()
+        QuantizationEngine.save_quantized(
+            self.model, path, config,
+            tokenizer=self.tokenizer,
+            params_used=self.params_used,
+            result=result,
+        )
 
     # ---- Config Management (NEW) --------------------------------------
     def save_config(self, path: str, params: dict):
