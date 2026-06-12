@@ -33,26 +33,31 @@ CONFIG_PRESETS = {
         "d_model": 64, "d_ff": 128, "n_heads": 2, "n_layers": 2,
         "seq_length": 32, "batch_size": 16, "lr": 0.001, "epochs": 200,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "sample_stride": 32, "val_interval": 5,
     },
     "Small (default)": {
         "d_model": 128, "d_ff": 256, "n_heads": 4, "n_layers": 4,
         "seq_length": 64, "batch_size": 32, "lr": 0.0003, "epochs": 100,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "sample_stride": 1, "val_interval": 1,
     },
     "Medium (GPU recommended)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "sample_stride": 1, "val_interval": 1,
     },
     "Large (powerful GPU)": {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
         "seq_length": 256, "batch_size": 32, "lr": 0.0001, "epochs": 30,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "sample_stride": 1, "val_interval": 1,
     },
     "GQA-efficient (Medium)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 2,
+        "sample_stride": 1, "val_interval": 1,
     },
 }
 
@@ -386,6 +391,23 @@ class AIApp:
         self.lora_var = tk.StringVar(value="0")
         ttk.Entry(row1b, textvariable=self.lora_var,
                   width=4).pack(side=tk.LEFT, padx=2)
+
+        row1c = ttk.Frame(tok_frame)
+        row1c.pack(fill=tk.X, pady=2)
+        ttk.Label(row1c, text="CPU Train Stride:").pack(side=tk.LEFT, padx=4)
+        self.sample_stride_var = tk.StringVar(value="1")
+        ttk.Entry(row1c, textvariable=self.sample_stride_var,
+                  width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1c, text="(1=exact, set to Seq for much faster CPU)",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row1c, text="Validate every N epochs:").pack(
+            side=tk.LEFT, padx=(16, 4))
+        self.val_interval_var = tk.StringVar(value="1")
+        ttk.Entry(row1c, textvariable=self.val_interval_var,
+                  width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1c, text="(0=off)", style="Sub.TLabel").pack(
+            side=tk.LEFT, padx=2)
 
         row2 = ttk.Frame(tok_frame)
         row2.pack(fill=tk.X, pady=2)
@@ -897,6 +919,10 @@ class AIApp:
         for key, value in preset.items():
             if key == "n_kv_heads":
                 self.n_kv_heads_var.set(str(value))
+            elif key == "sample_stride":
+                self.sample_stride_var.set(str(value))
+            elif key == "val_interval":
+                self.val_interval_var.set(str(value))
             else:
                 if key in self.params:
                     self.params[key].set(str(value))
@@ -1076,6 +1102,8 @@ class AIApp:
                 "autosave_every":  int(self.autosave_var.get()),
                 "n_kv_heads":      int(self.n_kv_heads_var.get()) or None,
                 "accumulation_steps": int(self.accum_var.get()) or 1,
+                "sample_stride":       int(self.sample_stride_var.get()) or 1,
+                "val_interval":        int(self.val_interval_var.get()),
                 "use_alibi":         bool(self.alibi_var.get()),
                 "lora_rank":         int(self.lora_var.get()) or 0,
             }
@@ -1719,6 +1747,8 @@ class AIApp:
                 "autosave_every": int(self.autosave_var.get()),
                 "n_kv_heads": int(self.n_kv_heads_var.get()) or None,
                 "accumulation_steps": int(self.accum_var.get()) or 1,
+                "sample_stride": int(self.sample_stride_var.get()) or 1,
+                "val_interval": int(self.val_interval_var.get()),
                 "use_alibi": bool(self.alibi_var.get()),
                 "lora_rank": int(self.lora_var.get()) or 0,
             }
@@ -1755,6 +1785,10 @@ class AIApp:
                 self.n_kv_heads_var.set(str(config["n_kv_heads"] or 0))
             if "accumulation_steps" in config:
                 self.accum_var.set(str(config["accumulation_steps"]))
+            if "sample_stride" in config:
+                self.sample_stride_var.set(str(config["sample_stride"]))
+            if "val_interval" in config:
+                self.val_interval_var.set(str(config["val_interval"]))
             if "lora_rank" in config:
                 self.lora_var.set(str(config["lora_rank"]))
             if "use_compile" in config:

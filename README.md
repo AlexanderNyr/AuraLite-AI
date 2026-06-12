@@ -85,4 +85,5 @@ To bundle the application into a portable application folder:
 ## ⚠️ Hardware Compatibility Note
 - **CUDA Acceleration**: Requires an NVIDIA GPU with Compute Capability 5.0 or higher.
 - **CPU Fallback**: If a compatible GPU is not detected, AuraLite AI automatically switches to CPU mode. While slower, it remains fully functional.
-- **Memory Tip**: For CPU-only users, keeping `D_Model` at 64 and `Seq Length` at 16 is recommended for optimal performance.
+- **Memory Tip**: For CPU-only users, keeping `D_Model` at 64 and `Seq Length` at 16–64 is recommended for optimal performance.
+- **CPU Training Speed Tip**: The Training tab includes `CPU Train Stride`. `1` keeps the original exhaustive sliding-window dataset. Setting it close/equal to `Seq Length` uses non-overlapping dense-loss LM blocks and can reduce CPU batches per epoch by roughly `Seq Length`× with little practical quality loss on typical corpora. Watch `val loss` to confirm for your data. `Validate every N epochs` can also be increased (e.g. `5`) to save monitoring overhead without changing training updates.

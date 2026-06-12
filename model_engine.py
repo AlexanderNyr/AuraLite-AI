@@ -30,6 +30,18 @@ try:
 except (RuntimeError, ValueError):
     pass
 
+# Keep full float32 quality, but let PyTorch choose the fastest high-precision
+# matmul kernels available on the current CPU/GPU backend.
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+try:
+    torch.backends.mkldnn.enabled = True
+except Exception:
+    pass
+
 
 # ===================================================================
 #  Parameter Validation
@@ -56,6 +68,8 @@ def validate_params(params: dict) -> list[str]:
     bpe_vocab_size = params.get("bpe_vocab_size", 512)
     val_split = params.get("val_split", 0.1)
     accumulation_steps = params.get("accumulation_steps", 1)
+    sample_stride = params.get("sample_stride", 1)
+    val_interval = params.get("val_interval", 1)
 
     if d_model <= 0:
         errors.append(f"d_model must be > 0, got {d_model}")
@@ -86,6 +100,10 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"val_split must be in (0, 1), got {val_split}")
     if accumulation_steps < 1:
         errors.append(f"accumulation_steps must be >= 1, got {accumulation_steps}")
+    if sample_stride < 1:
+        errors.append(f"sample_stride must be >= 1, got {sample_stride}")
+    if val_interval < 0:
+        errors.append(f"val_interval must be >= 0, got {val_interval}")
 
     return errors
 
@@ -847,23 +865,30 @@ class LoRALayer(nn.Module):
 # ===================================================================
 
 class CharDataset(Dataset):
-    """Sliding-window token-level dataset backed by one in-memory LongTensor.
+    """Token-level block dataset backed by one in-memory LongTensor.
 
     The full corpus is tokenised exactly once before training and stored as a
     single `torch.LongTensor`. We then create window *views* via `unfold()` so
     the DataLoader reads pre-tokenised tensors instead of repeatedly slicing raw
     Python text/list data on the hot path.
+
+    `stride=1` preserves the original exhaustive sliding-window behaviour.
+    Larger strides are much faster on CPU. With dense next-token loss, a stride
+    near `seq_length` is the standard non-overlapping LM-block setup: each token
+    is still trained through the loss, but the same token is not repeated in
+    dozens of nearly identical shifted windows every epoch.
     """
 
-    def __init__(self, encoded: torch.Tensor, seq_length: int):
+    def __init__(self, encoded: torch.Tensor, seq_length: int, stride: int = 1):
         self.data = encoded.contiguous()
-        self.seq_length = seq_length
+        self.seq_length = int(seq_length)
+        self.stride = max(1, int(stride))
 
         if len(self.data) <= self.seq_length:
             self.x = self.data.new_empty((0, self.seq_length))
             self.y = self.data.new_empty((0, self.seq_length))
         else:
-            windows = self.data.unfold(0, self.seq_length + 1, 1)
+            windows = self.data.unfold(0, self.seq_length + 1, self.stride)
             self.x = windows[:, :-1]
             self.y = windows[:, 1:]
 
@@ -1335,6 +1360,9 @@ class AuraLiteEngine:
           autosave_path    : where to autosave (default "aura_autosave.pt")
           continue_training: keep existing model/tokenizer and fine-tune (default False)
           accumulation_steps: gradient accumulation (default 1, no accumulation)
+          sample_stride    : training-window stride; 1 = exact old behaviour,
+                             seq_length = fast non-overlapping CPU blocks
+          val_interval     : run validation every N epochs; 0 = disabled
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
@@ -1370,11 +1398,22 @@ class AuraLiteEngine:
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
         accumulation_steps = params.get("accumulation_steps", 1)
+        sample_stride = int(params.get("sample_stride", 1))
+        val_interval = int(params.get("val_interval", 1))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
         resume_training_state = params.get("resume_training_state", True)
 
+        sample_stride = max(1, sample_stride)
+        if sample_stride > seq_length:
+            print(f"[AuraLite] WARNING: sample_stride={sample_stride} is larger than "
+                  f"seq_length={seq_length}; clamping to seq_length so tokens are not skipped.")
+            sample_stride = seq_length
+        val_interval = max(0, val_interval)
+
         self.params_used = dict(params)
+        self.params_used["sample_stride"] = sample_stride
+        self.params_used["val_interval"] = val_interval
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
@@ -1432,10 +1471,29 @@ class AuraLiteEngine:
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank)
 
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=lr,
-            weight_decay=weight_decay, betas=(0.9, 0.95),
+        optim_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not optim_params:
+            raise ValueError("No trainable parameters found for the optimizer.")
+
+        adamw_kwargs = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
         )
+        # foreach usually speeds up AdamW parameter updates on CPU; fused is a
+        # safe CUDA fast path. Fall back automatically if a PyTorch build does
+        # not support the requested variant.
+        if self.device.type == "cpu":
+            adamw_kwargs["foreach"] = True
+        elif self.device.type == "cuda":
+            adamw_kwargs["fused"] = True
+
+        try:
+            self.optimizer = optim.AdamW(optim_params, **adamw_kwargs)
+        except (TypeError, RuntimeError):
+            adamw_kwargs.pop("foreach", None)
+            adamw_kwargs.pop("fused", None)
+            self.optimizer = optim.AdamW(optim_params, **adamw_kwargs)
         if optimizer_state_to_restore is not None:
             try:
                 self.optimizer.load_state_dict(optimizer_state_to_restore)
@@ -1477,7 +1535,7 @@ class AuraLiteEngine:
         val_data = None
         train_data = encoded
 
-        if val_split > 0:
+        if val_split > 0 and val_interval != 0:
             if total_tokens < min_train_tokens + min_val_tokens:
                 print(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
                       f"encoding, need at least {min_train_tokens + min_val_tokens} "
@@ -1500,15 +1558,32 @@ class AuraLiteEngine:
                       f"({n_train_samples} samples), {len(val_data)} val tokens "
                       f"({n_val_samples} samples), seq_length={seq_length}")
 
-        dataset = CharDataset(train_data, seq_length)
+        dataset = CharDataset(train_data, seq_length, stride=sample_stride)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
             )
 
-        # IMPROVED: better worker count heuristic
-        use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
-        num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
+        if sample_stride > 1:
+            exhaustive = max(1, len(train_data) - seq_length)
+            approx_speedup = exhaustive / max(1, len(dataset))
+            print(f"[AuraLite] CPU-friendly training windows: stride={sample_stride} "
+                  f"=> {len(dataset):,} samples instead of {exhaustive:,} "
+                  f"(~{approx_speedup:.1f}× fewer batches per epoch).")
+        else:
+            print(f"[AuraLite] Training windows: stride=1, {len(dataset):,} samples "
+                  f"(exhaustive sliding windows).")
+
+        # The dataset is already a single in-memory tensor and __getitem__ is a
+        # cheap view. On CPU, DataLoader worker processes usually compete with
+        # PyTorch's own BLAS/OpenMP threads and can make training slower. Keep
+        # workers for CUDA prefetching, but default to zero workers on CPU.
+        if self.device.type == "cpu":
+            num_workers = 0
+        else:
+            use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
+            num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
+
         loader_kwargs: dict = dict(
             batch_size=batch_size,
             shuffle=True,
@@ -1524,7 +1599,9 @@ class AuraLiteEngine:
 
         val_loader = None
         if val_data is not None:
-            val_ds = CharDataset(val_data, seq_length)
+            # Keep validation exhaustive (stride=1) so val_loss stays comparable
+            # across different training strides. Use val_interval to reduce cost.
+            val_ds = CharDataset(val_data, seq_length, stride=1)
             if len(val_ds) > 0:
                 # Use a batch size that's guaranteed not to drop everything;
                 # never larger than the val set itself.
@@ -1538,7 +1615,8 @@ class AuraLiteEngine:
                       f"(val_data has {len(val_data)} tokens, need > {seq_length}). "
                       f"Validation DISABLED.")
 
-        total_steps  = epochs * len(loader)
+        steps_per_epoch = math.ceil(len(loader) / max(1, accumulation_steps))
+        total_steps  = epochs * steps_per_epoch
         warmup_steps = min(200, total_steps // 10)
         self.scheduler = CosineWarmupScheduler(
             self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
@@ -1641,7 +1719,12 @@ class AuraLiteEngine:
                 self.scheduler.step()
 
             val_loss = None
-            if val_loader is not None:
+            should_validate = (
+                val_loader is not None
+                and val_interval > 0
+                and ((epoch + 1) % val_interval == 0 or (epoch + 1) == epochs)
+            )
+            if should_validate:
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
 
