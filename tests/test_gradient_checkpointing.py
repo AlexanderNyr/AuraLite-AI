@@ -1,6 +1,7 @@
 """Tests for Gradient Checkpointing feature (v2.3)."""
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
 from model_engine import ModernTransformer, validate_params
 
 

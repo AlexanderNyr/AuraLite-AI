@@ -7,7 +7,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from model_engine import (
     ModernTransformer, AuraLiteEngine, CharTokenizer, BPETokenizer,
 )
