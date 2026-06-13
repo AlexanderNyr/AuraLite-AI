@@ -576,8 +576,8 @@ class HuggingFaceProxy:
                     avg = total_loss / (step + 1)
                     progress_callback(epoch + 1, epochs, avg, None)
 
+            avg_loss = total_loss / max(1, len(loader))
             if progress_callback:
-                avg_loss = total_loss / max(1, len(loader))
                 progress_callback(epoch + 1, epochs, avg_loss, None)
 
             print(f"[AuraLite-HF] Epoch {epoch+1}/{epochs} — loss: {avg_loss:.4f}")

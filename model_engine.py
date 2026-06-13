@@ -620,6 +620,10 @@ class Attention(nn.Module):
             cos = angles.cos()[None, :, None, :]
             sin = angles.sin()[None, :, None, :]
         else:
+            if start_pos + seq_len > len(self.rope_cos):
+                self._build_rope_buffers(start_pos + seq_len)
+                self.rope_cos = self.rope_cos.to(x.device)
+                self.rope_sin = self.rope_sin.to(x.device)
             cos = self.rope_cos[start_pos:start_pos + seq_len]  # (T, hd//2)
             sin = self.rope_sin[start_pos:start_pos + seq_len]
             cos = cos[None, :, None, :]
