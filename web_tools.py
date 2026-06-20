@@ -19,6 +19,7 @@ import re
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from pathlib import Path
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -243,3 +244,104 @@ def build_web_context(query: str, max_results: int = 4,
     if len(context) > max_chars:
         context = context[:max_chars].rsplit(" ", 1)[0] + "…"
     return context
+
+# ===================================================================
+#  v2.4 RAG upgrade: semantic chunking + optional persistent vector store
+# ===================================================================
+
+class SimpleVectorStore:
+    """Small persistent vector store with optional sentence-transformers.
+
+    It intentionally has no hard dependency: if sentence-transformers/faiss/chroma
+    are unavailable, AuraLite falls back to a hashed bag-of-words embedding stored
+    as JSON.  This keeps RAG educational and runnable on pure CPU.
+    """
+
+    def __init__(self, path: str = "rag_store.json", dim: int = 384):
+        self.path = Path(path)
+        self.dim = int(dim)
+        self.items: list[dict] = []
+        self._model = None
+        try:  # optional semantic encoder
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            self._model = None
+        if self.path.exists():
+            try:
+                self.items = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self.items = []
+
+    def _embed(self, text: str) -> list[float]:
+        if self._model is not None:  # pragma: no cover - optional
+            vec = self._model.encode([text], normalize_embeddings=True)[0]
+            return [float(x) for x in vec]
+        import hashlib, math
+        vec = [0.0] * self.dim
+        for tok in re.findall(r"\w+", text.lower()):
+            h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+            vec[h % self.dim] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    @staticmethod
+    def _cos(a: list[float], b: list[float]) -> float:
+        return sum(x*y for x, y in zip(a, b))
+
+    def add(self, text: str, *, source: str = "local", metadata: dict | None = None) -> None:
+        self.items.append({"text": text, "source": source, "metadata": metadata or {}, "embedding": self._embed(text)})
+
+    def persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.items, ensure_ascii=False), encoding="utf-8")
+
+    def search(self, query: str, k: int = 5) -> list[dict]:
+        q = self._embed(query)
+        scored = [(self._cos(q, item["embedding"]), item) for item in self.items]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [{**item, "score": score} for score, item in scored[:k]]
+
+
+def semantic_chunks(text: str, chunk_chars: int = 900, overlap: int = 120) -> list[str]:
+    """Sentence-aware chunking with character fallback and overlap."""
+    sentences = re.split(r"(?<=[.!?。！？])\s+", text.strip())
+    chunks, current = [], ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 > chunk_chars and current:
+            chunks.append(current.strip())
+            current = current[-overlap:] + " " + sent
+        else:
+            current = (current + " " + sent).strip()
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def hyde_query(query: str) -> str:
+    """HyDE-style hypothetical document without an external model."""
+    return f"This document answers the question: {query}. It provides definitions, facts, examples, and citations."
+
+
+def build_rag_context(query: str, local_docs: list[tuple[str, str]] | None = None,
+                      store_path: str = "rag_store.json", k: int = 5,
+                      use_hyde: bool = True) -> str:
+    """Fuse local vector search with existing web snippets and citation tags."""
+    store = SimpleVectorStore(store_path)
+    for source, text in local_docs or []:
+        for chunk in semantic_chunks(text):
+            store.add(chunk, source=source)
+    if local_docs:
+        store.persist()
+    search_query = hyde_query(query) if use_hyde else query
+    hits = store.search(search_query, k=k)
+    parts = []
+    for hit in hits:
+        parts.append(f"[source: {hit['source']}] {hit['text']}")
+    try:
+        web = build_web_context(query, max_results=max(1, k // 2))
+        if web:
+            parts.append(web)
+    except Exception:
+        pass
+    return "\n\n".join(parts)

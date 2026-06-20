@@ -1,15 +1,28 @@
+# Core runtime (minimal)
 torch>=2.1
 numpy>=1.24
-pytest>=7.0
 matplotlib>=3.5
+
+# Development / tests
+pytest>=7.0
+pytest-cov>=4.0
+hypothesis>=6.0
+
+# Optional: GGUF / llama.cpp backend
 llama-cpp-python>=0.2.90
 
-# Optional but recommended for "any model" support (Hugging Face + LoRA/QLoRA)
+# Optional: Hugging Face + LoRA/QLoRA
 transformers>=4.40.0
 peft>=0.11.0
 accelerate>=0.30.0
-bitsandbytes>=0.43.0; platform_system != "Darwin"   # QLoRA (4-bit) — not on Apple Silicon by default
+bitsandbytes>=0.43.0; platform_system != "Darwin"
 sentencepiece>=0.2.0
 protobuf>=4.21.0
-# Optional for faster tokenization
 tiktoken>=0.7.0
+
+# Optional: serving / RAG / typed config
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2
+sentence-transformers>=3.0
+faiss-cpu>=1.8

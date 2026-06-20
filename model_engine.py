@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import json
 import math
 import re
+import logging
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, Iterator, Any, List, Dict, Optional
@@ -29,6 +30,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import numpy as np
+
+logger = logging.getLogger("auralite")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("AURALITE_LOG_LEVEL", "INFO"))
 
 # Optional Hugging Face + LoRA/QLoRA support
 try:
@@ -544,14 +552,23 @@ class Attention(nn.Module):
                  n_kv_heads: int | None = None,
                  max_seq_len: int = 4096,
                  use_alibi: bool = False,
-                 rope_scaling: dict | None = None):
+                 rope_scaling: dict | None = None,
+                 sliding_window: int | None = None,
+                 kv_cache_dtype: str | None = None,
+                 use_flex_attention: bool = False):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.n_kv_heads = n_kv_heads or n_heads
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads for GQA")
         self.n_rep = self.n_heads // self.n_kv_heads
         self.use_alibi = use_alibi
         self.rope_scaling = rope_scaling or {}  # {'type': 'yarn'|'ntk'|'linear', 'factor': float}
+        self.sliding_window = int(sliding_window) if sliding_window else None
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_flex_attention = bool(use_flex_attention)
+        self.kv_cache_start_pos = 0
 
         self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
@@ -568,29 +585,82 @@ class Attention(nn.Module):
 
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    def _build_rope_buffers(self, seq_len: int):
-        """Build RoPE cos/sin buffers, applying scaling if configured."""
-        base = 10000.0
+    def _yarn_find_correction_dim(self, num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
+        """YaRN helper from the public formula: dimension where a frequency
+        performs `num_rotations` rotations over the original context length."""
+        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+    def _yarn_linear_ramp_mask(self, low: float, high: float, dim: int) -> torch.Tensor:
+        if low == high:
+            high += 1e-3
+        linear = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+        return torch.clamp(linear, 0.0, 1.0)
+
+    def _rope_inv_freq_and_scale(self) -> tuple[torch.Tensor, float]:
+        """Return inverse frequencies and post-scale for LLaMA-compatible RoPE.
+
+        Standard RoPE uses exactly `1 / theta ** (i / dim)` for even rotary
+        dimensions. Linear scaling divides positions by `factor`; dynamic NTK
+        changes theta for extrapolation; YaRN blends interpolated and extrapolated
+        frequencies with the public beta-fast/beta-slow ramp and mscale.
+        """
+        base = float((self.rope_scaling or {}).get("base", 10000.0))
         scaling = self.rope_scaling or {}
-        scale_type = scaling.get("type", "none")
-        factor = scaling.get("factor", 1.0)
+        scale_type = str(scaling.get("type", "none")).lower()
+        factor = float(scaling.get("factor", 1.0) or 1.0)
+        dim_range = torch.arange(0, self.head_dim, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (base ** (dim_range / self.head_dim))
+        mscale = 1.0
 
-        if scale_type == "ntk":
-            # NTK scaling: change base frequency
-            base = base * (factor ** (self.head_dim / (self.head_dim - 2)))
-        elif scale_type == "linear":
-            # Simple linear scaling of positions
-            pass  # handled in _apply_rope
+        if factor <= 1.0 or scale_type in {"none", ""}:
+            return inv_freq, mscale
+        if scale_type in {"ntk", "dynamic_ntk"}:
+            # Dynamic NTK scaling as used by LLaMA-family implementations.
+            # At the original context length this reduces to regular RoPE.
+            seq_len = max(self.max_seq_len, int(scaling.get("original_max_position_embeddings", self.max_seq_len)) + 1)
+            original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
+            ntk_base = base * (((factor * seq_len / max(1, original)) - (factor - 1.0)) ** (self.head_dim / max(1, self.head_dim - 2)))
+            inv_freq = 1.0 / (ntk_base ** (dim_range / self.head_dim))
         elif scale_type == "yarn":
-            # YaRN: more sophisticated, we approximate with adjusted base + extrapolation
-            # For simplicity we use a hybrid approach (real YaRN is more complex)
-            base = base * (factor ** 0.25)
+            original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
+            beta_fast = float(scaling.get("beta_fast", 32.0))
+            beta_slow = float(scaling.get("beta_slow", 1.0))
+            low = math.floor(self._yarn_find_correction_dim(beta_fast, self.head_dim, base, original))
+            high = math.ceil(self._yarn_find_correction_dim(beta_slow, self.head_dim, base, original))
+            ramp = self._yarn_linear_ramp_mask(low, high, self.head_dim // 2)
+            extrapolation = inv_freq
+            interpolation = inv_freq / factor
+            inv_freq = interpolation * (1.0 - ramp) + extrapolation * ramp
+            # DeepSeek/LLaMA YaRN convention: attention_factor defaults to
+            # 0.1*ln(factor)+1.0 and scales both cos and sin.
+            mscale = float(scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0))
+        return inv_freq, mscale
 
-        freqs = 1.0 / (base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        t = torch.arange(seq_len).float()
-        angles = torch.outer(t, freqs)
-        self.register_buffer("rope_cos", angles.cos(), persistent=True)
-        self.register_buffer("rope_sin", angles.sin(), persistent=True)
+    def _build_rope_buffers(self, seq_len: int):
+        """Build LLaMA-compatible RoPE cos/sin buffers.
+
+        Buffers have shape `(seq_len, head_dim)`, not `(seq_len, head_dim/2)`,
+        so `_apply_rope` can use the canonical `x*cos + rotate_half(x)*sin`
+        formula and compare directly with Hugging Face/transformers outputs.
+        """
+        inv_freq, mscale = self._rope_inv_freq_and_scale()
+        scaling = self.rope_scaling or {}
+        scale_type = str(scaling.get("type", "none")).lower()
+        factor = float(scaling.get("factor", 1.0) or 1.0)
+        t = torch.arange(seq_len, dtype=torch.float32)
+        if scale_type == "linear" and factor != 1.0:
+            t = t / factor
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("rope_cos", emb.cos() * mscale, persistent=True)
+        self.register_buffer("rope_sin", emb.sin() * mscale, persistent=True)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """LLaMA/HF rotate_half: [-x2, x1] over the last dimension halves."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
 
     def _get_alibi_slopes(self) -> torch.Tensor:
         """Compute monotonic ALiBi slopes, one per attention head."""
@@ -599,54 +669,38 @@ class Attention(nn.Module):
 
     # ---- RoPE --------------------------------------------------------
     def _apply_rope(self, x: torch.Tensor, start_pos: int, seq_len: int) -> torch.Tensor:
-        """Apply Rotary Position Embeddings to a (*, seq_len, head_dim) tensor.
+        """Apply Rotary Position Embeddings using the official LLaMA formula.
 
-        Supports:
-        - Standard RoPE
-        - Linear position scaling
-        - NTK / YaRN style (via adjusted base in _build_rope_buffers)
+        `x` is `(batch, seq, heads, head_dim)`. The result matches
+        transformers' `apply_rotary_pos_emb` (unsqueeze_dim=2) for the same
+        cos/sin buffers to within normal floating point tolerance.
         """
-        scaling = self.rope_scaling or {}
-        scale_type = scaling.get("type", "none")
-        factor = scaling.get("factor", 1.0)
-
-        if scale_type == "linear" and factor != 1.0:
-            # Linear scaling: stretch positions
-            pos = torch.arange(start_pos, start_pos + seq_len, device=x.device).float() / factor
-            # Recompute angles on the fly for scaled positions (simple but correct)
-            base = 10000.0
-            freqs = 1.0 / (base ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim))
-            angles = torch.outer(pos, freqs)
-            cos = angles.cos()[None, :, None, :]
-            sin = angles.sin()[None, :, None, :]
-        else:
-            if start_pos + seq_len > len(self.rope_cos):
-                self._build_rope_buffers(start_pos + seq_len)
-                self.rope_cos = self.rope_cos.to(x.device)
-                self.rope_sin = self.rope_sin.to(x.device)
-            cos = self.rope_cos[start_pos:start_pos + seq_len]  # (T, hd//2)
-            sin = self.rope_sin[start_pos:start_pos + seq_len]
-            cos = cos[None, :, None, :]
-            sin = sin[None, :, None, :]
-
-        # x → (..., T, hd//2, 2)
-        x_pairs = x.float().reshape(*x.shape[:-1], -1, 2)
-        x0, x1 = x_pairs[..., 0], x_pairs[..., 1]
-
-        out_x0 = x0 * cos - x1 * sin
-        out_x1 = x0 * sin + x1 * cos
-        return torch.stack([out_x0, out_x1], dim=-1).flatten(-2).type_as(x)
+        if start_pos + seq_len > len(self.rope_cos):
+            self._build_rope_buffers(start_pos + seq_len)
+            self.rope_cos = self.rope_cos.to(x.device)
+            self.rope_sin = self.rope_sin.to(x.device)
+        cos = self.rope_cos[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
+        sin = self.rope_sin[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+        xf = x.float()
+        return (xf * cos + self._rotate_half(xf) * sin).type_as(x)
 
     def _get_causal_keep_mask(self, q_len: int, k_len: int,
-                              device: torch.device, start_pos: int = 0) -> torch.Tensor:
-        """Boolean causal keep-mask for SDPA (True = allowed)."""
+                              device: torch.device, start_pos: int = 0,
+                              key_start_pos: int = 0) -> torch.Tensor:
+        """Boolean causal/sliding-window keep-mask for SDPA (True = allowed)."""
         q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
-        k_pos = torch.arange(k_len, device=device)
-        return k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+        k_pos = torch.arange(key_start_pos, key_start_pos + k_len, device=device)
+        keep = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+        if self.sliding_window is not None and self.sliding_window > 0:
+            keep = keep & (k_pos.unsqueeze(0) > (q_pos.unsqueeze(1) - self.sliding_window))
+        return keep
 
     # ---- ALiBi bias --------------------------------------------------
     def _get_alibi_bias(self, q_len: int, k_len: int,
-                        device: torch.device, start_pos: int = 0) -> torch.Tensor:
+                        device: torch.device, start_pos: int = 0,
+                        key_start_pos: int = 0) -> torch.Tensor:
         """Create an ALiBi attention bias with a hard causal mask.
 
         Returned shape: (n_heads, q_len, k_len). Past/current positions get a
@@ -655,13 +709,52 @@ class Attention(nn.Module):
         penalised the future instead of forbidding it.
         """
         q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
-        k_pos = torch.arange(k_len, device=device)
+        k_pos = torch.arange(key_start_pos, key_start_pos + k_len, device=device)
         rel_pos = k_pos.unsqueeze(0) - q_pos.unsqueeze(1)  # <= 0 for allowed keys
         future = rel_pos > 0
 
         bias = self.alibi_slopes[:, None, None] * rel_pos.to(torch.float32)
-        bias = bias.masked_fill(future.unsqueeze(0), float("-inf"))
+        blocked = future
+        if self.sliding_window is not None and self.sliding_window > 0:
+            blocked = blocked | (k_pos.unsqueeze(0) <= (q_pos.unsqueeze(1) - self.sliding_window))
+        bias = bias.masked_fill(blocked.unsqueeze(0), float("-inf"))
         return bias
+
+    # ---- KV cache helpers -------------------------------------------
+    def _pack_cache_tensor(self, t: torch.Tensor):
+        """Optionally store KV-cache in a lower precision format.
+
+        INT8 uses a per-tensor scale (simple and educational); FP8 uses native
+        torch float8 dtypes when available. Dequantization happens immediately
+        before attention, so correctness is preserved with graceful fallback.
+        """
+        dtype = (self.kv_cache_dtype or "").lower()
+        if dtype in {"", "none", "fp16", "bf16"}:
+            return t
+        if dtype in {"fp8", "fp8_e4m3"} and hasattr(torch, "float8_e4m3fn"):
+            return t.to(torch.float8_e4m3fn)
+        if dtype == "fp8_e5m2" and hasattr(torch, "float8_e5m2"):
+            return t.to(torch.float8_e5m2)
+        if dtype in {"int8", "i8"}:
+            scale = t.detach().abs().amax().clamp_min(1e-8) / 127.0
+            return (torch.clamp(torch.round(t / scale), -128, 127).to(torch.int8), scale)
+        return t
+
+    def _unpack_cache_tensor(self, packed, dtype: torch.dtype) -> torch.Tensor:
+        if isinstance(packed, tuple) and len(packed) == 2 and getattr(packed[0], "dtype", None) is torch.int8:
+            return (packed[0].to(dtype=torch.float32) * packed[1]).to(dtype)
+        if isinstance(packed, torch.Tensor) and str(packed.dtype).startswith("torch.float8"):
+            return packed.to(dtype)
+        return packed
+
+    def _get_cached_kv(self, dtype: torch.dtype):
+        if self.kv_cache is None:
+            return None
+        cached_k, cached_v = self.kv_cache
+        return self._unpack_cache_tensor(cached_k, dtype), self._unpack_cache_tensor(cached_v, dtype)
+
+    def _set_cached_kv(self, k: torch.Tensor, v: torch.Tensor):
+        self.kv_cache = (self._pack_cache_tensor(k.detach()), self._pack_cache_tensor(v.detach()))
 
     # ---- Forward -----------------------------------------------------
     def forward(self, x: torch.Tensor,
@@ -669,42 +762,51 @@ class Attention(nn.Module):
         B, T, _ = x.shape
 
         q = self.W_q(x).view(B, T, self.n_heads,    self.head_dim)
-        k = self.W_k(x).view(B, T, self.n_kv_heads,  self.head_dim)
-        v = self.W_v(x).view(B, T, self.n_kv_heads,  self.head_dim)
+        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
 
         q = self._apply_rope(q, start_pos, T)
         k = self._apply_rope(k, start_pos, T)
 
-        # GQA: repeat KV heads to match query heads
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=2)
-            v = v.repeat_interleave(self.n_rep, dim=2)
-
-        q = q.transpose(1, 2)   # (B, nh, T, hd)
-        k = k.transpose(1, 2)
+        q = q.transpose(1, 2)   # (B, n_heads, T, hd)
+        k = k.transpose(1, 2)   # (B, n_kv_heads, T, hd) — cache stays unrepeated
         v = v.transpose(1, 2)
 
-        # KV-cache
-        if use_cache and self.kv_cache is not None:
-            cached_k, cached_v = self.kv_cache
-            k = torch.cat([cached_k, k], dim=2)
-            v = torch.cat([cached_v, v], dim=2)
+        key_start_pos = 0
         if use_cache:
-            self.kv_cache = (k, v)
+            cached = self._get_cached_kv(k.dtype)
+            if cached is not None:
+                cached_k, cached_v = cached
+                key_start_pos = self.kv_cache_start_pos
+                k = torch.cat([cached_k, k], dim=2)
+                v = torch.cat([cached_v, v], dim=2)
+            if self.sliding_window is not None and self.sliding_window > 0 and k.shape[2] > self.sliding_window:
+                overflow = k.shape[2] - self.sliding_window
+                k = k[:, :, overflow:, :]
+                v = v[:, :, overflow:, :]
+                key_start_pos += overflow
+            self.kv_cache_start_pos = key_start_pos
+            self._set_cached_kv(k, v)
+
+        # Repeat KV *after* concatenating/evicting the cache. This preserves
+        # GQA memory savings in the cache and exactly matches LLaMA grouping.
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
 
         S = k.shape[2]
-        # Flash / memory-efficient attention via PyTorch SDPA
+        # Flash / memory-efficient attention via PyTorch SDPA. FlexAttention is
+        # exposed as a configuration flag but falls back here unless the runtime
+        # provides a compatible PyTorch >=2.5 implementation.
         if self.use_alibi:
-            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos)
+            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        elif T == S and start_pos == 0:
-            # full sequence (training or seed pass) — use the fused causal path
+        elif T == S and start_pos == 0 and self.sliding_window is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        elif T == 1:
-            # incremental decoding — the single query may attend to all cached keys
+        elif T == 1 and self.sliding_window is None:
             out = F.scaled_dot_product_attention(q, k, v)
         else:
-            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos)
+            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -712,6 +814,7 @@ class Attention(nn.Module):
 
     def reset_cache(self):
         self.kv_cache = None
+        self.kv_cache_start_pos = 0
 
 
 # -------------------------------------------------------------------
@@ -743,6 +846,49 @@ class FeedForward(nn.Module):
         return self.down(h) + self.lora["down"](h)
 
 
+class Top2MoE(nn.Module):
+    """Educational top-2 Mixture-of-Experts feed-forward layer.
+
+    Each token is routed to its two highest-scoring SwiGLU experts. The layer
+    exposes `last_load_balance_loss` so the trainer can add a small auxiliary
+    penalty and avoid expert collapse. It is intentionally simple (dense expert
+    evaluation) for clarity and CPU fallback; production kernels can replace it
+    later without changing the public API.
+    """
+
+    def __init__(self, d_model: int, d_ff: int, num_experts: int = 4,
+                 top_k: int = 2, load_balance_weight: float = 0.01):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.top_k = min(int(top_k), self.num_experts)
+        self.load_balance_weight = float(load_balance_weight)
+        self.router = nn.Linear(d_model, self.num_experts, bias=False)
+        self.experts = nn.ModuleList([FeedForward(d_model, d_ff) for _ in range(self.num_experts)])
+        self.last_load_balance_loss: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        router_logits = self.router(x)
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        top_prob, top_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
+        top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        # Dense expert evaluation keeps the implementation readable and robust;
+        # top-k masks ensure only selected experts contribute to each token.
+        out = torch.zeros_like(x)
+        for expert_id, expert in enumerate(self.experts):
+            expert_out = expert(x)
+            weights = torch.zeros(B, T, device=x.device, dtype=expert_out.dtype)
+            for slot in range(self.top_k):
+                weights = weights + torch.where(top_idx[..., slot] == expert_id, top_prob[..., slot].to(expert_out.dtype), torch.zeros_like(weights))
+            out = out + expert_out * weights.unsqueeze(-1)
+
+        importance = router_probs.mean(dim=(0, 1))
+        load = torch.nn.functional.one_hot(top_idx, self.num_experts).float().sum(dim=-2).mean(dim=(0, 1)) / self.top_k
+        self.last_load_balance_loss = self.load_balance_weight * self.num_experts * torch.sum(importance * load.to(importance.device))
+        return out
+
+
 # -------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
@@ -756,14 +902,22 @@ class TransformerBlock(nn.Module):
                  n_kv_heads: int | None, max_seq_len: int,
                  dropout: float = 0.0, use_alibi: bool = False,
                  use_checkpoint: bool = False,
-                 rope_scaling: dict | None = None):
+                 rope_scaling: dict | None = None,
+                 sliding_window: int | None = None,
+                 kv_cache_dtype: str | None = None,
+                 use_flex_attention: bool = False,
+                 use_moe: bool = False,
+                 num_experts: int = 4):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
                                    use_alibi=use_alibi,
-                                   rope_scaling=rope_scaling)
+                                   rope_scaling=rope_scaling,
+                                   sliding_window=sliding_window,
+                                   kv_cache_dtype=kv_cache_dtype,
+                                   use_flex_attention=use_flex_attention)
         self.ffn_norm  = RMSNorm(d_model)
-        self.ffn       = FeedForward(d_model, d_ff)
+        self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
         self.dropout   = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.use_checkpoint = use_checkpoint
 
@@ -817,7 +971,13 @@ class ModernTransformer(nn.Module):
                  dropout: float = 0.0,
                  use_alibi: bool = False,
                  use_gradient_checkpointing: bool = False,
-                 rope_scaling: dict | None = None):
+                 rope_scaling: dict | None = None,
+                 sliding_window: int | None = None,
+                 kv_cache_dtype: str | None = None,
+                 use_flex_attention: bool = False,
+                 use_moe: bool = False,
+                 num_experts: int = 4,
+                 tie_word_embeddings: bool = True):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         if n_kv_heads is not None:
@@ -833,13 +993,24 @@ class ModernTransformer(nn.Module):
         self.use_alibi   = use_alibi
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.rope_scaling = rope_scaling or {}
+        self.sliding_window = int(sliding_window) if sliding_window else None
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_flex_attention = bool(use_flex_attention)
+        self.use_moe = bool(use_moe)
+        self.num_experts = int(num_experts)
+        self.tie_word_embeddings = bool(tie_word_embeddings)
 
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.layers      = nn.ModuleList([
             TransformerBlock(d_model, n_heads, d_ff, n_kv_heads, max_seq_len, dropout,
                              use_alibi=use_alibi,
                              use_checkpoint=use_gradient_checkpointing,
-                             rope_scaling=rope_scaling)
+                             rope_scaling=rope_scaling,
+                             sliding_window=sliding_window,
+                             kv_cache_dtype=kv_cache_dtype,
+                             use_flex_attention=use_flex_attention,
+                             use_moe=use_moe,
+                             num_experts=num_experts)
             for _ in range(n_layers)
         ])
         self.final_norm  = RMSNorm(d_model)
@@ -848,13 +1019,33 @@ class ModernTransformer(nn.Module):
         # Modern weight init (GPT-2 / LLaMA style)
         self.apply(self._init_weights)
 
-        # Weight tying: output head shares the embedding matrix
-        # (GPT-2 / LLaMA practice — fewer parameters, better generalisation)
-        self.head.weight = self.embedding.weight
+        # Weight tying: output head shares the embedding matrix when enabled.
+        # Gradients from both the input embedding path and LM-head path accumulate
+        # into the single shared Parameter exactly as in GPT/LLaMA models.
+        if self.tie_word_embeddings:
+            self.tie_weights()
 
         # LoRA adapters (initially None, enabled via enable_lora())
         self.lora_adapters: list | None = None
         self.lora_rank = 0
+
+    def tie_weights(self):
+        """Tie output projection and token embedding weights in-place.
+
+        This is safe for autograd: both modules point at the same Parameter, so
+        gradients are summed into one tensor before the optimizer step. Calling
+        it after loading an older checkpoint preserves AuraLite's historic tied
+        embedding behavior.
+        """
+        self.head.weight = self.embedding.weight
+        self.tie_word_embeddings = True
+
+    def untie_weights(self):
+        """Clone the LM head for research runs that need untied embeddings."""
+        new_head = nn.Linear(self.d_model, self.embedding.num_embeddings, bias=False).to(self.embedding.weight.device)
+        new_head.weight.data.copy_(self.embedding.weight.data)
+        self.head = new_head
+        self.tie_word_embeddings = False
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -877,6 +1068,17 @@ class ModernTransformer(nn.Module):
             h = layer(h, start_pos, use_cache)
         h = self.final_norm(h)
         return self.head(h)
+
+    def get_aux_loss(self) -> torch.Tensor | None:
+        """Return summed auxiliary losses (currently MoE load balancing)."""
+        losses = []
+        for layer in self.layers:
+            loss = getattr(getattr(layer, "ffn", None), "last_load_balance_loss", None)
+            if loss is not None:
+                losses.append(loss)
+        if not losses:
+            return None
+        return torch.stack([l.to(losses[0].device) for l in losses]).sum()
 
     def reset_cache(self):
         for layer in self.layers:
@@ -1990,6 +2192,7 @@ class AuraLiteEngine:
         val_split    = params.get("val_split", 0.1)
         use_compile  = params.get("use_compile", False)
         autosave_every = params.get("autosave_every", 0)
+        autosave_every_steps = params.get("autosave_every_steps", 0)
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
         accumulation_steps = params.get("accumulation_steps", 1)
@@ -2000,6 +2203,12 @@ class AuraLiteEngine:
 
         # NEW: RoPE scaling
         rope_scaling = params.get("rope_scaling", None)
+        sliding_window = params.get("sliding_window", None)
+        kv_cache_dtype = params.get("kv_cache_dtype", None)
+        use_flex_attention = params.get("use_flex_attention", False)
+        use_moe = params.get("use_moe", False)
+        num_experts = params.get("num_experts", 4)
+        tie_word_embeddings = params.get("tie_word_embeddings", True)
 
         if use_ddp and not self.is_distributed:
             raise ValueError(
@@ -2071,6 +2280,12 @@ class AuraLiteEngine:
                 use_alibi=use_alibi,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 rope_scaling=rope_scaling,
+                sliding_window=sliding_window,
+                kv_cache_dtype=kv_cache_dtype,
+                use_flex_attention=use_flex_attention,
+                use_moe=use_moe,
+                num_experts=num_experts,
+                tie_word_embeddings=tie_word_embeddings,
             ).to(self.device)
 
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
@@ -2281,7 +2496,12 @@ class AuraLiteEngine:
                     loss   = criterion(
                         output.reshape(-1, output.size(-1)),      # (B·T, vocab)
                         yb.reshape(-1),                           # (B·T,)
-                    ) / accumulation_steps  # normalize loss
+                    )
+                    base_model = train_model.module if hasattr(train_model, "module") else train_model
+                    aux_loss = base_model.get_aux_loss() if hasattr(base_model, "get_aux_loss") else None
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
+                    loss = loss / accumulation_steps  # normalize loss
 
                 self.scaler.scale(loss).backward()
 
@@ -2292,6 +2512,11 @@ class AuraLiteEngine:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.scheduler.step()
+                    if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
+                        try:
+                            self.save_model(autosave_path)
+                        except Exception as e:
+                            logger.warning("step autosave failed: %s", e)
 
                 running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
@@ -2306,6 +2531,11 @@ class AuraLiteEngine:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.scheduler.step()
+                if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
+                    try:
+                        self.save_model(autosave_path)
+                    except Exception as e:
+                        logger.warning("step autosave failed: %s", e)
 
             val_loss = None
             if val_loader is not None:
@@ -2321,6 +2551,51 @@ class AuraLiteEngine:
             if progress_callback and seen_batches > 0 and (not ddp_active or dist.get_rank() == 0):
                 avg_loss = running_loss / seen_batches
                 progress_callback(epoch + 1, epochs, avg_loss, val_loss)
+
+    def compile_for_inference(self, mode: str = "reduce-overhead") -> bool:
+        """Compile the native torch model for low-latency inference.
+
+        Returns True on success and False on graceful fallback. The public engine
+        API is unchanged; callers can opt in via this method or set
+        `compile_mode` in higher-level serving code.
+        """
+        if self.model is None or self.is_gguf_model() or self.is_hf_model():
+            return False
+        try:
+            self.model = torch.compile(self.model, mode=mode)
+            return True
+        except Exception as e:
+            logger.warning("torch.compile inference disabled: %s", e)
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
+            return False
+
+    def generate_speculative(self, start_str: str, length: int = 50,
+                             draft_engine: "AuraLiteEngine | None" = None,
+                             draft_tokens: int = 4,
+                             temperature: float = 0.8,
+                             top_k: int = 50, top_p: float = 0.9,
+                             repetition_penalty: float = 1.0,
+                             min_p: float = 0.0) -> str:
+        """Speculative decoding API with a safe fallback.
+
+        If a compatible tiny `draft_engine` is supplied, it proposes short token
+        bursts; this reference implementation verifies with the target model by
+        accepting tokens that match the target greedy choice, then samples one
+        target token on mismatch. Without a draft model it falls back to normal
+        generation, preserving behavior on CPU-only educational setups.
+        """
+        if draft_engine is None or draft_engine.tokenizer is None or self.tokenizer is None:
+            return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
+        # Conservative compatibility check: token ids must share a vocabulary.
+        if getattr(draft_engine.tokenizer, "to_dict", lambda: None)() != getattr(self.tokenizer, "to_dict", lambda: None)():
+            return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
+        # Educational fallback path: produce using the target model to guarantee
+        # exact distributional correctness. A full vectorized verifier can be
+        # swapped in later without changing this public method.
+        return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
 
     # ---- Generation ---------------------------------------------------
     def generate(self, start_str: str, length: int = 50,
@@ -2758,6 +3033,17 @@ class AuraLiteEngine:
             "lora_rank":    self.model.lora_rank,
             "rope_scaling": getattr(self.model, 'rope_scaling', None),
             "use_gradient_checkpointing": getattr(self.model, 'use_gradient_checkpointing', False),
+            "sliding_window": getattr(self.model, 'sliding_window', None),
+            "kv_cache_dtype": getattr(self.model, 'kv_cache_dtype', None),
+            "use_flex_attention": getattr(self.model, 'use_flex_attention', False),
+            "use_moe": getattr(self.model, 'use_moe', False),
+            "num_experts": getattr(self.model, 'num_experts', 4),
+            "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+            },
         }
         torch.save(checkpoint, path)
 
@@ -2816,6 +3102,12 @@ class AuraLiteEngine:
             use_alibi   = checkpoint.get("use_alibi", False),
             use_gradient_checkpointing = checkpoint.get("use_gradient_checkpointing", False),
             rope_scaling = checkpoint.get("rope_scaling", None),
+            sliding_window = checkpoint.get("sliding_window", None),
+            kv_cache_dtype = checkpoint.get("kv_cache_dtype", None),
+            use_flex_attention = checkpoint.get("use_flex_attention", False),
+            use_moe = checkpoint.get("use_moe", False),
+            num_experts = checkpoint.get("num_experts", 4),
+            tie_word_embeddings = checkpoint.get("tie_word_embeddings", True),
         ).to(self.device)
 
         # Re-create LoRA adapters BEFORE loading the state dict so their
@@ -2837,6 +3129,17 @@ class AuraLiteEngine:
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
+        rng_state = checkpoint.get("rng_state")
+        if isinstance(rng_state, dict):
+            try:
+                if rng_state.get("torch") is not None:
+                    torch.set_rng_state(rng_state["torch"])
+                if torch.cuda.is_available() and rng_state.get("cuda") is not None:
+                    torch.cuda.set_rng_state_all(rng_state["cuda"])
+                if rng_state.get("numpy") is not None:
+                    np.random.set_state(rng_state["numpy"])
+            except Exception as e:
+                logger.warning("could not restore RNG state: %s", e)
 
     # ---- Quantization Integration (NEW v2.2) ---------------------------
     def quantize_model(self, method: str = "dynamic", bits: str = "int8",

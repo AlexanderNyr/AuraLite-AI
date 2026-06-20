@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auralite-ai"
+version = "2.4.0"
+description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "AuraLite AI contributors"}]
+dependencies = [
+  "torch>=2.1",
+  "numpy>=1.24",
+  "matplotlib>=3.5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4"]
+lint = ["ruff>=0.5", "pyright>=1.1"]
+full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
+quant = ["bitsandbytes>=0.43; platform_system != 'Darwin'", "auto-gptq>=0.7", "optimum>=1.20"]
+serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "vllm>=0.5; platform_system == 'Linux'"]
+rag = ["sentence-transformers>=3", "faiss-cpu>=1.8", "chromadb>=0.5"]
+dev = ["auralite-ai[test,lint,full,quant,serve,rag]"]
+
+[tool.setuptools]
+py-modules = ["model_engine", "quantization", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
+packages = ["model_engine", "gui", "gui.tabs", "kernels", "server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".git", "build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=line"
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "setup.py"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false

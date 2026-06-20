@@ -2,6 +2,64 @@
 
 **AuraLite AI** is a lightweight, educational Large Language Model (LLM) implemented using **PyTorch**. It is designed to demonstrate the inner workings of the Transformer architecture (the foundation of models like GPT-4) in a way that is accessible and runnable on consumer hardware.
 
+
+## 🚀 v2.4 Production-Grade Architecture Update
+
+AuraLite now keeps the original educational single-file entry points **and** adds a production-oriented package layout:
+
+```mermaid
+graph TD
+  Engine[AuraLiteEngine] --> Torch[ModernTransformer]
+  Engine --> GGUF[GGUFBackend]
+  Engine --> HF[HFBackend]
+  Torch --> Blocks[TransformerBlock]
+  Blocks --> Attention[RoPE + GQA + Sliding Window KV Cache]
+  Blocks --> FFN[SwiGLU / optional Top-2 MoE]
+  Engine --> Quant[Quantization: GPTQ/AWQ/HQQ/FP8]
+  Engine --> RAG[RAG: web + local vector store]
+  Server[FastAPI OpenAI Server] --> Engine
+```
+
+### New high-impact capabilities
+
+- **LLaMA-compatible RoPE**: `rotate_half` formulation, exact inverse-frequency formula, and improved Linear / Dynamic-NTK / YaRN scaling.
+- **Hardened GQA KV-cache**: per-layer caches keep unrepeated KV heads, support sliding-window eviction, and optional FP8/INT8 cache storage.
+- **Research architecture flags**: `sliding_window`, `use_moe`, `num_experts`, `use_flex_attention`, `kv_cache_dtype`, `tie_word_embeddings`.
+- **Explicit weight tying API**: `model.tie_weights()` and `model.untie_weights()` document and control shared embedding/head gradients.
+- **Refactored imports**: use `model_engine.layers`, `model_engine.model`, `model_engine.dataset`, `model_engine.backends`, etc.; legacy `from model_engine import AuraLiteEngine` still works.
+- **Serving**: `server/openai_server.py` exposes `/v1/completions`, `/v1/chat/completions`, and `/health`.
+- **RAG upgrade**: optional persistent vector store, semantic chunking, HyDE query expansion, and citation-style `[source: ...]` context.
+- **Quantization upgrade**: HQQ, optional FP8, AWQ alpha/clip grid search, Cholesky-stabilized GPTQ.
+
+### Example: train with modern options
+
+```python
+from model_engine import AuraLiteEngine
+
+engine = AuraLiteEngine()
+engine.train(text, {
+    "tokenizer": "bpe",
+    "bpe_vocab_size": 4096,
+    "d_model": 768,
+    "n_heads": 12,
+    "n_kv_heads": 4,
+    "n_layers": 12,
+    "d_ff": 2048,
+    "seq_length": 2048,
+    "sliding_window": 1024,
+    "rope_scaling": {"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 2048},
+    "use_moe": False,
+    "use_compile": True,
+})
+engine.save_model("auralite-v24.pt")
+```
+
+### Example: serve OpenAI-compatible API
+
+```bash
+AURALITE_MODEL=auralite-v24.pt uvicorn server.openai_server:app --host 0.0.0.0 --port 8000
+```
+
 ## 🚀 Key Features
 - **PyTorch Engine**: Professional-grade tensor operations, autograd and optimization.
 - **GGUF / llama.cpp Inference**: Load `.gguf` models directly (quantized Llama/Mistral/Qwen/etc.) via `llama-cpp-python` for generation, streaming, batch prompts, Thinking Mode and web-context prompting.

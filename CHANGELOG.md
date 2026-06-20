@@ -1,3 +1,27 @@
+# 🚀 Changelog — AuraLite AI v2.4 (2026-06-20)
+
+## Production-Grade Core
+- Added `model_engine/` package layout with compatibility shim for legacy `model_engine.py` imports.
+- Added typed `AuraLiteConfig`, backend abstractions, `PagedDataset`, profiler utilities, optional kernels, and OpenAI-compatible FastAPI server.
+
+## Model Architecture
+- Reworked RoPE to the LLaMA/Hugging Face `rotate_half` formula with exact inverse frequencies.
+- Added improved Linear / Dynamic-NTK / YaRN scaling.
+- Hardened GQA KV-cache: stores unrepeated KV heads, supports sliding-window eviction, optional low-precision cache storage.
+- Added explicit `tie_weights()` / `untie_weights()` and optional untied embedding mode.
+- Added optional Top-2 MoE, sliding-window attention, FlexAttention flag with SDPA fallback, and speculative decoding API fallback.
+
+## Quantization
+- Added HQQ and FP8 enum support.
+- Improved GPTQ Hessian handling with Cholesky inversion fallback.
+- Added AWQ alpha + clip-ratio grid search.
+
+## RAG / Serving / DevOps
+- Added persistent optional vector store, semantic chunking, HyDE query expansion, and citation context.
+- Added Docker multi-stage CPU/CUDA runtime, CI workflow, pre-commit, pyproject optional dependency groups.
+
+---
+
 # 🚀 Changelog — AuraLite AI v2.3 (2026-06-12)
 
 ## Major New Features

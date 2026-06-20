@@ -41,6 +41,7 @@ class QuantMethod(str, Enum):
     QAT      = "qat"
     GPTQ     = "gptq"
     AWQ      = "awq"
+    HQQ      = "hqq"
     HALF     = "half"
 
 
@@ -51,6 +52,8 @@ class BitWidth(str, Enum):
     INT8  = "int8"
     FP16  = "fp16"
     BF16  = "bf16"
+    FP8_E4M3 = "fp8_e4m3"
+    FP8_E5M2 = "fp8_e5m2"
 
 
 # Which methods support which bit widths
@@ -60,7 +63,8 @@ METHOD_SUPPORTED_BITS: dict[QuantMethod, list[BitWidth]] = {
     QuantMethod.QAT:     [BitWidth.INT8],
     QuantMethod.GPTQ:    [BitWidth.INT2, BitWidth.INT3, BitWidth.INT4, BitWidth.INT8],
     QuantMethod.AWQ:     [BitWidth.INT4, BitWidth.INT8],
-    QuantMethod.HALF:    [BitWidth.FP16, BitWidth.BF16],
+    QuantMethod.HQQ:     [BitWidth.INT2, BitWidth.INT3, BitWidth.INT4, BitWidth.INT8],
+    QuantMethod.HALF:    [BitWidth.FP16, BitWidth.BF16, BitWidth.FP8_E4M3, BitWidth.FP8_E5M2],
 }
 
 # Human-readable descriptions
@@ -85,10 +89,12 @@ METHOD_DESCRIPTIONS: dict[QuantMethod, str] = {
         "AWQ-style Activation-Aware Weights: Identifies salient weight channels "
         "(based on activation magnitudes) and protects them during quantization. "
         "Better quality than naive round-to-nearest at INT4."),
+    QuantMethod.HQQ: (
+        "HQQ (Half-Quadratic Quantization): calibration-free low-bit weight "
+        "quantization with iterative scale refinement. Good INT4 fallback when GPTQ calibration is unavailable."),
     QuantMethod.HALF: (
-        "Half Precision (FP16/BF16): Convert model to 16-bit float. "
-        "2× compression, near-zero quality loss, fast on GPU. "
-        "BF16 preferred for training stability."),
+        "Half / FP8 Precision: Convert model to FP16, BF16, or native FP8 on modern GPUs. "
+        "BF16 preferred for training stability; FP8 requires PyTorch float8 support."),
 }
 
 
@@ -109,6 +115,9 @@ class QuantConfig:
     # AWQ specific
     awq_n_calibration: int = 128
     awq_alpha: float = 0.5             # balance between weight and activation saliency
+    awq_clip_ratio: float = 1.0
+    awq_grid_alphas: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+    awq_grid_clip_ratios: tuple[float, ...] = (0.85, 0.9, 0.95, 1.0)
     # QAT specific
     qat_epochs: int = 5
     qat_lr: float = 1e-5
@@ -327,7 +336,9 @@ class PackedLinear(nn.Module):
         return weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = self._dequantize().to(x.dtype)
+        # Optional Triton dequantization can be dropped in here. The default
+        # vectorized PyTorch path is device-safe and avoids the old CPU-only loop.
+        weight = self._dequantize().to(device=x.device, dtype=x.dtype)
         scale = self.input_scale.to(device=x.device, dtype=x.dtype)
         x = x / scale
         out = F.linear(x, weight)
@@ -484,6 +495,9 @@ class QuantizationEngine:
                                               device, cb)
             elif config.method == QuantMethod.AWQ:
                 q_model = self._quantize_awq(model, config, tokenizer,
+                                             device, cb)
+            elif config.method == QuantMethod.HQQ:
+                q_model = self._quantize_hqq(model, config, tokenizer,
                                              device, cb)
             elif config.method == QuantMethod.HALF:
                 q_model = self._quantize_half(model, config, cb)
@@ -833,12 +847,20 @@ class QuantizationEngine:
                 n_samples += n
             if n_samples > 0:
                 H /= n_samples
-            H += config.gptq_percdamp * torch.eye(in_features, device=device)
+            damp = config.gptq_percdamp * torch.diag(H).mean().clamp(min=1e-8)
+            H += damp * torch.eye(in_features, device=device)
             input_hook_data.clear()
 
-            # Quantize weight using Hessian diagonal for importance
-            diag = torch.diag(H).clamp(min=1e-8)
-            importance = diag / diag.max()
+            # Cholesky inversion is more stable than directly inverting H.
+            # We only need a robust importance proxy for this educational GPTQ,
+            # so use diag(inv(H)) from cholesky_inverse with a diagonal fallback.
+            try:
+                chol = torch.linalg.cholesky(H)
+                H_inv = torch.cholesky_inverse(chol)
+                diag = torch.diag(H_inv).abs().reciprocal().clamp(min=1e-8)
+            except Exception:
+                diag = torch.diag(H).clamp(min=1e-8)
+            importance = diag / diag.max().clamp(min=1e-8)
 
             n_groups = math.ceil(in_features / group_size)
             scales = torch.zeros(out_features, n_groups, device=device)
@@ -996,25 +1018,42 @@ class QuantizationEngine:
             # Weight saliency: magnitude of weights per input channel
             w_mag = W.abs().mean(dim=0)
 
-            # Combined saliency (alpha blending)
-            alpha = config.awq_alpha
-            saliency = (act_mag / act_mag.max().clamp(min=1e-8)) * alpha + \
-                        (w_mag / w_mag.max().clamp(min=1e-8)) * (1 - alpha)
+            # Proper AWQ grid search over alpha and clip ratio. We choose the
+            # pair that minimizes local reconstruction MSE on a bounded weight
+            # sample; this is the core AWQ idea without adding hard kernels.
+            act_n = act_mag / act_mag.max().clamp(min=1e-8)
+            w_n = w_mag / w_mag.max().clamp(min=1e-8)
+            best_err = None
+            best_scale = torch.ones(in_features, device=device)
+            best_clip = float(config.awq_clip_ratio)
+            sample_cols = min(in_features, 2048)
+            sample_idx = torch.linspace(0, in_features - 1, sample_cols, device=device).long()
+            for alpha in config.awq_grid_alphas:
+                saliency = act_n * float(alpha) + w_n * (1.0 - float(alpha))
+                threshold = torch.quantile(saliency, 0.99)
+                salient_mask = saliency >= threshold
+                scale_factor = torch.ones(in_features, device=device)
+                scale_factor[salient_mask] = (
+                    saliency[salient_mask] / saliency[salient_mask].min().clamp(min=1e-8)
+                ).sqrt().clamp(max=4.0)
+                for clip_ratio in config.awq_grid_clip_ratios:
+                    W_try = W * scale_factor.unsqueeze(0)
+                    clip = torch.quantile(W_try.abs(), float(clip_ratio)).clamp(min=1e-8)
+                    W_clip = W_try.clamp(-clip, clip)
+                    # Cheap symmetric fake quant on sampled columns for search.
+                    s_try = W_clip[:, sample_idx].abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / (max_val / 2)
+                    q_try = torch.clamp(torch.round(W_clip[:, sample_idx] / s_try + max_val/2), 0, max_val)
+                    dq = (q_try - max_val/2) * s_try
+                    err = torch.mean((dq - W_try[:, sample_idx]) ** 2)
+                    if best_err is None or err < best_err:
+                        best_err = err
+                        best_scale = scale_factor
+                        best_clip = float(clip_ratio)
 
-            # Top 1% channels get protection scaling
-            threshold = torch.quantile(saliency, 0.99)
-            salient_mask = saliency >= threshold
-
-            # Scale salient channels up (will be compensated in output)
-            scale_factor = torch.ones(in_features, device=device)
-            # Salient channels get sqrt(saliency) scaling
-            scale_factor[salient_mask] = (
-                saliency[salient_mask] / saliency[salient_mask].min().clamp(min=1e-8)
-            ).sqrt().clamp(max=4.0)
-
-            # Apply scaling: W_scaled = W * diag(scale_factor)
-            # The inverse scaling is absorbed into the previous layer or input
+            scale_factor = best_scale
             W_scaled = W * scale_factor.unsqueeze(0)
+            clip = torch.quantile(W_scaled.abs(), best_clip).clamp(min=1e-8)
+            W_scaled = W_scaled.clamp(-clip, clip)
 
             # Group-wise quantization
             scales = torch.zeros(out_features, n_groups, device=device)
@@ -1061,6 +1100,59 @@ class QuantizationEngine:
         return q_model
 
     # ------------------------------------------------------------------
+    #  Internal: HQQ Quantization
+    # ------------------------------------------------------------------
+
+    def _quantize_hqq(self, model: nn.Module, config: QuantConfig,
+                      tokenizer, device: torch.device, cb: Callable) -> nn.Module:
+        """Half-Quadratic Quantization style fallback.
+
+        This calibration-light implementation iteratively refines group scales
+        around quantized weights. It is simpler than full HQQ but captures the
+        main benefit: better low-bit weight reconstruction than one-shot min/max.
+        """
+        bits = {"int2": 2, "int3": 3, "int4": 4, "int8": 8}[config.bits.value]
+        group_size = config.gptq_group_size
+        q_model = copy.deepcopy(model).to(device).eval()
+        layers = []
+        for name, mod in q_model.named_modules():
+            if isinstance(mod, nn.Linear) and mod.weight.shape[0] > 1:
+                parts = name.rsplit(".", 1)
+                parent = dict(q_model.named_modules())[parts[0]] if len(parts) == 2 else q_model
+                layers.append((parent, parts[-1], mod))
+        max_val = (1 << bits) - 1
+        for idx, (parent, attr_name, linear) in enumerate(layers):
+            W = linear.weight.data.float()
+            out_features, in_features = W.shape
+            n_groups = math.ceil(in_features / group_size)
+            scales = torch.zeros(out_features, n_groups, device=device)
+            zeros = torch.full((out_features, n_groups), max_val / 2, device=device)
+            W_q = torch.zeros_like(W)
+            for g in range(n_groups):
+                start, end = g * group_size, min((g + 1) * group_size, in_features)
+                wg = W[:, start:end]
+                scale = wg.abs().amax(dim=1).clamp(min=1e-8) / (max_val / 2)
+                # Half-quadratic style scale refinement.
+                for _ in range(3):
+                    q = torch.clamp(torch.round(wg / scale.unsqueeze(1) + max_val/2), 0, max_val)
+                    centered = (q - max_val/2)
+                    denom = centered.pow(2).sum(dim=1).clamp(min=1e-8)
+                    scale = (wg * centered).sum(dim=1).abs() / denom
+                    scale = scale.clamp(min=1e-8)
+                scales[:, g] = scale
+                q = torch.clamp(torch.round(wg / scale.unsqueeze(1) + max_val/2), 0, max_val)
+                W_q[:, start:end] = (q - max_val/2) * scale.unsqueeze(1)
+            packed = PackedLinear(in_features, out_features, bits=bits, group_size=group_size, bias=linear.bias is not None)
+            packed.pack_weights(W_q, scales, zeros)
+            if linear.bias is not None:
+                packed.bias_param = nn.Parameter(linear.bias.data.clone())
+            setattr(parent, attr_name, packed.to(device))
+            if (idx + 1) % 5 == 0 or idx == len(layers) - 1:
+                cb(1, 2, f"HQQ: {idx+1}/{len(layers)} layers")
+        cb(2, 2, f"HQQ INT{bits} quantization complete.")
+        return q_model
+
+    # ------------------------------------------------------------------
     #  Internal: Half Precision
     # ------------------------------------------------------------------
 
@@ -1070,9 +1162,13 @@ class QuantizationEngine:
         dtype_map = {
             BitWidth.FP16: torch.float16,
             BitWidth.BF16: torch.bfloat16,
+            BitWidth.FP8_E4M3: getattr(torch, "float8_e4m3fn", None),
+            BitWidth.FP8_E5M2: getattr(torch, "float8_e5m2", None),
         }
         dtype = dtype_map[config.bits]
-        dtype_name = "FP16" if config.bits == BitWidth.FP16 else "BF16"
+        if dtype is None:
+            raise RuntimeError(f"{config.bits.value} requires PyTorch float8 support")
+        dtype_name = config.bits.value.upper()
 
         cb(0, 2, f"Converting to {dtype_name}…")
 
@@ -1257,6 +1353,8 @@ def compare_quantizations(model: nn.Module, tokenizer, text: str,
             (QuantMethod.GPTQ,    BitWidth.INT4),
             (QuantMethod.GPTQ,    BitWidth.INT2),
             (QuantMethod.AWQ,     BitWidth.INT4),
+            (QuantMethod.HQQ,     BitWidth.INT4),
+            (QuantMethod.HALF,    BitWidth.FP8_E4M3),
         ]
 
     cb = progress_callback or (lambda s, t, m: None)
