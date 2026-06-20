@@ -1285,8 +1285,9 @@ class AIApp:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Quantization Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Quantization Error", err))
             finally:
                 self.root.after(0, lambda: (
                     self.q_quantize_btn.config(state=tk.NORMAL),
@@ -1332,8 +1333,9 @@ class AIApp:
 
                 self.root.after(0, update_ui)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Benchmark Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Benchmark Error", err))
             finally:
                 self.root.after(0, lambda: (
                     self.q_benchmark_btn.config(state=tk.NORMAL),
@@ -1375,8 +1377,9 @@ class AIApp:
 
                 self.root.after(0, update_ui)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Compare Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Compare Error", err))
             finally:
                 self.root.after(0, lambda: (
                     self.q_compare_btn.config(state=tk.NORMAL),
@@ -1570,7 +1573,8 @@ class AIApp:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Evaluation Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("Evaluation Error", err))
             finally:
                 self.root.after(0, lambda: self.eval_run_btn.config(state=tk.NORMAL))
 
@@ -1706,8 +1710,9 @@ class AIApp:
                     self.exp_status.config(text="Status: TorchScript export complete ✅")
                 ))
             except Exception as e:
-                self.root.after(0, lambda: (
-                    messagebox.showerror("Export Error", str(e)),
+                err = str(e)
+                self.root.after(0, lambda err=err: (
+                    messagebox.showerror("Export Error", err),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -1737,8 +1742,9 @@ class AIApp:
                     self.exp_status.config(text="Status: ONNX export complete ✅")
                 ))
             except Exception as e:
-                self.root.after(0, lambda: (
-                    messagebox.showerror("ONNX Export Error", str(e)),
+                err = str(e)
+                self.root.after(0, lambda err=err: (
+                    messagebox.showerror("ONNX Export Error", err),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -1763,8 +1769,9 @@ class AIApp:
                     self.exp_status.config(text="Status: Export all complete ✅")
                 ))
             except Exception as e:
-                self.root.after(0, lambda: (
-                    messagebox.showerror("Export All Error", str(e)),
+                err = str(e)
+                self.root.after(0, lambda err=err: (
+                    messagebox.showerror("Export All Error", err),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -2321,11 +2328,13 @@ class AIApp:
                     if HAS_QUANTIZATION:
                         self.root.after(0, self._update_quant_buttons)
             except ParamValidationError as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Validation Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Validation Error", err))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Train Error", f"Error during training:\n{e}"))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Train Error", f"Error during training:\n{err}"))
             finally:
                 self.root.after(0, self._reset_train_buttons)
 
@@ -2409,8 +2418,9 @@ class AIApp:
                                            min_p=min_p)
                 self.root.after(0, self._display_result, res)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{e}"))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Gen Error", f"Error during generation:\n{err}"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -2479,8 +2489,9 @@ class AIApp:
                 self.root.after(0, self._display_result,
                                 "\n\n".join(parts))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{e}"))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Gen Error", f"Error during generation:\n{err}"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -2526,8 +2537,9 @@ class AIApp:
                 self.root.after(0, lambda: self.result_text.insert(
                     tk.END, "\n\n✅ Generation complete."))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{e}"))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Gen Error", f"Error during generation:\n{err}"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -2574,8 +2586,9 @@ class AIApp:
                 self.root.after(0, lambda: self.result_text.insert(
                     tk.END, f"\n✅ Batch generation complete ({len(prompts)} prompts)"))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Gen Error", f"Error during batch generation:\n{e}"))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Gen Error", f"Error during batch generation:\n{err}"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -2736,7 +2749,8 @@ class AIApp:
                         self.root.after(0, lambda: self._append_chat_message("assistant", "[No response generated]"))
 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Chat Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("Chat Error", err))
             finally:
                 self.root.after(0, lambda: (
                     self.chat_send_btn.config(state=tk.NORMAL),
@@ -3132,12 +3146,14 @@ class AIApp:
                 self.root.after(0, update_ui)
 
             except HFNotAvailableError as e:
-                self.root.after(0, lambda: messagebox.showerror(
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
                     "HF support missing",
-                    f"{e}\n\nRun: pip install -r requirements.txt"
+                    f"{err}\n\nRun: pip install -r requirements.txt"
                 ))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("HF Load Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("HF Load Error", err))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -3227,7 +3243,8 @@ class AIApp:
                     text=f"Status: Pushed to {repo_id} ✅"
                 ))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Push Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("Push Error", err))
             finally:
                 self.root.after(0, lambda: self.hf_push_btn.config(state=tk.NORMAL))
 
@@ -3291,7 +3308,8 @@ class AIApp:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("HF Hub Load Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("HF Hub Load Error", err))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -3361,7 +3379,8 @@ class AIApp:
                 self.root.after(0, lambda: self.status_label.config(
                     text=f"Status: Fine-tuning complete ✅ Adapter in {out_dir}"))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Fine-tune Error", str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("Fine-tune Error", err))
             finally:
                 self.root.after(0, lambda: self.hf_finetune_btn.config(state=tk.NORMAL))
 

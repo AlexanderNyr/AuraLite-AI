@@ -21,10 +21,7 @@ WORKDIR /app
 COPY . .
 RUN pip install --upgrade pip && pip install -e '.[serve]' --extra-index-url https://download.pytorch.org/whl/cpu
 EXPOSE 8000
-HEALTHCHECK CMD python - <<'PY' || exit 1
-import urllib.request
-urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
-PY
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" || exit 1
 CMD ["uvicorn", "server.openai_server:app", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime-cuda

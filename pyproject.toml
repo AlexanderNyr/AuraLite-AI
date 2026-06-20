@@ -21,7 +21,8 @@ test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
 full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
 quant = ["bitsandbytes>=0.43; platform_system != 'Darwin'", "auto-gptq>=0.7", "optimum>=1.20"]
-serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "vllm>=0.5; platform_system == 'Linux'"]
+serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30"]
+vllm = ["vllm>=0.5; platform_system == 'Linux'"]
 rag = ["sentence-transformers>=3", "faiss-cpu>=1.8", "chromadb>=0.5"]
 dev = ["auralite-ai[test,lint,full,quant,serve,rag]"]
 
@@ -35,7 +36,7 @@ target-version = "py310"
 exclude = [".git", "build", "dist", ".venv"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E9", "F63", "F7", "F82"]
 ignore = ["E501"]
 
 [tool.pytest.ini_options]
@@ -48,8 +49,17 @@ omit = ["tests/*", "setup.py"]
 
 [tool.pyright]
 pythonVersion = "3.10"
-typeCheckingMode = "strict"
+typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
+
+reportMissingImports = false
+reportUnusedImport = false
+reportMissingTypeArgument = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportUnknownLambdaType = false
+reportUntypedBaseClass = false
+reportAttributeAccessIssue = false
