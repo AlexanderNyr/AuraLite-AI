@@ -1,24 +1,34 @@
 """AuraLite model_engine package shim (v2.4).
 
-The historic project exposed a single `model_engine.py` module.  v2.4 adds a
-package layout while preserving every public import by loading the legacy module
-under a private name and re-exporting its public symbols.
+The historic project exposed a single `model_engine.py` module. v2.4 adds a
+package layout while preserving every public import.
+
+PyInstaller note
+----------------
+The first v2.4 shim loaded ``../model_engine.py`` dynamically by filesystem path.
+That works from source but fails in frozen apps because PyInstaller does not
+bundle arbitrary sibling source files.  The legacy implementation now lives in
+``model_engine._legacy`` and is imported normally, so PyInstaller discovers and
+bundles it automatically.
 """
 from __future__ import annotations
 
-import importlib.util
-import pathlib
 import sys
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
-_LEGACY_PATH = pathlib.Path(__file__).resolve().parent.parent / "model_engine.py"
-_SPEC = importlib.util.spec_from_file_location("_auralite_legacy_model_engine", _LEGACY_PATH)
-if _SPEC is None or _SPEC.loader is None:  # pragma: no cover
-    raise ImportError(f"Could not load legacy model_engine.py from {_LEGACY_PATH}")
-_legacy = importlib.util.module_from_spec(_SPEC)
+try:
+    from . import _legacy as _legacy
+except Exception as exc:  # pragma: no cover - import-time dependency failures are surfaced clearly
+    raise ImportError(
+        "AuraLite could not import the bundled model_engine._legacy module. "
+        "If this is a frozen/PyInstaller build, rebuild with the updated "
+        "model_engine package included."
+    ) from exc
+
+# Keep the private name used by older v2.4 shims for compatibility with any
+# already-imported references.
 sys.modules.setdefault("_auralite_legacy_model_engine", _legacy)
-_SPEC.loader.exec_module(_legacy)
 
 for _name in dir(_legacy):
     if not _name.startswith("_"):

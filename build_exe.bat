@@ -1,9 +1,9 @@
 @echo off
 cd /d "%~dp0"
 chcp 65001 >nul
-title AuraLite AI v2.0 Builder
+title AuraLite AI v2.4 Builder
 echo ====================================================
-echo    Building AuraLite AI v2.0 — Modern Edition
+echo    Building AuraLite AI v2.4 — Modern Edition
 echo ====================================================
 echo.
 
@@ -20,7 +20,14 @@ python -m pip install torch numpy pyinstaller
 
 echo.
 echo [+] Starting compilation (--onedir)...
-python -m PyInstaller --onedir --noconsole --name "AuraLite_AI_v2" gui_app.py
+REM v2.4+: collect package submodules explicitly so frozen builds include
+REM model_engine._legacy and the gradual-refactor package shims.
+python -m PyInstaller --onedir --noconsole --name "AuraLite_AI_v2" ^
+    --hidden-import model_engine._legacy ^
+    --collect-submodules model_engine ^
+    --collect-submodules gui ^
+    --collect-submodules kernels ^
+    gui_app.py
 
 if %errorlevel% equ 0 (
     echo.

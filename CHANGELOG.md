@@ -1,3 +1,13 @@
+# 🔧 Changelog — AuraLite AI v2.4.1 (2026-06-20)
+
+## PyInstaller / Windows frozen build fix
+- Fixed a crash where `model_engine/__init__.py` dynamically loaded `../model_engine.py`, which is not bundled by PyInstaller in `dist/.../_internal/`.
+- Added bundled `model_engine/_legacy.py` and changed the shim to import it normally so PyInstaller discovers it.
+- Updated `build_exe.bat` with explicit `--collect-submodules` / `--hidden-import` flags.
+- Removed duplicate `model_engine` from `pyproject.toml` `py-modules` because the package now owns that import name.
+
+---
+
 # 🚀 Changelog — AuraLite AI v2.4 (2026-06-20)
 
 ## Production-Grade Core

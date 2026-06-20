@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.4.0"
+version = "2.4.1"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,7 @@ rag = ["sentence-transformers>=3", "faiss-cpu>=1.8", "chromadb>=0.5"]
 dev = ["auralite-ai[test,lint,full,quant,serve,rag]"]
 
 [tool.setuptools]
-py-modules = ["model_engine", "quantization", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
+py-modules = ["quantization", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
 packages = ["model_engine", "gui", "gui.tabs", "kernels", "server"]
 
 [tool.ruff]
