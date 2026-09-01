@@ -629,11 +629,16 @@ class QuantizationEngine:
         cb(0, 2, "Applying dynamic INT8 quantization…")
         model_cpu = copy.deepcopy(model).cpu().eval()
         try:
-            q_model = torch.quantization.quantize_dynamic(
-                model_cpu,
-                {nn.Linear},
-                dtype=torch.qint8,
-            )
+            # torch.quantization deprecated in PyTorch >=2.9; prefer torch.ao
+            try:
+                import torch.ao.quantization as _taq
+                q_model = _taq.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.qint8)
+            except (ImportError, AttributeError):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    q_model = torch.quantization.quantize_dynamic(  # type: ignore[attr-defined]
+                        model_cpu, {nn.Linear}, dtype=torch.qint8)
         except Exception as e:
             raise RuntimeError(f"Dynamic quantization failed: {e}") from e
         cb(2, 2, "Dynamic quantization complete.")
@@ -655,8 +660,22 @@ class QuantizationEngine:
 
         # Fuse modules where possible (norm+linear patterns)
         # PyTorch static quant needs backend config
-        wrapped.qconfig = torch.quantization.get_default_qconfig("x86")
-        torch.quantization.prepare(wrapped, inplace=True)
+        try:
+            import torch.ao.quantization as _taq2
+            wrapped.qconfig = _taq2.get_default_qconfig("x86")
+        except (ImportError, AttributeError):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                wrapped.qconfig = torch.quantization.get_default_qconfig("x86")  # type: ignore
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                import torch.ao.quantization as _taq3
+                _taq3.prepare(wrapped, inplace=True)
+            except (ImportError, AttributeError):
+                torch.quantization.prepare(wrapped, inplace=True)  # type: ignore
 
         cb(1, 4, "Calibrating on sample data…")
         # Calibration pass
@@ -677,7 +696,14 @@ class QuantizationEngine:
                     cb(1, 4, f"Calibrating… {i+1}/{len(calib_inputs)}")
 
         cb(3, 4, "Converting to quantized model…")
-        torch.quantization.convert(wrapped, inplace=True)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                import torch.ao.quantization as _taq4
+                _taq4.convert(wrapped, inplace=True)
+            except (ImportError, AttributeError):
+                torch.quantization.convert(wrapped, inplace=True)  # type: ignore
         cb(4, 4, "Static quantization complete.")
         return wrapped
 
@@ -1299,9 +1325,13 @@ class _StaticQuantWrapper(nn.Module):
 
     def __init__(self, model: nn.Module):
         super().__init__()
-        self.quant = torch.quantization.QuantStub()
+        try:
+            import torch.ao.nn.quantized as _taonnq; self.quant = torch.ao.quantization.QuantStub()
+        except Exception: self.quant = torch.quantization.QuantStub()  # type: ignore
         self.model = model
-        self.dequant = torch.quantization.DeQuantStub()
+        try:
+            self.dequant = torch.ao.quantization.DeQuantStub()
+        except Exception: self.dequant = torch.quantization.DeQuantStub()  # type: ignore
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # Embedding lookup produces float — quantize that

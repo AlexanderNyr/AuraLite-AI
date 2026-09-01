@@ -28,7 +28,7 @@ dev = ["auralite-ai[test,lint,full,quant,serve,rag]"]
 
 [tool.setuptools]
 py-modules = ["quantization", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
-packages = ["model_engine", "gui", "gui.tabs", "kernels", "server"]
+packages = ["model_engine", "gui", "gui.tabs", "kernels", "server", "agent"]
 
 [tool.ruff]
 line-length = 100

@@ -780,11 +780,14 @@ class Attention(nn.Module):
                 key_start_pos = self.kv_cache_start_pos
                 k = torch.cat([cached_k, k], dim=2)
                 v = torch.cat([cached_v, v], dim=2)
+            # Sliding-window eviction: drop oldest tokens from the KV cache.
+            # key_start_pos tracks the absolute sequence position of cache[0].
             if self.sliding_window is not None and self.sliding_window > 0 and k.shape[2] > self.sliding_window:
                 overflow = k.shape[2] - self.sliding_window
                 k = k[:, :, overflow:, :]
                 v = v[:, :, overflow:, :]
-                key_start_pos += overflow
+                key_start_pos = key_start_pos + overflow  # absolute position of new cache[0]
+            # Always update stored start position *before* writing cache
             self.kv_cache_start_pos = key_start_pos
             self._set_cached_kv(k, v)
 
