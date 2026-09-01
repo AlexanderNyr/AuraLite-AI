@@ -218,8 +218,22 @@ class AIApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AuraLite AI v2.3 — Modern Transformer Edition")
-        self.root.geometry("920x840")
-        self.root.minsize(820, 700)
+        # Default 800x600, clamped to the physical screen so the window (and its
+        # content) never exceeds what the monitor can show. The scrollable tabs
+        # handle the rest, so nothing is clipped on 1280x720 / 1280x800 / 1280x1024.
+        win_w, win_h = 800, 600
+        # Guard the screen-probe calls: tests pass a DummyTk mock without them.
+        try:
+            avail_w = self.root.winfo_screenwidth()
+            avail_h = self.root.winfo_screenheight()
+        except AttributeError:
+            avail_w = avail_h = 0
+        if avail_h and avail_h < win_h + 40:      # taskbar / scale margin
+            win_h = max(400, avail_h - 72)
+        if avail_w and avail_w < win_w + 40:
+            win_w = max(560, avail_w - 72)
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(min(560, win_w), min(420, win_h))
         self.root.configure(bg="#f5f6f7")
 
         # Dark theme toggle (NEW v2.5)
@@ -267,23 +281,24 @@ class AIApp:
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.tab_train   = ttk.Frame(self.notebook, padding="12")
-        self.tab_gen     = ttk.Frame(self.notebook, padding="12")
-        self.tab_chat    = ttk.Frame(self.notebook, padding="12")
-        self.tab_model   = ttk.Frame(self.notebook, padding="12")
-        self.tab_quant   = ttk.Frame(self.notebook, padding="12")
-        self.tab_eval    = ttk.Frame(self.notebook, padding="12")
-        self.tab_export  = ttk.Frame(self.notebook, padding="12")
-        self.tab_console = ttk.Frame(self.notebook, padding="12")
-
-        self.notebook.add(self.tab_train,   text=" 🏋️  Training ")
-        self.notebook.add(self.tab_gen,     text=" ✨  Generation ")
-        self.notebook.add(self.tab_chat,    text=" 💬  Chat ")
-        self.notebook.add(self.tab_model,   text=" 💾  Model ")
-        self.notebook.add(self.tab_quant,   text=" ⚡  Quantization ")
-        self.notebook.add(self.tab_eval,    text=" 📊  Evaluation ")
-        self.notebook.add(self.tab_export,  text=" 📦  Export ")
-        self.notebook.add(self.tab_console, text=" 🖥️  Console ")
+        # Each tab is wrapped in a scrollable canvas so its content is never
+        # clipped on small screens. self.tab_* stays the inner frame, so the
+        # existing _build_*_tab() methods keep working unchanged.
+        self._scroll_canvases = []  # keep refs so we can theme their background
+        for _name, _text in (
+            ("train",   " Train "),
+            ("gen",     " Generate "),
+            ("chat",    " Chat "),
+            ("model",   " Model "),
+            ("quant",   " Quant "),
+            ("eval",    " Eval "),
+            ("export",  " Export "),
+            ("console", " Console "),
+        ):
+            container, canvas, inner = self._make_scrollable_tab()
+            setattr(self, f"tab_{_name}", inner)
+            self._scroll_canvases.append((container, canvas, inner))
+            self.notebook.add(container, text=_text)
 
         self._build_training_tab()
         self._build_generation_tab()
@@ -312,6 +327,57 @@ class AIApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ==================================================================
+    #  Scrollable tab container (small-screen safe layout)
+    # ==================================================================
+    def _make_scrollable_tab(self):
+        """Build a (container, canvas, inner) triple.
+
+        The container is what the notebook holds; the canvas + vertical
+        scrollbar provide scrolling so tall content is never clipped on
+        720p-style screens; the inner frame is where the tab's widgets live
+        (exposed as self.tab_<name> for the existing _build_*_tab methods).
+        """
+        container = ttk.Frame(self.notebook)
+        canvas = tk.Canvas(container, highlightthickness=0, bd=0, bg="#f5f6f7")
+        vsb = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+
+        inner = ttk.Frame(canvas, padding="12")
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        canvas.configure(yscrollcommand=vsb.set)
+
+        def _on_canvas_configure(event):
+            # Inner frame always matches the canvas width.
+            canvas.itemconfigure(inner_id, width=event.width)
+            # If content is shorter than the viewport, stretch inner to fill.
+            req_h = inner.winfo_reqheight()
+            if req_h < event.height:
+                canvas.itemconfigure(inner_id, height=event.height)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_inner_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_mousewheel(event):
+            if event.num == 4:            # Linux/Windows wheel up
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:          # Linux/Windows wheel down
+                canvas.yview_scroll(1, "units")
+            else:                          # Windows <MouseWheel>
+                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_mousewheel)
+        canvas.bind("<Button-5>", _on_mousewheel)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        return container, canvas, inner
+
+    # ==================================================================
     #  Theme handling (NEW v2.5)
     # ==================================================================
     def _apply_theme(self, light: bool = True):
@@ -336,6 +402,13 @@ class AIApp:
             console_fg = "#dcdcdc"
 
         self.root.configure(bg=bg)
+
+        # Scrollable tab canvases follow the theme background.
+        for _container, _canvas, _inner in getattr(self, "_scroll_canvases", []):
+            try:
+                _canvas.configure(bg=bg)
+            except tk.TclError:
+                pass
 
         # ttk styles
         style.configure("TFrame", background=bg)
@@ -2747,7 +2820,6 @@ class AIApp:
         self._agent: "AuraLiteAgent | None" = None
         self._agent_sandbox: "Sandbox | None" = None
         self._agent_stop_event = threading.Event()
-
 
     def _send_chat_message(self):
         if not self.engine.model:
