@@ -1,3 +1,65 @@
+# 🤖 Changelog — AuraLite AI v2.5.0 (2026-09-01)
+
+## Agent Framework (NEW)
+
+### `agent/` package
+- **`Sandbox`** — subprocess-based isolated execution environment that works on Windows 10, Linux, and macOS without Docker or root privileges.
+  - Watchdog thread kills runaway processes after configurable timeout
+  - Separate `tempfile.TemporaryDirectory` working directory per session (auto-cleaned)
+  - Command whitelist for shell mode (`HARD_BLOCKED` + `DEFAULT_SHELL_WHITELIST`)
+  - Path-escape prevention (`_safe_path` enforces sandbox root)
+  - stdout/stderr size-capped at 64 KB / 500 lines
+  - `run_python()`, `run_shell()`, `write_file()`, `read_file()`, `list_files()`, `install_package()`
+  - Context-manager API (`with Sandbox() as sb:`)
+
+- **`TOOL_REGISTRY`** — 8 built-in tools exposed via XML-style `<tool name="...">` tags:
+  - `python` — execute Python code in the sandbox
+  - `shell` — run whitelisted shell commands
+  - `write_file` / `read_file` / `list_files` — filesystem access (sandbox-only)
+  - `install` — `pip install` in sandbox Python
+  - `web_search` — DuckDuckGo/Wikipedia search (via existing `web_tools.py`)
+  - `calculate` — safe math expression evaluator
+  - `parse_tool_calls()` — XML parser that handles attributes + body, multi-call per response
+  - `build_system_prompt()` — generates the system prompt section for the agent
+
+- **`AuraLiteAgent`** — ReAct-style reasoning loop:
+  - Works with ANY backend (GGUF, HuggingFace, native torch)
+  - `run()` — synchronous full-loop, returns final answer
+  - `run_streaming()` — async generator, yields tokens and `[TOOL RESULT]` blocks in real-time
+  - `stop()` / `reset()` — safe interruption from GUI thread
+  - `on_step` callback for custom UI hooks
+  - Configurable `max_iterations`, sampling parameters, `chat_template`
+
+### GUI: Agent Mode in Chat Tab
+- New **"🤖 Agent Mode"** section in the Chat tab (extends existing tab, not a new one)
+- Toggle checkbox enables/disables agent mode per-session
+- Sandbox log widget (dark terminal-style) shows tool calls and results in real-time
+- **⏹ Stop Agent** button halts the running loop immediately
+- Available tools listed directly in the UI
+- Agent mode integrates with GGUF models (Llama, Mistral, Qwen, etc.) via `generate_chat_streaming`
+
+## Bug Fixes
+
+### `model_engine/_legacy.py`
+- **KV-cache sliding window**: fixed `kv_cache_start_pos` tracking — on first call (no cache), the eviction overflow was double-counted. Now correctly set to `key_start_pos + overflow` (absolute position of new cache[0]).
+
+### `quantization.py`
+- **Deprecated `torch.quantization` API**: replaced `torch.quantization.quantize_dynamic`, `prepare`, `convert`, `get_default_qconfig`, `QuantStub`, `DeQuantStub` with `torch.ao.quantization` equivalents (with graceful fallback for older PyTorch versions). Eliminates `DeprecationWarning` in PyTorch ≥2.9.
+
+### `tests/test_gui_export_extras.py`
+- **SyntaxError: too many statically nested blocks**: replaced deeply-nested `with patch(...), patch(...), ...` chains with `contextlib.ExitStack`. File now compiles correctly on all Python 3.11+ versions.
+- Added `pytest.importorskip("tkinter")` so the file auto-skips in headless/CI environments where tkinter is unavailable.
+
+### `agent/sandbox.py`
+- **Timeout detection**: when watchdog thread kills the process before `subprocess.TimeoutExpired` is raised (common on Linux), `timed_out=True` is now correctly set based on returncode + elapsed time.
+
+### `agent/tools.py`
+- **XML parser**: `parse_tool_calls` now correctly maps the body to the first *unset* parameter (not always the first parameter). Fixes `write_file` body mapping to `content` when `filename` is provided as an attribute.
+
+## Tests
+- Added `tests/test_agent.py` — 30 tests covering Sandbox, Tool dispatch, XML parser, and Agent loop.
+- CI updated to `--ignore=tests/test_gui_export_extras.py` for headless builds.
+
 # 🔧 Changelog — AuraLite AI v2.4.2 (2026-06-20)
 
 ## CI / Docker stability fix
