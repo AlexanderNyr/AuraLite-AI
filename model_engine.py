@@ -980,6 +980,10 @@ class ModernTransformer(nn.Module):
                  tie_word_embeddings: bool = True):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        # n_kv_heads == 0 means "no GQA" (use MHA, i.e. n_kv_heads = n_heads).
+        # Normalise here so the %-modulo below never divides by zero.
+        if n_kv_heads in (0, "0"):
+            n_kv_heads = None
         if n_kv_heads is not None:
             assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
 
@@ -2180,6 +2184,10 @@ class AuraLiteEngine:
         n_heads    = params.get("n_heads", 4)
         n_layers   = params.get("n_layers", 4)
         n_kv_heads = params.get("n_kv_heads", None)
+        # Treat n_kv_heads == 0 as "no GQA" (MHA). Zero is a common GUI default and
+        # previously reached ModernTransformer where the %-modulo raised ZeroDivisionError.
+        if n_kv_heads in (0, "0"):
+            n_kv_heads = None
         lr         = params.get("lr", 3e-4)
         epochs     = params.get("epochs", 100)
         batch_size = params.get("batch_size", 32)

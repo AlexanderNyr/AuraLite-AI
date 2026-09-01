@@ -2613,6 +2613,9 @@ class AIApp:
     def _build_chat_tab(self):
         tab = self.tab_chat
 
+        # Declare agent-mode state BEFORE it is used by any widget below.
+        self.agent_mode_var = tk.BooleanVar(value=False)
+
         if not HAS_CHAT_SUPPORT:
             ttk.Label(tab,
                       text="⚠ Chat interface not available (chat_interface.py missing).",
@@ -2744,7 +2747,7 @@ class AIApp:
         self._agent: "AuraLiteAgent | None" = None
         self._agent_sandbox: "Sandbox | None" = None
         self._agent_stop_event = threading.Event()
-        self.agent_mode_var = tk.BooleanVar(value=False)
+
 
     def _send_chat_message(self):
         if not self.engine.model:
