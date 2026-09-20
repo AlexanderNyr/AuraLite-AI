@@ -140,6 +140,32 @@ def validate_params(params: dict) -> list[str]:
     if use_ddp and not torch.cuda.is_available():
         errors.append("Multi-GPU (DDP) requires CUDA")
 
+    # v2.6: modern training stack validation
+    optimizer_name = str(params.get("optimizer", "adamw")).lower()
+    if optimizer_name not in ("adamw", "muon"):
+        errors.append(f"optimizer must be 'adamw' or 'muon', got {optimizer_name!r}")
+    if optimizer_name == "muon":
+        muon_lr = params.get("muon_lr", 0.02)
+        if muon_lr <= 0:
+            errors.append(f"muon_lr must be > 0, got {muon_lr}")
+        if not (0.0 < params.get("muon_momentum", 0.95) < 1.0):
+            errors.append(f"muon_momentum must be in (0, 1), got {params.get('muon_momentum')}")
+        if params.get("muon_adjust_lr", "match_rms_adamw") not in ("original", "match_rms_adamw", "spectral_unclamped"):
+            errors.append(f"muon_adjust_lr must be original/match_rms_adamw/spectral_unclamped, got {params.get('muon_adjust_lr')!r}")
+
+    lr_schedule = str(params.get("lr_schedule", "wsd")).lower()
+    if lr_schedule not in ("cosine", "wsd"):
+        errors.append(f"lr_schedule must be 'cosine' or 'wsd', got {lr_schedule!r}")
+    if lr_schedule == "wsd":
+        stable_ratio = params.get("wsd_stable_ratio", 0.8)
+        if not (0.0 < stable_ratio < 1.0):
+            errors.append(f"wsd_stable_ratio must be in (0, 1), got {stable_ratio}")
+        min_lr_ratio = params.get("wsd_min_lr_ratio", 0.2)
+        if not (0.0 <= min_lr_ratio <= 1.0):
+            errors.append(f"wsd_min_lr_ratio must be in [0, 1], got {min_lr_ratio}")
+        if params.get("wsd_decay", "cosine") not in ("cosine", "linear", "sqrt"):
+            errors.append(f"wsd_decay must be cosine/linear/sqrt, got {params.get('wsd_decay')!r}")
+
     return errors
 
 
@@ -537,6 +563,32 @@ class RMSNorm(nn.Module):
 
 # -------------------------------------------------------------------
 
+class HeadwiseRMSNorm(nn.Module):
+    """Per-head RMSNorm for QK-norm (query/key normalization).
+
+    QK-norm was popularized for vision transformers (Dehghani et al., 2023,
+    "Scaling Vision Transformers to 22 Billion Parameters") and is now standard
+    in modern LLMs (OLMo-2, Gemma-2/3, Qwen3, GLM): normalizing q/k per head
+    before RoPE caps attention-logit growth and stabilizes training at high LR.
+
+    Weight shape is ``(num_heads, head_dim)`` so every head learns its own
+    scale, matching the head-wise formulations used in recent codebases.
+
+    Expected input layout: ``(batch, seq, num_heads, head_dim)``.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_heads, head_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms).type_as(x) * self.weight
+
+
+# -------------------------------------------------------------------
+
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -555,7 +607,8 @@ class Attention(nn.Module):
                  rope_scaling: dict | None = None,
                  sliding_window: int | None = None,
                  kv_cache_dtype: str | None = None,
-                 use_flex_attention: bool = False):
+                 use_flex_attention: bool = False,
+                 use_qk_norm: bool = False):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
@@ -568,12 +621,19 @@ class Attention(nn.Module):
         self.sliding_window = int(sliding_window) if sliding_window else None
         self.kv_cache_dtype = kv_cache_dtype
         self.use_flex_attention = bool(use_flex_attention)
+        self.use_qk_norm = bool(use_qk_norm)
         self.kv_cache_start_pos = 0
 
         self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+
+        # QK-norm (v2.6): per-head RMSNorm applied to q/k BEFORE RoPE.
+        # Stabilizes attention logits; standard in OLMo-2 / Gemma-2 / Qwen3.
+        if self.use_qk_norm:
+            self.q_norm = HeadwiseRMSNorm(n_heads, self.head_dim)
+            self.k_norm = HeadwiseRMSNorm(self.n_kv_heads, self.head_dim)
 
         # Pre-compute RoPE cos / sin as persistent buffers (move with .to(device))
         self.max_seq_len = max_seq_len
@@ -765,6 +825,11 @@ class Attention(nn.Module):
         k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
 
+        # QK-norm: normalize per head BEFORE rotary embeddings.
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         q = self._apply_rope(q, start_pos, T)
         k = self._apply_rope(k, start_pos, T)
 
@@ -910,7 +975,8 @@ class TransformerBlock(nn.Module):
                  kv_cache_dtype: str | None = None,
                  use_flex_attention: bool = False,
                  use_moe: bool = False,
-                 num_experts: int = 4):
+                 num_experts: int = 4,
+                 use_qk_norm: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
@@ -918,7 +984,8 @@ class TransformerBlock(nn.Module):
                                    rope_scaling=rope_scaling,
                                    sliding_window=sliding_window,
                                    kv_cache_dtype=kv_cache_dtype,
-                                   use_flex_attention=use_flex_attention)
+                                   use_flex_attention=use_flex_attention,
+                                   use_qk_norm=use_qk_norm)
         self.ffn_norm  = RMSNorm(d_model)
         self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
         self.dropout   = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -980,7 +1047,8 @@ class ModernTransformer(nn.Module):
                  use_flex_attention: bool = False,
                  use_moe: bool = False,
                  num_experts: int = 4,
-                 tie_word_embeddings: bool = True):
+                 tie_word_embeddings: bool = True,
+                 use_qk_norm: bool = False):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         # n_kv_heads == 0 means "no GQA" (use MHA, i.e. n_kv_heads = n_heads).
@@ -1006,6 +1074,7 @@ class ModernTransformer(nn.Module):
         self.use_moe = bool(use_moe)
         self.num_experts = int(num_experts)
         self.tie_word_embeddings = bool(tie_word_embeddings)
+        self.use_qk_norm = bool(use_qk_norm)
 
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.layers      = nn.ModuleList([
@@ -1017,7 +1086,8 @@ class ModernTransformer(nn.Module):
                              kv_cache_dtype=kv_cache_dtype,
                              use_flex_attention=use_flex_attention,
                              use_moe=use_moe,
-                             num_experts=num_experts)
+                             num_experts=num_experts,
+                             use_qk_norm=use_qk_norm)
             for _ in range(n_layers)
         ])
         self.final_norm  = RMSNorm(d_model)
@@ -1256,6 +1326,274 @@ class CosineWarmupScheduler:
             for pg, lr in zip(self.optimizer.param_groups, current_lrs):
                 pg["lr"] = lr
 
+
+class WSDScheduler:
+    """Warmup-Stable-Decay (WSD / trapezoidal) LR schedule.
+
+    Modern alternative to pure cosine decay (MiniCPM 2024, DeepSeek V3 style):
+      1. **Warmup**  — linear ramp from 0 to the base LR,
+      2. **Stable**  — constant LR until ``stable_ratio`` of training,
+      3. **Decay**   — short decay phase (cosine/linear/sqrt) down to
+         ``min_lr_ratio`` of the base LR.
+
+    Advantages over cosine: you can keep a model in the stable phase
+    indefinitely, branch a new decay run from any stable-phase checkpoint,
+    and empirical convergence matches or beats cosine at equal compute.
+
+    API-compatible with :class:`CosineWarmupScheduler` (step / get_lr /
+    state_dict / load_state_dict) so the training loop needs no changes.
+    """
+
+    VALID_DECAYS = ("cosine", "linear", "sqrt")
+
+    def __init__(self, optimizer, warmup_steps: int, max_steps: int,
+                 stable_ratio: float = 0.8, min_lr_ratio: float = 0.2,
+                 decay_type: str = "cosine"):
+        self.optimizer    = optimizer
+        self.warmup_steps = max(1, warmup_steps)
+        self.max_steps    = max(1, max_steps)
+        self.stable_ratio = float(min(max(stable_ratio, 0.0), 0.99))
+        self.min_lr_ratio = float(min(max(min_lr_ratio, 0.0), 1.0))
+        self.decay_type   = decay_type if decay_type in self.VALID_DECAYS else "cosine"
+        self.base_lrs     = [pg["lr"] for pg in optimizer.param_groups]
+        self.step_count   = 0
+
+    def _decay_start(self) -> int:
+        return max(self.warmup_steps, int(self.max_steps * self.stable_ratio))
+
+    def _multiplier(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return step / self.warmup_steps
+        decay_start = self._decay_start()
+        if step < decay_start:
+            return 1.0
+        decay_steps = max(1, self.max_steps - decay_start)
+        progress = min(1.0, (step - decay_start) / decay_steps)
+        if self.decay_type == "linear":
+            scale = 1.0 - progress
+        elif self.decay_type == "sqrt":
+            # 1 - sqrt(p): spends more of the decay at a useful LR
+            scale = 1.0 - math.sqrt(progress)
+        else:  # cosine decay inside the decay phase (MiniCPM-style)
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * scale
+
+    def step(self):
+        self.step_count += 1
+        mult = self._multiplier(self.step_count)
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = base_lr * mult
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> dict:
+        return {
+            "schedule": "wsd",
+            "warmup_steps": self.warmup_steps,
+            "max_steps": self.max_steps,
+            "stable_ratio": self.stable_ratio,
+            "min_lr_ratio": self.min_lr_ratio,
+            "decay_type": self.decay_type,
+            "base_lrs": list(self.base_lrs),
+            "step_count": self.step_count,
+            "current_lrs": [pg["lr"] for pg in self.optimizer.param_groups],
+        }
+
+    def load_state_dict(self, state: dict):
+        self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
+        self.max_steps = state.get("max_steps", self.max_steps)
+        self.stable_ratio = float(state.get("stable_ratio", self.stable_ratio))
+        self.min_lr_ratio = float(state.get("min_lr_ratio", self.min_lr_ratio))
+        self.decay_type = state.get("decay_type", self.decay_type)
+        self.base_lrs = list(state.get("base_lrs", self.base_lrs))
+        self.step_count = int(state.get("step_count", self.step_count))
+        current_lrs = state.get("current_lrs")
+        if current_lrs is not None:
+            for pg, lr in zip(self.optimizer.param_groups, current_lrs):
+                pg["lr"] = lr
+
+
+
+# ===================================================================
+#  Muon optimizer (Newton–Schulz orthogonalized momentum) — v2.6
+# ===================================================================
+#
+# Muon (Keller Jordan et al., 2024; Moonlight/Kimi K2 adoption) replaces
+# AdamW for the *hidden* 2-D weight matrices of the transformer body.
+# Idea: take the momentum buffer, orthogonalize the update matrix via a
+# quintic Newton–Schulz iteration (i.e. approximate UV^T of the SVD), then
+# apply it with a shape-aware learning rate. Embeddings, the LM head and
+# all norm/scalar parameters must stay on AdamW — see
+# :func:`split_parameters_for_muon`.
+
+def _newton_schulz_ortho(grad: torch.Tensor, ns_steps: int, eps: float) -> torch.Tensor:
+    """Quintic Newton–Schulz iteration approximating the nearest
+    semi-orthogonal matrix (the UV^T factor) of ``grad``.
+
+    Runs in bf16 on CUDA (as in the reference implementation) and in fp32 on
+    CPU, where bf16 matmul throughput is poor and precision is cheap.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    compute_dtype = torch.bfloat16 if (grad.is_cuda and torch.cuda.is_bf16_supported()) else torch.float32
+    X = grad.to(compute_dtype)
+
+    transpose = X.size(-2) > X.size(-1)
+    if transpose:
+        X = X.mT
+
+    # clamp the spectral norm below 1 so the iteration converges
+    X = X / (X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
+
+    for _ in range(ns_steps):
+        gram = X @ X.mT
+        B = b * gram + c * (gram @ gram)
+        X = a * X + B @ X
+
+    if transpose:
+        X = X.mT
+    return X
+
+
+def _muon_adjust_lr(lr: float, adjust_lr_fn: str, shape: torch.Size) -> float:
+    """Shape-aware LR scaling for Muon updates.
+
+    - ``"original"``        : lr * sqrt(max(1, fan_out / fan_in)) — Keller Jordan
+    - ``"match_rms_adamw"`` : lr * 0.2 * sqrt(max(fan_out, fan_in)) — matches the
+      update RMS of AdamW, so AdamW-tuned LRs transfer (Moonlight default)
+    - ``"spectral_unclamped"`` : lr * sqrt(fan_out / fan_in)
+    """
+    out_dim, in_dim = shape[:2]
+    if adjust_lr_fn == "match_rms_adamw":
+        return lr * 0.2 * math.sqrt(max(out_dim, in_dim))
+    if adjust_lr_fn == "spectral_unclamped":
+        return lr * math.sqrt(out_dim / in_dim)
+    return lr * math.sqrt(max(1.0, out_dim / in_dim))
+
+
+class Muon(optim.Optimizer):
+    """Muon: MomentUm Orthogonalized by Newton–Schulz.
+
+    Accepts ONLY 2-D parameters (hidden weight matrices). Pair with an AdamW
+    group for embeddings / LM head / norms / LoRA — conveniently produced by
+    :func:`split_parameters_for_muon`.
+    """
+
+    def __init__(self, params, lr: float = 0.02, weight_decay: float = 0.0,
+                 momentum: float = 0.95, nesterov: bool = True,
+                 ns_steps: int = 5, eps: float = 1e-7,
+                 adjust_lr_fn: str = "match_rms_adamw"):
+        if adjust_lr_fn not in ("original", "match_rms_adamw", "spectral_unclamped"):
+            raise ValueError(f"Unknown adjust_lr_fn: {adjust_lr_fn!r}")
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
+                        nesterov=nesterov, ns_steps=ns_steps, eps=eps,
+                        adjust_lr_fn=adjust_lr_fn)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError(
+                        f"Muon only supports 2-D parameters, got shape {tuple(p.shape)}. "
+                        "Use split_parameters_for_muon(model) to separate embeddings/"
+                        "norms/scalars into an AdamW group."
+                    )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr         = group["lr"]
+            wd         = group["weight_decay"]
+            momentum   = group["momentum"]
+            nesterov   = group["nesterov"]
+            ns_steps   = group["ns_steps"]
+            eps        = group["eps"]
+            adjust_fn  = group["adjust_lr_fn"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Muon does not support sparse gradients")
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                buf = state["momentum_buffer"]
+
+                # buf = buf * momentum + grad * (1 - momentum) in fp32
+                buf.lerp_(grad.to(torch.float32), 1.0 - momentum)
+                update = grad.to(torch.float32).lerp_(buf, momentum) if nesterov else buf
+
+                ortho = _newton_schulz_ortho(update, ns_steps, eps)
+                adjusted_lr = _muon_adjust_lr(lr, adjust_fn, p.shape)
+
+                if wd:
+                    p.mul_(1.0 - lr * wd)
+                p.add_(ortho.to(p.dtype), alpha=-adjusted_lr)
+
+        return loss
+
+
+def split_parameters_for_muon(model: nn.Module):
+    """Split trainable parameters into (muon_params, adam_decay, adam_no_decay).
+
+    - Embeddings, norms, scalars (ndim < 2)  -> AdamW without weight decay
+    - 2-D matrices inside transformer blocks -> Muon
+    - everything else (e.g. an untied LM head) -> AdamW with weight decay
+
+    With tied embeddings the shared matrix is registered under
+    ``embedding.weight`` and therefore correctly lands in the AdamW group.
+    """
+    muon_params, adam_decay, adam_no_decay = [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "norm" in name or "embedding" in name or param.ndim < 2:
+            adam_no_decay.append(param)
+        elif param.ndim == 2 and "layers." in name:
+            muon_params.append(param)
+        else:
+            adam_decay.append(param)
+    return muon_params, adam_decay, adam_no_decay
+
+
+class _ChainedOptimizers:
+    """Thin wrapper that steps several optimizers as one (Muon + AdamW).
+
+    Exposes just what the training loop touches: zero_grad, step, state_dict
+    and load_state_dict (with scalar optimizer states moved to device by
+    ``_move_optimizer_state_to_device``).
+    """
+
+    def __init__(self, *optimizers):
+        self.optimizers = [o for o in optimizers if o is not None]
+        self.param_groups = [pg for o in self.optimizers for pg in o.param_groups]
+
+    def zero_grad(self, set_to_none: bool = True):
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        loss = None
+        for opt in self.optimizers:
+            out = opt.step(closure) if closure is not None else opt.step()
+            if out is not None:
+                loss = out
+        return loss
+
+    def state_dict(self):
+        return [opt.state_dict() for opt in self.optimizers]
+
+    def load_state_dict(self, state):
+        if not isinstance(state, (list, tuple)) or len(state) != len(self.optimizers):
+            raise ValueError("Chained optimizer state does not match the optimizer layout")
+        for opt, sub in zip(self.optimizers, state):
+            opt.load_state_dict(sub)
 
 
 # ===================================================================
@@ -2065,12 +2403,30 @@ class AuraLiteEngine:
             raise ValueError("No tokenizer — train or load a model first!")
         return self.tokenizer.decode(ids)
 
+    def _scaler_unscale_optimizer(self):
+        """GradScaler.unscale_ that also supports chained (Muon + AdamW) optimizers."""
+        if isinstance(self.optimizer, _ChainedOptimizers):
+            for opt in self.optimizer.optimizers:
+                self.scaler.unscale_(opt)
+        else:
+            self.scaler.unscale_(self.optimizer)
+
+    def _scaler_step_optimizer(self):
+        """GradScaler.step that also supports chained (Muon + AdamW) optimizers."""
+        if isinstance(self.optimizer, _ChainedOptimizers):
+            for opt in self.optimizer.optimizers:
+                self.scaler.step(opt)
+        else:
+            self.scaler.step(self.optimizer)
+
     @staticmethod
     def _move_optimizer_state_to_device(optimizer, device: torch.device):
-        for state in optimizer.state.values():
-            for key, value in list(state.items()):
-                if torch.is_tensor(value):
-                    state[key] = value.to(device)
+        optimizers = optimizer.optimizers if isinstance(optimizer, _ChainedOptimizers) else [optimizer]
+        for opt in optimizers:
+            for state in opt.state.values():
+                for key, value in list(state.items()):
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device)
 
     def _prepare_prompt_ids(self, start_str: str,
                             reserve_generation_slot: bool = True) -> list[int]:
@@ -2221,6 +2577,22 @@ class AuraLiteEngine:
         num_experts = params.get("num_experts", 4)
         tie_word_embeddings = params.get("tie_word_embeddings", True)
 
+        # NEW (v2.6): modern training stack
+        #   QK-norm          — per-head RMS normalization of q/k before RoPE
+        #   Muon optimizer   — Newton–Schulz orthogonalized momentum for the
+        #                      hidden 2-D matrices (embeddings/head/norms stay
+        #                      on AdamW)
+        #   WSD schedule     — Warmup-Stable-Decay replaces plain cosine decay
+        use_qk_norm     = bool(params.get("use_qk_norm", False))
+        optimizer_name  = str(params.get("optimizer", "adamw")).strip().lower()
+        muon_lr         = float(params.get("muon_lr", 0.02))
+        muon_momentum   = float(params.get("muon_momentum", 0.95))
+        muon_adjust_lr  = str(params.get("muon_adjust_lr", "match_rms_adamw")).strip()
+        lr_schedule     = str(params.get("lr_schedule", "wsd")).strip().lower()
+        wsd_stable_ratio  = float(params.get("wsd_stable_ratio", 0.8))
+        wsd_min_lr_ratio  = float(params.get("wsd_min_lr_ratio", 0.2))
+        wsd_decay       = str(params.get("wsd_decay", "cosine")).strip().lower()
+
         if use_ddp and not self.is_distributed:
             raise ValueError(
                 "use_ddp=True, but no distributed process group is active. "
@@ -2297,6 +2669,7 @@ class AuraLiteEngine:
                 use_moe=use_moe,
                 num_experts=num_experts,
                 tie_word_embeddings=tie_word_embeddings,
+                use_qk_norm=use_qk_norm,
             ).to(self.device)
 
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
@@ -2305,10 +2678,45 @@ class AuraLiteEngine:
 
         self._ddp_model = None
 
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=lr,
-            weight_decay=weight_decay, betas=(0.9, 0.95),
-        )
+        # ---- Optimizer ------------------------------------------------
+        # "adamw" (classic) or "muon" (v2.6 — Newton–Schulz orthogonalized
+        # momentum). Muon handles only the hidden 2-D matrices of the
+        # transformer blocks; embeddings / norm scales / an untied LM head
+        # are trained by a companion AdamW, following Moonlight et al.
+        has_lora = bool(getattr(self.model, "lora_adapters", None))
+        if optimizer_name == "muon" and has_lora:
+            print("[AuraLite] WARNING: LoRA adapters are trained with AdamW "
+                  "(Muon is not recommended for low-rank adapters). Falling back to AdamW.")
+            optimizer_name = "adamw"
+
+        if optimizer_name == "muon":
+            muon_params, adam_decay_params, adam_no_decay_params = split_parameters_for_muon(self.model)
+            if not muon_params:
+                print("[AuraLite] WARNING: no eligible 2-D matrices for Muon (LoRA-only?). Using AdamW.")
+                optimizer_name = "adamw"
+            else:
+                sub_optimizers = [
+                    Muon(muon_params, lr=muon_lr, momentum=muon_momentum,
+                         weight_decay=weight_decay, adjust_lr_fn=muon_adjust_lr),
+                ]
+                adam_groups = []
+                if adam_decay_params:
+                    adam_groups.append({"params": adam_decay_params, "weight_decay": weight_decay})
+                if adam_no_decay_params:
+                    adam_groups.append({"params": adam_no_decay_params, "weight_decay": 0.0})
+                if adam_groups:
+                    sub_optimizers.append(optim.AdamW(adam_groups, lr=lr, betas=(0.9, 0.95)))
+                self.optimizer = _ChainedOptimizers(*sub_optimizers)
+                print(f"[AuraLite] Optimizer: Muon ({len(muon_params)} matrices, "
+                      f"lr={muon_lr}, momentum={muon_momentum}, adjust_lr={muon_adjust_lr}) + "
+                      f"AdamW ({len(adam_decay_params) + len(adam_no_decay_params)} params, lr={lr})")
+
+        if optimizer_name != "muon":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(), lr=lr,
+                weight_decay=weight_decay, betas=(0.9, 0.95),
+            )
+        self.optimizer_name = optimizer_name
         if optimizer_state_to_restore is not None:
             try:
                 self.optimizer.load_state_dict(optimizer_state_to_restore)
@@ -2421,9 +2829,23 @@ class AuraLiteEngine:
 
         total_steps  = epochs * len(loader)
         warmup_steps = min(200, total_steps // 10)
-        self.scheduler = CosineWarmupScheduler(
-            self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
-        )
+        # v2.6: WSD (Warmup-Stable-Decay) is the default schedule — it matches
+        # or beats cosine convergence and supports branching decay runs from
+        # any stable-phase checkpoint. "cosine" remains available.
+        if lr_schedule == "wsd":
+            self.scheduler = WSDScheduler(
+                self.optimizer, warmup_steps, total_steps,
+                stable_ratio=wsd_stable_ratio,
+                min_lr_ratio=wsd_min_lr_ratio,
+                decay_type=wsd_decay,
+            )
+            print(f"[AuraLite] LR schedule: WSD (stable={wsd_stable_ratio:.0%}, "
+                  f"min_lr_ratio={wsd_min_lr_ratio}, decay={wsd_decay})")
+        else:
+            self.scheduler = CosineWarmupScheduler(
+                self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
+            )
+            print("[AuraLite] LR schedule: cosine + warmup")
         if scheduler_state_to_restore is not None:
             try:
                 self.scheduler.load_state_dict(scheduler_state_to_restore)
@@ -2518,9 +2940,9 @@ class AuraLiteEngine:
 
                 # Only step optimizer after accumulation
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
+                    self._scaler_unscale_optimizer()
                     nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                    self.scaler.step(self.optimizer)
+                    self._scaler_step_optimizer()
                     self.scaler.update()
                     self.scheduler.step()
                     if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
@@ -2537,9 +2959,9 @@ class AuraLiteEngine:
 
             # Handle remaining accumulated gradients
             if seen_batches > 0 and (batch_idx + 1) % accumulation_steps != 0:
-                self.scaler.unscale_(self.optimizer)
+                self._scaler_unscale_optimizer()
                 nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                self.scaler.step(self.optimizer)
+                self._scaler_step_optimizer()
                 self.scaler.update()
                 self.scheduler.step()
                 if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
@@ -3050,6 +3472,7 @@ class AuraLiteEngine:
             "use_moe": getattr(self.model, 'use_moe', False),
             "num_experts": getattr(self.model, 'num_experts', 4),
             "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
+            "use_qk_norm": getattr(self.model, 'use_qk_norm', False),
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -3119,6 +3542,7 @@ class AuraLiteEngine:
             use_moe = checkpoint.get("use_moe", False),
             num_experts = checkpoint.get("num_experts", 4),
             tie_word_embeddings = checkpoint.get("tie_word_embeddings", True),
+            use_qk_norm = checkpoint.get("use_qk_norm", False),
         ).to(self.device)
 
         # Re-create LoRA adapters BEFORE loading the state dict so their

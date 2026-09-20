@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.4.1"
+version = "2.6.0"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.10"

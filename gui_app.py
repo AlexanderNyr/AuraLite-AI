@@ -590,6 +590,31 @@ class AIApp:
         self.rope_factor_var = tk.StringVar(value="1.0")
         ttk.Entry(rope_row, textvariable=self.rope_factor_var, width=6).pack(side=tk.LEFT, padx=2)
 
+        # NEW: Modern training stack (v2.6) — QK-norm + Muon + WSD
+        modern_row = ttk.Frame(tok_frame)
+        modern_row.pack(fill=tk.X, pady=2)
+
+        self.qk_norm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(modern_row, text="QK-norm (modern, stable attention)",
+                        variable=self.qk_norm_var).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(modern_row, text="Optimizer:").pack(side=tk.LEFT, padx=(12, 4))
+        self.opt_var = tk.StringVar(value="muon")
+        ttk.Combobox(modern_row, textvariable=self.opt_var,
+                     values=["muon", "adamw"],
+                     state="readonly", width=7).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(modern_row, text="Muon LR:").pack(side=tk.LEFT, padx=(8, 2))
+        self.muon_lr_var = tk.StringVar(value="0.02")
+        ttk.Entry(modern_row, textvariable=self.muon_lr_var,
+                  width=7).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(modern_row, text="LR Schedule:").pack(side=tk.LEFT, padx=(12, 4))
+        self.sched_var = tk.StringVar(value="wsd")
+        ttk.Combobox(modern_row, textvariable=self.sched_var,
+                     values=["wsd", "cosine"],
+                     state="readonly", width=7).pack(side=tk.LEFT, padx=2)
+
         row2 = ttk.Frame(tok_frame)
         row2.pack(fill=tk.X, pady=2)
 
@@ -2308,6 +2333,11 @@ class AIApp:
                 } if self.rope_type_var.get() != "none" else None,
                 # NEW: Multi-GPU (DDP) — v2.3
                 "use_ddp": bool(self.ddp_var.get()),
+                # NEW: modern training stack — v2.6
+                "use_qk_norm": bool(self.qk_norm_var.get()),
+                "optimizer": self.opt_var.get(),
+                "muon_lr": float(self.muon_lr_var.get()),
+                "lr_schedule": self.sched_var.get(),
             }
         except ValueError:
             messagebox.showerror("Params Error",
@@ -3693,6 +3723,10 @@ class AIApp:
                     "type": self.rope_type_var.get() if self.rope_type_var.get() != "none" else None,
                     "factor": float(self.rope_factor_var.get()) if self.rope_type_var.get() != "none" else 1.0,
                 } if self.rope_type_var.get() != "none" else None,
+                "use_qk_norm": bool(self.qk_norm_var.get()),
+                "optimizer": self.opt_var.get(),
+                "muon_lr": float(self.muon_lr_var.get()),
+                "lr_schedule": self.sched_var.get(),
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
@@ -3743,6 +3777,14 @@ class AIApp:
             elif "rope_scaling" in config:
                 self.rope_type_var.set("none")
                 self.rope_factor_var.set("1.0")
+            if "use_qk_norm" in config:
+                self.qk_norm_var.set(bool(config["use_qk_norm"]))
+            if "optimizer" in config:
+                self.opt_var.set(config["optimizer"] if config["optimizer"] in ("muon", "adamw") else "muon")
+            if "muon_lr" in config:
+                self.muon_lr_var.set(str(config["muon_lr"]))
+            if "lr_schedule" in config:
+                self.sched_var.set(config["lr_schedule"] if config["lr_schedule"] in ("wsd", "cosine") else "wsd")
             self.status_label.config(
                 text=f"Status: Config loaded ✅ ({os.path.basename(path)})")
             messagebox.showinfo("Config Loaded",

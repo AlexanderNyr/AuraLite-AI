@@ -1,4 +1,4 @@
 """Learning-rate schedulers."""
-from . import CosineWarmupScheduler
+from . import CosineWarmupScheduler, WSDScheduler
 
-__all__ = ["CosineWarmupScheduler"]
+__all__ = ["CosineWarmupScheduler", "WSDScheduler"]

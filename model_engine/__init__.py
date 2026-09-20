@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "2.4.1"
+__version__ = "2.6.0"
 
 try:
     from . import _legacy as _legacy

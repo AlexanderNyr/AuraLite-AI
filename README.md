@@ -3,6 +3,27 @@
 **AuraLite AI** is a lightweight, educational Large Language Model (LLM) implemented using **PyTorch**. It is designed to demonstrate the inner workings of the Transformer architecture (the foundation of models like GPT-4) in a way that is accessible and runnable on consumer hardware.
 
 
+## ⚡ v2.6 Modern Training Stack
+
+Three upgrades straight from 2024–2025 frontier practice:
+
+- **QK-norm** (`use_qk_norm`) — per-head RMS normalization of queries/keys **before** RoPE. Popularized by ViT-22B (Dehghani et al., 2023) and now standard in OLMo-2, Gemma-2/3, Qwen3 and GLM. Caps attention-logit growth and stabilizes training at higher learning rates.
+- **Muon optimizer** (`optimizer="muon"`) — **M**oment**U**m **O**rthogonalized by **N**ewton–Schulz (Keller Jordan et al., 2024; used in Moonlight / Kimi K2 and every current speedrun). The hidden 2-D weight matrices of the transformer body are updated with a Newton–Schulz-orthogonalized momentum step at a shape-aware LR (`match_rms_adamw` mode transfers AdamW-tuned LRs). Embeddings, norm scales and an untied LM head automatically stay on a companion AdamW group (`split_parameters_for_muon`). AdamW remains available (`optimizer="adamw"`) and is auto-selected for LoRA runs.
+- **WSD scheduler** (`lr_schedule="wsd"`, now the default) — **W**armup-**S**table-**D**ecay trapezoidal schedule (MiniCPM 2024, DeepSeek-V3-style multi-phase training). Linear warmup → constant LR until `wsd_stable_ratio` (default 80%) → short decay (`cosine` / `linear` / `sqrt`) to `wsd_min_lr_ratio`. Matches or beats cosine convergence and lets you branch a decay run from any stable-phase checkpoint. Pure cosine remains available via `lr_schedule="cosine"`.
+
+```python
+engine.train(text, {
+    "use_qk_norm": True,        # QK-norm per attention head
+    "optimizer": "muon",        # Muon for hidden matrices
+    "muon_lr": 0.02,
+    "lr_schedule": "wsd",       # Warmup-Stable-Decay (default)
+    "wsd_stable_ratio": 0.8,
+    "wsd_decay": "cosine",
+    ...
+})
+```
+
+
 ## 🚀 v2.4 Production-Grade Architecture Update
 
 AuraLite now keeps the original educational single-file entry points **and** adds a production-oriented package layout:

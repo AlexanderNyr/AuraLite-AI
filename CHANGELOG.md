@@ -1,3 +1,29 @@
+# ⚡ Changelog — AuraLite AI v2.6.0 (2026-09-20)
+
+## Modern Training Stack (QK-norm + Muon + WSD)
+
+### Architecture
+- **`HeadwiseRMSNorm`** — per-head RMS normalization with `(num_heads, head_dim)` weights.
+- **QK-norm** (`use_qk_norm`, model + engine + GUI checkbox) — normalizes q/k per head **before** RoPE. Dehghani et al. 2023 (ViT-22B) → OLMo-2 / Gemma-2/3 / Qwen3 practice. Checkpoint field `use_qk_norm` keeps old `.pt` files loading transparently (flag off ⇒ bitwise-compatible state dict).
+
+### Optimizer
+- **`Muon`** — Newton–Schulz orthogonalized momentum optimizer for hidden 2-D matrices (quintic NS iteration, bf16 on CUDA / fp32 on CPU, nesterov momentum, shape-aware LR: `original` / `match_rms_adamw` / `spectral_unclamped`, decoupled weight decay).
+- **`split_parameters_for_muon()`** — embeddings / norm scales / ndim<2 → AdamW without decay; 2-D matrices inside transformer blocks → Muon; untied LM head → AdamW with decay.
+- **`_ChainedOptimizers`** — steps Muon + AdamW as one optimizer; AMP scaler path handles per-optimizer unscale/step.
+- Engine param `optimizer="muon"|"adamw"` (LoRA runs auto-fallback to AdamW), `muon_lr`, `muon_momentum`, `muon_adjust_lr`; validation rules added.
+
+### Scheduler
+- **`WSDScheduler`** — Warmup-Stable-Decay (trapezoidal) schedule: linear warmup → constant LR until `stable_ratio` → cosine / linear / sqrt decay to `min_lr_ratio`. API-compatible with `CosineWarmupScheduler` (step/get_lr/state_dict/load_state_dict). Selected with `lr_schedule="wsd"` (**new default**; `"cosine"` still available), tuned via `wsd_stable_ratio`, `wsd_min_lr_ratio`, `wsd_decay`.
+
+### GUI
+- Training tab row: "QK-norm" checkbox (on by default), Optimizer combobox (muon/adamw, default muon), Muon LR field, LR Schedule combobox (wsd/cosine, default wsd).
+- Configuration save/load round-trips the new options.
+
+### Tests
+- `tests/test_modern_stack.py` — 42 tests: QK-norm math/shapes/flag persistence, NS orthogonalization spectrum, Muon mechanics & state, WSD phase boundaries/monotonic decay/state round-trip, validation, engine integration (muon+wsd+qknorm training, checkpoint round-trip, legacy checkpoint compat, continue-training, cosine still available, LoRA fallback).
+
+---
+
 # 🤖 Changelog — AuraLite AI v2.5.0 (2026-09-01)
 
 ## Agent Framework (NEW)
