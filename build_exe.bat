@@ -1,39 +1,50 @@
 @echo off
 cd /d "%~dp0"
-chcp 65001 >nul
 title AuraLite AI v2.6 Builder
 echo ====================================================
 echo    Building AuraLite AI v2.6
 echo ====================================================
 echo.
 
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [!] Error: Python is not installed.
-    pause
-    exit /b
+REM --- Locate Python ---------------------------------------------------------
+set "PYTHON_EXE="
+where python >nul 2>&1
+if %errorlevel% equ 0 set "PYTHON_EXE=python"
+if not defined PYTHON_EXE (
+    where py >nul 2>&1
+    if %errorlevel% equ 0 set "PYTHON_EXE=py -3"
 )
+if not defined PYTHON_EXE (
+    echo [!] Error: Python is not in PATH. Install Python 3.10-3.13 from python.org
+    echo     and check "Add Python to PATH" during installation.
+    pause
+    exit /b 1
+)
+echo [+] Using Python: %PYTHON_EXE%
+%PYTHON_EXE% --version
 
-REM ---- Use a CLEAN virtual environment so PyInstaller does NOT drag
-REM      in every package in the global site-packages (scipy/pandas/PyQt/gradio/etc).
+REM --- Create / reuse clean virtual environment ------------------------------
 if not exist ".venv\Scripts\python.exe" (
     echo [+] Creating clean virtual environment in .venv ...
-    python -m venv .venv
-    if %errorlevel% neq 0 (
+    %PYTHON_EXE% -m venv .venv
+    if errorlevel 1 (
         echo [!] Failed to create virtual environment.
         pause
-        exit /b
+        exit /b 1
     )
 )
 
 echo [+] Activating .venv ...
 call ".venv\Scripts\activate.bat"
+set "PYTHON_EXE=.venv\Scripts\python.exe"
+
+echo [+] Upgrading pip ...
+"%PYTHON_EXE%" -m pip install --upgrade pip --disable-pip-version-check
 
 echo [+] Installing minimal runtime dependencies into .venv ...
-python -m pip install --upgrade pip
-python -m pip install torch numpy matplotlib pyinstaller
-REM Optional (uncomment if you want HF/GGUF/serving in the build):
-REM python -m pip install transformers peft accelerate sentencepiece protobuf tiktoken fastapi uvicorn pydantic
+"%PYTHON_EXE%" -m pip install torch numpy matplotlib pyinstaller --disable-pip-version-check
+REM Uncomment the next line if you need HuggingFace / serving / RAG in build:
+REM "%PYTHON_EXE%" -m pip install transformers peft accelerate sentencepiece protobuf tiktoken fastapi uvicorn pydantic --disable-pip-version-check
 
 echo.
 echo [+] Cleaning previous build artifacts ...
@@ -42,14 +53,7 @@ if exist "dist" rmdir /s /q dist
 if exist "AuraLite_AI_v2.spec" del /q AuraLite_AI_v2.spec
 
 echo [+] Starting compilation (--onedir) ...
-REM Key fixes:
-REM   --exclude-module : keep heavy/unrelated packages OUT of the build so
-REM     PyInstaller never imports them (no access-violation from DLL collisions
-REM     in the isolated subprocess). Add/remove as you wish.
-REM   --collect-submodules : ensure shim packages (model_engine, gui, kernels,
-REM     server, agent) are included.
-REM   --noconfirm : non-interactive overwrite.
-python -m PyInstaller ^
+"%PYTHON_EXE%" -m PyInstaller ^
     --onedir ^
     --windowed ^
     --name "AuraLite_AI_v2" ^
@@ -99,19 +103,20 @@ python -m PyInstaller ^
     --exclude-module torch.distributed.tensor.parallel ^
     gui_app.py
 
-if %errorlevel% equ 0 (
+if errorlevel 1 (
     echo.
     echo ====================================================
-    echo [OK] Build successful!
-    echo Your app folder is in: dist\AuraLite_AI_v2\
-    echo Run: dist\AuraLite_AI_v2\AuraLite_AI_v2.exe
+    echo [!] Build FAILED. See errors above.
     echo ====================================================
 ) else (
     echo.
-    echo [!] Build failed. See errors above.
+    echo ====================================================
+    echo [OK] Build SUCCESS!
+    echo Output folder: dist\AuraLite_AI_v2\
+    echo Run: dist\AuraLite_AI_v2\AuraLite_AI_v2.exe
+    echo ====================================================
 )
 
 echo.
-echo To rebuild quickly next time just run this script again —
-echo the .venv is kept and reused.
+echo Re-run this script anytime to rebuild (.venv is reused).
 pause >nul
