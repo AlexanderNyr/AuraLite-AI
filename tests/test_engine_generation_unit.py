@@ -75,13 +75,22 @@ class TestEngineTokenizerGuards:
         engine = make_engine()
         assert engine._prepare_prompt_ids("") == [0]
 
-    def test_prepare_prompt_truncates_with_generation_reserve(self):
+    def test_prepare_prompt_truncates_very_long_prompts(self):
+        # Prompts longer than the safety cap are truncated from the left.
+        # Short prompts are kept whole even if they exceed the training window
+        # (RoPE extrapolates past the trained context).
         engine = make_engine(max_seq_len=5)
-        assert engine._prepare_prompt_ids("abcdef") == engine.tokenizer.encode("cdef")
+        long_text = "a" * 10000
+        truncated = engine._prepare_prompt_ids(long_text)
+        safety_cap = max(engine.model.max_seq_len, engine.model.max_seq_len + 50, 8192)
+        assert len(truncated) <= safety_cap - 1
+        short = engine._prepare_prompt_ids("abcdef")
+        assert short == engine.tokenizer.encode("abcdef")
 
     def test_prepare_prompt_can_use_full_context_without_reserve(self):
         engine = make_engine(max_seq_len=5)
-        assert engine._prepare_prompt_ids("abcdef", reserve_generation_slot=False) == engine.tokenizer.encode("bcdef")
+        ids = engine._prepare_prompt_ids("abcdef", reserve_generation_slot=False)
+        assert ids == engine.tokenizer.encode("abcdef")
 
 
 class TestSampling:

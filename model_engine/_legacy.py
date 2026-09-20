@@ -532,10 +532,10 @@ def recommend_gen_length(seed_str: str,
 
     seed_tokens = max(1, seed_tokens)
     raw = int(round(seed_tokens * multiplier))
-    raw = max(hard_min, min(hard_max, raw))
-    # Leave at least 2 tokens of headroom in the context window
-    headroom = max(1, max_seq_len - seed_tokens - 2)
-    return max(1, min(raw, headroom))
+    # Allow long outputs past training window (RoPE extrapolates).
+    effective_max = max(hard_max, max_seq_len * 2, 1024)
+    raw = max(hard_min, min(effective_max, raw))
+    return max(1, raw)
 
 
 def tokenizer_from_dict(d: dict):
@@ -1935,7 +1935,7 @@ class AuraLiteEngine:
 
         else:
             # Native AuraLite model
-            ids = self._prepare_prompt_ids(prompt)
+            ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
             result_ids = self._generate_ids(
                 ids, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p=min_p
@@ -2023,7 +2023,7 @@ class AuraLiteEngine:
             return
 
         # Native AuraLite streaming
-        ids = self._prepare_prompt_ids(prompt)
+        ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
         self.model.eval()
         self.model.reset_cache()
 
@@ -2040,9 +2040,11 @@ class AuraLiteEngine:
             result_ids.append(nxt)
             yield self.decode([nxt])
 
+            hard_cap = max(self.model.max_seq_len + max_new_tokens, self.model.max_seq_len * 4, 8192)
+
             for _ in range(max_new_tokens - 1):
                 pos = len(result_ids) - 1
-                if pos >= self.model.max_seq_len - 1:
+                if pos + 1 >= hard_cap:
                     break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
                 logits = self.model(t, start_pos=pos, use_cache=True)
@@ -2429,7 +2431,8 @@ class AuraLiteEngine:
                         state[key] = value.to(device)
 
     def _prepare_prompt_ids(self, start_str: str,
-                            reserve_generation_slot: bool = True) -> list[int]:
+                            reserve_generation_slot: bool = True,
+                            max_gen_tokens: int | None = None) -> list[int]:
         if self.model is None:
             raise ValueError("Train or load a model first!")
 
@@ -2437,7 +2440,9 @@ class AuraLiteEngine:
         if not ids:
             ids = [0]
 
-        max_prompt_tokens = self.model.max_seq_len - (1 if reserve_generation_slot else 0)
+        # Safety cap allows RoPE extrapolation beyond training window.
+        safety_cap = max(self.model.max_seq_len, (max_gen_tokens or 0) + self.model.max_seq_len, 8192)
+        max_prompt_tokens = safety_cap - (1 if reserve_generation_slot else 0)
         max_prompt_tokens = max(1, max_prompt_tokens)
         if len(ids) > max_prompt_tokens:
             ids = ids[-max_prompt_tokens:]
@@ -2447,7 +2452,8 @@ class AuraLiteEngine:
                       temperature: float = 0.8,
                       top_k: int = 50, top_p: float = 0.9,
                       repetition_penalty: float = 1.0,
-                      min_p: float = 0.0) -> list[int]:
+                      min_p: float = 0.0,
+                      stop_token_ids: set[int] | None = None) -> list[int]:
         if self.model is None:
             raise ValueError("Train or load a model first!")
 
@@ -2458,6 +2464,12 @@ class AuraLiteEngine:
         if length <= 0:
             return result_ids
 
+        # Hard safety cap on total sequence length to prevent unbounded
+        # KV-cache growth. Trained max_seq_len is NOT a hard stop — RoPE
+        # auto-extends its rotary buffers and extrapolates.
+        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
+        stop_token_ids = stop_token_ids or set()
+
         with torch.no_grad():
             # --- Process full seed in one pass --------------------------
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
@@ -2465,17 +2477,24 @@ class AuraLiteEngine:
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                      repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
+            if nxt in stop_token_ids:
+                self.model.reset_cache()
+                return result_ids
 
             # --- Generate remaining tokens one-by-one (KV-cache) --------
             for _ in range(length - 1):
                 pos = len(result_ids) - 1
-                if pos >= self.model.max_seq_len - 1:
-                    break   # context limit reached
+                # Safety cap instead of hard stop at training window — RoPE
+                # auto-extends its buffers and extrapolates beyond max_seq_len.
+                if pos + 1 >= hard_cap:
+                    break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
                 logits = self.model(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                          repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
+                if nxt in stop_token_ids:
+                    break
 
         self.model.reset_cache()
         return result_ids
@@ -3056,7 +3075,7 @@ class AuraLiteEngine:
                 kwargs["min_p"] = min_p
             return self.hf_proxy.generate(start_str, **kwargs)
 
-        ids = self._prepare_prompt_ids(start_str)
+        ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
         used_prompt = self.decode(ids)
         result_ids = self._generate_ids(
             ids, length, temperature, top_k, top_p,
@@ -3162,7 +3181,7 @@ class AuraLiteEngine:
         if web_context:
             think_prompt = f"{web_context}\n{start_str}"
 
-        think_ids = self._prepare_prompt_ids(think_prompt)
+        think_ids = self._prepare_prompt_ids(think_prompt, max_gen_tokens=thinking_length)
         think_prompt_used = self.decode(think_ids)
         draft_full = self.decode(self._generate_ids(
             think_ids, thinking_length,
@@ -3181,7 +3200,7 @@ class AuraLiteEngine:
         ctx_parts.append(start_str)
 
         final_prompt = "\n".join(ctx_parts)
-        final_ids = self._prepare_prompt_ids(final_prompt)
+        final_ids = self._prepare_prompt_ids(final_prompt, max_gen_tokens=length)
         final_prompt_used = self.decode(final_ids)
         final_full = self.decode(self._generate_ids(
             final_ids, length,
@@ -3255,7 +3274,7 @@ class AuraLiteEngine:
                 yield full[len(start_str):] if full.startswith(start_str) else full
             return
 
-        ids = self._prepare_prompt_ids(start_str)
+        ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
 
         self.model.eval()
         self.model.reset_cache()
@@ -3263,6 +3282,8 @@ class AuraLiteEngine:
         result_ids: list[int] = list(ids)
         if length <= 0:
             return
+
+        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
 
         with torch.no_grad():
             # Process seed
@@ -3276,7 +3297,7 @@ class AuraLiteEngine:
             # Generate remaining tokens
             for _ in range(length - 1):
                 pos = len(result_ids) - 1
-                if pos >= self.model.max_seq_len - 1:
+                if pos + 1 >= hard_cap:
                     break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
                 logits = self.model(t, start_pos=pos, use_cache=True)
@@ -3306,6 +3327,8 @@ class AuraLiteEngine:
         if length <= 0:
             return result_ids
 
+        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
+
         with torch.no_grad():
             logits = self.model(batch, start_pos=0, use_cache=True)
             last_logits = logits[:, -1, :]
@@ -3319,7 +3342,7 @@ class AuraLiteEngine:
 
             for _ in range(length - 1):
                 pos = len(result_ids[0]) - 1
-                if pos >= self.model.max_seq_len - 1:
+                if pos + 1 >= hard_cap:
                     break
 
                 next_input = torch.tensor(next_tokens, dtype=torch.long).unsqueeze(1).to(self.device)
@@ -3362,7 +3385,7 @@ class AuraLiteEngine:
 
         grouped: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
         for idx, prompt in enumerate(prompts):
-            ids = self._prepare_prompt_ids(prompt)
+            ids = self._prepare_prompt_ids(prompt, max_gen_tokens=length)
             grouped[len(ids)].append((idx, ids))
 
         results: list[str | None] = [None] * len(prompts)
