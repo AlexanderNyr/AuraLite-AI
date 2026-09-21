@@ -10,6 +10,9 @@ Environment:
     AURALITE_MAX_CONCURRENT max in-flight generation requests (default 4);
                             excess requests get HTTP 503 `server is busy`
     AURALITE_RATE_LIMIT     requests per minute per client (default 60)
+    AURALITE_CPU_INT8       =1 to dynamically INT8-quantize the model at load
+                            (inference-only; faster on VNNI-class CPUs, can be
+                            slower on tiny containers — benchmark first)
 
 NOTE: run with a single uvicorn worker (the default). Generation state and the
 rate limiter are per-process; multiple workers would load N model copies and

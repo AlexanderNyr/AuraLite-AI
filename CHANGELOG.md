@@ -1,3 +1,53 @@
+# ⚡ Changelog — AuraLite AI v2.6.3 (2026-09-21) — CPU performance pass
+
+Goal: everything runs well on CPU. Measured on a 2-vCPU container
+(`benchmarks/benchmark_cpu_decode.py`, 128d/4L GQA+BPE model, 40-token greedy
+decode): **500 → 581 tok/s (+16%)** for fp32, plus the groundwork below.
+
+## Engine — CPU optimizations (`model_engine/_legacy.py`)
+
+- **Native GQA in SDPA** (`enable_gqa=True`, torch ≥ 2.5): the KV cache is no
+  longer materialized with `repeat_interleave` on every layer of every decode
+  step — one full-cache copy per layer per token less. Verified numerically
+  *identical* to the repeated variant on all masking paths (causal, sliding
+  window, ALiBi bias, single-token decode) with dedicated equivalence tests;
+  automatic fallback on older torch.
+- **`torch.inference_mode()`** instead of `no_grad` in all native generation
+  loops (`_generate_ids`, `generate_streaming`, `_generate_batch_group`,
+  chat streaming) — less bookkeeping per token.
+- **Top-p sampling sorts only the top-k candidates** (when `top_k` is set)
+  instead of the full vocabulary — same nucleus semantics (asserted against a
+  reference implementation in tests), O(V log V) → O(K log K) per token.
+- **Sane CPU thread defaults, env-tunable**: `AURALITE_NUM_THREADS`
+  (default cpu_count, capped 64) and `AURALITE_INTEROP_THREADS` (default **1**,
+  capped 8 — the old default of cpu_count inter-op threads mostly added
+  scheduling overhead). Also exposed as `configure_cpu_threads()`.
+- **Opt-in CPU INT8 dynamic quantization at load**:
+  `load_model(path, cpu_quantize=True)` or `AURALITE_CPU_INT8=1` (honored by
+  the API server). Inference-only path using the existing, tested dynamic
+  quantization. NOTE: on ≤2-core containers fp32 was *faster* in our
+  measurements (581 vs 380 tok/s) — INT8 pays off on wider models with
+  AVX-512 VNNI/AMX kernels. Benchmark on your hardware; hence strictly opt-in.
+
+## Server
+
+- Docstring updated: `AURALITE_CPU_INT8=1` behavior documented.
+
+## Tooling
+
+- New `benchmarks/benchmark_cpu_decode.py` — one command to measure fp32 vs
+  INT8 decode tok/s on your own hardware (small and `--big` configs, model
+  cached under /tmp between runs).
+
+## Tests
+
+- New `tests/test_cpu_v263.py` (17 tests): thread config + caps, native-GQA
+  vs repeat parity on every attention path, nucleus-sort semantics vs
+  reference, INT8 load via kwarg and env, fp32-by-default guarantee.
+- Full suite: **510 passed / 2 skipped**.
+
+---
+
 # 🚀 Changelog — AuraLite AI v2.6.2 (2026-09-21)
 
 Improvement pass on top of the tests/CI update — repo hygiene, server parity

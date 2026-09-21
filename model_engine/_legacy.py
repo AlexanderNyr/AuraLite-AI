@@ -5,10 +5,27 @@ import os
 # MKL / OpenBLAS backends pick them up.
 # -----------------------------------------------------------------------
 _CPU_COUNT = os.cpu_count() or 1
-os.environ.setdefault("OMP_NUM_THREADS", str(_CPU_COUNT))
-os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_COUNT))
-os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_CPU_COUNT))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_CPU_COUNT))
+
+
+def _cpu_thread_counts() -> tuple[int, int]:
+    """(intra-op, inter-op) thread counts with sane CPU defaults and env overrides.
+
+    Historical behaviour spawned `cpu_count` *inter-op* threads, which mostly
+    adds scheduling overhead: generation runs tiny sequential ops, so inter-op
+    parallelism is wasted. Defaults are now:
+      intra-op = AURALITE_NUM_THREADS   (default cpu_count, capped at 64)
+      inter-op = AURALITE_INTEROP_THREADS (default 1, capped at 8)
+    """
+    intra = max(1, min(int(os.environ.get("AURALITE_NUM_THREADS", _CPU_COUNT)), 64))
+    interop = max(1, min(int(os.environ.get("AURALITE_INTEROP_THREADS", 1)), 8))
+    return intra, interop
+
+
+_INTRA_THREADS, _INTEROP_THREADS = _cpu_thread_counts()
+os.environ.setdefault("OMP_NUM_THREADS", str(_INTRA_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_INTRA_THREADS))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_INTRA_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_INTRA_THREADS))
 
 # -----------------------------------------------------------------------
 # Distributed training (DDP) support — v2.3
@@ -63,11 +80,27 @@ except ImportError:
     get_stop_tokens = lambda x: []
     build_chat_prompt = None
 
-try:
-    torch.set_num_threads(_CPU_COUNT)
-    torch.set_num_interop_threads(max(1, _CPU_COUNT))
-except (RuntimeError, ValueError):
-    pass
+def configure_cpu_threads() -> tuple[int, int]:
+    """Apply the intra/inter-op thread counts (idempotent-safe).
+
+    Called once at import; exposed so tests and embedders can re-read the
+    environment (torch raises if inter-op threads are set after parallel work
+    started, which we deliberately swallow here).
+    """
+    global _INTRA_THREADS, _INTEROP_THREADS
+    _INTRA_THREADS, _INTEROP_THREADS = _cpu_thread_counts()
+    try:
+        torch.set_num_threads(_INTRA_THREADS)
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        torch.set_num_interop_threads(_INTEROP_THREADS)
+    except (RuntimeError, ValueError):
+        pass
+    return _INTRA_THREADS, _INTEROP_THREADS
+
+
+configure_cpu_threads()
 
 
 # ===================================================================
@@ -676,6 +709,24 @@ class HeadwiseRMSNorm(nn.Module):
 
 # -------------------------------------------------------------------
 
+_SDPA_GQA_SUPPORTED: bool | None = None
+
+
+def _sdpa_supports_gqa() -> bool:
+    """True when this torch supports SDPA `enable_gqa=True` (>= 2.5)."""
+    global _SDPA_GQA_SUPPORTED
+    if _SDPA_GQA_SUPPORTED is None:
+        try:
+            q = torch.zeros(1, 2, 1, 4)
+            kv = torch.zeros(1, 1, 1, 4)
+            F.scaled_dot_product_attention(q, kv, kv, enable_gqa=True)
+            F.scaled_dot_product_attention(q, kv, kv, is_causal=True, enable_gqa=True)
+            _SDPA_GQA_SUPPORTED = True
+        except (TypeError, RuntimeError):
+            _SDPA_GQA_SUPPORTED = False
+    return _SDPA_GQA_SUPPORTED
+
+
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -725,6 +776,9 @@ class Attention(nn.Module):
         # Pre-compute RoPE cos / sin as persistent buffers (move with .to(device))
         self.max_seq_len = max_seq_len
         self._build_rope_buffers(max_seq_len)
+        # v2.6.3: native GQA in SDPA (torch>=2.5) removes the per-step
+        # repeat_interleave copy of the whole KV cache. Detect once per process.
+        self._sdpa_enable_gqa = _sdpa_supports_gqa() if self.n_rep > 1 else False
 
         # ALiBi slopes (one per head)
         if use_alibi:
@@ -951,24 +1005,31 @@ class Attention(nn.Module):
 
         # Repeat KV *after* concatenating/evicting the cache. This preserves
         # GQA memory savings in the cache and exactly matches LLaMA grouping.
-        if self.n_rep > 1:
+        # v2.6.3: when SDPA natively supports GQA (torch>=2.5) we skip the
+        # materialized repeat entirely — one less full-KV copy per layer per
+        # token, the dominant RAM-bandwidth cost of CPU decoding with GQA.
+        # Every code path here (causal / bool / float-bias / decode) is
+        # numerically identical to the repeated variant.
+        use_native_gqa = self.n_rep > 1 and self._sdpa_enable_gqa
+        if self.n_rep > 1 and not use_native_gqa:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
         S = k.shape[2]
+        sdpa_gqa_kw = {"enable_gqa": True} if use_native_gqa else {}
         # Flash / memory-efficient attention via PyTorch SDPA. FlexAttention is
         # exposed as a configuration flag but falls back here unless the runtime
         # provides a compatible PyTorch >=2.5 implementation.
         if self.use_alibi:
             attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, **sdpa_gqa_kw)
         elif T == S and start_pos == 0 and self.sliding_window is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **sdpa_gqa_kw)
         elif T == 1 and self.sliding_window is None:
-            out = F.scaled_dot_product_attention(q, k, v)
+            out = F.scaled_dot_product_attention(q, k, v, **sdpa_gqa_kw)
         else:
             keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, **sdpa_gqa_kw)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.W_o(out)
@@ -2232,7 +2293,7 @@ class AuraLiteEngine:
             return
 
         hit_stop = False
-        with torch.no_grad():
+        with torch.inference_mode():
             # Process prompt
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
             logits = self.model(t, start_pos=0, use_cache=True)
@@ -2688,7 +2749,7 @@ class AuraLiteEngine:
         hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
         stop_token_ids = stop_token_ids or set()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # --- Process full seed in one pass --------------------------
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
             logits = self.model(t, start_pos=0, use_cache=True)
@@ -3534,7 +3595,7 @@ class AuraLiteEngine:
 
         hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Process seed
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
             logits = self.model(t, start_pos=0, use_cache=True)
@@ -3578,7 +3639,7 @@ class AuraLiteEngine:
 
         hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.model(batch, start_pos=0, use_cache=True)
             last_logits = logits[:, -1, :]
 
@@ -3689,12 +3750,26 @@ class AuraLiteEngine:
 
         # Top-p (nucleus) filtering
         if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            # v2.6.3: after top-k masking only `top_k` entries can ever be
+            # sampled; sorting those K candidates instead of the full vocab is
+            # exactly equivalent and much cheaper on CPU (V >> K).
+            if 0 < top_k < self.vocab_size:
+                cand = min(top_k, self.vocab_size)
+                work, cand_idx = torch.topk(logits, cand)
+            else:
+                work = logits
+                cand_idx = None
+            # torch.sort (stable, like the previous full-vocab implementation)
+            sorted_logits, order = torch.sort(work, descending=True)
             cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
             remove = cum_probs > top_p
             remove[1:] = remove[:-1].clone()
-            remove[0]  = False
-            logits = logits.scatter(0, sorted_idx[remove], float("-inf"))
+            remove[0] = False
+            removed_sorted_idx = order[remove]
+            if cand_idx is None:
+                logits = logits.scatter(0, removed_sorted_idx, float("-inf"))
+            else:
+                logits = logits.scatter(0, cand_idx[removed_sorted_idx], float("-inf"))
 
         # IMPROVED: fallback if all logits are -inf (prevents NaN crash)
         if torch.all(logits == float("-inf")):
@@ -3775,7 +3850,18 @@ class AuraLiteEngine:
                 pass
             raise
 
-    def load_model(self, path: str):
+    def load_model(self, path: str, cpu_quantize: bool | str | None = None):
+        """Load a checkpoint.
+
+        Args:
+            cpu_quantize: on CPU devices, dynamically INT8-quantize Linear layers
+                after loading (much faster decode + ~4x smaller resident model,
+                at a small quality cost). Truthy values accepted: True, "int8".
+                May also be enabled globally via the `AURALITE_CPU_INT8=1`
+                environment variable (used by the API server). Inference-only:
+                a quantized model cannot be trained further; save it with
+                `save_quantized_model()`.
+        """
         if str(path).lower().endswith(".gguf"):
             # Optional advanced knobs without complicating the GUI:
             #   AURALITE_GGUF_N_CTX=8192
@@ -3889,6 +3975,21 @@ class AuraLiteEngine:
                     np.random.set_state(rng_state["numpy"])
             except Exception as e:
                 logger.warning("could not restore RNG state: %s", e)
+
+        # v2.6.3: opt-in CPU INT8 dynamic quantization at load time
+        env_flag = os.environ.get("AURALITE_CPU_INT8", "").strip().lower()
+        want_int8 = cpu_quantize if cpu_quantize is not None else (
+            env_flag in {"1", "true", "yes", "on"})
+        if want_int8 in (True, "int8", "1") or want_int8 == "True":
+            if self.device.type != "cpu":
+                logger.info("cpu_quantize requested but device is %s — skipped",
+                            self.device.type)
+            else:
+                try:
+                    self.quantize_model("dynamic")
+                except Exception as e:
+                    logger.warning("CPU INT8 load-time quantization failed, "
+                                   "keeping fp32 model: %s", e)
 
     # ---- Quantization Integration (NEW v2.2) ---------------------------
     def quantize_model(self, method: str = "dynamic", bits: str = "int8",
