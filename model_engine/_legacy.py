@@ -158,6 +158,19 @@ def validate_params(params: dict) -> list[str]:
     lr_schedule = str(params.get("lr_schedule", "wsd")).lower()
     if lr_schedule not in ("cosine", "wsd"):
         errors.append(f"lr_schedule must be 'cosine' or 'wsd', got {lr_schedule!r}")
+
+    # v2.6.2: AMP dtype and reproducibility seed
+    amp_dtype_val = str(params.get("amp_dtype", "fp16")).lower()
+    if amp_dtype_val not in ("fp16", "bf16", "none"):
+        errors.append(f"amp_dtype must be 'fp16', 'bf16' or 'none', got {amp_dtype_val!r}")
+    seed_val = params.get("seed", None)
+    if seed_val is not None:
+        try:
+            if int(seed_val) < 0:
+                errors.append(f"seed must be >= 0, got {seed_val}")
+        except (TypeError, ValueError):
+            errors.append(f"seed must be an integer, got {seed_val!r}")
+
     if lr_schedule == "wsd":
         stable_ratio = params.get("wsd_stable_ratio", 0.8)
         if not (0.0 < stable_ratio < 1.0):
@@ -278,20 +291,67 @@ class BPETokenizer:
 
         # word-frequency corpus: distinct pieces with counts
         piece_counts = Counter(self._split_pieces(sample))
-        corpus: list[tuple[list[int], int]] = [
-            ([self.token_to_id.get(c, self._unk_id) for c in piece], cnt)
-            for piece, cnt in piece_counts.items()
+        corpus: list[list[int]] = []
+        piece_cnts: list[int] = []
+        for piece, cnt in piece_counts.items():
+            corpus.append([self.token_to_id.get(c, self._unk_id) for c in piece])
+            piece_cnts.append(cnt)
+
+        # ---- Incremental merge trainer (v2.6.2) -------------------------
+        # The naive implementation rebuilt the full pair-count table and
+        # rescanned every piece for EVERY merge — O(merges x corpus). Here we
+        # keep the counts, the first-occurrence keys and the piece index
+        # up-to-date incrementally, and pull the best pair from a max-heap.
+        # Only the pieces that actually contain the merged pair are touched.
+        #
+        # The result is *bit-for-bit identical* to the naive trainer: the heap
+        # key (-count, first_key) reproduces Counter.most_common()'s tie-break
+        # by first insertion order, because first insertion during a full scan
+        # == the pair with the smallest (piece_index, position) key.
+        import heapq
+
+        M = max((len(ids) for ids in corpus), default=1) + 1  # bounds positions
+
+        pair_totals: Counter = Counter()
+        pair_pos: dict[tuple[int, int], dict[int, int]] = {}  # pair -> {piece: first_pos}
+        for pidx, ids in enumerate(corpus):
+            if len(ids) < 2:
+                continue
+            cnt = piece_cnts[pidx]
+            for i in range(len(ids) - 1):
+                pair = (ids[i], ids[i + 1])
+                pair_totals[pair] += cnt
+                entry = pair_pos.setdefault(pair, {})
+                if pidx not in entry:
+                    entry[pidx] = i  # positions are visited left-to-right
+
+        def _first_key(pair: tuple[int, int]) -> int:
+            entry = pair_pos.get(pair)
+            if not entry:
+                return (1 << 62)
+            return min(p * M + i for p, i in entry.items())
+
+        heap: list[tuple[int, int, tuple[int, int]]] = [
+            (-c, _first_key(pair), pair) for pair, c in pair_totals.items()
         ]
+        heapq.heapify(heap)
+
+        def _refresh(pair: tuple[int, int]):
+            if pair_totals.get(pair, 0) > 0:
+                heapq.heappush(heap, (-pair_totals[pair], _first_key(pair), pair))
 
         while len(self.vocab) < vocab_size:
-            pair_counts: Counter = Counter()
-            for ids, cnt in corpus:
-                for i in range(len(ids) - 1):
-                    pair_counts[(ids[i], ids[i + 1])] += cnt
-            if not pair_counts:
-                break
-            (a, b), best_cnt = pair_counts.most_common(1)[0]
-            if best_cnt < 2:
+            # Pop stale heap entries until the top is current.
+            a = b = best_cnt = None
+            while heap:
+                neg_c, fk, pair = heap[0]
+                if (pair_totals.get(pair, 0) == -neg_c
+                        and _first_key(pair) == fk):
+                    a, b = pair
+                    best_cnt = -neg_c
+                    break
+                heapq.heappop(heap)
+            if best_cnt is None or best_cnt < 2:
                 break
 
             new_id = len(self.vocab)
@@ -300,11 +360,25 @@ class BPETokenizer:
             self.token_to_id[new_tok] = new_id
             self.merges.append((a, b, new_id))
 
-            # apply the merge to every distinct piece
-            for entry in corpus:
-                ids = entry[0]
-                if len(ids) < 2:
-                    continue
+            touched: set[tuple[int, int]] = set()
+            # Apply the merge to every piece that contains the pair.
+            for pidx in sorted(pair_pos.get((a, b), ())):
+                ids = corpus[pidx]
+                cnt = piece_cnts[pidx]
+                # remove this piece's old pair contributions
+                for i in range(len(ids) - 1):
+                    old_pair = (ids[i], ids[i + 1])
+                    pair_totals[old_pair] -= cnt
+                    pos_map = pair_pos.get(old_pair)
+                    if pos_map is not None:
+                        pos_map.pop(pidx, None)
+                        if not pos_map:
+                            pair_pos.pop(old_pair, None)
+                    if pair_totals[old_pair] <= 0:
+                        pair_totals.pop(old_pair, None)
+                        pair_pos.pop(old_pair, None)
+                    touched.add(old_pair)
+                # apply the merge
                 i, out = 0, []
                 while i < len(ids):
                     if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
@@ -313,7 +387,17 @@ class BPETokenizer:
                     else:
                         out.append(ids[i])
                         i += 1
-                entry[0][:] = out
+                ids[:] = out
+                # add this piece's new pair contributions
+                for i in range(len(ids) - 1):
+                    new_pair = (ids[i], ids[i + 1])
+                    pair_totals[new_pair] += cnt
+                    entry = pair_pos.setdefault(new_pair, {})
+                    if pidx not in entry:
+                        entry[pidx] = i
+                    touched.add(new_pair)
+            for pair in touched:
+                _refresh(pair)
 
         self._build_ranks()
 
@@ -1811,6 +1895,9 @@ class AuraLiteEngine:
         self.vocab_size  = 0
         self.params_used: dict = {}          # remember last training/load params
         self.last_val_loss: float | None = None
+        # v2.6.2: chat template persisted with the checkpoint; generate_chat()
+        # uses it when the caller does not pass `chat_template` explicitly.
+        self.default_chat_template: str = "chatml"
         self._resume_optimizer_state = None
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
@@ -1913,7 +2000,7 @@ class AuraLiteEngine:
         top_p: float = 0.9,
         repetition_penalty: float = 1.1,
         min_p: float = 0.0,
-        chat_template: str = "chatml",
+        chat_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stop_tokens: Optional[List[str]] = None,
     ) -> str:
@@ -1931,6 +2018,8 @@ class AuraLiteEngine:
         """
         if not HAS_CHAT_SUPPORT:
             raise RuntimeError("chat_interface.py is required for chat mode.")
+        if chat_template is None:
+            chat_template = self.default_chat_template
 
         # Convert to ChatHistory if needed
         if isinstance(messages, list):
@@ -2015,7 +2104,7 @@ class AuraLiteEngine:
         top_p: float = 0.9,
         repetition_penalty: float = 1.1,
         min_p: float = 0.0,
-        chat_template: str = "chatml",
+        chat_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stop_tokens: Optional[List[str]] = None,
     ) -> Iterator[str]:
@@ -2026,6 +2115,8 @@ class AuraLiteEngine:
         """
         if not HAS_CHAT_SUPPORT:
             raise RuntimeError("chat_interface.py is required for chat mode.")
+        if chat_template is None:
+            chat_template = self.default_chat_template
 
         if isinstance(messages, list):
             history = ChatHistory.from_list(messages)
@@ -2730,6 +2821,12 @@ class AuraLiteEngine:
         #                      on AdamW)
         #   WSD schedule     — Warmup-Stable-Decay replaces plain cosine decay
         use_qk_norm     = bool(params.get("use_qk_norm", False))
+        # v2.6.2: reproducibility + AMP dtype + persisted chat template
+        seed             = params.get("seed", None)
+        amp_dtype        = str(params.get("amp_dtype", "fp16")).strip().lower()
+        chat_template    = params.get("chat_template", None)
+        if chat_template:
+            self.default_chat_template = str(chat_template)
         optimizer_name  = str(params.get("optimizer", "adamw")).strip().lower()
         muon_lr         = float(params.get("muon_lr", 0.02))
         muon_momentum   = float(params.get("muon_momentum", 0.95))
@@ -2752,6 +2849,14 @@ class AuraLiteEngine:
         ddp_active = bool(use_ddp and self.is_distributed)
 
         self.params_used = dict(params)
+
+        # ---- Reproducibility (v2.6.2) --------------------------------
+        # Seed torch/numpy BEFORE the tokenizer trains, the model initializes
+        # and the DataLoader starts shuffling so a full run can be replayed.
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            np.random.seed(int(seed))
+            print(f"[AuraLite] Seed set: {seed} (torch & numpy RNG)")
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
@@ -2872,9 +2977,26 @@ class AuraLiteEngine:
                 print(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
         criterion = nn.CrossEntropyLoss()
 
-        # Mixed precision (CUDA only)
-        use_amp = self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        # Mixed precision. History: fp16 autocast + GradScaler on CUDA only.
+        # v2.6.2 adds `amp_dtype`:
+        #   "fp16" — old behaviour (CUDA autocast fp16 with a GradScaler)
+        #   "bf16" — autocast bf16 on CUDA *and* CPU (bf16 needs no scaler);
+        #            bf16 is far more forgiving than fp16 for training
+        #   "none" — force full fp32 everywhere (debugging / determinism)
+        if amp_dtype == "none":
+            use_amp = False
+            amp_t = None
+        elif amp_dtype == "bf16":
+            use_amp = True
+            amp_t = torch.bfloat16
+        else:  # fp16
+            use_amp = self.device.type == "cuda"
+            amp_t = torch.float16
+        amp_device = self.device.type if self.device.type in ("cuda", "cpu") else "cpu"
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=bool(use_amp and amp_t is torch.float16))
+        if use_amp:
+            print(f"[AuraLite] AMP: {amp_dtype} autocast on {amp_device}")
         if scaler_state_to_restore is not None:
             try:
                 self.scaler.load_state_dict(scaler_state_to_restore)
@@ -3070,7 +3192,7 @@ class AuraLiteEngine:
                 if batch_idx % accumulation_steps == 0:
                     self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
                     output = train_model(xb)                      # (B, T, vocab)
                     loss   = criterion(
                         output.reshape(-1, output.size(-1)),      # (B·T, vocab)
@@ -3623,13 +3745,35 @@ class AuraLiteEngine:
             "num_experts": getattr(self.model, 'num_experts', 4),
             "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
             "use_qk_norm": getattr(self.model, 'use_qk_norm', False),
+            # v2.6.2: chat template used at training time
+            "chat_template": self.default_chat_template,
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 "numpy": np.random.get_state(),
             },
+            # Format versioning: 1 = pre-2.4 (may carry "chars"), 2 = v2.4..v2.6.1,
+            # 3 = v2.6.2+ (adds chat_template; old files load unchanged).
+            "format": "auralite",
+            "checkpoint_version": 3,
         }
-        torch.save(checkpoint, path)
+        # Atomic write: save next to the target and os.replace() it in place, so
+        # an interrupted save (Ctrl+C, out of disk) can never leave a truncated,
+        # unloadable checkpoint at `path`.
+        import tempfile
+        dir_name = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=dir_name)
+        try:
+            os.close(fd)
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load_model(self, path: str):
         if str(path).lower().endswith(".gguf"):
@@ -3662,6 +3806,17 @@ class AuraLiteEngine:
         self.hf_path = None
         self._ddp_model = None
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        ckpt_version = int(checkpoint.get("checkpoint_version", 1))
+        if ckpt_version >= 2:
+            logger.info("loading AuraLite checkpoint v%s from %s", ckpt_version, path)
+        # v2.6.2: restore the chat template the model was trained with
+        # (fall back to params_used, then to the historic "chatml" default).
+        self.default_chat_template = (
+            checkpoint.get("chat_template")
+            or checkpoint.get("params_used", {}).get("chat_template")
+            or "chatml"
+        )
 
         if checkpoint.get("tokenizer"):
             self.tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])

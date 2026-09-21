@@ -29,6 +29,9 @@ try:  # pragma: no cover - optional
         use_moe: bool = False
         num_experts: int = Field(default=4, gt=0)
         tie_word_embeddings: bool = True
+        seed: int | None = Field(default=None, ge=0)
+        amp_dtype: str = "fp16"
+        chat_template: str | None = None
 
         @field_validator("n_kv_heads")
         @classmethod
@@ -56,6 +59,9 @@ except Exception:  # pragma: no cover
         use_moe: bool = False
         num_experts: int = 4
         tie_word_embeddings: bool = True
+        seed: int | None = None
+        amp_dtype: str = "fp16"
+        chat_template: str | None = None
         extra: dict[str, Any] = field(default_factory=dict)
 
 __all__ = ["AuraLiteConfig"]

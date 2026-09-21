@@ -1,0 +1,9 @@
+
+# Python caches / build artifacts (tracked by accident before v2.6.2)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/

@@ -249,6 +249,22 @@ def build_web_context(query: str, max_results: int = 4,
 #  v2.4 RAG upgrade: semantic chunking + optional persistent vector store
 # ===================================================================
 
+def hash_embedding(text: str, dim: int = 384) -> list[float]:
+    """Deterministic hashed bag-of-words embedding (no dependencies).
+
+    Used as the zero-dependency fallback by SimpleVectorStore and by the
+    server's /v1/embeddings endpoint, so RAG retrieval and the OpenAI-
+    compatible API always see the *same* vectors. Unit-norm, `dim` floats.
+    """
+    import hashlib, math
+    vec = [0.0] * dim
+    for tok in re.findall(r"\w+", text.lower()):
+        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+        vec[h % dim] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
 class SimpleVectorStore:
     """Small persistent vector store with optional sentence-transformers.
 
@@ -277,13 +293,7 @@ class SimpleVectorStore:
         if self._model is not None:  # pragma: no cover - optional
             vec = self._model.encode([text], normalize_embeddings=True)[0]
             return [float(x) for x in vec]
-        import hashlib, math
-        vec = [0.0] * self.dim
-        for tok in re.findall(r"\w+", text.lower()):
-            h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
-            vec[h % self.dim] += 1.0
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [v / norm for v in vec]
+        return hash_embedding(text, self.dim)
 
     @staticmethod
     def _cos(a: list[float], b: list[float]) -> float:

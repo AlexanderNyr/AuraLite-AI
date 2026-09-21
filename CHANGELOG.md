@@ -1,3 +1,60 @@
+# 🚀 Changelog — AuraLite AI v2.6.2 (2026-09-21)
+
+Improvement pass on top of the tests/CI update — repo hygiene, server parity
+with the OpenAI API surface, training reproducibility, and a much faster BPE
+trainer. All of it is covered by the new `tests/test_improvements_v262.py`
+(38 tests); the full suite is **493 passed / 2 skipped**.
+
+## Repo hygiene
+
+- Removed **31 tracked `.pyc`/`__pycache__` artifacts** from git and hardened
+  `.gitignore` (caches, coverage, egg-info). Clones and diffs stay clean; a
+  regression test (`test_no_pyc_files_tracked_in_git`) guards it.
+
+## Server (OpenAI compatibility)
+
+- **`usage`** token accounting on `/v1/completions` and `/v1/chat/completions`
+  (prompt/completion/total), plus the `created` timestamp the OpenAI SDK expects.
+- **`GET /v1/models`** — clients (Open WebUI, LangChain, …) probe it on connect.
+- **`POST /v1/embeddings`** — deterministic hashed bag-of-words vectors shared
+  with the RAG stack (`web_tools.hash_embedding`), so retrieval and the API
+  serve identical embeddings with zero extra dependencies.
+- **API-key auth**: set `AURALITE_API_KEY` and every endpoint except `/health`
+  requires `Authorization: Bearer <key>` (HTTP 401 otherwise).
+- **Concurrency guard**: bounded semaphore (`AURALITE_MAX_CONCURRENT`, default 4)
+  protects the engine's mutable KV-cache; excess requests fail fast with
+  HTTP 503 + `Retry-After` instead of interleaving generation state.
+
+## Engine
+
+- **`seed` training param** — torch+numpy RNG seeded before tokenizer training,
+  model init and DataLoader shuffling: full runs reproduce bit-for-bit.
+- **`amp_dtype`** — `"fp16"` (legacy default, CUDA+GradScaler), `"bf16"` (autocast
+  without scaler, works on CUDA *and* CPU), `"none"` (pure fp32).
+- **`chat_template` persists in checkpoints** and becomes the engine default —
+  `generate_chat()` without an explicit template now uses the template the model
+  was trained with (older checkpoints fall back to `chatml`).
+- **Atomic + versioned checkpoints**: saves go through a temp file + `os.replace`
+  (an interrupted save can no longer corrupt the model), and checkpoints carry
+  `checkpoint_version: 3` / `format: "auralite"`.
+- **BPE trainer rewritten incrementally** (heap + per-piece pair index instead of
+  full corpus rescans per merge): **~10× faster**, and verified *bit-for-bit
+  identical* vocabulary/merges to the naive trainer across english/unicode/
+  forced-tie/random corpora (regression test ships the reference implementation).
+
+## CLI
+
+- New `auralite` console entry point (`auralite_cli.py`): `train`, `generate`,
+  `chat` (interactive or one-shot), `serve` (single-worker uvicorn by design),
+  `info` (checkpoint inspector).
+
+## Config
+
+- `AuraLiteConfig` (pydantic + dataclass) gains `seed`, `amp_dtype`,
+  `chat_template` fields explicitly.
+
+---
+
 # 🧪 Changelog — Testing & CI Update (2026-09-21)
 
 ## Test expansion (335 → 455 tests, +120)
