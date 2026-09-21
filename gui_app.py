@@ -1378,7 +1378,7 @@ class AIApp:
                     self.q_result_text.insert(tk.END, result.summary())
                     if result.errors:
                         self.q_status_label.config(
-                            text=f"Status: Quantization FAILED ✗")
+                            text="Status: Quantization FAILED ✗")
                         for e in result.errors:
                             self.q_result_text.insert(tk.END, f"\n✗ {e}",
                                                        "error")

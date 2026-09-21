@@ -58,46 +58,111 @@ class AuraLiteLM(LM):
 
     def loglikelihood(self, requests):
         """Compute log-likelihood of continuation given context."""
+        import torch
         res = []
         for req in requests:
             context, continuation = req.args
             # Encode
             ctx_ids = self.engine.encode(context)
             cont_ids = self.engine.encode(continuation)
+            if not cont_ids:
+                # Empty continuation: zero-length logprob, vacuously greedy.
+                res.append((0.0, True))
+                continue
 
-            # We need the model to return logits for the continuation tokens
-            # For simplicity we use a greedy approach here (can be improved)
             full = ctx_ids + cont_ids
             input_ids = full[:-1]
-            target_ids = full[1:]
 
             # Run forward
-            import torch
             with torch.no_grad():
                 logits = self.model(
                     torch.tensor([input_ids], device=self.device)
                 )
                 log_probs = torch.log_softmax(logits[0], dim=-1)
 
-            # Sum logprobs of the continuation tokens
+            # Sum logprobs of the continuation tokens, and check argmax agreement.
+            # (is_greedy was previously hardcoded True, which silently inflated
+            # every metric that depends on it.)
             cont_logprob = 0.0
+            is_greedy = True
             for i, tid in enumerate(cont_ids):
                 pos = len(ctx_ids) + i - 1
-                if pos < len(log_probs):
-                    cont_logprob += log_probs[pos, tid].item()
+                if pos < 0 or pos >= len(log_probs):
+                    # Cannot score this token (e.g. empty context edge case);
+                    # treat as impossible rather than borrowing a wrong index.
+                    cont_logprob = float("-inf")
+                    is_greedy = False
+                    continue
+                lp_row = log_probs[pos]
+                cont_logprob += lp_row[tid].item()
+                if int(torch.argmax(lp_row).item()) != int(tid):
+                    is_greedy = False
 
-            # is_greedy = True if we would have generated exactly this continuation
-            is_greedy = True
             res.append((cont_logprob, is_greedy))
         return res
 
     def generate_until(self, requests):
-        """Not used in most benchmarks, but required by the interface."""
-        return [""] * len(requests)
+        """Generate a continuation per request (needed by GSM8K-style tasks).
+
+        Previously a stub returning empty strings, which broke every
+        generative task. Honours lm-eval gen_kwargs: `until` stop strings and
+        `max_gen_toks`.
+        """
+        res = []
+        for req in requests:
+            context = req.args[0]
+            gen_kwargs = req.args[1] if len(req.args) > 1 else {}
+            max_toks = int(gen_kwargs.get("max_gen_toks", 256))
+            until = gen_kwargs.get("until", []) or []
+            if isinstance(until, str):
+                until = [until]
+            text = self.engine.generate(context, length=max_toks)
+            continuation = text[len(context):] if text.startswith(context) else text
+            cut = None
+            for stop in until:
+                i = continuation.find(stop)
+                if i != -1 and (cut is None or i < cut):
+                    cut = i
+            if cut is not None:
+                continuation = continuation[:cut]
+            res.append(continuation)
+        return res
 
     def loglikelihood_rolling(self, requests):
-        """Used for perplexity calculation."""
-        return self.loglikelihood(requests)
+        """Rolling log-likelihood for perplexity tasks (e.g. wikitext).
+
+        lm-eval passes single-argument requests here and expects a plain list
+        of total logprobs (not (logprob, is_greedy) tuples). The old shim
+        delegated to loglikelihood(), which crashed unpacking 1-tuples and
+        returned the wrong type. Tokens beyond the context window are scored
+        with a sliding window of size max_seq_len (stride = window).
+        """
+        import torch
+        res: list[float] = []
+        max_seq = int(getattr(self.model, "max_seq_len", 4096) or 4096)
+        for req in requests:
+            text = req.args[0]
+            ids = self.engine.encode(text)
+            if len(ids) < 2:
+                res.append(0.0)
+                continue
+            total = 0.0
+            with torch.no_grad():
+                start = 0
+                # First window scores tokens 1..max_seq; then slide.
+                while start < len(ids) - 1:
+                    end = min(start + max_seq, len(ids) - 1)
+                    window_in = ids[start:end]
+                    window_tgt = ids[start + 1:end + 1]
+                    logits = self.model(
+                        torch.tensor([window_in], device=self.device)
+                    )
+                    log_probs = torch.log_softmax(logits[0], dim=-1)
+                    for j, tid in enumerate(window_tgt):
+                        total += log_probs[j, tid].item()
+                    start = end
+            res.append(total)
+        return res
 
 
 # ======================================================================

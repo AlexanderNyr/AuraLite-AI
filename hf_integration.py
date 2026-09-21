@@ -359,7 +359,14 @@ class HuggingFaceProxy:
                 **kwargs,
             )
 
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Decode only the continuation ids and prepend the ORIGINAL prompt.
+        # Decoding the full sequence with skip_special_tokens=True can drop
+        # special tokens that appear in `prompt` (chat-template markers such
+        # as <|im_start|>), so the result would NOT start with the prompt and
+        # every caller doing `full[len(prompt):]` string-slicing mis-slices.
+        n_input = inputs["input_ids"].shape[1]
+        continuation = self.tokenizer.decode(outputs[0][n_input:], skip_special_tokens=True)
+        return prompt + continuation
 
     def generate_streaming(
         self,

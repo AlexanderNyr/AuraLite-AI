@@ -505,7 +505,9 @@ class TestAuraLiteEngine:
         finally:
             os.unlink(path)
 
-    def test_generate_truncates_long_prompt_to_context(self):
+    def test_generate_allows_prompt_beyond_training_window(self):
+        # v2.6: prompts longer than the training window are NOT truncated —
+        # RoPE extrapolates past max_seq_len (the safety cap is far larger).
         engine = AuraLiteEngine()
         tok = TinyAlphabetTokenizer()
         engine.tokenizer = tok
@@ -513,10 +515,93 @@ class TestAuraLiteEngine:
         engine.model = NextTokenIsCurrentPlusOne(engine.vocab_size, max_seq_len=5)
 
         result = engine.generate("abcdefg", length=1, temperature=1.0, top_k=1, top_p=1.0)
-        # Prompt is truncated to the last 4 tokens so the first seed pass fits.
-        assert engine.model.seed_lengths == [4]
-        # Output still preserves the original user prompt, only the model context is truncated.
+        # The full 7-token prompt reaches the model in one seed pass.
+        assert engine.model.seed_lengths == [7]
+        # Output still preserves the original user prompt verbatim.
         assert result == "abcdefgh"
+
+    def test_generate_chat_respects_stop_tokens(self):
+        # Regression (v2.6.1): the stop_tokens argument was silently ignored.
+        engine = AuraLiteEngine()
+        tok = TinyAlphabetTokenizer()
+        engine.tokenizer = tok
+        engine.vocab_size = len(tok.vocab)
+        engine.model = NextTokenIsCurrentPlusOne(engine.vocab_size, max_seq_len=64)
+
+        out = engine.generate_chat(
+            [{"role": "user", "content": "a"}],
+            max_new_tokens=16, temperature=1.0, top_k=1, top_p=1.0,
+            chat_template="simple", stop_tokens=["c"],
+        )
+        assert out == "ab"          # generation halted before/at the stop marker
+        assert "c" not in out
+
+    def test_generate_chat_stream_truncates_stop_spanning_tokens(self):
+        # Regression (v2.6.1): multi-token stop strings must be cut even when
+        # they are split across several streamed tokens.
+        engine = AuraLiteEngine()
+        tok = TinyAlphabetTokenizer()
+        engine.tokenizer = tok
+        engine.vocab_size = len(tok.vocab)
+        engine.model = NextTokenIsCurrentPlusOne(engine.vocab_size, max_seq_len=64)
+
+        pieces = list(engine.generate_chat_streaming(
+            [{"role": "user", "content": "a"}],
+            max_new_tokens=16, temperature=1.0, top_k=1, top_p=1.0,
+            chat_template="simple", stop_tokens=["bc"],
+        ))
+        assert "".join(pieces) == "a"
+
+    def test_checkpoint_roundtrip_after_rope_extrapolation(self, small_text):
+        # Regression (v2.6.1): generating past max_seq_len extends the RoPE
+        # buffers; a checkpoint saved afterwards must still load.
+        engine = AuraLiteEngine()
+        engine.train(small_text, {
+            "tokenizer": "char", "d_model": 32, "n_heads": 4, "n_layers": 2,
+            "d_ff": 64, "seq_length": 8, "epochs": 1, "batch_size": 8,
+            "val_split": 0.1, "optimizer": "adamw", "lr_schedule": "cosine",
+        })
+        engine.generate(small_text[:8], length=12)  # extends RoPE past seq_length=8
+
+        fd, path = tempfile.mkstemp(suffix=".pt")
+        os.close(fd)
+        try:
+            engine.save_model(path)
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            # RoPE buffers are derived data and must not be persisted.
+            assert not any(
+                k.endswith((".rope_cos", ".rope_sin")) for k in ckpt["model_state"]
+            )
+            engine2 = AuraLiteEngine()
+            engine2.load_model(path)  # must not raise a size mismatch
+            assert engine2.generate(small_text[:8], length=4).startswith(small_text[:8])
+        finally:
+            os.unlink(path)
+
+    def test_load_checkpoint_strips_legacy_rope_buffers(self, small_text):
+        # Old checkpoints (and ones saved after long generations) may carry
+        # rope_cos/rope_sin buffers of arbitrary size — loading must drop them.
+        engine = AuraLiteEngine()
+        engine.train(small_text, {
+            "tokenizer": "char", "d_model": 32, "n_heads": 4, "n_layers": 2,
+            "d_ff": 64, "seq_length": 16, "epochs": 1, "batch_size": 8,
+            "val_split": 0.1, "optimizer": "adamw", "lr_schedule": "cosine",
+        })
+        fd, path = tempfile.mkstemp(suffix=".pt")
+        os.close(fd)
+        try:
+            engine.save_model(path)
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            head_dim = ckpt["d_model"] // ckpt["n_heads"]
+            for i in range(ckpt["n_layers"]):
+                # Simulate buffers grown far beyond max_seq_len.
+                ckpt["model_state"][f"layers.{i}.attn.rope_cos"] = torch.zeros(999, head_dim)
+                ckpt["model_state"][f"layers.{i}.attn.rope_sin"] = torch.zeros(999, head_dim)
+            torch.save(ckpt, path)
+            engine2 = AuraLiteEngine()
+            engine2.load_model(path)  # must not raise
+        finally:
+            os.unlink(path)
 
     def test_generate_batch_mixed_prompt_lengths(self):
         engine = AuraLiteEngine()

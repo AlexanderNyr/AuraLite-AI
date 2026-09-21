@@ -143,9 +143,9 @@ class QuantConfig:
             if self.qat_epochs < 1:
                 errors.append(f"QAT epochs must be >= 1, got {self.qat_epochs}")
         if self.gptq_block_size < 1:
-            errors.append(f"GPTQ block_size must be >= 1")
+            errors.append("GPTQ block_size must be >= 1")
         if self.gptq_group_size < 1:
-            errors.append(f"GPTQ group_size must be >= 1")
+            errors.append("GPTQ group_size must be >= 1")
         return errors
 
 
@@ -173,7 +173,7 @@ class QuantResult:
 
     def summary(self) -> str:
         lines = [
-            f"═══ Quantization Result ═══",
+            "═══ Quantization Result ═══",
             f"Method         : {self.method}",
             f"Bits           : {self.bits}",
             f"Original size  : {self.original_size_mb:.2f} MB",

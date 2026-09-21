@@ -5,6 +5,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -82,8 +83,12 @@ def completions(req: CompletionRequest, request: Request):
     if req.stream and len(prompts) == 1:
         def gen():
             for tok in engine.generate_streaming(sanitize_prompt(prompts[0]), req.max_tokens, req.temperature, top_p=req.top_p):
-                chunk = {"choices": [{"text": tok, "index": 0, "finish_reason": None}]}
-                yield f"data: {chunk}\n\n"
+                chunk = {"id": f"cmpl-{uuid.uuid4().hex}", "object": "text_completion",
+                         "model": req.model,
+                         "choices": [{"text": tok, "index": 0, "finish_reason": None}]}
+                # SSE payloads must be valid JSON; f"{dict}" produced Python
+                # repr with single quotes, which OpenAI clients cannot parse.
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
     choices = []
@@ -101,8 +106,10 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     if req.stream:
         def gen():
             for tok in engine.generate_chat_streaming(messages, req.max_tokens, req.temperature, top_p=req.top_p):
-                chunk = {"choices": [{"delta": {"content": tok}, "index": 0, "finish_reason": None}]}
-                yield f"data: {chunk}\n\n"
+                chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+                         "model": req.model,
+                         "choices": [{"delta": {"content": tok}, "index": 0, "finish_reason": None}]}
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
     try:

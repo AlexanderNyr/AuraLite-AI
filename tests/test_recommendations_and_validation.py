@@ -109,13 +109,17 @@ class TestGenerationLengthRecommendations:
         tok = FixedLengthTokenizer(1)
         assert recommend_gen_length("x", tok, max_seq_len=100) == 30
 
-    def test_recommend_gen_length_uses_hard_max_for_long_prompt(self):
+    def test_recommend_gen_length_scales_past_hard_max_for_long_prompt(self):
+        # v2.6: the ceiling is max(hard_max, 2*max_seq_len, 1024) — RoPE
+        # extrapolation makes long outputs past the training window legitimate.
         tok = FixedLengthTokenizer(1_000)
-        assert recommend_gen_length("long", tok, max_seq_len=2_000, hard_max=123) == 123
+        assert recommend_gen_length("long", tok, max_seq_len=2_000, hard_max=123) == 4_000
 
-    def test_recommend_gen_length_respects_context_headroom(self):
+    def test_recommend_gen_length_not_clamped_to_context_headroom(self):
+        # v2.6: recommendation is no longer clamped to `max_seq_len - seed - 2`;
+        # only the [hard_min, effective_max] band applies -> 7 * 8 = 56.
         tok = FixedLengthTokenizer(7)
-        assert recommend_gen_length("abcdefg", tok, max_seq_len=10, hard_min=30) == 1
+        assert recommend_gen_length("abcdefg", tok, max_seq_len=10, hard_min=30) == 56
 
     def test_recommend_gen_length_falls_back_to_character_length_on_tokenizer_error(self):
         assert recommend_gen_length("abcd", BrokenTokenizer(), max_seq_len=100, multiplier=8) == 32
@@ -148,6 +152,16 @@ class TestValidationRules:
             "bpe_vocab_size", "val_split", "accumulation_steps",
         ):
             assert field in joined
+
+    def test_validate_params_allows_zero_val_split(self):
+        # val_split=0 disables validation by design (train() and the GUI both
+        # treat it as "no validation"); validation must not reject it.
+        errors = validate_params({"val_split": 0.0})
+        assert not any("val_split" in e for e in errors)
+
+    def test_validate_params_rejects_invalid_val_split(self):
+        assert any("val_split" in e for e in validate_params({"val_split": -0.1}))
+        assert any("val_split" in e for e in validate_params({"val_split": 1.0}))
 
     def test_non_boolean_checkpoint_flag_is_invalid(self):
         errors = validate_params({"use_gradient_checkpointing": "yes"})

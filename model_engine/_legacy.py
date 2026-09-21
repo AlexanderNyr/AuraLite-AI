@@ -127,8 +127,10 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"grad_clip must be > 0, got {grad_clip}")
     if bpe_vocab_size < 2:
         errors.append(f"bpe_vocab_size must be >= 2, got {bpe_vocab_size}")
-    if not (0.0 < val_split < 1.0):
-        errors.append(f"val_split must be in (0, 1), got {val_split}")
+    # val_split=0 is legitimate: it disables the validation split (train() and
+    # the GUI both treat 0 as "no validation"). Only negatives and >=1 are bad.
+    if not (0.0 <= val_split < 1.0):
+        errors.append(f"val_split must be in [0, 1), got {val_split}")
     if accumulation_steps < 1:
         errors.append(f"accumulation_steps must be >= 1, got {accumulation_steps}")
 
@@ -501,8 +503,9 @@ def recommend_gen_length(seed_str: str,
     """Recommend a generation length (in tokens) for a given seed.
 
     Aims for `multiplier` times the seed length so short prompts still
-    produce meaningful output. Bounded by [hard_min, hard_max] AND by the
-    model's max context window.
+    produce meaningful output. Bounded below by hard_min and above by
+    max(hard_max, 2*max_seq_len, 1024) — since v2.6 the recommendation may
+    legitimately exceed the training window because RoPE extrapolates.
 
     Examples (multiplier=8):
         seed_tokens=1   → 30   (hard_min)
@@ -515,7 +518,7 @@ def recommend_gen_length(seed_str: str,
     Args:
         seed_str:   the prompt the user typed
         tokenizer:  trained CharTokenizer/BPETokenizer (None = use chars)
-        max_seq_len: model.max_seq_len (we never exceed it)
+        max_seq_len: model.max_seq_len (a reference scale, not a hard cap)
         multiplier: how much longer than the seed the output should be
         hard_min/hard_max: absolute clamps
 
@@ -712,8 +715,14 @@ class Attention(nn.Module):
             t = t / factor
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("rope_cos", emb.cos() * mscale, persistent=True)
-        self.register_buffer("rope_sin", emb.sin() * mscale, persistent=True)
+        # NOTE (v2.6.1): buffers are NON-persistent. They are a pure function of
+        # (head_dim, theta, scaling, seq_len), rebuilt in __init__ and extended on
+        # demand by _apply_rope (RoPE extrapolation past max_seq_len). Persisting
+        # them poisoned checkpoints: after a long generation the buffers grew past
+        # max_seq_len and load_state_dict() failed with a size mismatch, making the
+        # saved model unloadable.
+        self.register_buffer("rope_cos", emb.cos() * mscale, persistent=False)
+        self.register_buffer("rope_sin", emb.sin() * mscale, persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -1734,7 +1743,11 @@ class GGUFModelProxy:
     def create_completion(self, prompt: str, *, max_tokens: int = 50,
                           temperature: float = 0.8, top_k: int = 50,
                           top_p: float = 0.9, repeat_penalty: float = 1.0,
-                          min_p: float = 0.0, stream: bool = False):
+                          min_p: float = 0.0, stream: bool = False,
+                          stop: list[str] | None = None):
+        kwargs: dict[str, Any] = {}
+        if stop:
+            kwargs["stop"] = list(stop)
         return self.llama.create_completion(
             prompt=prompt,
             max_tokens=max(0, int(max_tokens)),
@@ -1744,13 +1757,18 @@ class GGUFModelProxy:
             min_p=float(min_p),
             repeat_penalty=float(repeat_penalty),
             stream=stream,
+            **kwargs,
         )
 
     def create_chat_completion(self, messages: list[dict], *, max_tokens: int = 50,
                                temperature: float = 0.8, top_k: int = 50,
                                top_p: float = 0.9, repeat_penalty: float = 1.0,
-                               min_p: float = 0.0, stream: bool = False):
+                               min_p: float = 0.0, stream: bool = False,
+                               stop: list[str] | None = None):
         """Use llama.cpp chat formatting for instruction/chat GGUF models."""
+        kwargs: dict[str, Any] = {}
+        if stop:
+            kwargs["stop"] = list(stop)
         return self.llama.create_chat_completion(
             messages=messages,
             max_tokens=max(0, int(max_tokens)),
@@ -1760,6 +1778,7 @@ class GGUFModelProxy:
             min_p=float(min_p),
             repeat_penalty=float(repeat_penalty),
             stream=stream,
+            **kwargs,
         )
 
 # ===================================================================
@@ -1848,6 +1867,43 @@ class AuraLiteEngine:
     #  Chat / Instruction Mode (NEW v2.3)
     # ===================================================================
 
+    # ---- Stop-sequence helpers (v2.6.1) --------------------------------
+    # Previously the `stop_tokens` argument of generate_chat() was accepted
+    # but silently ignored, and template stop markers (e.g. <|im_end|>) were
+    # never applied for the native backend, so chat generations ran past the
+    # end of the assistant turn and leaked template artifacts.
+    def _resolve_stop_strings(self, stop_tokens: Optional[List[str]] | None,
+                              chat_template: str) -> list[str]:
+        """Explicit stop strings override the chat-template defaults."""
+        if stop_tokens:
+            return [s for s in stop_tokens if s]
+        try:
+            return [s for s in get_stop_tokens(chat_template) if s]
+        except Exception:
+            return []
+
+    def _stop_token_ids(self, stop_strings: list[str]) -> set[int]:
+        """Single-token stop strings can match during sampling (early exit)."""
+        ids: set[int] = set()
+        for s in stop_strings:
+            try:
+                enc = self.encode(s)
+            except Exception:
+                continue
+            if len(enc) == 1:
+                ids.add(enc[0])
+        return ids
+
+    @staticmethod
+    def _truncate_at_stop(text: str, stop_strings: list[str]) -> str:
+        """Cut text at the earliest occurrence of any stop string."""
+        best: int | None = None
+        for s in stop_strings:
+            i = text.find(s)
+            if i != -1 and (best is None or i < best):
+                best = i
+        return text[:best] if best is not None else text
+
     def generate_chat(
         self,
         messages: List[Dict[str, str]] | "ChatHistory",
@@ -1887,6 +1943,7 @@ class AuraLiteEngine:
             history.messages.insert(0, ChatMessage(role="system", content=system_prompt))
 
         prompt = apply_chat_template(history, template_name=chat_template, add_generation_prompt=True)
+        stop_strs = self._resolve_stop_strings(stop_tokens, chat_template)
 
         # Generate
         if self.is_gguf_model():
@@ -1906,6 +1963,7 @@ class AuraLiteEngine:
                     repeat_penalty=repetition_penalty,
                     min_p=min_p,
                     stream=False,
+                    stop=stop_strs,
                 )
                 try:
                     return result["choices"][0]["message"]["content"]
@@ -1915,9 +1973,9 @@ class AuraLiteEngine:
                 # Fallback to regular completion with formatted prompt
                 full = self._gguf_generate_text(
                     prompt, max_new_tokens, temperature, top_k, top_p,
-                    repetition_penalty, min_p
+                    repetition_penalty, min_p, stop=stop_strs,
                 )
-                return full[len(prompt):].strip()
+                return self._truncate_at_stop(full[len(prompt):], stop_strs).strip()
 
         elif self.is_hf_model():
             # HF models usually have their own chat template
@@ -1931,18 +1989,22 @@ class AuraLiteEngine:
             if min_p > 0:
                 kwargs["min_p"] = min_p
             full = self.hf_proxy.generate(prompt, **kwargs)
-            return full[len(prompt):].strip() if full.startswith(prompt) else full.strip()
+            text = full[len(prompt):] if full.startswith(prompt) else full
+            return self._truncate_at_stop(text, stop_strs).strip()
 
         else:
             # Native AuraLite model
             ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
             result_ids = self._generate_ids(
                 ids, max_new_tokens, temperature, top_k, top_p,
-                repetition_penalty, min_p=min_p
+                repetition_penalty, min_p=min_p,
+                stop_token_ids=self._stop_token_ids(stop_strs),
             )
-            # Return only the newly generated part (token-based slice)
+            # Return only the newly generated part (token-based slice),
+            # cut at the first stop marker (incl. multi-token ones).
             generated_ids = result_ids[len(ids):]
-            return self.decode(generated_ids).strip()
+            text = self.decode(generated_ids)
+            return self._truncate_at_stop(text, stop_strs).strip()
 
     def generate_chat_streaming(
         self,
@@ -1955,6 +2017,7 @@ class AuraLiteEngine:
         min_p: float = 0.0,
         chat_template: str = "chatml",
         system_prompt: Optional[str] = None,
+        stop_tokens: Optional[List[str]] = None,
     ) -> Iterator[str]:
         """
         Streaming version of generate_chat — yields tokens one by one.
@@ -1973,6 +2036,37 @@ class AuraLiteEngine:
             history.messages.insert(0, ChatMessage(role="system", content=system_prompt))
 
         prompt = apply_chat_template(history, template_name=chat_template, add_generation_prompt=True)
+        stop_strs = self._resolve_stop_strings(stop_tokens, chat_template)
+        text_buffer = ""
+
+        def _consume(piece: str) -> tuple[str, bool]:
+            """Accumulate decoded text; return (emittable_text, hit_stop).
+
+            Stop strings are cut even when they span multiple yielded pieces;
+            a tail that is a prefix of a stop string is held back either way.
+            """
+            nonlocal text_buffer
+            text_buffer += piece
+            cut_pos: int | None = None
+            for s in stop_strs:
+                i = text_buffer.find(s)
+                if i != -1 and (cut_pos is None or i < cut_pos):
+                    cut_pos = i
+            if cut_pos is not None:
+                out = text_buffer[:cut_pos]
+                text_buffer = ""
+                return out, True
+            keep = 0
+            for s in stop_strs:
+                for k in range(min(len(s) - 1, len(text_buffer)), 0, -1):
+                    if text_buffer.endswith(s[:k]):
+                        keep = max(keep, k)
+                        break
+            if keep:
+                out, text_buffer = text_buffer[:-keep], text_buffer[-keep:]
+            else:
+                out, text_buffer = text_buffer, ""
+            return out, False
 
         if self.is_gguf_model():
             if self.model.use_chat_completion:
@@ -1985,14 +2079,21 @@ class AuraLiteEngine:
                     repeat_penalty=repetition_penalty,
                     min_p=min_p,
                     stream=True,
+                    stop=stop_strs,
                 )
                 for chunk in stream:
                     try:
                         delta = chunk["choices"][0].get("delta", {}).get("content", "")
                         if delta:
-                            yield delta
+                            out, hit = _consume(delta)
+                            if out:
+                                yield out
+                            if hit:
+                                return
                     except Exception:
                         continue
+                if text_buffer:
+                    yield text_buffer
             else:
                 # Fallback: non-streaming
                 full = self.generate_chat(
@@ -2015,15 +2116,23 @@ class AuraLiteEngine:
                 kwargs["min_p"] = min_p
             try:
                 for token in self.hf_proxy.generate_streaming(prompt, **kwargs):
-                    yield token
+                    out, hit = _consume(token)
+                    if out:
+                        yield out
+                    if hit:
+                        return
+                if text_buffer:
+                    yield text_buffer
             except Exception:
                 # Fallback
                 result = self.hf_proxy.generate(prompt, **kwargs)
-                yield result[len(prompt):] if result.startswith(prompt) else result
+                text = result[len(prompt):] if result.startswith(prompt) else result
+                yield self._truncate_at_stop(text, stop_strs)
             return
 
         # Native AuraLite streaming
         ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
+        stop_ids = self._stop_token_ids(stop_strs)
         self.model.eval()
         self.model.reset_cache()
 
@@ -2031,6 +2140,7 @@ class AuraLiteEngine:
         if max_new_tokens <= 0:
             return
 
+        hit_stop = False
         with torch.no_grad():
             # Process prompt
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
@@ -2038,11 +2148,18 @@ class AuraLiteEngine:
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                      repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
-            yield self.decode([nxt])
+            if nxt in stop_ids:
+                hit_stop = True
+            else:
+                out, hit_stop = _consume(self.decode([nxt]))
+                if out:
+                    yield out
 
             hard_cap = max(self.model.max_seq_len + max_new_tokens, self.model.max_seq_len * 4, 8192)
 
             for _ in range(max_new_tokens - 1):
+                if hit_stop:
+                    break
                 pos = len(result_ids) - 1
                 if pos + 1 >= hard_cap:
                     break
@@ -2051,9 +2168,16 @@ class AuraLiteEngine:
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                          repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
-                yield self.decode([nxt])
+                if nxt in stop_ids:
+                    hit_stop = True
+                    break
+                out, hit_stop = _consume(self.decode([nxt]))
+                if out:
+                    yield out
 
         self.model.reset_cache()
+        if not hit_stop and text_buffer:
+            yield text_buffer
 
     def load_gguf_model(self, path: str, *, n_ctx: int = 4096,
                         n_threads: int | None = None,
@@ -2368,7 +2492,8 @@ class AuraLiteEngine:
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
                             repetition_penalty: float = 1.0,
-                            min_p: float = 0.0) -> str:
+                            min_p: float = 0.0,
+                            stop: list[str] | None = None) -> str:
         if not isinstance(self.model, GGUFModelProxy):
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
@@ -2377,6 +2502,7 @@ class AuraLiteEngine:
                 max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, stream=False,
+                stop=stop,
             )
             try:
                 suffix = out["choices"][0].get("message", {}).get("content", "")
@@ -2387,6 +2513,7 @@ class AuraLiteEngine:
                 prompt, max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, stream=False,
+                stop=stop,
             )
             try:
                 suffix = out["choices"][0].get("text", "")
@@ -3575,7 +3702,16 @@ class AuraLiteEngine:
         if lora_rank > 0:
             self.model.enable_lora(rank=lora_rank)
 
-        self.model.load_state_dict(checkpoint["model_state"])
+        # Backward compatibility: drop RoPE cos/sin buffers from the checkpoint.
+        # They are non-persistent since v2.6.1 (derived data, rebuilt on demand),
+        # and older checkpoints may carry them at a different size after RoPE
+        # auto-extension during generation — loading them verbatim would fail
+        # with a state_dict size mismatch.
+        model_state = {
+            k: v for k, v in checkpoint["model_state"].items()
+            if not (k.endswith(".rope_cos") or k.endswith(".rope_sin"))
+        }
+        self.model.load_state_dict(model_state)
         self.model.to(self.device)
         self.model.eval()
 

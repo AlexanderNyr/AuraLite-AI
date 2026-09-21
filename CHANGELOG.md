@@ -1,3 +1,59 @@
+# 🐞 Changelog — AuraLite AI v2.6.1 (2026-09-21)
+
+## Bug fixes
+
+### Engine / checkpoints
+- **Unloadable checkpoints after long generation (critical)** — RoPE `rope_cos`/`rope_sin`
+  buffers were persistent, so a generation that extrapolated past `max_seq_len` enlarged
+  them, and the next `load_model()` crashed with a state_dict size mismatch. The buffers
+  are now non-persistent (derived data, rebuilt on demand), and `load_model()` strips
+  legacy `*.rope_cos` / `*.rope_sin` keys for backward compatibility.
+- **`val_split=0` rejected** — `validate_params()` required `val_split` in `(0, 1)` while
+  `train()` and the GUI both documented/treated `0` as "validation disabled". Now `[0, 1)`.
+- **`recommend_gen_length` docstring** updated to the v2.6 contract (the recommendation may
+  exceed the training window because RoPE extrapolates).
+
+### Chat
+- **Stop sequences were silently ignored** — `generate_chat(..., stop_tokens=...)` accepted
+  the argument but never applied it, and template stop markers (`<|im_end|>`, `</s>`, …)
+  were never honored on the native backend, so answers ran past the assistant turn and
+  leaked template artifacts. Now all backends resolve stop strings (explicit argument →
+  template defaults → none), use single-token stop ids for early exit, and truncate the
+  decoded text at the earliest stop marker; streaming holds back tails that are prefixes
+  of a stop string, so multi-token markers split across streamed tokens are cut correctly.
+
+### Serving
+- **SSE streams were not valid JSON** — `/v1/completions` and `/v1/chat/completions`
+  (stream=true) yielded Python dict reprs (`data: {'choices': ...}`). Now proper
+  `json.dumps` payloads with OpenAI-style chunk ids/objects.
+
+### Evaluation (lm-eval wrapper)
+- `loglikelihood()` hardcoded `is_greedy=True` (inflated metrics) and could index log
+  probs at a negative position for an empty-context edge case. Both fixed.
+- `loglikelihood_rolling()` crashed unpacking 1-element request args and returned the
+  wrong type (tuples instead of floats). Now computes proper non-overlapping-window
+  rolling log-likelihood and returns `list[float]`.
+- `generate_until()` was a stub returning empty strings (broke all generative tasks).
+  Now generates via the engine and honours `until` / `max_gen_toks` gen_kwargs.
+
+### Hugging Face proxy
+- `HuggingFaceProxy.generate()` decoded the whole id sequence with
+  `skip_special_tokens=True`; with chat-template prompts containing special tokens the
+  result did not start with the prompt, so callers slicing `text[len(prompt):]`
+  mis-sliced. Now only the continuation ids are decoded and the original prompt is
+  prepended verbatim.
+
+### Misc
+- Removed extraneous `f`-string prefixes (GUI status labels, quantization messages).
+
+## Tests
+- Updated 3 tests to the documented v2.6 generation-length/prompt semantics.
+- Added regression tests: checkpoint save/load after RoPE extrapolation, legacy rope
+  buffer stripping, `val_split=0` validation, chat stop handling (batch + streaming),
+  HF prompt preservation.
+
+---
+
 # ⚡ Changelog — AuraLite AI v2.6.0 (2026-09-20)
 
 ## Modern Training Stack (QK-norm + Muon + WSD)

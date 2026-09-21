@@ -219,7 +219,8 @@ class TestHuggingFaceProxyLoadingAndGeneration:
             repetition_penalty=1.2,
         )
 
-        assert text == "decoded text"
+        # Prompt is preserved verbatim; only the continuation ids are decoded.
+        assert text == "prompt" + "decoded text"
         call = proxy.model.generate_calls[0]
         assert call["max_new_tokens"] == 5
         assert call["temperature"] == 0.0
