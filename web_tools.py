@@ -304,11 +304,31 @@ class SimpleVectorStore:
 
 
 def semantic_chunks(text: str, chunk_chars: int = 900, overlap: int = 120) -> list[str]:
-    """Sentence-aware chunking with character fallback and overlap."""
-    sentences = re.split(r"(?<=[.!?。！？])\s+", text.strip())
+    """Sentence-aware chunking with character fallback and overlap.
+
+    Sentences longer than ``chunk_chars`` (or texts without any sentence
+    boundaries) fall back to hard character splitting so no chunk can grow
+    unbounded — the fallback the docstring has always promised.
+    """
+    def _hard_split(long_text: str) -> list[str]:
+        pieces = []
+        step = max(1, chunk_chars - overlap)
+        for i in range(0, len(long_text), step):
+            piece = long_text[i:i + chunk_chars].strip()
+            if piece:
+                pieces.append(piece)
+        return pieces
+
     chunks, current = [], ""
+    sentences = re.split(r"(?<=[.!?。！？])\s+", text.strip())
     for sent in sentences:
-        if len(current) + len(sent) + 1 > chunk_chars and current:
+        if len(sent) > chunk_chars:
+            # Flush what we have, then hard-split the oversized sentence.
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            chunks.extend(_hard_split(sent))
+        elif len(current) + len(sent) + 1 > chunk_chars and current:
             chunks.append(current.strip())
             current = current[-overlap:] + " " + sent
         else:

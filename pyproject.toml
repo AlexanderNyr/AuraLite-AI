@@ -17,7 +17,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4"]
+test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
+        "fastapi>=0.111", "uvicorn>=0.30", "httpx>=0.27", "pydantic>=2"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
 full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
 quant = ["bitsandbytes>=0.43; platform_system != 'Darwin'", "auto-gptq>=0.7", "optimum>=1.20"]

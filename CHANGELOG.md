@@ -1,3 +1,56 @@
+# 🧪 Changelog — Testing & CI Update (2026-09-21)
+
+## Test expansion (335 → 455 tests, +120)
+
+New test files on top of the v2.6.1 bugfixes:
+
+- **`tests/test_server_openai.py`** — FastAPI TestClient suite: `/health`,
+  `/v1/completions` (+ batch, sanitize, SSE JSON validity, pydantic 422s),
+  `/v1/chat/completions` (+ SSE), rate-limit 429/window expiry, 500 JSON error shape.
+- **`tests/test_attention_extended.py`** — KV-cache incremental vs full-forward parity
+  (incl. chunked prompts, GQA, QK-norm, ALiBi, all RoPE scalings), GQA unrepeated cache
+  layout, sliding-window eviction and positional correctness, ALiBi causality,
+  QK-norm scale-invariance of attention weights, RoPE auto-extension, past-window
+  forward, INT8/FP16 cache packing.
+- **`tests/test_engine_api.py`** — config save/load, autosave per-epoch/per-steps,
+  optimizer/scheduler resume on continue-training, stop_event early halt, val-loss
+  callback, generation edges (length 0, empty prompt), batch grouping/order/parity,
+  backend guards (GGUF/HF save/quantize), speculative+compile fallbacks,
+  GGUF-missing dependency error, checkpoint internals, legacy `chars` checkpoint load,
+  full modern-stack smoke (bpe+muon+wsd+qk_norm+gqa+sliding_window), estimate_n_params.
+- **`tests/test_package_extras.py`** — AuraLiteConfig validation, PagedDataset roundtrip/
+  bounds/dtypes/DataLoader, profiling helpers, sanitize_prompt/safe_path, backends
+  facade, kernels/ parity with engine implementations, estimate_n_params accuracy.
+- **`tests/test_rag_v24.py`** — SimpleVectorStore add/search/persist/corrupt-recovery/
+  metadata, semantic chunking (sizes, overlap continuity, no empty), HyDE,
+  build_rag_context citations + web fusion + offline tolerance.
+- **`tests/test_property_extended.py`** — hypothesis: BPE round-trip/id bounds/
+  serialization, CharTokenizer round-trip, KV-cache parity over random lengths,
+  rotate_half involution, PackedLinear INT8 error bounds, FakeQuantize scale bound.
+- **`tests/test_e2e_pipeline.py`** — end-to-end: train (BPE+Muon+WSD+QK-norm+GQA) →
+  generate/stream/batch parity → chat → checkpoint regeneration equivalence →
+  perplexity metrics → dynamic-quantize + save pipeline → thinking mode.
+
+## Bug fix (found by the new tests)
+
+- **`web_tools.semantic_chunks`** — the documented "character fallback" never worked:
+  texts without sentence boundaries (or a single oversized sentence) produced one
+  unbounded chunk. Now oversized sentences are hard-split with overlap.
+
+## CI
+
+- Test matrix: Python **3.10–3.13** on Ubuntu + Windows-latest (3.11) with pip caching.
+- New **`server-smoke`** job: trains a tiny checkpoint, boots uvicorn and curls
+  `/health`, `/v1/completions`, `/v1/chat/completions` over real HTTP.
+- New **`coverage`** job publishing `coverage.xml` artifact
+  (model_engine/server/agent/quantization/chat/web/eval/export scopes).
+- Lint job: ruff (critical, per pyproject) + extended hygiene report (non-blocking) +
+  pyright smoke; docker job now depends on lint+tests green.
+- `pyproject` test extras gain `fastapi`, `uvicorn`, `httpx`, `pydantic` so the
+  server suite runs in any `[test]` environment.
+
+---
+
 # 🐞 Changelog — AuraLite AI v2.6.1 (2026-09-21)
 
 ## Bug fixes
