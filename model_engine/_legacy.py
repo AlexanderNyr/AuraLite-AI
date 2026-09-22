@@ -1,4 +1,5 @@
 import os
+import time
 
 # -----------------------------------------------------------------------
 # CPU multithreading — set BEFORE importing torch / numpy so the OpenMP /
@@ -2801,11 +2802,63 @@ class AuraLiteEngine:
         return total / n
 
     # ---- Training ----------------------------------------------------
+    @staticmethod
+    def _invoke_progress(progress_callback, epoch, total_epochs, train_loss,
+                         val_loss=None, info=None):
+        """Call a progress callback with optional live-training `info` dict.
+
+        Compatible with both:
+          cb(epoch, total, loss, val_loss)          — legacy: only on epoch end
+          cb(epoch, total, loss, val_loss, info)    — live batch/setup updates
+
+        `info` keys (all optional): phase, message, batch, batches, global_step,
+        total_steps, percent, epoch_percent, lr, samples_per_sec, tokens_per_sec,
+        elapsed, eta_seconds, is_epoch_end, epoch_loss.
+        """
+        if progress_callback is None:
+            return
+        if info is None:
+            info = {}
+        mode = getattr(progress_callback, "_auralite_progress_mode", None)
+        if mode is None:
+            # Probe once: prefer the 5-arg live API, fall back to legacy 4-arg.
+            try:
+                progress_callback(epoch, total_epochs, train_loss, val_loss, info)
+                try:
+                    progress_callback._auralite_progress_mode = "info"
+                except Exception:
+                    pass
+                return
+            except TypeError:
+                try:
+                    progress_callback._auralite_progress_mode = "legacy"
+                except Exception:
+                    pass
+                mode = "legacy"
+        if mode == "info":
+            progress_callback(epoch, total_epochs, train_loss, val_loss, info)
+            return
+        # Legacy 4-arg: keep the historic contract — one call per finished epoch.
+        if info.get("is_epoch_end") and int(epoch) > 0:
+            progress_callback(epoch, total_epochs, train_loss, val_loss)
+
     def train(self, training_text: str, params: dict,
               progress_callback=None, stop_event=None):
         """Train (or continue training) the model.
 
-        progress_callback(epoch, total_epochs, train_loss, val_loss_or_None)
+        progress_callback(epoch, total_epochs, train_loss, val_loss_or_None, info=None)
+
+        The optional 5th argument `info` is a dict with live batch/ETA fields so
+        UIs can update the progress bar *between* epochs. Old 4-arg callbacks
+        still work and are only invoked once per finished epoch.
+
+        info keys: phase (setup|train|val|epoch_end|stopped), message, batch,
+        batches, global_step, total_steps, percent, epoch_percent, lr,
+        tokens_per_sec, batches_per_sec, elapsed, eta_seconds, is_epoch_end.
+
+        Throttle knobs in params:
+          progress_every_batches  : emit at least every N batches (default ~1%)
+          progress_every_seconds  : also emit at least every N seconds (default 0.5)
 
         params (beyond architecture/optimizer):
           tokenizer        : "char" (default) or "bpe"
@@ -2944,19 +2997,57 @@ class AuraLiteEngine:
             elif self._resume_scaler_state is not None:
                 scaler_state_to_restore = self._resume_scaler_state
 
+        # ---- Live progress helpers ------------------------------------
+        # progress_every_batches: 0 = auto (≈1% of epoch, min 1, max 25)
+        # progress_every_seconds: also emit at least this often (default 0.5s)
+        progress_every_batches = int(params.get("progress_every_batches", 0) or 0)
+        progress_every_seconds = float(params.get("progress_every_seconds", 0.5) or 0.5)
+        train_t0 = time.time()
+        n_loader_batches_est = 0  # filled after DataLoader is built
+        total_steps_est = 0
+
+        def _setup_progress(message: str, frac: float = 0.0):
+            """Setup-phase updates (tokenizer / encode) before epoch 1."""
+            self._invoke_progress(
+                progress_callback, 0, epochs, 0.0, None,
+                info={
+                    "phase": "setup",
+                    "message": message,
+                    "percent": max(0.0, min(2.0, float(frac) * 2.0)),  # keep setup <2%
+                    "elapsed": time.time() - train_t0,
+                    "is_epoch_end": False,
+                    "batch": 0,
+                    "batches": 0,
+                },
+            )
+
+        _setup_progress("Подготовка: проверка параметров…", 0.02)
+
         # ---- Tokenizer ------------------------------------------------
         if not resuming:
             if tok_kind == "bpe":
+                _setup_progress(
+                    f"Обучение BPE-токенизатора (vocab={bpe_vocab})… "
+                    "на больших корпусах это может занять несколько минут",
+                    0.08,
+                )
                 self.tokenizer = BPETokenizer()
                 # IMPROVED: stratified sampling instead of prefix
                 self.tokenizer.train(training_text, vocab_size=bpe_vocab)
             else:
+                _setup_progress("Обучение char-токенизатора…", 0.08)
                 self.tokenizer = CharTokenizer()
                 self.tokenizer.train(training_text)
             self.vocab_size = self.tokenizer.vocab_size
+            _setup_progress(
+                f"Токенизатор готов (vocab={self.vocab_size})", 0.25,
+            )
+        else:
+            _setup_progress("Продолжение обучения — токенизатор уже в памяти", 0.15)
 
         # ---- Model ----------------------------------------------------
         if not resuming:
+            _setup_progress("Создание модели…", 0.30)
             self.backend = "torch"
             self.gguf_path = None
             self.hf_path = None
@@ -3066,10 +3157,14 @@ class AuraLiteEngine:
                 print(f"[AuraLite] WARNING: could not restore AMP scaler state: {e}")
 
         # ---- Dataset / DataLoader ------------------------------------
+        _setup_progress("Токенизация корпуса (encode)…", 0.45)
         encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
         encoded_bytes = encoded.numel() * encoded.element_size()
         print(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
               f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
+        _setup_progress(
+            f"Корпус токенизирован: {len(encoded):,} токенов", 0.55,
+        )
 
         # ---- Train / validation split -------------------------------------
         # Goal: both train and val slices must produce at least one full
@@ -3230,6 +3325,41 @@ class AuraLiteEngine:
         train_model.train()
         self.last_val_loss = None
 
+        n_loader_batches = max(1, len(loader))
+        if progress_every_batches <= 0:
+            # ~1% of the epoch, but keep UI responsive without flooding Tk
+            progress_every_batches = max(1, min(25, n_loader_batches // 100 or 1))
+        total_opt_steps = max(1, epochs * n_loader_batches)
+        tokens_per_batch = batch_size * seq_length
+        report_rank_ok = (not ddp_active or dist.get_rank() == 0)
+
+        _setup_progress(
+            f"Старт обучения: {epochs} эпох × {n_loader_batches} батчей "
+            f"(~{epochs * n_loader_batches} шагов)",
+            0.95,
+        )
+        if report_rank_ok:
+            self._invoke_progress(
+                progress_callback, 0, epochs, 0.0, None,
+                info={
+                    "phase": "train",
+                    "message": f"Эпоха 1/{epochs} — старт",
+                    "batch": 0,
+                    "batches": n_loader_batches,
+                    "global_step": 0,
+                    "total_steps": total_opt_steps,
+                    "percent": 0.0,
+                    "epoch_percent": 0.0,
+                    "elapsed": time.time() - train_t0,
+                    "eta_seconds": None,
+                    "is_epoch_end": False,
+                    "lr": self.scheduler.get_lr() if self.scheduler else lr,
+                },
+            )
+
+        last_report_t = 0.0
+        completed_batches_total = 0
+
         for epoch in range(epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -3239,6 +3369,8 @@ class AuraLiteEngine:
             running_loss   = 0.0
             seen_batches   = 0
             stopped_mid    = False
+            epoch_t0       = time.time()
+            last_report_t  = 0.0
 
             # IMPROVED: gradient accumulation loop
             for batch_idx, (xb, yb) in enumerate(loader):
@@ -3282,8 +3414,77 @@ class AuraLiteEngine:
 
                 running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
+                completed_batches_total += 1
+
+                # ---- Live batch progress (between epochs) ----------------
+                if report_rank_ok and progress_callback is not None:
+                    now = time.time()
+                    is_last_batch = (batch_idx + 1) >= n_loader_batches
+                    due_by_count = (seen_batches == 1
+                                    or seen_batches % progress_every_batches == 0
+                                    or is_last_batch)
+                    due_by_time = (progress_every_seconds > 0
+                                   and (now - last_report_t) >= progress_every_seconds)
+                    if due_by_count or due_by_time:
+                        last_report_t = now
+                        avg_loss = running_loss / max(1, seen_batches)
+                        epoch_frac = seen_batches / float(n_loader_batches)
+                        # overall percent across all epochs
+                        overall_frac = (epoch + epoch_frac) / float(max(1, epochs))
+                        elapsed = now - train_t0
+                        epoch_elapsed = now - epoch_t0
+                        # speed from this epoch so far
+                        sps = (seen_batches / epoch_elapsed) if epoch_elapsed > 0 else 0.0
+                        tps = sps * tokens_per_batch
+                        # ETA: remaining batches in this epoch + future epochs
+                        remain_batches = (n_loader_batches - seen_batches) +                             max(0, epochs - epoch - 1) * n_loader_batches
+                        eta = (remain_batches / sps) if sps > 0 else None
+                        cur_lr = self.scheduler.get_lr() if self.scheduler else lr
+                        self._invoke_progress(
+                            progress_callback,
+                            epoch + 1, epochs, avg_loss, None,
+                            info={
+                                "phase": "train",
+                                "message": (
+                                    f"Эпоха {epoch + 1}/{epochs} · "
+                                    f"батч {seen_batches}/{n_loader_batches}"
+                                ),
+                                "batch": seen_batches,
+                                "batches": n_loader_batches,
+                                "global_step": completed_batches_total,
+                                "total_steps": total_opt_steps,
+                                "percent": overall_frac * 100.0,
+                                "epoch_percent": epoch_frac * 100.0,
+                                "lr": cur_lr,
+                                "samples_per_sec": sps * batch_size,
+                                "batches_per_sec": sps,
+                                "tokens_per_sec": tps,
+                                "elapsed": elapsed,
+                                "eta_seconds": eta,
+                                "is_epoch_end": False,
+                                "epoch_loss": avg_loss,
+                            },
+                        )
 
             if stopped_mid:
+                # Final status for interrupted epoch
+                if report_rank_ok and seen_batches > 0:
+                    avg_loss = running_loss / seen_batches
+                    self._invoke_progress(
+                        progress_callback, epoch + 1, epochs, avg_loss, None,
+                        info={
+                            "phase": "stopped",
+                            "message": f"Остановка на эпохе {epoch + 1}, батч {seen_batches}/{n_loader_batches}",
+                            "batch": seen_batches,
+                            "batches": n_loader_batches,
+                            "global_step": completed_batches_total,
+                            "total_steps": total_opt_steps,
+                            "percent": ((epoch + seen_batches / float(n_loader_batches))
+                                        / float(max(1, epochs))) * 100.0,
+                            "elapsed": time.time() - train_t0,
+                            "is_epoch_end": False,
+                        },
+                    )
                 break
 
             # Handle remaining accumulated gradients
@@ -3301,6 +3502,24 @@ class AuraLiteEngine:
 
             val_loss = None
             if val_loader is not None:
+                if report_rank_ok:
+                    self._invoke_progress(
+                        progress_callback, epoch + 1, epochs,
+                        running_loss / max(1, seen_batches), None,
+                        info={
+                            "phase": "val",
+                            "message": f"Эпоха {epoch + 1}/{epochs} — валидация…",
+                            "batch": n_loader_batches,
+                            "batches": n_loader_batches,
+                            "global_step": completed_batches_total,
+                            "total_steps": total_opt_steps,
+                            "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0 - 0.01,
+                            "epoch_percent": 100.0,
+                            "elapsed": time.time() - train_t0,
+                            "is_epoch_end": False,
+                            "lr": self.scheduler.get_lr() if self.scheduler else lr,
+                        },
+                    )
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
 
@@ -3310,9 +3529,34 @@ class AuraLiteEngine:
                 except Exception:
                     pass   # autosave must never kill training
 
-            if progress_callback and seen_batches > 0 and (not ddp_active or dist.get_rank() == 0):
+            if progress_callback and seen_batches > 0 and report_rank_ok:
                 avg_loss = running_loss / seen_batches
-                progress_callback(epoch + 1, epochs, avg_loss, val_loss)
+                elapsed = time.time() - train_t0
+                # ETA for remaining full epochs after this one
+                remain_epochs = max(0, epochs - (epoch + 1))
+                epoch_dur = time.time() - epoch_t0
+                eta = (epoch_dur * remain_epochs) if epoch_dur > 0 else None
+                self._invoke_progress(
+                    progress_callback, epoch + 1, epochs, avg_loss, val_loss,
+                    info={
+                        "phase": "epoch_end",
+                        "message": f"Эпоха {epoch + 1}/{epochs} завершена",
+                        "batch": n_loader_batches,
+                        "batches": n_loader_batches,
+                        "global_step": completed_batches_total,
+                        "total_steps": total_opt_steps,
+                        "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0,
+                        "epoch_percent": 100.0,
+                        "lr": self.scheduler.get_lr() if self.scheduler else lr,
+                        "batches_per_sec": (n_loader_batches / epoch_dur) if epoch_dur > 0 else 0.0,
+                        "tokens_per_sec": ((n_loader_batches * tokens_per_batch) / epoch_dur) if epoch_dur > 0 else 0.0,
+                        "elapsed": elapsed,
+                        "eta_seconds": eta,
+                        "is_epoch_end": True,
+                        "epoch_loss": avg_loss,
+                        "epoch_seconds": epoch_dur,
+                    },
+                )
 
     def compile_for_inference(self, mode: str = "reduce-overhead") -> bool:
         """Compile the native torch model for low-latency inference.

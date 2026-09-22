@@ -248,6 +248,8 @@ class AIApp:
         # ETA tracking
         self.train_start_time: float | None = None
         self.epoch_times: list[float] = []   # seconds per completed epoch
+        self._progress_ui_last_ts: float = 0.0  # throttle Tk updates from train thread
+        self._progress_ui_pending = None        # latest skipped payload
         self._last_epoch_ts: float | None = None
 
         # ---- Styles ----------------------------------------------------
@@ -671,6 +673,12 @@ class AIApp:
                                             variable=self.progress_var,
                                             maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=4)
+
+        # Live detail line under the bar (batch / phase / speed / ETA)
+        self.progress_detail_var = tk.StringVar(value="")
+        self.progress_detail_label = ttk.Label(
+            run_frame, textvariable=self.progress_detail_var, style="Sub.TLabel")
+        self.progress_detail_label.pack(fill=tk.X, pady=(0, 2), anchor=tk.W)
 
         self.status_label = ttk.Label(run_frame,
                                       text="Status: Waiting for file…")
@@ -2250,48 +2258,182 @@ class AIApp:
             self.status_label.config(text="Status: Ready to train")
 
     # ------------------------------------------------------------------
-    def update_progress(self, current, total, loss, val_loss=None):
+    def update_progress(self, current, total, loss, val_loss=None, info=None):
         """Called from the training thread — marshal the actual UI update
-        onto the Tk main loop via root.after (tkinter is not thread-safe)."""
-        self.root.after(0, self._apply_progress, current, total, loss, val_loss)
+        onto the Tk main loop via root.after (tkinter is not thread-safe).
 
-    def _apply_progress(self, current, total, loss, val_loss):
-        percent = (current / total) * 100
-        self.progress_var.set(percent)
-        lr = self.engine.scheduler.get_lr() if self.engine.scheduler else 0
-
-        # ---- ETA computation ----------------------------------------------
+        `info` (optional dict from AuraLiteEngine) carries live batch/ETA fields
+        so the progress bar moves *between* epochs, not only after each one.
+        Mid-epoch updates are throttled (~8 Hz) so Tk stays responsive.
+        """
+        if info is None:
+            info = {}
+        # Copy dict so the worker thread can mutate its next payload safely.
+        info = dict(info)
+        phase = str(info.get("phase") or "")
+        is_epoch_end = bool(info.get("is_epoch_end")) or phase == "epoch_end"
+        important = is_epoch_end or phase in ("setup", "val", "stopped") or current <= 0
         now = time.time()
-        if self._last_epoch_ts is not None:
-            self.epoch_times.append(now - self._last_epoch_ts)
-            # Keep a rolling window of the most recent 20 epochs for stability.
-            if len(self.epoch_times) > 20:
-                self.epoch_times = self.epoch_times[-20:]
-        self._last_epoch_ts = now
+        # Always schedule important events; throttle the rest (~8 UI fps).
+        if (not important) and (now - getattr(self, "_progress_ui_last_ts", 0.0) < 0.12):
+            self._progress_ui_pending = (current, total, loss, val_loss, info)
+            return
+        self._progress_ui_last_ts = now
+        self._progress_ui_pending = None
+        self.root.after(0, self._apply_progress, current, total, loss, val_loss, info)
 
-        elapsed = (now - self.train_start_time) if self.train_start_time else 0.0
-        remaining_epochs = max(0, total - current)
+    def _apply_progress(self, current, total, loss, val_loss, info=None):
+        if info is None:
+            info = {}
+        phase = str(info.get("phase") or ("epoch_end" if info.get("is_epoch_end") else "train"))
+        is_epoch_end = bool(info.get("is_epoch_end")) or phase == "epoch_end"
+
+        # Prefer engine-provided overall percent (includes intra-epoch fraction).
+        if "percent" in info and info["percent"] is not None:
+            try:
+                percent = float(info["percent"])
+            except (TypeError, ValueError):
+                percent = (current / max(1, total)) * 100.0
+        else:
+            percent = (current / max(1, total)) * 100.0
+        percent = max(0.0, min(100.0, percent))
+        self.progress_var.set(percent)
+
+        # LR: prefer info, fall back to live scheduler
+        lr = info.get("lr")
+        if lr is None:
+            lr = self.engine.scheduler.get_lr() if self.engine.scheduler else 0
+        try:
+            lr_f = float(lr)
+        except (TypeError, ValueError):
+            lr_f = 0.0
+
+        now = time.time()
+        elapsed = info.get("elapsed")
+        if elapsed is None:
+            elapsed = (now - self.train_start_time) if self.train_start_time else 0.0
+        try:
+            elapsed = float(elapsed)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+
+        # ETA from engine (batch-accurate) when present
+        eta_seconds = info.get("eta_seconds")
         eta_str = "—"
-        speed_str = ""
-        if self.epoch_times:
-            avg_epoch = sum(self.epoch_times) / len(self.epoch_times)
-            eta_seconds = avg_epoch * remaining_epochs
-            eta_str = _fmt_duration(eta_seconds)
-            speed_str = f"  |  {avg_epoch:.2f}s/epoch"
+        if eta_seconds is not None:
+            try:
+                eta_str = _fmt_duration(float(eta_seconds))
+            except (TypeError, ValueError):
+                eta_str = "—"
+
+        # On epoch end keep rolling epoch-duration stats (for plot / fallback ETA)
+        if is_epoch_end and current > 0:
+            if self._last_epoch_ts is not None:
+                self.epoch_times.append(now - self._last_epoch_ts)
+                if len(self.epoch_times) > 20:
+                    self.epoch_times = self.epoch_times[-20:]
+            self._last_epoch_ts = now
+            if eta_seconds is None and self.epoch_times:
+                remaining_epochs = max(0, total - current)
+                eta_str = _fmt_duration(
+                    (sum(self.epoch_times) / len(self.epoch_times)) * remaining_epochs)
+
+        # Speed line
+        speed_bits = []
+        tps = info.get("tokens_per_sec")
+        bps = info.get("batches_per_sec")
+        if tps is not None:
+            try:
+                speed_bits.append(f"{float(tps):.0f} tok/s")
+            except (TypeError, ValueError):
+                pass
+        if bps is not None:
+            try:
+                speed_bits.append(f"{float(bps):.2f} batch/s")
+            except (TypeError, ValueError):
+                pass
+        if is_epoch_end and self.epoch_times:
+            speed_bits.append(f"{self.epoch_times[-1]:.1f}s/ep")
+        speed_str = ("  |  " + " · ".join(speed_bits)) if speed_bits else ""
+
+        batch = info.get("batch")
+        batches = info.get("batches")
+        batch_part = ""
+        if batch is not None and batches is not None:
+            try:
+                batch_part = f"  |  Batch {int(batch)}/{int(batches)}"
+            except (TypeError, ValueError):
+                batch_part = ""
+
+        epoch_pct = info.get("epoch_percent")
+        epoch_pct_part = ""
+        if epoch_pct is not None and not is_epoch_end and phase == "train":
+            try:
+                epoch_pct_part = f" ({float(epoch_pct):.0f}% эпохи)"
+            except (TypeError, ValueError):
+                pass
 
         val_part = f"  |  Val: {val_loss:.4f}" if val_loss is not None else ""
-        self.status_label.config(
-            text=f"Epoch {current}/{total}  |  Loss: {loss:.4f}{val_part}"
-                 f"  |  LR: {lr:.6f}{speed_str}"
-                 f"  |  Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta_str}"
-        )
+        loss_part = ""
+        try:
+            if loss is not None and float(loss) > 0:
+                loss_part = f"  |  Loss: {float(loss):.4f}"
+        except (TypeError, ValueError):
+            pass
 
-        vtxt = f"{val_loss:.4f}" if val_loss is not None else None
-        self.loss_history.append((current, loss, val_loss))
-        self._append_loss_line(
-            f"epoch {current:>4}/{total}   train {loss:.4f}   val {vtxt or '  —  '}"
-            f"   eta {eta_str}")
-        self._update_loss_plot()
+        if current <= 0 and phase == "setup":
+            head = info.get("message") or "Подготовка…"
+            self.status_label.config(
+                text=f"Status: {head}  |  Elapsed: {_fmt_duration(elapsed)}"
+            )
+        elif phase == "val":
+            head = info.get("message") or f"Эпоха {current}/{total} — валидация…"
+            self.status_label.config(
+                text=f"Status: {head}{loss_part}"
+                     f"  |  LR: {lr_f:.6f}"
+                     f"  |  Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta_str}"
+            )
+        elif phase == "stopped":
+            head = info.get("message") or "Остановка…"
+            self.status_label.config(text=f"Status: {head} 🛑")
+        else:
+            self.status_label.config(
+                text=f"Status: Epoch {current}/{total}{epoch_pct_part}"
+                     f"{batch_part}{loss_part}{val_part}"
+                     f"  |  LR: {lr_f:.6f}{speed_str}"
+                     f"  |  Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta_str}"
+            )
+
+        # Detail strip under the bar — always shows "what is happening now"
+        detail_bits = []
+        msg = info.get("message")
+        if msg:
+            detail_bits.append(str(msg))
+        gstep = info.get("global_step")
+        tstep = info.get("total_steps")
+        if gstep is not None and tstep is not None:
+            try:
+                detail_bits.append(f"шаг {int(gstep)}/{int(tstep)}")
+            except (TypeError, ValueError):
+                pass
+        detail_bits.append(f"всего {percent:.1f}%")
+        if eta_str and eta_str != "—":
+            detail_bits.append(f"осталось ~{eta_str}")
+        try:
+            self.progress_detail_var.set(" · ".join(detail_bits))
+        except Exception:
+            pass
+
+        # Loss history / plot — only once per finished epoch (avoid spam)
+        if is_epoch_end and current > 0:
+            vtxt = f"{val_loss:.4f}" if val_loss is not None else None
+            # Avoid duplicate epoch rows if engine somehow double-fires
+            if not self.loss_history or self.loss_history[-1][0] != current:
+                self.loss_history.append((current, float(loss) if loss is not None else 0.0, val_loss))
+                self._append_loss_line(
+                    f"epoch {current:>4}/{total}   train {float(loss):.4f}   "
+                    f"val {vtxt or '  —  '}   eta {eta_str}")
+                self._update_loss_plot()
 
     # ------------------------------------------------------------------
     def stop_training(self):
@@ -2318,6 +2460,8 @@ class AIApp:
                 "tokenizer":       self.tok_var.get(),
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
                 "val_split":       float(self.val_split_var.get()),
+                # Live progress bar: ~1% of epoch + time-based ticks
+                "progress_every_seconds": 0.5,
                 "use_compile":     bool(self.compile_var.get()),
                 "continue_training": bool(self.continue_var.get()),
                 "autosave_every":  int(self.autosave_var.get()),
@@ -2393,6 +2537,14 @@ class AIApp:
         self.train_start_time = time.time()
         self.epoch_times = []
         self._last_epoch_ts = self.train_start_time
+        self.progress_var.set(0)
+        self._progress_ui_last_ts = 0.0
+        self._progress_ui_pending = None
+        try:
+            self.progress_detail_var.set("Подготовка к обучению…")
+        except Exception:
+            pass
+        self.status_label.config(text="Status: Starting… ⏳")
         self.train_btn.config(state=tk.DISABLED)
         self.file_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)

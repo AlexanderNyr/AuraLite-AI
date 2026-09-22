@@ -25,9 +25,42 @@ DEFAULT_TRAIN_PARAMS: dict = {
 }
 
 
-def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None) -> None:
+def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
+              info: dict | None = None) -> None:
+    info = info or {}
+    phase = info.get("phase", "train")
+    # Quiet setup spam — one line is enough
+    if phase == "setup":
+        msg = info.get("message") or "setup"
+        print(f"  setup | {msg}", flush=True)
+        return
+    # Live batch lines (same epoch) — overwrite-friendly single line
+    if phase == "train" and not info.get("is_epoch_end"):
+        batch = info.get("batch")
+        batches = info.get("batches")
+        pct = info.get("percent")
+        eta = info.get("eta_seconds")
+        tps = info.get("tokens_per_sec")
+        parts = [f"  epoch {epoch}/{total}"]
+        if batch is not None and batches is not None:
+            parts.append(f"batch {batch}/{batches}")
+        if train_loss:
+            parts.append(f"loss={train_loss:.4f}")
+        if tps:
+            parts.append(f"{float(tps):.0f} tok/s")
+        if pct is not None:
+            parts.append(f"{float(pct):.1f}%")
+        if eta is not None:
+            m, s = divmod(int(max(0, float(eta))), 60)
+            h, m = divmod(m, 60)
+            parts.append(f"ETA {h}h{m:02d}m{s:02d}s" if h else f"ETA {m}m{s:02d}s")
+        print(" | ".join(parts), flush=True)
+        return
+    if phase == "val":
+        print(f"  epoch {epoch}/{total} | validating…", flush=True)
+        return
     val = f" | val={val_loss:.4f}" if val_loss is not None else ""
-    print(f"  epoch {epoch}/{total} | loss={train_loss:.4f}{val}", flush=True)
+    print(f"  epoch {epoch}/{total} done | loss={train_loss:.4f}{val}", flush=True)
 
 
 def cmd_train(args: argparse.Namespace) -> int:
