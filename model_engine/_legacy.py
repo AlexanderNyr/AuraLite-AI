@@ -519,13 +519,16 @@ def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
                       n_kv_heads: int | None = None) -> int:
     """Rough parameter count for a LLaMA-style decoder-only transformer.
 
-    Mirrors `ModernTransformer` (weight tying => embedding/head counted once).
+    Mirrors `ModernTransformer`, which by default keeps the input embedding and
+    the output LM head as two independent matrices (untied), so both are counted.
     Accurate to within ~3% of `model.count_parameters()` for typical configs.
     """
     n_kv = n_kv_heads if (n_kv_heads and n_kv_heads > 0) else n_heads
     head_dim = d_model // max(1, n_heads)
 
-    embed = vocab_size * d_model        # tied with output head
+    # Input embedding + separate output head (untied by default).
+    embed = vocab_size * d_model        # token embedding
+    head = vocab_size * d_model         # output projection (LM head)
 
     # Per layer:
     #   attn: W_q (d_model * n_heads*head_dim)
@@ -542,7 +545,7 @@ def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
 
     per_layer = attn + ffn + norms_per_layer
     final_norm = d_model
-    return embed + n_layers * per_layer + final_norm
+    return embed + head + n_layers * per_layer + final_norm
 
 
 def recommend_epochs(n_tokens: int, n_params: int,
@@ -1176,7 +1179,13 @@ class ModernTransformer(nn.Module):
     • SwiGLU   activation          — better than plain ReLU / GELU
     • Multi-Head Attn w/ opt. GQA  — flexible efficiency
     • Flash Attention (SDPA)       — fused, memory-efficient kernels
-    • Weight tying (emb = head)    — fewer params, better generalisation
+    • Untied input/output (default) — the token embedding (read/context) and the
+      LM head (write/classification) are two mathematically distinct layers.
+      Sharing one matrix forces it to both cluster synonyms (for the input) and
+      separate them (for the output); the opposing gradients partially cancel,
+      which slows convergence. They are kept as independent parameters by
+      default. Legacy weight tying is still available via
+      ``tie_word_embeddings=True`` / ``tie_weights()``.
     • No bias in linear layers     — modern practice
     • KV-cache for fast generation — O(1) per token after prompt
     • Configurable depth (n_layers)
@@ -1202,7 +1211,7 @@ class ModernTransformer(nn.Module):
                  use_flex_attention: bool = False,
                  use_moe: bool = False,
                  num_experts: int = 4,
-                 tie_word_embeddings: bool = True,
+                 tie_word_embeddings: bool = False,
                  use_qk_norm: bool = False):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -2926,7 +2935,11 @@ class AuraLiteEngine:
         use_flex_attention = params.get("use_flex_attention", False)
         use_moe = params.get("use_moe", False)
         num_experts = params.get("num_experts", 4)
-        tie_word_embeddings = params.get("tie_word_embeddings", True)
+        # Untie the input embedding and the output (LM head) by default: they are
+        # two distinct layers and sharing one matrix cancels gradients and slows
+        # convergence. Opt back into legacy weight tying with
+        # {"tie_word_embeddings": True}.
+        tie_word_embeddings = params.get("tie_word_embeddings", False)
 
         # NEW (v2.6): modern training stack
         #   QK-norm          — per-head RMS normalization of q/k before RoPE
@@ -3021,33 +3034,33 @@ class AuraLiteEngine:
                 },
             )
 
-        _setup_progress("Подготовка: проверка параметров…", 0.02)
+        _setup_progress("Preparing: validating parameters…", 0.02)
 
         # ---- Tokenizer ------------------------------------------------
         if not resuming:
             if tok_kind == "bpe":
                 _setup_progress(
-                    f"Обучение BPE-токенизатора (vocab={bpe_vocab})… "
-                    "на больших корпусах это может занять несколько минут",
+                    f"Training BPE tokenizer (vocab={bpe_vocab})… "
+                    "on large corpora this may take a few minutes",
                     0.08,
                 )
                 self.tokenizer = BPETokenizer()
                 # IMPROVED: stratified sampling instead of prefix
                 self.tokenizer.train(training_text, vocab_size=bpe_vocab)
             else:
-                _setup_progress("Обучение char-токенизатора…", 0.08)
+                _setup_progress("Training char tokenizer…", 0.08)
                 self.tokenizer = CharTokenizer()
                 self.tokenizer.train(training_text)
             self.vocab_size = self.tokenizer.vocab_size
             _setup_progress(
-                f"Токенизатор готов (vocab={self.vocab_size})", 0.25,
+                f"Tokenizer ready (vocab={self.vocab_size})", 0.25,
             )
         else:
-            _setup_progress("Продолжение обучения — токенизатор уже в памяти", 0.15)
+            _setup_progress("Continued training — tokenizer already in memory", 0.15)
 
         # ---- Model ----------------------------------------------------
         if not resuming:
-            _setup_progress("Создание модели…", 0.30)
+            _setup_progress("Building model…", 0.30)
             self.backend = "torch"
             self.gguf_path = None
             self.hf_path = None
@@ -3157,13 +3170,13 @@ class AuraLiteEngine:
                 print(f"[AuraLite] WARNING: could not restore AMP scaler state: {e}")
 
         # ---- Dataset / DataLoader ------------------------------------
-        _setup_progress("Токенизация корпуса (encode)…", 0.45)
+        _setup_progress("Tokenizing corpus (encode)…", 0.45)
         encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
         encoded_bytes = encoded.numel() * encoded.element_size()
         print(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
               f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
         _setup_progress(
-            f"Корпус токенизирован: {len(encoded):,} токенов", 0.55,
+            f"Corpus tokenized: {len(encoded):,} tokens", 0.55,
         )
 
         # ---- Train / validation split -------------------------------------
@@ -3334,8 +3347,8 @@ class AuraLiteEngine:
         report_rank_ok = (not ddp_active or dist.get_rank() == 0)
 
         _setup_progress(
-            f"Старт обучения: {epochs} эпох × {n_loader_batches} батчей "
-            f"(~{epochs * n_loader_batches} шагов)",
+            f"Training start: {epochs} epochs × {n_loader_batches} batches "
+            f"(~{epochs * n_loader_batches} steps)",
             0.95,
         )
         if report_rank_ok:
@@ -3343,7 +3356,7 @@ class AuraLiteEngine:
                 progress_callback, 0, epochs, 0.0, None,
                 info={
                     "phase": "train",
-                    "message": f"Эпоха 1/{epochs} — старт",
+                    "message": f"Epoch 1/{epochs} — start",
                     "batch": 0,
                     "batches": n_loader_batches,
                     "global_step": 0,
@@ -3446,8 +3459,8 @@ class AuraLiteEngine:
                             info={
                                 "phase": "train",
                                 "message": (
-                                    f"Эпоха {epoch + 1}/{epochs} · "
-                                    f"батч {seen_batches}/{n_loader_batches}"
+                                    f"Epoch {epoch + 1}/{epochs} · "
+                                    f"batch {seen_batches}/{n_loader_batches}"
                                 ),
                                 "batch": seen_batches,
                                 "batches": n_loader_batches,
@@ -3474,7 +3487,7 @@ class AuraLiteEngine:
                         progress_callback, epoch + 1, epochs, avg_loss, None,
                         info={
                             "phase": "stopped",
-                            "message": f"Остановка на эпохе {epoch + 1}, батч {seen_batches}/{n_loader_batches}",
+                            "message": f"Stopped at epoch {epoch + 1}, batch {seen_batches}/{n_loader_batches}",
                             "batch": seen_batches,
                             "batches": n_loader_batches,
                             "global_step": completed_batches_total,
@@ -3508,7 +3521,7 @@ class AuraLiteEngine:
                         running_loss / max(1, seen_batches), None,
                         info={
                             "phase": "val",
-                            "message": f"Эпоха {epoch + 1}/{epochs} — валидация…",
+                            "message": f"Epoch {epoch + 1}/{epochs} — validation…",
                             "batch": n_loader_batches,
                             "batches": n_loader_batches,
                             "global_step": completed_batches_total,
@@ -3540,7 +3553,7 @@ class AuraLiteEngine:
                     progress_callback, epoch + 1, epochs, avg_loss, val_loss,
                     info={
                         "phase": "epoch_end",
-                        "message": f"Эпоха {epoch + 1}/{epochs} завершена",
+                        "message": f"Epoch {epoch + 1}/{epochs} finished",
                         "batch": n_loader_batches,
                         "batches": n_loader_batches,
                         "global_step": completed_batches_total,

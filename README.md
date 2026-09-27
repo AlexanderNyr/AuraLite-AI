@@ -46,7 +46,7 @@ graph TD
 - **LLaMA-compatible RoPE**: `rotate_half` formulation, exact inverse-frequency formula, and improved Linear / Dynamic-NTK / YaRN scaling.
 - **Hardened GQA KV-cache**: per-layer caches keep unrepeated KV heads, support sliding-window eviction, and optional FP8/INT8 cache storage.
 - **Research architecture flags**: `sliding_window`, `use_moe`, `num_experts`, `use_flex_attention`, `kv_cache_dtype`, `tie_word_embeddings`.
-- **Explicit weight tying API**: `model.tie_weights()` and `model.untie_weights()` document and control shared embedding/head gradients.
+- **Untied input/output embeddings (default)**: the token embedding (read/context) and the LM head (write/classification) are two mathematically distinct layers, kept as **independent parameters by default**. Sharing one matrix forces it to both cluster synonyms (input) and separate them (output); the opposing gradients partially cancel and slow convergence. Legacy weight tying remains an explicit opt-in via `tie_word_embeddings=True`, `model.tie_weights()` / `model.untie_weights()`.
 - **Refactored imports**: use `model_engine.layers`, `model_engine.model`, `model_engine.dataset`, `model_engine.backends`, etc.; legacy `from model_engine import AuraLiteEngine` still works.
 - **Serving**: `server/openai_server.py` exposes `/v1/completions`, `/v1/chat/completions`, and `/health`.
 - **RAG upgrade**: optional persistent vector store, semantic chunking, HyDE query expansion, and citation-style `[source: ...]` context.
@@ -84,7 +84,7 @@ AURALITE_MODEL=auralite-v24.pt uvicorn server.openai_server:app --host 0.0.0.0 -
 ## 🚀 Key Features
 - **PyTorch Engine**: Professional-grade tensor operations, autograd and optimization.
 - **GGUF / llama.cpp Inference**: Load `.gguf` models directly (quantized Llama/Mistral/Qwen/etc.) via `llama-cpp-python` for generation, streaming, batch prompts, Thinking Mode and web-context prompting.
-- **Modern Transformer Architecture (LLaMA-style)**: A decoder-only transformer with **RMSNorm** (pre-norm), **RoPE** (Rotary Position Embeddings), **SwiGLU** feed-forward, optional **GQA** (Grouped-Query Attention), **weight tying** (embedding = output head) and a **KV-cache** for fast generation.
+- **Modern Transformer Architecture (LLaMA-style)**: A decoder-only transformer with **RMSNorm** (pre-norm), **RoPE** (Rotary Position Embeddings), **SwiGLU** feed-forward, optional **GQA** (Grouped-Query Attention), **untied input/output embeddings by default** (optional weight tying via `tie_word_embeddings=True`) and a **KV-cache** for fast generation.
 - **Flash Attention**: Uses PyTorch `scaled_dot_product_attention` (fused / memory-efficient kernels) instead of a hand-rolled softmax.
 - **BPE Tokenizer (built-in)**: A self-contained mini-BPE trained on your corpus (configurable vocab size), switchable to classic character-level tokenization. BPE dramatically improves text quality — the model learns sub-words instead of single letters.
 - **Validation Split**: A held-out fraction of the text is evaluated every epoch — watch **val loss** to catch overfitting.

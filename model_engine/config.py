@@ -28,7 +28,7 @@ try:  # pragma: no cover - optional
         use_flex_attention: bool = False
         use_moe: bool = False
         num_experts: int = Field(default=4, gt=0)
-        tie_word_embeddings: bool = True
+        tie_word_embeddings: bool = False
         seed: int | None = Field(default=None, ge=0)
         amp_dtype: str = "fp16"
         chat_template: str | None = None
@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover
         use_flex_attention: bool = False
         use_moe: bool = False
         num_experts: int = 4
-        tie_word_embeddings: bool = True
+        tie_word_embeddings: bool = False
         seed: int | None = None
         amp_dtype: str = "fp16"
         chat_template: str | None = None

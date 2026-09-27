@@ -1,3 +1,30 @@
+# 🚀 Changelog — AuraLite AI v2.6.4 (2026-09-27) — untied input/output embeddings
+
+Fixes a training-speed / convergence regression caused by weight tying.
+
+## Model — untie the input embedding from the output head (default)
+
+The token embedding and the LM head are **two mathematically distinct layers**:
+the input matrix wants to *cluster* related tokens (read/context), while the
+output matrix wants to *separate* them for a sharp softmax (write/classification).
+Sharing a single matrix (weight tying) forces both jobs onto one tensor, so the
+two gradient signals partially cancel (destructive interference) and convergence
+slows down.
+
+- `ModernTransformer(..., tie_word_embeddings=False)` is now the **default** — the
+  input embedding and the output projection are independent parameters, each with
+  its own initialization and gradients.
+- `AuraLiteEngine.train()` defaults to untied; pass `{"tie_word_embeddings": True}`
+  to restore the legacy shared-matrix behavior.
+- `AuraLiteConfig.tie_word_embeddings` default flipped to `False`.
+- `estimate_n_params()` now counts the embedding **and** the head (they are no
+  longer a single shared matrix).
+- **Backward compatible**: existing checkpoints record the flag; older checkpoints
+  that predate it still load as tied, so their weights are reproduced exactly.
+  Use `model.tie_weights()` / `model.untie_weights()` to switch explicitly.
+
+---
+
 # ⚡ Changelog — AuraLite AI v2.6.3 (2026-09-21) — CPU performance pass
 
 Goal: everything runs well on CPU. Measured on a 2-vCPU container

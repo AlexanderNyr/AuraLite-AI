@@ -31,7 +31,7 @@ class TestAuraLiteConfig:
         from model_engine.config import AuraLiteConfig
         cfg = AuraLiteConfig()
         assert cfg.d_model == 128 and cfg.n_heads == 4 and cfg.n_layers == 4
-        assert cfg.tie_word_embeddings is True
+        assert cfg.tie_word_embeddings is False
         assert isinstance(cfg.max_seq_len, int) and cfg.max_seq_len > 0
 
     def test_gqa_divisibility_validated(self):
@@ -216,5 +216,5 @@ class TestParamEstimation:
         model = ModernTransformer(max_seq_len=16, **cfg)
         real = model.count_parameters()
         est = estimate_n_params(**cfg)
-        # tied-embedding models: estimate is exact except head re-counted once
+        # untied by default: estimate counts embedding + head, matching the model
         assert abs(est - real) / real < 0.05

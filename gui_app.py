@@ -2369,7 +2369,7 @@ class AIApp:
         epoch_pct_part = ""
         if epoch_pct is not None and not is_epoch_end and phase == "train":
             try:
-                epoch_pct_part = f" ({float(epoch_pct):.0f}% эпохи)"
+                epoch_pct_part = f" ({float(epoch_pct):.0f}% of epoch)"
             except (TypeError, ValueError):
                 pass
 
@@ -2382,19 +2382,19 @@ class AIApp:
             pass
 
         if current <= 0 and phase == "setup":
-            head = info.get("message") or "Подготовка…"
+            head = info.get("message") or "Preparing…"
             self.status_label.config(
                 text=f"Status: {head}  |  Elapsed: {_fmt_duration(elapsed)}"
             )
         elif phase == "val":
-            head = info.get("message") or f"Эпоха {current}/{total} — валидация…"
+            head = info.get("message") or f"Epoch {current}/{total} — validation…"
             self.status_label.config(
                 text=f"Status: {head}{loss_part}"
                      f"  |  LR: {lr_f:.6f}"
                      f"  |  Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta_str}"
             )
         elif phase == "stopped":
-            head = info.get("message") or "Остановка…"
+            head = info.get("message") or "Stopping…"
             self.status_label.config(text=f"Status: {head} 🛑")
         else:
             self.status_label.config(
@@ -2413,12 +2413,12 @@ class AIApp:
         tstep = info.get("total_steps")
         if gstep is not None and tstep is not None:
             try:
-                detail_bits.append(f"шаг {int(gstep)}/{int(tstep)}")
+                detail_bits.append(f"step {int(gstep)}/{int(tstep)}")
             except (TypeError, ValueError):
                 pass
-        detail_bits.append(f"всего {percent:.1f}%")
+        detail_bits.append(f"total {percent:.1f}%")
         if eta_str and eta_str != "—":
-            detail_bits.append(f"осталось ~{eta_str}")
+            detail_bits.append(f"~{eta_str} left")
         try:
             self.progress_detail_var.set(" · ".join(detail_bits))
         except Exception:
@@ -2541,7 +2541,7 @@ class AIApp:
         self._progress_ui_last_ts = 0.0
         self._progress_ui_pending = None
         try:
-            self.progress_detail_var.set("Подготовка к обучению…")
+            self.progress_detail_var.set("Preparing for training…")
         except Exception:
             pass
         self.status_label.config(text="Status: Starting… ⏳")
@@ -3532,12 +3532,12 @@ class AIApp:
     def _browse_local_hf_model(self):
         """Open folder dialog to select an already downloaded HF model directory."""
         folder = filedialog.askdirectory(
-            title="Выбери папку со скачанной моделью Hugging Face (должна содержать config.json)"
+            title="Choose the folder with the downloaded Hugging Face model (must contain config.json)"
         )
         if folder:
             self.hf_model_var.set(folder)
-            self.hf_local_only_var.set(True)   # автоматически включаем оффлайн-режим
-            self.status_label.config(text=f"Status: Выбрана локальная модель: {os.path.basename(folder)}")
+            self.hf_local_only_var.set(True)   # automatically enable offline mode
+            self.status_label.config(text=f"Status: Selected local model: {os.path.basename(folder)}")
 
     def _load_hf_model(self):
         model_name = self.hf_model_var.get().strip()

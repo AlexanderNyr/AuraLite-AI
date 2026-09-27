@@ -252,10 +252,18 @@ class TestModernTransformer:
         assert n > 0
 
     def test_weight_tying(self, device):
+        # Untied by default: the input embedding and the output LM head are two
+        # independent matrices (avoids gradient cancellation / slow convergence).
         model = ModernTransformer(
             vocab_size=50, d_model=64, n_heads=4, n_layers=2, d_ff=128,
         ).to(device)
-        assert model.head.weight is model.embedding.weight
+        assert model.head.weight is not model.embedding.weight
+        # Legacy weight tying is still available as an explicit opt-in.
+        tied = ModernTransformer(
+            vocab_size=50, d_model=64, n_heads=4, n_layers=2, d_ff=128,
+            tie_word_embeddings=True,
+        ).to(device)
+        assert tied.head.weight is tied.embedding.weight
 
     def test_gqa_model(self, device):
         model = ModernTransformer(

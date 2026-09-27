@@ -1,7 +1,7 @@
 """AuraLite command line interface.
 
     auralite train     --text corpus.txt --params params.json --model out.pt
-    auralite generate  --model out.pt --prompt "Привет" --length 40
+    auralite generate  --model out.pt --prompt "Hello" --length 40
     auralite chat      --model out.pt [--template chatml] [--system "..."]
     auralite serve     --model out.pt [--host 0.0.0.0] [--port 8000]
     auralite info      --model out.pt

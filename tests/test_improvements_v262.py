@@ -253,7 +253,7 @@ class TestBPETrainerIdentity:
     CASES = [
         ("english", "the quick brown fox jumps over the lazy dog. " * 60, 128),
         ("forced_ties", "aa bb cc dd ee ff gg hh " * 40, 60),
-        ("unicode", "привет мир! тестовый текст. Café au lait. " * 30, 100),
+        ("unicode", "héllo wörld! ünïcödé têxt. Café au lait. Γειά σου. " * 30, 100),
         ("repetitive", "ab " * 800, 40),
         ("tiny", "tiny", 64),
     ]
@@ -439,7 +439,10 @@ class TestCLI:
                    "--prompt", "improvements", "--length", "3",
                    "--temperature", "1.0", "--top-k", "1"])
         assert rc == 0
-        out = capsys.readouterr().out.strip()
+        # Strip only the trailing newline added by print(); keep any generated
+        # whitespace so the length check stays exact (char-level greedy decode
+        # appends exactly `--length` characters to the prompt).
+        out = capsys.readouterr().out.rstrip("\n")
         assert len(out) == len("improvements") + 3
 
     def test_chat_one_shot_via_cli(self, trained_model, capsys):
