@@ -3580,16 +3580,51 @@ class AuraLiteEngine:
         """
         if self.model is None or self.is_gguf_model() or self.is_hf_model():
             return False
+        original_model = self.model
         try:
-            self.model = torch.compile(self.model, mode=mode)
+            # torch.compile() is lazy: Dynamo/Inductor only run on the FIRST
+            # forward pass. On machines without a C++ compiler (e.g. Windows CI:
+            # "InvalidCxxCompiler: Compiler: cl is not found") that lazy step
+            # would otherwise blow up later, inside generate(). Two safeguards:
+            #   1) suppress_errors => Dynamo falls back to eager for any frame it
+            #      cannot compile, instead of raising (covers every recompile).
+            #   2) an explicit warm-up so a hard failure is caught here and we
+            #      cleanly revert to the eager model + report False.
+            try:
+                torch._dynamo.config.suppress_errors = True
+            except Exception:
+                pass
+            compiled = torch.compile(self.model, mode=mode)
+            self._warmup_compiled_model(compiled)
+            self.model = compiled
             return True
         except Exception as e:
-            logger.warning("torch.compile inference disabled: %s", e)
+            logger.warning("torch.compile inference disabled (eager fallback): %s", e)
+            self.model = original_model
             try:
                 torch._dynamo.reset()
             except Exception:
                 pass
             return False
+
+    def _warmup_compiled_model(self, compiled_model) -> None:
+        """Force lazy torch.compile compilation via a tiny warm-up forward.
+
+        Runs the same call shape generation uses (single token, use_cache=True)
+        so any backend-compile error surfaces now rather than mid-generation.
+        """
+        try:
+            if hasattr(compiled_model, "reset_cache"):
+                compiled_model.reset_cache()
+            with torch.inference_mode():
+                dummy = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                compiled_model(dummy, start_pos=0, use_cache=True)
+        finally:
+            if hasattr(compiled_model, "reset_cache"):
+                try:
+                    compiled_model.reset_cache()
+                except Exception:
+                    pass
 
     def generate_speculative(self, start_str: str, length: int = 50,
                              draft_engine: "AuraLiteEngine | None" = None,

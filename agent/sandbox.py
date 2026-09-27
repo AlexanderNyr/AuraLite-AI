@@ -251,15 +251,17 @@ class Sandbox:
         except Exception as e:
             return SandboxResult(error=str(e), returncode=1, duration_s=time.perf_counter() - t0)
 
-        killed = threading.Event()
+        finished = threading.Event()         # set when the process completes/returns
+        watchdog_killed = threading.Event()  # set only if the watchdog kills it
 
         def _watchdog():
-            if not killed.wait(timeout=timeout):
+            # Wait up to `timeout`; if the process has not finished by then, kill it.
+            if not finished.wait(timeout=timeout):
+                watchdog_killed.set()
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                killed.set()
 
         wd = threading.Thread(target=_watchdog, daemon=True)
         wd.start()
@@ -272,11 +274,12 @@ class Sandbox:
             raw_stdout, raw_stderr = proc.communicate()
             _did_timeout = True
         finally:
-            killed.set()
+            finished.set()
 
-        # Also detect watchdog kill (returncode == -9 on Linux, 1 on Windows)
-        actual_timed_out = _did_timeout or (proc.returncode in (-9, -15) and
-                                             time.perf_counter() - t0 >= timeout - 0.5)
+        # Cross-platform timeout detection: the watchdog sets its own flag when it
+        # kills the process, regardless of the platform-specific return code
+        # (POSIX reports -9/-15, Windows reports 1), so we never rely on the code.
+        actual_timed_out = _did_timeout or watchdog_killed.is_set()
         return SandboxResult(stdout=self._cap(raw_stdout), stderr=self._cap(raw_stderr),
                              returncode=-1 if actual_timed_out else proc.returncode,
                              timed_out=actual_timed_out,
