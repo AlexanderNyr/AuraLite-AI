@@ -255,30 +255,34 @@ class AIApp:
         # ---- Styles ----------------------------------------------------
         self._apply_theme(light=True)
 
-        # ---- Header ------------------------------------------------------
+        # ---- Main container ---------------------------------------------
         main_frame = ttk.Frame(root, padding="12")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Label(main_frame,
-                           text="🌟 AuraLite AI v2.1 — Modern Edition",
-                           style="Header.TLabel")
-        header.pack(pady=(0, 2))
-
+        # The old big top banner was removed; its info now lives in a footer
+        # at the bottom of the window. Packed FIRST with side=BOTTOM so it
+        # stays pinned below the (expanding) notebook.
         if self.engine.device.type == "cuda":
             dev = "GPU: CUDA 🟢"
         else:
             dev = f"CPU: {self.engine.num_threads} threads"
         info_row = ttk.Frame(main_frame)
-        info_row.pack(pady=(0, 6))
+        info_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Label(info_row, text="🌟 AuraLite AI — Modern Edition",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=8)
         self.device_label = ttk.Label(info_row, text=f"Hardware: {dev}",
                                       style="Sub.TLabel")
         self.device_label.pack(side=tk.LEFT, padx=8)
         self.param_label = ttk.Label(info_row, text="Parameters: —",
                                      style="Sub.TLabel")
         self.param_label.pack(side=tk.LEFT, padx=8)
+        # Dark theme toggle (moved down together with the rest of the header).
+        theme_btn = ttk.Checkbutton(info_row, text="🌙 Dark", variable=self.dark_mode,
+                                    command=self._toggle_dark_mode)
+        theme_btn.pack(side=tk.RIGHT, padx=8)
 
         # ==================================================================
-        #  Notebook — 3 tabs
+        #  Notebook — tabs
         # ==================================================================
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -319,11 +323,6 @@ class AIApp:
         sys.stderr = ConsoleRedirector(self.console_text, self.root, self._orig_stderr)
         print(f"[AuraLite] Console attached. Device: {self.engine.device}, "
               f"threads: {self.engine.num_threads}")
-
-        # Dark mode toggle in header
-        theme_btn = ttk.Checkbutton(info_row, text="🌙 Dark", variable=self.dark_mode,
-                                    command=self._toggle_dark_mode)
-        theme_btn.pack(side=tk.RIGHT, padx=8)
 
         # Restore original streams on window close.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -627,6 +626,11 @@ class AIApp:
         self.continue_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="Continue training current model",
                         variable=self.continue_var).pack(side=tk.LEFT, padx=12)
+
+        # Architecture: input/output embedding tying (untied by default).
+        self.tie_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="Tie in/out embeddings (legacy)",
+                        variable=self.tie_var).pack(side=tk.LEFT, padx=12)
 
         ttk.Label(row2, text="Autosave every N epochs (0=off):").pack(
             side=tk.LEFT, padx=(8, 4))
@@ -2482,6 +2486,9 @@ class AIApp:
                 "optimizer": self.opt_var.get(),
                 "muon_lr": float(self.muon_lr_var.get()),
                 "lr_schedule": self.sched_var.get(),
+                # Architecture: tie the input embedding with the output head
+                # (legacy; off by default to avoid gradient cancellation).
+                "tie_word_embeddings": bool(self.tie_var.get()),
             }
         except ValueError:
             messagebox.showerror("Params Error",
@@ -3879,6 +3886,7 @@ class AIApp:
                 "optimizer": self.opt_var.get(),
                 "muon_lr": float(self.muon_lr_var.get()),
                 "lr_schedule": self.sched_var.get(),
+                "tie_word_embeddings": bool(self.tie_var.get()),
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
@@ -3937,6 +3945,8 @@ class AIApp:
                 self.muon_lr_var.set(str(config["muon_lr"]))
             if "lr_schedule" in config:
                 self.sched_var.set(config["lr_schedule"] if config["lr_schedule"] in ("wsd", "cosine") else "wsd")
+            if "tie_word_embeddings" in config:
+                self.tie_var.set(bool(config["tie_word_embeddings"]))
             self.status_label.config(
                 text=f"Status: Config loaded ✅ ({os.path.basename(path)})")
             messagebox.showinfo("Config Loaded",
