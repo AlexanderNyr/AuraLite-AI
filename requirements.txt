@@ -20,6 +20,9 @@ sentencepiece>=0.2.0
 protobuf>=4.21.0
 tiktoken>=0.7.0
 
+# Optional: from-scratch image generator (Image tab, DDPM diffusion)
+Pillow>=10.0
+
 # Optional: serving / RAG / typed config
 fastapi>=0.111
 uvicorn[standard]>=0.30

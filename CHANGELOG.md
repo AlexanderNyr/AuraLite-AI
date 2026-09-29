@@ -1,3 +1,61 @@
+# 🖼️ Changelog — AuraLite AI (2026-09-29) — from-scratch image generator (modern stack)
+
+Adds a new **Image** tab (right after **Train**) that trains your own image
+generator **from scratch** — no pretrained weights — with the same
+"tune-everything + modern techniques" depth as the text trainer.
+
+## New module — `image_engine.py`
+
+- **`TinyUNet`** — a compact, time-conditioned U-Net with **multi-head
+  self-attention** blocks at configurable resolutions, residual blocks
+  (GroupNorm + SiLU), sinusoidal timestep embedding, and optional
+  gradient checkpointing. Depth/attention auto-scale with the image size;
+  output shape always equals the input.
+- **`DDPM`** — **linear / cosine / sigmoid** noise schedules, forward
+  `q_sample`, **ε / x0 / v-prediction** parameterizations, **Min-SNR-γ** loss
+  weighting, and a unified **DDIM/DDPM** sampler with step respacing and an
+  `eta` stochasticity knob (eta=0 → deterministic DDIM, eta=1 → ancestral DDPM).
+- **`EMA`** — exponential moving average of the weights, used for sampling.
+- **`ImageFolderDataset`** — recursive folder load, center-crop, resize,
+  `[-1, 1]` normalization (RAM-cached), optional random h-flip augmentation.
+  RGB or grayscale.
+- **`ImageGenEngine`** — `train / generate / save_model / load_model`, mirroring
+  `AuraLiteEngine`. Training supports AMP (fp16 GradScaler on CUDA / bf16),
+  gradient accumulation, warmup+cosine LR schedules, weight decay, seeding,
+  continue-training and autosave. Checkpoints use `auralite-image-ddpm-v2`
+  (config + weights + EMA), and still load the older v1 format.
+- **`IMAGE_PRESETS`** — Tiny / Small / Medium / Large presets.
+
+## GUI — new **Image** tab (fully tunable)
+
+- **Presets** with one-click apply, plus grouped controls: **Architecture**
+  (image size, color, base channels, channel mults, res-blocks/level, attention
+  resolutions & heads, time-emb dim, dropout), **Diffusion & Modern Stack**
+  (steps `T`, schedule, prediction type, Min-SNR-γ, AMP, EMA + decay, gradient
+  checkpointing, torch.compile, augmentation), and **Optimization** (epochs,
+  batch, LR, LR schedule + warmup, accumulation, weight decay, grad clip, seed,
+  autosave, continue-training).
+- Start/Stop training with a live progress bar (loss + lr + ETA) and loss plot.
+- Generation panel: sample count, **DDIM/DDPM** sampler, step count,
+  stochasticity **η**, seed, **EMA-weights** toggle, an in-app preview grid,
+  **Save Samples**, and **Save/Load Model**.
+- Degrades gracefully: if `Pillow` is missing the tab shows an install hint.
+
+## Tests
+
+- `tests/test_image_engine.py` (25 tests) — U-Net + attention shape preservation
+  (16/32/48/64 px, 1/3 ch), all prediction types (loss + backward), all noise
+  schedules, Min-SNR weighting, x0/eps recovery, gradient checkpointing, EMA
+  tracking, dataset load/normalize/augment, param validation, preset validity,
+  and a full modern-stack train→generate(DDIM+DDPM)→save→load roundtrip with
+  seed determinism and EMA restore.
+
+## Dependencies
+
+- Adds optional `Pillow>=10.0` (image I/O for the Image tab).
+
+---
+
 # 🚀 Changelog — AuraLite AI v2.6.4 (2026-09-27) — untied input/output embeddings
 
 Fixes a training-speed / convergence regression caused by weight tying.
