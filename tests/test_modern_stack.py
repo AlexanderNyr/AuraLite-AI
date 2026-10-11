@@ -234,7 +234,7 @@ class TestWSDScheduler:
         for _ in range(49):
             sched.step()
             lrs.append(sched.get_lr())
-        assert all(a >= b for a, b in zip(lrs, lrs[1:]))
+        assert all(a >= b for a, b in zip(lrs, lrs[1:], strict=False))
 
     def test_linear_decay_variant(self):
         opt = _make_optimizer()

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from export import ModelExporter  # noqa: E402
+from export import ModelExporter, _OnnxForwardWrapper  # noqa: E402
 
 
 class DummyModel(torch.nn.Module):
@@ -151,7 +151,10 @@ class TestModelExporterONNX:
 
         assert returned == str(out)
         assert out.read_bytes() == b"onnx"
-        assert export_calls["model"] is model
+        # The exporter deliberately wraps the model so that `start_pos` does not
+        # leak into the ONNX graph as a required input (see _OnnxForwardWrapper).
+        assert isinstance(export_calls["model"], _OnnxForwardWrapper)
+        assert export_calls["model"].model is model
         assert export_calls["shape"] == (1, 7)
         assert export_calls["input_names"] == ["input_ids"]
         assert export_calls["output_names"] == ["logits"]

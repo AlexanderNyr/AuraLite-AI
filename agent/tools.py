@@ -4,7 +4,9 @@ agent/tools.py — Tool registry for AuraLite Agent.
 from __future__ import annotations
 
 import json
+import math
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -98,12 +100,124 @@ def _tool_web_search(sandbox, query: str) -> ToolResult:
         return ToolResult.fail(str(e))
 
 
+# ── Safe arithmetic evaluator (used by the `calculate` tool) ────────────────
+#
+# The previous implementation ran `eval(expr, {'__builtins__': {}})` inside the
+# sandbox subprocess. Restricting `__builtins__` does NOT make `eval` safe: the
+# classic `().__class__.__base__.__subclasses__()` walk still reaches `os` and
+# friends. Since the sandbox is a risk-reduction layer, not a security
+# boundary, arithmetic evaluation is now done by walking a strict AST
+# allowlist in-process — no `eval`, no attribute access, no imports.
+
+_SAFE_MATH_CONSTANTS = {
+    "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf, "nan": math.nan,
+    "j": 1j,
+}
+
+_SAFE_MATH_FUNCS: dict[str, Callable] = {
+    name: getattr(math, name)
+    for name in (
+        "sqrt", "exp", "log", "log2", "log10", "log1p", "sin", "cos", "tan",
+        "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
+        "acosh", "atanh", "degrees", "radians", "floor", "ceil", "trunc",
+        "fabs", "factorial", "gcd", "lcm", "hypot", "pow", "copysign",
+        "fmod", "remainder", "dist", "prod", "comb", "perm",
+    )
+    if hasattr(math, name)
+}
+_SAFE_MATH_FUNCS.update({
+    "min": min, "max": max, "abs": abs, "round": round, "sum": sum,
+    "int": int, "float": float,
+})
+
+_SAFE_CALC_LIMIT = 240          # max AST nodes
+_MAX_POW_EXPONENT = 10_000      # 2**10000 is fine; 2**10**10 is not
+
+
+def _eval_node(node, depth: int = 0):
+    """Evaluate a whitelisted arithmetic AST node (raises ValueError otherwise)."""
+    import ast
+
+    if depth > 64:
+        raise ValueError("expression nested too deeply")
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body, depth + 1)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, complex)) and not isinstance(node.value, bool):
+            return node.value
+        raise ValueError(f"unsupported constant: {node.value!r}")
+    if isinstance(node, ast.Name):
+        if node.id in _SAFE_MATH_CONSTANTS:
+            return _SAFE_MATH_CONSTANTS[node.id]
+        raise ValueError(f"unknown name: {node.id!r}")
+    if isinstance(node, ast.UnaryOp):
+        value = _eval_node(node.operand, depth + 1)
+        if isinstance(node.op, ast.USub):
+            return -value
+        if isinstance(node.op, ast.UAdd):
+            return +value
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(node.left, depth + 1)
+        right = _eval_node(node.right, depth + 1)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.FloorDiv):
+            return left // right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > _MAX_POW_EXPONENT:
+                raise ValueError("exponent too large")
+            return left ** right
+        raise ValueError("unsupported binary operator")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.keywords:
+            raise ValueError("only direct calls to whitelisted math functions are allowed")
+        fn = _SAFE_MATH_FUNCS.get(node.func.id)
+        if fn is None:
+            raise ValueError(f"unknown function: {node.func.id!r}")
+        args = [_eval_node(a, depth + 1) for a in node.args]
+        if node.func.id == "factorial" and args and abs(args[0]) > 10_000:
+            raise ValueError("argument too large for factorial")
+        return fn(*args)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [_eval_node(el, depth + 1) for el in node.elts]
+    raise ValueError(f"unsupported expression element: {type(node).__name__}")
+
+
+def safe_calculate(expression: str):
+    """Evaluate an arithmetic expression built from whitelisted AST nodes."""
+    import ast
+
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("empty expression")
+    if len(expression) > 500:
+        raise ValueError("expression too long (max 500 characters)")
+    tree = ast.parse(expression.strip(), mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > _SAFE_CALC_LIMIT:
+        raise ValueError("expression too complex")
+    return _eval_node(tree)
+
+
 def _tool_calculate(sandbox, expression: str) -> ToolResult:
-    code = f"import math, cmath\nprint(eval({expression!r}, {{'__builtins__': {{}}, 'math': math, 'cmath': cmath}}))"
-    result = sandbox.run_python(code)
-    if result.returncode != 0 or result.stderr:
-        return ToolResult.fail(f"Calculation error: {result.stderr or result.stdout}")
-    return ToolResult.ok(result.stdout.strip())
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # e.g. sqrt(-1) → nan
+            value = safe_calculate(expression)
+    except SyntaxError as err:
+        return ToolResult.fail(f"Calculation error: invalid syntax: {err.msg}")
+    except (TypeError, ZeroDivisionError, OverflowError) as err:
+        return ToolResult.fail(f"Calculation error: {type(err).__name__}: {err}")
+    except ValueError as err:  # includes all rejected-AST errors from safe_calculate
+        return ToolResult.fail(f"Calculation error: {err}")
+    return ToolResult.ok(repr(value))
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────

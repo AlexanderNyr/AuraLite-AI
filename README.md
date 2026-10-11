@@ -121,6 +121,35 @@ AURALITE_MODEL=auralite-v24.pt uvicorn server.openai_server:app --host 0.0.0.0 -
 - **☁️ Hugging Face Hub Integration**: Push/pull models and LoRA adapters to/from the Hub.
 - **📊 Model Evaluation**: Built-in evaluation using `lm-evaluation-harness` (ARC, MMLU, GSM8K, etc.).
 
+## ✅ Feature status: implemented / limited / opt-in (v2.6.5)
+
+Honest status of the features that are easy to over-promise. Everything marked
+"implemented" has a regression test in `tests/` (see `tests/test_improvements_v265.py`).
+
+| Feature | Status | Notes |
+|---|---|---|
+| Speculative decoding (`generate_speculative`) | **implemented** | Real prompt-lookup drafting + batched verification with exact speculative sampling; output is token-identical to `generate()` in greedy mode and distribution-matched at T>0. Optional `stats=` dict reports drafted/accepted/acceptance_rate. |
+| FlexAttention (`use_flex_attention=True`) | **implemented, opt-in** | Real `torch.nn.attention.flex_attention` path (compiled once on first use) used for sliding-window/causal prefill; verified to match SDPA (≤1e-4). Falls back to SDPA automatically when the runtime can't compile it. |
+| GGUF evaluation | **implemented** | `.gguf` models are scored directly through llama.cpp: perplexity / rolling log-likelihood in `n_ctx-1` windows (`engine.gguf_perplexity`, `gguf_loglikelihood_rolling`). Needs `llama-cpp-python` with `logits_all` support; `evaluation.py` also tries the `lm_eval` llama.cpp backend first. |
+| Checkpoint safety | **implemented** | `.pt` files load with `weights_only=True`; pre-2.6.5 checkpoints work through a scoped numpy allowlist. `.safetensors` (weights + JSON metadata, no pickle) is supported for text and image models. `AURALITE_UNSAFE_LOAD=1` / `allow_unsafe=True` is an explicit opt-in for trusted old files. |
+| Agent tools (`calculate`, sandbox) | **implemented, limited** | `calculate` is an AST whitelist (no `eval`), the sandbox runs in a subprocess with a sanitized environment, resource limits and tree-kill. OS-level isolation is **not** provided — a determined payload can still open sockets (documented limitation). |
+| Quantization backends | **torch.ao (verified) + torchao (opt-in)** | `AURALITE_QUANT_BACKEND=torch.ao` (default) uses the deprecated-but-working `torch.ao.quantization`; `=torchao` routes dynamic INT8 through `torchao.quantization.quantize_`; `=auto` prefers torchao when installed. See `quantization_backends.py`, `auralite info --backends`. |
+| ONNX / TorchScript / Hugging Face export | **opt-in extras** | Requires `onnx`, `onnxruntime`, `transformers`, `peft`. The `optional-deps` CI job installs them and runs the real-model export tests, so these paths are covered. |
+| OpenAI-compatible server | **implemented, single worker** | API-key auth (`AURALITE_API_KEY`, comma-separated keys, constant-time compare), SSE streaming with graceful shutdown, `/metrics` (Prometheus text format). Single worker is deliberate: engine, KV-cache and rate-limiter live in process memory. |
+| Streaming chat text | **implemented** | `generate_chat_streaming()` and `generate_chat()` now produce the same text (leading whitespace of the first piece is trimmed). |
+| Batch generation | **implemented** | Mixed-length prompts are grouped by length, identical prompts are deduplicated (a repeated question costs one forward pass). |
+| GUI code layout | **implemented** | `gui_app.py` is a thin entry point; `gui/app.py` holds the app core and `gui/tabs/*.py` one module per tab (mixins). `python gui_app.py` and `from gui_app import AIApp` keep working. |
+| Library logging | **partially migrated** | The CLI honors `--quiet` / `--log-level` (and `$AURALITE_LOG_LEVEL`); core modules log through the `auralite` logger. Some training/progress lines are still `print()`ed to stdout (they are asserted by existing tests and the GUI console redirector reads stdout). |
+
+### Diagnostics
+
+```bash
+auralite info --model model.pt --backends        # quantization backend availability
+auralite info --model model.pt --bench 128       # tokens/s, weight memory, KV-cache mode
+auralite info --model model.pt --quiet           # no progress/library noise
+AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 python gui_app.py
+```
+
 ## 🛠 Technical Specifications
 - **Framework**: PyTorch (Tensors, Autograd, AMP on CUDA, optional `torch.compile`).
 - **Attention**: Multi-Head Self-Attention via PyTorch SDPA (Flash / memory-efficient kernels) with Causal Masking, RoPE and optional GQA.

@@ -23,16 +23,25 @@ auralite = "auralite_cli:main"
 test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
         "fastapi>=0.111", "uvicorn>=0.30", "httpx>=0.27", "pydantic>=2"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
-full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
-quant = ["bitsandbytes>=0.43; platform_system != 'Darwin'", "auto-gptq>=0.7", "optimum>=1.20"]
+full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11",
+        "bitsandbytes>=0.43; platform_system != 'Darwin'", "safetensors>=0.4", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
+# NOTE (v2.6.5): `auto-gptq`, `optimum` and `chromadb` were listed here but are
+# not imported anywhere in the codebase — GPTQ/AWQ are implemented natively in
+# quantization.py and the RAG stack uses the built-in hashed embeddings. The
+# unused extras were removed to keep installs honest and small.
 serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30"]
 vllm = ["vllm>=0.5; platform_system == 'Linux'"]
-rag = ["sentence-transformers>=3", "faiss-cpu>=1.8", "chromadb>=0.5"]
-dev = ["auralite-ai[test,lint,full,quant,serve,rag]"]
+rag = ["sentence-transformers>=3", "faiss-cpu>=1.8"]
+safetensors = ["safetensors>=0.4"]
+dev = ["auralite-ai[test,lint,full,serve,rag]"]
 
 [tool.setuptools]
-py-modules = ["quantization", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
+py-modules = ["quantization", "quantization_backends", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app"]
 packages = ["model_engine", "gui", "gui.tabs", "kernels", "server", "agent"]
+
+[tool.setuptools.package-data]
+# PEP 561 marker: model_engine ships inline type hints (v2.6.5).
+model_engine = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
@@ -45,7 +54,10 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --tb=line"
+addopts = "--tb=line"
+markers = [
+    "integration: requires optional dependencies (onnx, transformers, lm_eval, llama-cpp-python)",
+]
 
 [tool.coverage.run]
 source = ["."]

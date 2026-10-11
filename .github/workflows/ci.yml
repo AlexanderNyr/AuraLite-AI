@@ -3,6 +3,7 @@ name: AuraLite CI
 on:
   push:
   pull_request:
+  workflow_dispatch:  # manual runs (e.g. the PyInstaller smoke job)
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,8 +24,17 @@ jobs:
           pip install -e '.[lint]'
       - name: Ruff critical lint
         run: ruff check .
-      - name: Ruff extended hygiene (non-blocking)
-        run: ruff check --select F,B --ignore E501,B008,B904,F401,F811,E402,E731,E741,E701,E702,B007,B905,F841 . || true
+      - name: Ruff extended hygiene (blocking)
+        # v2.6.5: this promotion is safe only because the codebase is free of
+        # F/E9/B findings today (bugs like zip-without-strict, unused loop
+        # variables and raise-without-from were fixed in the 2.6.5 audit pass).
+        # The ignores below are deliberate:
+        #   F401 — optional-dependency probes / availability checks
+        #   B008 — idiomatic FastAPI `Depends(...)` defaults
+        #   B017 — tests assert broad exceptions on purpose (pydantic/dataclass)
+        run: ruff check --select E9,F,B --ignore E501,F401,B008,B017 .
+      - name: Ruff format check (advisory)
+        run: ruff format --check . || true
       - name: Pyright smoke
         run: pyright || true
 
@@ -81,6 +91,34 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
           retention-days: 7
+
+  optional-deps:
+    # v2.6.5: exercises the code paths that are invisible without optional
+    # packages — ONNX export, safetensors I/O, HF/peft and llama.cpp shims.
+    # The original export bug (real ModernTransformer crashing TorchScript
+    # export) lived exactly here: CI never installed onnx, so CI never saw it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install with optional dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test,serve,safetensors]' --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install onnx onnxruntime
+      - name: Optional-dependency test suites
+        run: |
+          pytest tests/test_export.py tests/test_bugfixes_regression.py \
+                 tests/test_improvements_v265.py tests/test_hf_integration.py \
+                 -q --tb=short -rs
+      - name: Verify ONNX/TS export actually ran (not skipped)
+        run: |
+          pytest tests/test_bugfixes_regression.py -q -rs \
+            -k "torchscript_export_roundtrip or onnx_export_roundtrip or onnx_numeric_parity"
 
   server-smoke:
     # Boot the OpenAI-compatible server against a tiny trained checkpoint and
@@ -152,3 +190,23 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Docker build CPU runtime
         run: docker build --target runtime-cpu -t auralite-ai:cpu .
+
+  pyinstaller-smoke:
+    # Manual/nightly check that the Windows exe build still works. Kept off the
+    # default push path (cold PyInstaller builds are slow) — run it before a
+    # release with:  gh workflow run ci.yml -f pyinstaller=1
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pyinstaller
+      - name: Build exe (build_exe.bat)
+        run: cmd /c build_exe.bat
+      - name: Verify artifact exists
+        run: dir dist

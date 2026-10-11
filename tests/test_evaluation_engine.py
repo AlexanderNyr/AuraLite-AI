@@ -108,9 +108,36 @@ class TestEvaluationEngine:
         result = EvaluationEngine(FakeNativeEngine()).evaluate(tasks=["mmlu", "gsm8k"])
         assert result["tasks"] == ["mmlu", "gsm8k"]
 
-    def test_gguf_evaluation_is_explicitly_not_implemented(self, monkeypatch):
+    def test_gguf_evaluation_uses_llamacpp_wrapper(self, monkeypatch):
+        """v2.6.5: GGUF goes through lm-eval's llama.cpp wrapper when available."""
+        created = {}
+
+        class FakeLlamaCpp:
+            def __init__(self, pretrained, batch_size):
+                created["pretrained"] = pretrained
+                created["batch_size"] = batch_size
+
+        llamacpp = types.ModuleType("lm_eval.models.llamacpp")
+        llamacpp.LlamaCpp = FakeLlamaCpp
+        monkeypatch.setitem(sys.modules, "lm_eval.models.llamacpp", llamacpp)
+
+        engine = FakeGGUFEngine()
+        engine.gguf_path = "model.gguf"
         monkeypatch.setattr(evaluation, "HAS_LM_EVAL", True)
-        with pytest.raises(NotImplementedError, match="GGUF evaluation"):
+        monkeypatch.setattr(
+            evaluation, "evaluator",
+            types.SimpleNamespace(simple_evaluate=lambda **kwargs: {"model": kwargs["model"]}),
+            raising=False)
+
+        results = EvaluationEngine(engine).evaluate("arc_easy", batch_size=2)
+        assert isinstance(results["model"], FakeLlamaCpp)
+        assert created == {"pretrained": "model.gguf", "batch_size": 2}
+
+    def test_gguf_evaluation_without_llamacpp_points_at_perplexity(self, monkeypatch):
+        """No llama.cpp wrapper → actionable message, not a dead end."""
+        monkeypatch.setitem(sys.modules, "lm_eval.models.llamacpp", None)
+        monkeypatch.setattr(evaluation, "HAS_LM_EVAL", True)
+        with pytest.raises(LMEvalNotAvailableError, match="gguf_perplexity"):
             EvaluationEngine(FakeGGUFEngine()).evaluate("arc_easy")
 
     def test_hf_evaluate_uses_hflm_wrapper(self, monkeypatch):

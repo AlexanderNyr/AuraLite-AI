@@ -297,7 +297,10 @@ class SimpleVectorStore:
 
     @staticmethod
     def _cos(a: list[float], b: list[float]) -> float:
-        return sum(x*y for x, y in zip(a, b))
+        # Embeddings here are unit-norm (hash_embedding), so the dot product
+        # IS the cosine similarity. `strict=True`: vectors of different
+        # dimensionality must fail loudly instead of being silently truncated.
+        return sum(x*y for x, y in zip(a, b, strict=True))
 
     def add(self, text: str, *, source: str = "local", metadata: dict | None = None) -> None:
         self.items.append({"text": text, "source": source, "metadata": metadata or {}, "embedding": self._embed(text)})

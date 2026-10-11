@@ -628,17 +628,11 @@ class QuantizationEngine:
         """PyTorch dynamic quantization — INT8 weights, dynamic activations."""
         cb(0, 2, "Applying dynamic INT8 quantization…")
         model_cpu = copy.deepcopy(model).cpu().eval()
+        # v2.6.5: backend selection (torch.ao by default, opt-in torchao) lives
+        # in quantization_backends.py — one place, with descriptive errors.
+        from quantization_backends import dynamic_int8
         try:
-            # torch.quantization deprecated in PyTorch >=2.9; prefer torch.ao
-            try:
-                import torch.ao.quantization as _taq
-                q_model = _taq.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.qint8)
-            except (ImportError, AttributeError):
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", DeprecationWarning)
-                    q_model = torch.quantization.quantize_dynamic(  # type: ignore[attr-defined]
-                        model_cpu, {nn.Linear}, dtype=torch.qint8)
+            q_model = dynamic_int8(model_cpu)
         except Exception as e:
             raise RuntimeError(f"Dynamic quantization failed: {e}") from e
         cb(2, 2, "Dynamic quantization complete.")
@@ -651,61 +645,77 @@ class QuantizationEngine:
     def _quantize_static(self, model: nn.Module, config: QuantConfig,
                          tokenizer, device: torch.device,
                          cb: Callable) -> nn.Module:
-        """Static INT8 quantization with calibration."""
+        """Static INT8 quantization with calibration.
+
+        Strategy (fixed): whole-model `prepare()` used to crash on every real
+        AuraLite model with
+
+            "Embedding quantization is only supported with
+             float_qparams_weight_only_qconfig"
+
+        (and, once the embedding was excluded, with "Creation of quantized
+        tensor requires quantized dtype…" from RMSNorm's custom float ops).
+        AuraLite's transformer body is full of custom float math (RMSNorm, RoPE,
+        SDPA, SwiGLU), so it cannot be quantized as one prepared graph.
+
+        Instead every `nn.Linear` is wrapped in its own
+        `QuantStub → Linear → DeQuantStub` block: activations and weights are
+        statically INT8-quantized *inside each Linear*, while everything around
+        it (embeddings, norms, attention math, KV-cache) stays in float. This
+        is also what keeps the returned object a normal `ModernTransformer`
+        that engine generation can use unchanged.
+        """
         cb(0, 4, "Preparing model for static quantization…")
 
-        # Create a wrapper that adds QuantStub/DeQuantStub
+        taq = _taq_module()
         model_cpu = copy.deepcopy(model).cpu().eval()
-        wrapped = _StaticQuantWrapper(model_cpu)
 
-        # Fuse modules where possible (norm+linear patterns)
-        # PyTorch static quant needs backend config
-        try:
-            import torch.ao.quantization as _taq2
-            wrapped.qconfig = _taq2.get_default_qconfig("x86")
-        except (ImportError, AttributeError):
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                wrapped.qconfig = torch.quantization.get_default_qconfig("x86")  # type: ignore
+        # Wrap every Linear layer in its own quantize/dequantize block.
+        blocks: list[_StaticLinear] = []
+        for parent in list(model_cpu.modules()):
+            for attr_name, child in list(parent.named_children()):
+                if isinstance(child, nn.Linear):
+                    block = _StaticLinear(child)
+                    setattr(parent, attr_name, block)
+                    blocks.append(block)
+
+        if not blocks:
+            raise RuntimeError("Static quantization found no nn.Linear layers to quantize.")
+
+        cb(0, 4, f"Prepared {len(blocks)} Linear layers for static quantization…")
+
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            try:
-                import torch.ao.quantization as _taq3
-                _taq3.prepare(wrapped, inplace=True)
-            except (ImportError, AttributeError):
-                torch.quantization.prepare(wrapped, inplace=True)  # type: ignore
+            for block in blocks:
+                taq.prepare(block, inplace=True)
 
         cb(1, 4, "Calibrating on sample data…")
-        # Calibration pass
         calib_inputs = _get_calibration_inputs(
             config.calibration_text, tokenizer,
             config.calibration_seq_length, config.calibration_samples,
             torch.device("cpu"))
 
-        wrapped.eval()
-        with torch.no_grad():
+        model_cpu.eval()
+        with torch.inference_mode():
             for i, inp in enumerate(calib_inputs):
                 inp_cpu = inp.cpu()
                 try:
-                    wrapped(inp_cpu)
+                    model_cpu(inp_cpu)
                 except Exception:
                     pass  # some inputs may fail; keep going
                 if (i + 1) % 10 == 0:
                     cb(1, 4, f"Calibrating… {i+1}/{len(calib_inputs)}")
 
         cb(3, 4, "Converting to quantized model…")
-        import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            try:
-                import torch.ao.quantization as _taq4
-                _taq4.convert(wrapped, inplace=True)
-            except (ImportError, AttributeError):
-                torch.quantization.convert(wrapped, inplace=True)  # type: ignore
+            for block in blocks:
+                taq.convert(block, inplace=True)
+
+        model_cpu.eval()
         cb(4, 4, "Static quantization complete.")
-        return wrapped
+        return model_cpu
 
     # ------------------------------------------------------------------
     #  Internal: QAT (Quantization-Aware Training)
@@ -835,7 +845,7 @@ class QuantizationEngine:
 
         cb(1, 3, f"Quantizing {len(linear_layers)} linear layers to INT{bits}…")
 
-        for idx, (name, parent, linear, attr_name) in enumerate(linear_layers):
+        for idx, (_name, parent, linear, attr_name) in enumerate(linear_layers):
             W = linear.weight.data.float()
             out_features, in_features = W.shape
 
@@ -848,16 +858,20 @@ class QuantizationEngine:
 
             input_hook_data = []
 
-            def capture_input_hook(module, input, output):
+            # NOTE: `data=input_hook_data` binds the *current* list at definition
+            # time. Without it, the closure over a loop variable would be a
+            # (latent) bug — ruff B023 — even though the hook is registered and
+            # removed within the same iteration here.
+            def capture_input_hook(module, input, output, data=input_hook_data):
                 if input and isinstance(input[0], torch.Tensor):
                     x = input[0].detach().float()
                     if x.ndim == 3:
                         x = x.reshape(-1, x.shape[-1])
-                    input_hook_data.append(x)
+                    data.append(x)
 
             hook = linear.register_forward_hook(capture_input_hook)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for inp in calib_inputs[:32]:
                     try:
                         q_model(inp.to(device))
@@ -1000,7 +1014,7 @@ class QuantizationEngine:
                 h = mod.register_forward_hook(make_stat_hook(name, mod))
                 hooks.append(h)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for inp in calib_inputs:
                 try:
                     q_model(inp.to(device))
@@ -1205,9 +1219,9 @@ class QuantizationEngine:
                 try:
                     test = torch.tensor([1.0]).to(torch.bfloat16)
                     _ = test + test
-                except Exception:
+                except Exception as err:
                     raise RuntimeError(
-                        "BF16 is not supported on this hardware. Use FP16 instead.")
+                        "BF16 is not supported on this hardware. Use FP16 instead.") from err
 
         q_model = copy.deepcopy(model)
         q_model = q_model.to(dtype)
@@ -1219,7 +1233,7 @@ class QuantizationEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    @torch.no_grad()
+    @torch.inference_mode()
     def _compute_perplexity(model: nn.Module, inputs: list[torch.Tensor],
                             device: torch.device) -> float:
         """Quick perplexity estimate on calibration inputs."""
@@ -1253,7 +1267,7 @@ class QuantizationEngine:
         return math.exp(min(total_loss / n, 100))
 
     @staticmethod
-    @torch.no_grad()
+    @torch.inference_mode()
     def _bench_speed(model: nn.Module, tokenizer,
                      device: torch.device,
                      gen_length: int = 50) -> float:
@@ -1292,7 +1306,7 @@ class QuantizationEngine:
             except TypeError:
                 logits = model(t_in)
 
-            for step in range(gen_length):
+            for _ in range(gen_length):
                 next_id = logits[0, -1].argmax().item()
                 result_ids.append(next_id)
                 t_in = torch.tensor([[next_id]], dtype=torch.long, device=device)
@@ -1316,48 +1330,40 @@ class QuantizationEngine:
 #  Static Quantization Wrapper
 # ======================================================================
 
-class _StaticQuantWrapper(nn.Module):
-    """Wraps a ModernTransformer for PyTorch static quantization.
+class _StaticLinear(nn.Module):
+    """`QuantStub → Linear → DeQuantStub` block for static INT8 quantization.
 
-    Adds QuantStub before the embedding lookup and DeQuantStub after
-    the output head.
+    Used by `QuantizationEngine._quantize_static()`: only the Linear itself is
+    quantized, so surrounding custom float math (RMSNorm/RoPE/SDPA) never sees
+    quantized activations. `qconfig` is attached so PyTorch's prepare/convert
+    insert observers and swap the inner Linear for `nn.quantized.Linear`.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, linear: nn.Linear):
         super().__init__()
+        taq = _taq_module()
+        self.quant = taq.QuantStub()
+        self.linear = linear
+        self.dequant = taq.DeQuantStub()
         try:
-            import torch.ao.nn.quantized as _taonnq; self.quant = torch.ao.quantization.QuantStub()
-        except Exception: self.quant = torch.quantization.QuantStub()  # type: ignore
-        self.model = model
-        try:
-            self.dequant = torch.ao.quantization.DeQuantStub()
-        except Exception: self.dequant = torch.quantization.DeQuantStub()  # type: ignore
+            self.qconfig = taq.get_default_qconfig("x86")
+        except Exception:  # pragma: no cover - unusual torch builds
+            self.qconfig = taq.get_default_qconfig("fbgemm")
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        # Embedding lookup produces float — quantize that
-        h = self.model.embedding(x)
-        h = self.quant(h)
-        for layer in self.model.layers:
-            h = layer(h)
-        h = self.model.final_norm(h)
-        logits = self.model.head(h)
-        logits = self.dequant(logits)
-        return logits
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D102
+        return self.dequant(self.linear(self.quant(x)))
 
-    # Proxy attributes for compatibility
-    @property
-    def max_seq_len(self):
-        return getattr(self.model, "max_seq_len", 4096)
 
-    def reset_cache(self):
-        if hasattr(self.model, "reset_cache"):
-            self.model.reset_cache()
+def _taq_module():
+    """Return the torch quantization namespace (torch.ao preferred).
 
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+    Kept as a thin alias so older call sites/tests keep working; the single
+    source of truth is :func:`quantization_backends.torch_ao_namespace` (which
+    also raises a descriptive error when PyTorch drops the deprecated API).
+    """
+    from quantization_backends import torch_ao_namespace
+    return torch_ao_namespace()
 
-    def count_trainable_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # ======================================================================

@@ -62,7 +62,11 @@ def client(monkeypatch):
     monkeypatch.setattr(srv, "_rate_bucket", {})
     # raise_server_exceptions=False: Starlette's ServerErrorMiddleware re-raises
     # after responding, which would leak into the test instead of the 500 JSON.
-    return TestClient(srv.app, raise_server_exceptions=False), engine
+    # The context manager runs the lifespan: it clears the module-level
+    # `_shutdown` flag, so SSE streaming is live even after an earlier test (or
+    # an earlier server run in the same process) shut the app down.
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        yield client, engine
 
 
 # ----------------------------------------------------------------------

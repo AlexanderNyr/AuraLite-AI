@@ -73,10 +73,21 @@ class AuraLiteLM(LM):
             full = ctx_ids + cont_ids
             input_ids = full[:-1]
 
+            if not input_ids:
+                # Nothing to condition on (e.g. empty context with a
+                # single-token continuation): a causal LM cannot score the
+                # very first token without any preceding context.
+                # Previously this crashed with
+                # "Expected tensor for argument #1 'indices' to have … Long …
+                # but got torch.FloatTensor" because torch.tensor([[]])
+                # produced an empty *float* tensor fed into the embedding.
+                res.append((float("-inf"), False))
+                continue
+
             # Run forward
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.model(
-                    torch.tensor([input_ids], device=self.device)
+                    torch.tensor([input_ids], dtype=torch.long, device=self.device)
                 )
                 log_probs = torch.log_softmax(logits[0], dim=-1)
 
@@ -147,7 +158,7 @@ class AuraLiteLM(LM):
                 res.append(0.0)
                 continue
             total = 0.0
-            with torch.no_grad():
+            with torch.inference_mode():
                 start = 0
                 # First window scores tokens 1..max_seq; then slide.
                 while start < len(ids) - 1:
@@ -217,10 +228,21 @@ class EvaluationEngine:
             from lm_eval.models.huggingface import HFLM
             lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
         elif self.engine.is_gguf_model():
-            raise NotImplementedError(
-                "GGUF evaluation via lm-evaluation-harness is not implemented in AuraLite yet. "
-                "Use a native AuraLite or Hugging Face model for evaluation."
-            )
+            # v2.6.5: lm-eval ships its own llama.cpp wrapper; use it when this
+            # installation provides one. Otherwise GGUF evaluation is still
+            # available as perplexity through the engine helper (see the error
+            # message) instead of being a dead end.
+            try:
+                from lm_eval.models.llamacpp import LlamaCpp  # type: ignore
+                lm = LlamaCpp(pretrained=self.engine.gguf_path, batch_size=batch_size)
+            except Exception as err:  # noqa: BLE001 - optional integration
+                raise LMEvalNotAvailableError(
+                    "GGUF evaluation through lm-evaluation-harness needs the "
+                    "llama.cpp wrapper shipped with recent lm-eval builds "
+                    f"({type(err).__name__}: {err}).\n"
+                    "As an alternative, compute perplexity directly with:\n"
+                    "    engine.gguf_perplexity(text)   # requires llama-cpp-python"
+                ) from err
         else:
             # Native AuraLite → use our wrapper
             lm = AuraLiteLM(self.engine, batch_size=batch_size)

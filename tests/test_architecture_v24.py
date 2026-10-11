@@ -38,7 +38,7 @@ def test_moe_forward_and_aux_loss():
 
 
 def test_rope_matches_transformers_rotate_half_formula():
-    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers")
     attn = Attention(16, 2, max_seq_len=8)
     x = torch.randn(1, 4, 2, 8)
     ours = attn._apply_rope(x, 0, 4)

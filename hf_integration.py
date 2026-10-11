@@ -383,9 +383,9 @@ class HuggingFaceProxy:
             raise ValueError("Model not loaded")
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_length = inputs["input_ids"].shape[1]
 
         # Use transformers TextIteratorStreamer if available
+        yielded_any = False
         try:
             from transformers import TextIteratorStreamer
             streamer = TextIteratorStreamer(
@@ -411,11 +411,16 @@ class HuggingFaceProxy:
             thread.start()
 
             for text in streamer:
+                yielded_any = True
                 yield text
 
             thread.join()
             return
         except Exception:
+            if yielded_any:
+                # Streaming already emitted chunks — re-running generation in
+                # the fallback would duplicate the output. Surface the error.
+                raise
             # Fallback: non-streaming (yield whole thing at once)
             full = self.generate(
                 prompt,
@@ -679,8 +684,8 @@ class HuggingFaceProxy:
 
         try:
             from huggingface_hub import HfApi, login
-        except ImportError:
-            raise HFNotAvailableError("huggingface_hub is required for push_to_hub.")
+        except ImportError as err:
+            raise HFNotAvailableError("huggingface_hub is required for push_to_hub.") from err
 
         if token:
             login(token=token)

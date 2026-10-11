@@ -46,7 +46,7 @@ def _compute_avg_token_loss(engine: AuraLiteEngine, text: str,
     total_pred_tokens = 0
     engine.model.eval()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(0, len(full_starts), batch_size):
             batch_starts = full_starts[i:i + batch_size]
             if not batch_starts:

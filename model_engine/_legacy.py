@@ -56,6 +56,17 @@ if not logger.handlers:
     logger.addHandler(_handler)
 logger.setLevel(os.environ.get("AURALITE_LOG_LEVEL", "INFO"))
 
+
+# Safe checkpoint I/O lives in model_engine/safe_io.py (shared with
+# image_engine). `.pt` files are loaded with weights_only=True by default.
+from model_engine.safe_io import (  # noqa: E402
+    numpy_rng_state_to_builtins as _numpy_rng_state_to_builtins,
+    numpy_rng_state_from_builtins as _numpy_rng_state_from_builtins,
+    safe_torch_load as _safe_torch_load,
+    save_safetensors_checkpoint as _save_safetensors_checkpoint,
+    load_safetensors_checkpoint as _load_safetensors_checkpoint,
+)
+
 # Optional Hugging Face + LoRA/QLoRA support
 try:
     from hf_integration import HuggingFaceProxy, HFNotAvailableError, create_hf_proxy, HAS_HF_SUPPORT
@@ -731,6 +742,68 @@ def _sdpa_supports_gqa() -> bool:
     return _SDPA_GQA_SUPPORTED
 
 
+# -------------------------------------------------------------------
+#  FlexAttention support (v2.6.5) — opt-in via use_flex_attention=True
+# -------------------------------------------------------------------
+_FLEX_COMPILED = None      # compiled flex_attention fn, or False when unavailable
+_FLEX_BLOCK_MASKS: dict = {}
+_FLEX_FAILED: set = set()  # module ids where flex raised → permanent SDPA fallback
+
+
+def _flex_attention_available() -> bool:
+    """True when torch provides FlexAttention (torch >= 2.5)."""
+    return _get_flex_attention() is not False
+
+
+def _get_flex_attention():
+    """Lazily import + compile `flex_attention` (compilation is one-off, ~seconds).
+
+    Returns the compiled callable, or False when unavailable. Compilation is
+    attempted at most once per process; any failure disables the path for good.
+    """
+    global _FLEX_COMPILED
+    if _FLEX_COMPILED is None:
+        try:
+            from torch.nn.attention.flex_attention import flex_attention
+            _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
+            logger.info(
+                "use_flex_attention=True: FlexAttention compiled on first use "
+                "(this can take a few seconds).")
+        except Exception as err:  # pragma: no cover - depends on torch build
+            logger.warning("FlexAttention unavailable (%s); falling back to SDPA.", err)
+            _FLEX_COMPILED = False
+    return _FLEX_COMPILED
+
+
+def _flex_block_mask(batch: int, heads: int, q_len: int, kv_len: int,
+                     start_pos: int, key_start_pos: int, window: int | None,
+                     device):
+    """Cached block mask for causal (+ optional sliding-window) attention.
+
+    `start_pos` / `key_start_pos` shift the causal diagonal: with a KV-cache the
+    query at absolute position `start_pos + i` may attend to keys at absolute
+    positions `key_start_pos + j <= start_pos + i`.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    key = (batch, heads, q_len, kv_len, start_pos, key_start_pos, window, str(device))
+    mask = _FLEX_BLOCK_MASKS.get(key)
+    if mask is None:
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_abs = q_idx + start_pos
+            kv_abs = kv_idx + key_start_pos
+            keep = q_abs >= kv_abs
+            if window is not None:
+                keep = keep & ((q_abs - kv_abs) < window)
+            return keep
+
+        mask = create_block_mask(mask_mod, batch, heads, q_len, kv_len, device=device)
+        if len(_FLEX_BLOCK_MASKS) > 32:  # keep the cache bounded (decode steps)
+            _FLEX_BLOCK_MASKS.clear()
+        _FLEX_BLOCK_MASKS[key] = mask
+    return mask
+
+
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -1021,9 +1094,29 @@ class Attention(nn.Module):
 
         S = k.shape[2]
         sdpa_gqa_kw = {"enable_gqa": True} if use_native_gqa else {}
-        # Flash / memory-efficient attention via PyTorch SDPA. FlexAttention is
-        # exposed as a configuration flag but falls back here unless the runtime
-        # provides a compatible PyTorch >=2.5 implementation.
+        # v2.6.5: real FlexAttention path when the model was built with
+        # use_flex_attention=True and the runtime supports it. It is used for
+        # prefill-shaped calls (T > 1) where the block mask can be cached;
+        # single-token decode steps stay on SDPA (a fresh block mask per token
+        # costs more than it saves on CPU). Any failure falls back to SDPA for
+        # that module permanently, so the flag can never break generation.
+        if (self.use_flex_attention and T > 1 and not self.use_alibi
+                and id(self) not in _FLEX_FAILED):
+            flex = _get_flex_attention()
+            if flex is not False:
+                try:
+                    mask = _flex_block_mask(
+                        B, self.n_heads, T, S, start_pos, key_start_pos,
+                        self.sliding_window, x.device)
+                    out = flex(q, k, v, block_mask=mask, enable_gqa=use_native_gqa)
+                    out = out.transpose(1, 2).contiguous().view(B, T, -1)
+                    return self.W_o(out)
+                except Exception as err:  # noqa: BLE001 - fall back, never crash
+                    _FLEX_FAILED.add(id(self))
+                    logger.warning(
+                        "FlexAttention failed (%s); module falls back to SDPA "
+                        "for the rest of the session.", err)
+        # Flash / memory-efficient attention via PyTorch SDPA.
         if self.use_alibi:
             attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, **sdpa_gqa_kw)
@@ -1454,7 +1547,7 @@ class CosineWarmupScheduler:
 
     def step(self):
         self.step_count += 1
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
             if self.step_count < self.warmup_steps:
                 lr = base_lr * self.step_count / self.warmup_steps
             else:
@@ -1487,7 +1580,7 @@ class CosineWarmupScheduler:
         self.step_count = int(state.get("step_count", self.step_count))
         current_lrs = state.get("current_lrs")
         if current_lrs is not None:
-            for pg, lr in zip(self.optimizer.param_groups, current_lrs):
+            for pg, lr in zip(self.optimizer.param_groups, current_lrs, strict=True):
                 pg["lr"] = lr
 
 
@@ -1545,7 +1638,7 @@ class WSDScheduler:
     def step(self):
         self.step_count += 1
         mult = self._multiplier(self.step_count)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
             pg["lr"] = base_lr * mult
 
     def get_lr(self) -> float:
@@ -1574,7 +1667,7 @@ class WSDScheduler:
         self.step_count = int(state.get("step_count", self.step_count))
         current_lrs = state.get("current_lrs")
         if current_lrs is not None:
-            for pg, lr in zip(self.optimizer.param_groups, current_lrs):
+            for pg, lr in zip(self.optimizer.param_groups, current_lrs, strict=True):
                 pg["lr"] = lr
 
 
@@ -1756,7 +1849,7 @@ class _ChainedOptimizers:
     def load_state_dict(self, state):
         if not isinstance(state, (list, tuple)) or len(state) != len(self.optimizers):
             raise ValueError("Chained optimizer state does not match the optimizer layout")
-        for opt, sub in zip(self.optimizers, state):
+        for opt, sub in zip(self.optimizers, state, strict=True):
             opt.load_state_dict(sub)
 
 
@@ -1804,6 +1897,55 @@ class GGUFTokenizerProxy:
 
     def to_dict(self) -> dict:
         return {"kind": self.kind}
+
+
+def _gguf_rolling_loglikelihood(llama, text: str, n_ctx: int, tokenizer,
+                                return_count: bool = False):
+    """Sum log P(token_i | token_<i) for a GGUF model via llama.cpp scores.
+
+    The numeric core behind `GGUFModelProxy.loglikelihood_rolling` and
+    `.perplexity()`. Kept as a module-level function so it can be unit-tested
+    against a fake llama object without the optional llama-cpp-python package.
+
+    Requires the llama instance to expose per-token logits (`llama.scores`),
+    which llama-cpp-python provides when loaded with `logits_all=True`.
+    """
+    token_ids = list(tokenizer.encode(text))
+    if len(token_ids) < 2:
+        return (0.0, 0) if return_count else 0.0
+
+    window = max(2, int(n_ctx) - 1)
+    total_logprob = 0.0
+    scored = 0
+    first_window = True
+    try:
+        llama.reset()
+        for start in range(0, len(token_ids) - 1, window):
+            chunk = token_ids[start:start + window + 1]
+            llama.eval(chunk)
+            scores = llama.scores
+            rows = len(scores)
+            # Row i holds the logits that predict chunk[i+1]; the very first
+            # token of every window after the first has no left context.
+            skip_first = 0 if first_window else 1
+            for i in range(skip_first, min(len(chunk) - 1, rows - 1)):
+                row = scores[i]
+                logits = torch.as_tensor(row, dtype=torch.float32)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                total_logprob += float(log_probs[int(chunk[i + 1])].item())
+                scored += 1
+            first_window = False
+            llama.reset()
+    except AttributeError as err:
+        raise RuntimeError(
+            "This llama-cpp-python version does not expose per-token scores "
+            "(`llama.scores`). Load the model with logits_all=True or upgrade "
+            "llama-cpp-python to compute GGUF perplexity."
+        ) from err
+
+    if return_count:
+        return total_logprob, scored
+    return total_logprob
 
 
 class GGUFModelProxy:
@@ -1861,9 +2003,66 @@ class GGUFModelProxy:
         if extra_kwargs:
             kwargs.update(extra_kwargs)
 
+        self._load_kwargs = dict(kwargs)
         self.llama = Llama(**kwargs)
         self.tokenizer = GGUFTokenizerProxy(self.llama)
         self.metadata = getattr(self.llama, "metadata", {}) or {}
+
+    def _perplexity_llama(self):
+        """Return (llama_instance, owns_instance) able to report per-token scores.
+
+        llama.cpp only keeps per-token logits when the model was loaded with
+        `logits_all=True`, which the normal generation path does not need (it
+        costs one logits row per prompt token). For perplexity we spin up a
+        second instance with that flag and free it afterwards.
+        """
+        if self.llama is not None and getattr(self.llama, "logits_all", False):
+            return self.llama, False
+        try:
+            from llama_cpp import Llama
+        except Exception as err:  # pragma: no cover - optional dependency
+            raise GGUFNotAvailableError(
+                "llama-cpp-python is required for GGUF perplexity. "
+                "Install with: pip install llama-cpp-python"
+            ) from err
+        kwargs = dict(self._load_kwargs)
+        kwargs["logits_all"] = True
+        return Llama(**kwargs), True
+
+    # ---- perplexity scoring (v2.6.5) ---------------------------------
+    def _loglikelihood_rolling_with_count(self, text: str) -> tuple[float, int]:
+        """(total logprob, scored-token count) for `text`.
+
+        Uses llama.cpp's per-token scores: the model is evaluated in windows of
+        `n_ctx - 1` tokens, and each token is scored from the logits of its
+        predecessor. One token per window boundary has no left context, so it
+        is not scored (the standard no-overlap approximation); windows are
+        processed independently to keep the KV cache within `n_ctx`.
+        """
+        llama, owns = self._perplexity_llama()
+        try:
+            return _gguf_rolling_loglikelihood(
+                llama, text, self.max_seq_len, self.tokenizer, return_count=True)
+        finally:
+            if owns:
+                close = getattr(llama, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+    def loglikelihood_rolling(self, text: str) -> float:
+        """Total log-probability of `text` under the model (for perplexity)."""
+        total, _ = self._loglikelihood_rolling_with_count(text)
+        return total
+
+    def perplexity(self, text: str) -> float:
+        """Exponentiated per-token negative log-likelihood of `text`."""
+        total, n_scored = self._loglikelihood_rolling_with_count(text)
+        if n_scored == 0:
+            return float("nan")
+        return math.exp(-total / n_scored)
 
     def eval(self):
         return self
@@ -2180,10 +2379,43 @@ class AuraLiteEngine:
         stop_tokens: Optional[List[str]] = None,
     ) -> Iterator[str]:
         """
-        Streaming version of generate_chat — yields tokens one by one.
+        Streaming version of generate_chat — yields text pieces one by one.
 
         Works with native AuraLite and GGUF (when streaming is supported).
+
+        v2.6.5: leading whitespace of the first emitted piece is trimmed, so
+        the streamed answer starts exactly like `generate_chat()`'s output
+        (previously the batch path returned "Hello" while streaming emitted
+        " Hello"). Internal spacing is untouched.
         """
+        started = False
+        for piece in self._generate_chat_streaming_raw(
+                messages, max_new_tokens, temperature, top_k, top_p,
+                repetition_penalty, min_p, chat_template, system_prompt,
+                stop_tokens):
+            if not piece:
+                continue
+            if not started:
+                piece = piece.lstrip()
+                if not piece:
+                    continue
+                started = True
+            yield piece
+
+    def _generate_chat_streaming_raw(
+        self,
+        messages: List[Dict[str, str]] | "ChatHistory",
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        min_p: float = 0.0,
+        chat_template: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        stop_tokens: Optional[List[str]] = None,
+    ) -> Iterator[str]:
+        """Unprocessed streaming implementation (see generate_chat_streaming)."""
         if not HAS_CHAT_SUPPORT:
             raise RuntimeError("chat_interface.py is required for chat mode.")
         if chat_template is None:
@@ -2650,6 +2882,26 @@ class AuraLiteEngine:
         """Wrap a raw prompt into a minimal chat message list for GGUF chat APIs."""
         return [{"role": "user", "content": prompt}]
 
+    # ---- GGUF evaluation (v2.6.5) -------------------------------------
+    def gguf_perplexity(self, text: str) -> float:
+        """Perplexity of `text` for the loaded GGUF model.
+
+        GGUF models cannot be wrapped by lm-evaluation-harness through the
+        native path, so evaluation is exposed here directly: llama.cpp is run
+        in `n_ctx - 1` token windows and PPL is computed from per-token
+        logprobs (one token per window boundary is skipped — it has no left
+        context). Requires llama-cpp-python >= 0.2.20 with score support.
+        """
+        if not self.is_gguf_model():
+            raise ValueError("gguf_perplexity() requires a loaded .gguf model.")
+        return self.model.perplexity(text)
+
+    def gguf_loglikelihood_rolling(self, text: str) -> float:
+        """Total log-probability of `text` under the loaded GGUF model."""
+        if not self.is_gguf_model():
+            raise ValueError("gguf_loglikelihood_rolling() requires a loaded .gguf model.")
+        return self.model.loglikelihood_rolling(text)
+
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
@@ -3016,8 +3268,6 @@ class AuraLiteEngine:
         progress_every_batches = int(params.get("progress_every_batches", 0) or 0)
         progress_every_seconds = float(params.get("progress_every_seconds", 0.5) or 0.5)
         train_t0 = time.time()
-        n_loader_batches_est = 0  # filled after DataLoader is built
-        total_steps_est = 0
 
         def _setup_progress(message: str, frac: float = 0.0):
             """Setup-phase updates (tokenizer / encode) before epoch 1."""
@@ -3091,6 +3341,20 @@ class AuraLiteEngine:
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank)
+
+            # v2.6.5: report the *actual* size. `estimate_n_params` works from
+            # the requested vocab_size (BPE may shrink it a lot), so GUI/CLI
+            # estimates can differ noticeably from what was really built.
+            actual_params = self.model.count_parameters()
+            estimated = None
+            if not (use_moe or use_qk_norm or tie_word_embeddings):
+                estimated = estimate_n_params(
+                    self.vocab_size, d_model, n_layers, d_ff,
+                    n_heads=n_heads, n_kv_heads=n_kv_heads)
+            note = (f"; pre-tokenizer estimate was {estimated:,}" if estimated is not None
+                    and estimated != actual_params else "")
+            print(f"[AuraLite] Model built: {actual_params:,} params "
+                  f"(vocab={self.vocab_size:,}{note})")
 
         self._ddp_model = None
 
@@ -3626,30 +3890,205 @@ class AuraLiteEngine:
                 except Exception:
                     pass
 
+    def _propose_prompt_lookup(self, ids: list[int], max_proposals: int,
+                               ngram: int = 2, max_lookback: int = 512) -> list[int]:
+        """Prompt-lookup drafting: continue the most recent matching n-gram.
+
+        Finds the previous occurrence of the last `ngram` tokens inside the
+        recent context and proposes the tokens that followed it. No second
+        model is needed; it shines on repetitive text (code, lists, quotes)
+        and costs a few list comparisons.
+        """
+        if max_proposals <= 0:
+            return []
+        n = min(ngram, max(0, len(ids) - 1))
+        if n <= 0:
+            return []
+        suffix = ids[-n:]
+        search_end = len(ids) - n
+        search_start = max(0, search_end - max_lookback)
+        for start in range(search_end - 1, search_start - 1, -1):
+            if ids[start:start + n] == suffix:
+                proposal = ids[start + n:start + n + max_proposals]
+                if proposal:
+                    return list(proposal)
+        return []
+
+    def _propose_draft_model(self, draft_engine, ids: list[int],
+                             max_proposals: int) -> list[int]:
+        """Greedy proposal from a small draft model with the same vocabulary."""
+        try:
+            out = draft_engine._generate_ids(ids, max_proposals, temperature=0.0, top_k=1)
+            return list(out[len(ids):len(ids) + max_proposals])
+        except Exception:
+            return []
+
+    def _sample_corrected_token(self, filtered_logits: torch.Tensor, rejected_id: int) -> int:
+        """Sample from the *residual* distribution p\\{rejected_id} (spec-decoding).
+
+        With a deterministic (point-mass) proposal the rejection rule reduces
+        to: accept the draft token with probability p(token); on rejection the
+        exact correction is a draw from p with that token's mass removed and
+        the remainder renormalized. This keeps the output distribution
+        identical to plain sampling with the same filters.
+        """
+        probs = torch.softmax(filtered_logits, dim=-1)
+        probs = probs.clone()
+        probs[rejected_id] = 0.0
+        total = probs.sum()
+        if not torch.isfinite(total) or total <= 0:
+            return self._sample_token(filtered_logits, 1.0, 0, 1.0)
+        return int(torch.multinomial(probs / total, num_samples=1).item())
+
+    def _speculative_generate_ids(self, ids: list[int], length: int,
+                                  temperature: float, top_k: int, top_p: float,
+                                  repetition_penalty: float, min_p: float,
+                                  draft_engine=None, draft_tokens: int = 4,
+                                  stop_token_ids: set[int] | None = None,
+                                  stats: dict | None = None) -> list[int]:
+        """Exact speculative decoding loop (shared by both draft sources).
+
+        Verification is exact for *any* temperature: each proposal is treated as
+        a point-mass draft distribution, accepted with probability p_target(x),
+        and replaced by a draw from the residual distribution on rejection — so
+        the sampled sequence follows the same law as normal generation, while
+        accepted tokens cost one batch forward instead of one forward each.
+        """
+        model = self.model
+        model.eval()
+        model.reset_cache()
+        result_ids = list(ids)
+        if length <= 0:
+            return result_ids
+
+        hard_cap = max(model.max_seq_len + length, model.max_seq_len * 4, 8192)
+        stop = set(stop_token_ids or ())
+        n_drafted = n_accepted = n_resets = 0
+
+        def _finish():
+            model.reset_cache()
+            if stats is not None:
+                stats.update({"drafted": n_drafted, "accepted": n_accepted,
+                              "acceptance_rate": (n_accepted / n_drafted) if n_drafted else 0.0,
+                              "cache_resets": n_resets,
+                              "tokens": len(result_ids) - len(ids)})
+            return result_ids
+
+        def _refresh_cache():
+            nonlocal n_resets
+            n_resets += 1
+            model.reset_cache()
+            t = torch.tensor([result_ids], dtype=torch.long).to(self.device)
+            logits = model(t, start_pos=0, use_cache=True)
+            return logits[0, -1]
+
+        with torch.inference_mode():
+            full = torch.tensor([ids], dtype=torch.long).to(self.device)
+            pending = model(full, start_pos=0, use_cache=True)[0, -1]
+
+            while len(result_ids) - len(ids) < length:
+                if len(result_ids) + 1 >= hard_cap:
+                    break
+                # Never draft more than the remaining budget: a fully accepted
+                # batch must not overshoot `length` by an extra token.
+                remaining = length - (len(result_ids) - len(ids))
+
+                if draft_engine is not None:
+                    proposals = self._propose_draft_model(draft_engine, result_ids, draft_tokens)
+                else:
+                    proposals = self._propose_prompt_lookup(result_ids, draft_tokens)
+                proposals = [int(t) for t in proposals if 0 <= int(t) < self.vocab_size
+                             and int(t) not in stop][:max(0, min(draft_tokens, remaining))]
+
+                if not proposals:
+                    # No draft available → ordinary single-token step.
+                    nxt = self._sample_token(pending, temperature, top_k, top_p,
+                                             repetition_penalty, result_ids, min_p=min_p)
+                    result_ids.append(nxt)
+                    if nxt in stop:
+                        return _finish()
+                    pos = len(result_ids) - 1
+                    tok = torch.tensor([[nxt]], dtype=torch.long).to(self.device)
+                    pending = model(tok, start_pos=pos, use_cache=True)[0, -1]
+                    continue
+
+                n_drafted += len(proposals)
+                pt = torch.tensor([proposals], dtype=torch.long).to(self.device)
+                verif = model(pt, start_pos=len(result_ids), use_cache=True)
+
+                rejected = False
+                for i, tok in enumerate(proposals):
+                    step_logits = pending if i == 0 else verif[0, i - 1]
+                    filtered = self._filtered_logits(
+                        step_logits, temperature, top_k, top_p,
+                        repetition_penalty, result_ids, min_p)
+                    probs = torch.softmax(filtered, dim=-1)
+                    p_tok = float(probs[tok].item()) if torch.isfinite(probs[tok]) else 0.0
+                    if torch.rand(1).item() < p_tok:
+                        result_ids.append(tok)
+                        n_accepted += 1
+                        if tok in stop:
+                            return _finish()
+                    else:
+                        result_ids.append(self._sample_corrected_token(filtered, tok))
+                        rejected = True
+                        break
+
+                if rejected:
+                    pending = _refresh_cache()
+                else:
+                    pending = verif[0, len(proposals) - 1]
+
+        return _finish()
+
     def generate_speculative(self, start_str: str, length: int = 50,
                              draft_engine: "AuraLiteEngine | None" = None,
                              draft_tokens: int = 4,
                              temperature: float = 0.8,
                              top_k: int = 50, top_p: float = 0.9,
                              repetition_penalty: float = 1.0,
-                             min_p: float = 0.0) -> str:
-        """Speculative decoding API with a safe fallback.
+                             min_p: float = 0.0,
+                             stats: dict | None = None) -> str:
+        """Speculative decoding with prompt-lookup drafting (v2.6.5 — real).
 
-        If a compatible tiny `draft_engine` is supplied, it proposes short token
-        bursts; this reference implementation verifies with the target model by
-        accepting tokens that match the target greedy choice, then samples one
-        target token on mismatch. Without a draft model it falls back to normal
-        generation, preserving behavior on CPU-only educational setups.
+        Two ways to obtain draft tokens:
+        - **prompt-lookup** (default, no extra model): if the last `ngram`
+          tokens appeared earlier in the context, propose what followed them —
+          very effective on repetitive text;
+        - **draft_engine**: a small compatible model proposes its greedy tokens.
+
+        Drafts are verified in a single batched forward pass; acceptance uses
+        exact speculative sampling (accept with probability p_target, resample
+        from the residual on rejection), so the output distribution matches
+        ordinary `generate()` — including temperature, top-k/top-p and
+        repetition penalty — while accepted proposals skip forward passes.
+        Measured speedup: see `stats` (`acceptance_rate`); on non-repetitive
+        text the fallback per-token path keeps it close to plain decoding.
+
+        For GGUF/HF backends this delegates to the backend's own generation.
         """
-        if draft_engine is None or draft_engine.tokenizer is None or self.tokenizer is None:
-            return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
-        # Conservative compatibility check: token ids must share a vocabulary.
-        if getattr(draft_engine.tokenizer, "to_dict", lambda: None)() != getattr(self.tokenizer, "to_dict", lambda: None)():
-            return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
-        # Educational fallback path: produce using the target model to guarantee
-        # exact distributional correctness. A full vectorized verifier can be
-        # swapped in later without changing this public method.
-        return self.generate(start_str, length, temperature, top_k, top_p, repetition_penalty, min_p)
+        if self.is_gguf_model() or self.is_hf_model():
+            return self.generate(start_str, length, temperature, top_k, top_p,
+                                 repetition_penalty, min_p)
+
+        if self.tokenizer is None:
+            return self.generate(start_str, length, temperature, top_k, top_p,
+                                 repetition_penalty, min_p)
+        # Conservative compatibility check for an external draft model: it must
+        # share the target's vocabulary (token ids are compared directly).
+        if draft_engine is not None:
+            draft_vocab = getattr(draft_engine.tokenizer, "to_dict", lambda: None)()
+            target_vocab = getattr(self.tokenizer, "to_dict", lambda: None)()
+            if not draft_vocab or draft_vocab != target_vocab or draft_engine.model is None:
+                draft_engine = None
+
+        ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
+        used_prompt = self.decode(ids)
+        result_ids = self._speculative_generate_ids(
+            ids, length, temperature, top_k, top_p, repetition_penalty, min_p,
+            draft_engine=draft_engine, draft_tokens=draft_tokens, stats=stats)
+        generated_full = self.decode(result_ids)
+        return start_str + generated_full[len(used_prompt):]
 
     # ---- Generation ---------------------------------------------------
     def generate(self, start_str: str, length: int = 50,
@@ -3972,6 +4411,10 @@ class AuraLiteEngine:
         by prompt length. Each equal-length group is generated as a true batch.
         This fixes the old mixed-length padding bug where shorter prompts were
         sampled from the logits of a padding token.
+
+        v2.6.5: identical prompts are deduplicated — a batch like
+        ["Что такое X?", "Что такое X?", "другое"] runs the duplicate once and
+        reuses the result, which is the common GUI/API pattern.
         """
         if self.model is None:
             raise ValueError("Train or load a model first!")
@@ -3983,38 +4426,48 @@ class AuraLiteEngine:
                                   repetition_penalty=repetition_penalty, min_p=min_p)
                     for p in prompts]
 
+        # --- Deduplicate identical prompts -----------------------------
+        unique_prompts: list[str] = []
+        first_index: dict[str, int] = {}
+        for p in prompts:
+            if p not in first_index:
+                first_index[p] = len(unique_prompts)
+                unique_prompts.append(p)
+
         self.model.eval()
 
         grouped: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
-        for idx, prompt in enumerate(prompts):
+        for idx, prompt in enumerate(unique_prompts):
             ids = self._prepare_prompt_ids(prompt, max_gen_tokens=length)
             grouped[len(ids)].append((idx, ids))
 
-        results: list[str | None] = [None] * len(prompts)
+        results: list[str | None] = [None] * len(unique_prompts)
         for prompt_len in sorted(grouped.keys(), reverse=True):
             batch_group = grouped[prompt_len]
             batch_ids = [ids for _, ids in batch_group]
             generated_ids = self._generate_batch_group(
                 batch_ids, length, temperature, top_k, top_p,
                 repetition_penalty=repetition_penalty, min_p=min_p)
-            for (orig_idx, used_ids), out_ids in zip(batch_group, generated_ids):
+            for (orig_idx, used_ids), out_ids in zip(batch_group, generated_ids, strict=True):
                 used_prompt = self.decode(used_ids)
                 out_text = self.decode(out_ids)
-                results[orig_idx] = prompts[orig_idx] + out_text[len(used_prompt):]
+                results[orig_idx] = unique_prompts[orig_idx] + out_text[len(used_prompt):]
 
         self.model.reset_cache()
-        return [r if r is not None else "" for r in results]
+        unique_final = [r if r is not None else "" for r in results]
+        return [unique_final[first_index[p]] for p in prompts]
 
-    def _sample_token(self, logits: torch.Tensor,
-                      temperature: float, top_k: int, top_p: float,
-                      repetition_penalty: float = 1.0,
-                      recent_ids: list[int] | None = None,
-                      min_p: float = 0.0) -> int:
-        """Sample a single token id with temperature, repetition penalty,
-        top-k, and top-p (nucleus) filtering.
+    def _filtered_logits(self, logits: torch.Tensor,
+                         temperature: float, top_k: int, top_p: float,
+                         repetition_penalty: float = 1.0,
+                         recent_ids: list[int] | None = None,
+                         min_p: float = 0.0) -> torch.Tensor:
+        """Apply the sampling filters (repetition / temperature / top-k / min-p /
+        top-p) and return the masked logits.
 
-        IMPROVED (v2.1+):
-        - Fallback to uniform sampling if all logits become -inf
+        Split out of `_sample_token` (v2.6.5) so speculative decoding can build
+        the *exact same* distribution the normal sampler would use and verify
+        draft tokens against it.
         """
         logits = logits.float().clone()
 
@@ -4063,6 +4516,22 @@ class AuraLiteEngine:
             else:
                 logits = logits.scatter(0, cand_idx[removed_sorted_idx], float("-inf"))
 
+        return logits
+
+    def _sample_token(self, logits: torch.Tensor,
+                      temperature: float, top_k: int, top_p: float,
+                      repetition_penalty: float = 1.0,
+                      recent_ids: list[int] | None = None,
+                      min_p: float = 0.0) -> int:
+        """Sample a single token id with temperature, repetition penalty,
+        top-k, and top-p (nucleus) filtering.
+
+        IMPROVED (v2.1+):
+        - Fallback to uniform sampling if all logits become -inf
+        """
+        logits = self._filtered_logits(
+            logits, temperature, top_k, top_p, repetition_penalty, recent_ids, min_p)
+
         # IMPROVED: fallback if all logits are -inf (prevents NaN crash)
         if torch.all(logits == float("-inf")):
             return torch.randint(0, self.vocab_size, (1,)).item()
@@ -4071,9 +4540,23 @@ class AuraLiteEngine:
         return torch.multinomial(probs, num_samples=1).item()
 
     # ---- Save / Load --------------------------------------------------
-    def save_model(self, path: str):
+    def save_model(self, path: str, include_optimizer: bool = True):
+        """Save a checkpoint.
+
+        The container is chosen by the file extension:
+        - `*.safetensors` — weights + metadata only (no pickle, no optimizer
+          state; ideal for sharing model weights safely);
+        - anything else (`*.pt`) — full checkpoint v3: weights, optimizer /
+          scheduler / scaler state and RNG (needed to resume training).
+
+        Args:
+            include_optimizer: .pt only — set False to store a pure-weights
+                checkpoint (smaller, still resumable as inference model).
+        """
         if self.model is None:
             raise ValueError("No model to save!")
+        if str(path).lower().endswith(".safetensors"):
+            return self._save_model_safetensors(path)
         if self.is_gguf_model():
             raise ValueError(
                 "Loaded .gguf models are inference-only external files and "
@@ -4087,9 +4570,9 @@ class AuraLiteEngine:
             )
         checkpoint = {
             "model_state":  self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict() if self.optimizer is not None else None,
-            "scheduler_state": self.scheduler.state_dict() if self.scheduler is not None else None,
-            "scaler_state": self.scaler.state_dict() if self.scaler is not None else None,
+            "optimizer_state": self.optimizer.state_dict() if (include_optimizer and self.optimizer is not None) else None,
+            "scheduler_state": self.scheduler.state_dict() if (include_optimizer and self.scheduler is not None) else None,
+            "scaler_state": self.scaler.state_dict() if (include_optimizer and self.scaler is not None) else None,
             "vocab_size":   self.vocab_size,
             "tokenizer":    self.tokenizer.to_dict() if self.tokenizer else None,
             "params_used":  self.params_used,
@@ -4117,7 +4600,10 @@ class AuraLiteEngine:
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                "numpy": np.random.get_state(),
+                # v2.6.5: builtins-only representation (safe to load with
+                # weights_only=True); old checkpoints still load via a scoped
+                # numpy allowlist in _safe_torch_load.
+                "numpy": _numpy_rng_state_to_builtins(np.random.get_state()),
             },
             # Format versioning: 1 = pre-2.4 (may carry "chars"), 2 = v2.4..v2.6.1,
             # 3 = v2.6.2+ (adds chat_template; old files load unchanged).
@@ -4142,7 +4628,62 @@ class AuraLiteEngine:
                 pass
             raise
 
-    def load_model(self, path: str, cpu_quantize: bool | str | None = None):
+    # ---- safetensors (pickle-free) checkpoints ------------------------
+    def _checkpoint_metadata(self) -> dict:
+        """Architecture + tokenizer fields stored alongside the weights."""
+        return {
+            "vocab_size":   self.vocab_size,
+            "tokenizer":    self.tokenizer.to_dict() if self.tokenizer else None,
+            "params_used":  self.params_used,
+            "d_model":      self.model.d_model,
+            "d_ff":         self.model.d_ff,
+            "n_heads":      self.model.n_heads,
+            "n_layers":     self.model.n_layers,
+            "n_kv_heads":   self.model.n_kv_heads,
+            "dropout":      self.model.dropout,
+            "max_seq_len":  self.model.max_seq_len,
+            "use_alibi":    self.model.use_alibi,
+            "lora_rank":    self.model.lora_rank,
+            "rope_scaling": getattr(self.model, 'rope_scaling', None),
+            "use_gradient_checkpointing": getattr(self.model, 'use_gradient_checkpointing', False),
+            "sliding_window": getattr(self.model, 'sliding_window', None),
+            "kv_cache_dtype": getattr(self.model, 'kv_cache_dtype', None),
+            "use_flex_attention": getattr(self.model, 'use_flex_attention', False),
+            "use_moe": getattr(self.model, 'use_moe', False),
+            "num_experts": getattr(self.model, 'num_experts', 4),
+            "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
+            "use_qk_norm": getattr(self.model, 'use_qk_norm', False),
+            "chat_template": self.default_chat_template,
+            "format": "auralite",
+            "checkpoint_version": 3,
+        }
+
+    def _save_model_safetensors(self, path: str):
+        """Pickle-free export: tensors + JSON metadata, no optimizer/RNG state.
+
+        `safetensors` files cannot execute code on load, which makes them the
+        safest way to share model weights. They carry weights only — training
+        resumption needs the `.pt` format.
+        """
+        tensors = {
+            k: v for k, v in self.model.state_dict().items()
+            if not (k.endswith(".rope_cos") or k.endswith(".rope_sin"))
+        }
+        return _save_safetensors_checkpoint(path, tensors, self._checkpoint_metadata())
+
+    def _read_checkpoint(self, path: str, allow_unsafe: bool = False) -> dict:
+        """Read a `.pt` / `.safetensors` checkpoint into a unified dict."""
+        if str(path).lower().endswith(".safetensors"):
+            checkpoint = _load_safetensors_checkpoint(path)
+            checkpoint.setdefault("optimizer_state", None)
+            checkpoint.setdefault("scheduler_state", None)
+            checkpoint.setdefault("scaler_state", None)
+            checkpoint.setdefault("rng_state", None)
+            return checkpoint
+        return _safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
+
+    def load_model(self, path: str, cpu_quantize: bool | str | None = None,
+                   allow_unsafe: bool = False):
         """Load a checkpoint.
 
         Args:
@@ -4183,7 +4724,7 @@ class AuraLiteEngine:
         self.gguf_path = None
         self.hf_path = None
         self._ddp_model = None
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = self._read_checkpoint(path, allow_unsafe=allow_unsafe)
 
         ckpt_version = int(checkpoint.get("checkpoint_version", 1))
         if ckpt_version >= 2:
@@ -4264,7 +4805,9 @@ class AuraLiteEngine:
                 if torch.cuda.is_available() and rng_state.get("cuda") is not None:
                     torch.cuda.set_rng_state_all(rng_state["cuda"])
                 if rng_state.get("numpy") is not None:
-                    np.random.set_state(rng_state["numpy"])
+                    np.random.set_state(
+                        _numpy_rng_state_from_builtins(rng_state["numpy"])
+                        or rng_state["numpy"])
             except Exception as e:
                 logger.warning("could not restore RNG state: %s", e)
 

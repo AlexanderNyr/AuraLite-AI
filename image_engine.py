@@ -316,9 +316,9 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        for e, p in zip(self.ema_model.parameters(), model.parameters()):
+        for e, p in zip(self.ema_model.parameters(), model.parameters(), strict=True):
             e.mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
-        for eb, b in zip(self.ema_model.buffers(), model.buffers()):
+        for eb, b in zip(self.ema_model.buffers(), model.buffers(), strict=True):
             eb.copy_(b)
 
     def to(self, device):
@@ -422,7 +422,7 @@ class DDPM:
             eps = sb * x_t + sa * out
         return x0.clamp(-1, 1), eps
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample(self, model, n, channels, img_size, steps=None, eta=0.0,
                generator=None, progress=None):
         """Unified DDIM/DDPM sampler. eta=0 → DDIM, eta=1 → ancestral DDPM."""
@@ -663,7 +663,7 @@ class ImageGenEngine:
         if cfg.get("use_compile"):
             try:
                 compiled = torch.compile(model)
-                with torch.no_grad():
+                with torch.inference_mode():
                     probe = torch.zeros((1, cfg["channels"], cfg["img_size"], cfg["img_size"]),
                                         device=self.device)
                     _ = compiled(probe, torch.zeros(1, dtype=torch.long, device=self.device))
@@ -768,7 +768,7 @@ class ImageGenEngine:
         return history
 
     # ------------------------------------------------------------------
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(self, n: int = 4, steps: Optional[int] = None, eta: float = 0.0,
                  seed: Optional[int] = None, use_ema: bool = True,
                  progress: Optional[Callable[[int, int], bool]] = None) -> list[np.ndarray]:
@@ -787,8 +787,22 @@ class ImageGenEngine:
 
     # ------------------------------------------------------------------
     def save_model(self, path: str):
+        """Save an image-generator checkpoint.
+
+        `*.safetensors` → pickle-free weights + JSON metadata (safe to share);
+        anything else → the classic `.pt` container.
+        """
         if self.model is None:
             raise RuntimeError("Nothing to save — no model in memory.")
+        if str(path).lower().endswith(".safetensors"):
+            from model_engine.safe_io import save_safetensors_checkpoint
+            tensors = {f"model.{k}": v for k, v in self.model.state_dict().items()}
+            metadata = {"format": "auralite-image-ddpm-v2", "config": self.config}
+            if self.ema is not None:
+                tensors.update({f"ema.{k}": v for k, v in self.ema.ema_model.state_dict().items()})
+                metadata["has_ema"] = True
+            return save_safetensors_checkpoint(
+                path, tensors, metadata, meta_key="auralite-image")
         torch.save({
             "format": "auralite-image-ddpm-v2",
             "config": self.config,
@@ -796,8 +810,26 @@ class ImageGenEngine:
             "ema_state": self.ema.ema_model.state_dict() if self.ema is not None else None,
         }, path)
 
-    def load_model(self, path: str):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+    def load_model(self, path: str, allow_unsafe: bool = False):
+        if str(path).lower().endswith(".safetensors"):
+            from model_engine.safe_io import load_safetensors_checkpoint
+            ckpt = load_safetensors_checkpoint(path, meta_key="auralite-image")
+            model_state = {
+                k[len("model."):]: v for k, v in ckpt["model_state"].items()
+                if k.startswith("model.")
+            }
+            ckpt = {
+                "format": ckpt.get("format", "auralite-image-ddpm-v2"),
+                "config": ckpt.get("config", {}),
+                "model_state": model_state,
+                "ema_state": ({
+                    k[len("ema."):]: v for k, v in ckpt["model_state"].items()
+                    if k.startswith("ema.")
+                } if ckpt.get("has_ema") else None),
+            }
+        else:
+            from model_engine.safe_io import safe_torch_load
+            ckpt = safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
         if ckpt.get("format") not in ("auralite-image-ddpm-v1", "auralite-image-ddpm-v2"):
             raise ValueError("Not an AuraLite image-generator checkpoint.")
         cfg = dict(self.DEFAULTS)

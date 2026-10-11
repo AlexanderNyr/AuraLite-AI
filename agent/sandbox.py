@@ -1,16 +1,32 @@
 """
-agent/sandbox.py — Isolated execution sandbox for AuraLite Agent.
+agent/sandbox.py — Execution sandbox for AuraLite Agent.
 
 Strategy: subprocess-based sandboxing that works on Windows 10, Linux, and macOS
 without requiring Docker or root privileges.
 
-Security layers:
-  1. subprocess with timeout (no runaway processes)
-  2. Separate working directory per session (tempdir, auto-cleaned)
-  3. Watchdog thread kills the process via Popen.kill()
-  4. Command whitelist for shell mode
-  5. stdout/stderr captured, size-capped
-  6. Path escape prevention
+.. warning::
+    This is **risk reduction, not a security boundary**. The agent's subprocesses
+    run as your user: they can read files outside the workdir (e.g. /etc/passwd),
+    reach the network, and bypass the shell whitelist by executing code through
+    `python -c`. Real isolation requires a container/VM with dropped privileges,
+    a read-only filesystem and ``--network none``. What this module *does* give
+    you:
+
+  1. subprocess with timeout (no runaway processes) + POSIX resource limits
+     (CPU time, file size, optional address-space cap) and process-group kill
+     so orphaned grandchildren cannot linger;
+  2. a separate working directory per session (tempdir, auto-cleaned), used as
+     TMPDIR/HOME so temporary and cache files do not leak into your real home;
+  3. a watchdog thread that kills the process (and its group) on timeout;
+  4. a command whitelist for shell mode, with network tools removed when
+     ``allow_network=False`` (best-effort: proxies are also pointed at a dead
+     port, but a direct socket call can still connect);
+  5. stdout/stderr captured and size-capped;
+  6. path-escape prevention for the file tools (real containment, no prefix
+     tricks);
+  7. secret-looking environment variables (``*TOKEN*``, ``*API_KEY*``,
+     ``*SECRET*``, ``*PASSWORD*``, ``*CREDENTIAL*``) are stripped from the
+     child environment by default.
 """
 from __future__ import annotations
 
@@ -29,6 +45,13 @@ from typing import Optional
 DEFAULT_TIMEOUT_S = 15
 MAX_OUTPUT_BYTES  = 64 * 1024
 MAX_OUTPUT_LINES  = 500
+
+# POSIX resource limits (best-effort; ignored on Windows).
+# Memory limit defaults to disabled (0) because torch-based code legitimately
+# needs a few hundred MB; set AURALITE_SANDBOX_MEM_MB to cap it.
+DEFAULT_FILE_LIMIT_MB = 64
+_SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "API_KEY", "PASSWORD", "CREDENTIAL", "PRIVATE_KEY")
+_NETWORK_COMMANDS = {"curl", "wget", "ping", "nc", "ncat", "netcat", "ssh", "scp", "ftp"}
 
 HARD_BLOCKED = {
     "rm", "rmdir", "del", "rd", "format", "mkfs",
@@ -99,12 +122,20 @@ class Sandbox:
         allow_network: bool = True,
         max_output_bytes: int = MAX_OUTPUT_BYTES,
         python_executable: Optional[str] = None,
+        memory_limit_mb: int | None = None,
+        file_limit_mb: int | None = None,
+        strip_secret_env: bool = True,
     ):
         self.timeout = float(timeout)
         self.shell_whitelist = shell_whitelist if shell_whitelist is not None else DEFAULT_SHELL_WHITELIST
         self.allow_network = allow_network
         self.max_output_bytes = int(max_output_bytes)
         self.python_executable = python_executable or sys.executable
+        self.memory_limit_mb = int(memory_limit_mb if memory_limit_mb is not None
+                                   else os.environ.get("AURALITE_SANDBOX_MEM_MB", "0") or 0)
+        self.file_limit_mb = int(file_limit_mb if file_limit_mb is not None
+                                 else os.environ.get("AURALITE_SANDBOX_FILE_MB", DEFAULT_FILE_LIMIT_MB) or 0)
+        self.strip_secret_env = strip_secret_env
 
         if workdir:
             self._workdir_obj = None
@@ -115,6 +146,11 @@ class Sandbox:
             self.workdir = Path(self._workdir_obj.name)
 
         self._is_windows = platform.system() == "Windows"
+        if not allow_network:
+            # Best-effort network denial: drop network tools from the whitelist
+            # and point proxy variables at a dead local port. A direct socket
+            # connection from python is still possible — see module docstring.
+            self.shell_whitelist = set(self.shell_whitelist) - _NETWORK_COMMANDS
 
     def __enter__(self):
         return self
@@ -216,21 +252,98 @@ class Sandbox:
         return self._run_cmd(cmd, label="pip", timeout_override=120.0)
 
     def _safe_path(self, filename: str) -> Path:
+        """Resolve `filename` inside the sandbox workdir, rejecting escapes.
+
+        NOTE: the previous check was a plain string-prefix test
+        (`str(p).startswith(str(self.workdir))`), which also accepted sibling
+        directories that merely *share the prefix* — e.g. workdir
+        "/tmp/sbx" allowed reading "/tmp/sbx_secret/..." because
+        "/tmp/sbx_secret/x".startswith("/tmp/sbx") is True. Use real path
+        containment instead.
+        """
+        root = self.workdir.resolve()
         p = (self.workdir / filename).resolve()
-        if not str(p).startswith(str(self.workdir.resolve())):
-            raise ValueError(f"Path escape attempt blocked: {filename}")
+        try:
+            p.relative_to(root)
+        except ValueError:
+            raise ValueError(f"Path escape attempt blocked: {filename}") from None
         return p
+
+    def _child_env(self, extra_env=None) -> dict:
+        """Sanitized environment for the child process."""
+        env = os.environ.copy()
+        if self.strip_secret_env:
+            for key in list(env.keys()):
+                upper = key.upper()
+                if any(marker in upper for marker in _SECRET_ENV_MARKERS):
+                    env.pop(key, None)
+        # Keep temporary files and byte-code caches inside the sandbox dir.
+        tmp_dir = self.workdir / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env.update({
+            "TMPDIR": str(tmp_dir), "TEMP": str(tmp_dir), "TMP": str(tmp_dir),
+            "PYTHONPYCACHEPREFIX": str(self.workdir / ".pycache"),
+        })
+        if not os.environ.get("AURALITE_SANDBOX_KEEP_HOME"):
+            env["HOME"] = str(self.workdir)
+            env["USERPROFILE"] = str(self.workdir)
+        if not self.allow_network:
+            # Requests-based libraries fail fast against a dead proxy; raw
+            # sockets can still escape (documented limitation).
+            env.update({
+                "http_proxy": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9",
+                "HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+                "no_proxy": "", "NO_PROXY": "",
+            })
+        if extra_env:
+            env.update({str(k): str(v) for k, v in extra_env.items()})
+        return env
+
+    def _preexec(self):
+        """POSIX child setup: resource limits + own process group (None on Windows)."""
+        if self._is_windows:
+            return None
+        cpu_limit = int(self.timeout) + 5
+        file_limit = self.file_limit_mb * 1024 * 1024 if self.file_limit_mb > 0 else 0
+        mem_limit = self.memory_limit_mb * 1024 * 1024 if self.memory_limit_mb > 0 else 0
+        if not (cpu_limit or file_limit or mem_limit):
+            return None
+
+        def _apply():
+            try:
+                os.setsid()  # own process group → we can kill the whole tree
+            except OSError:
+                pass
+            try:
+                import resource
+                if cpu_limit:
+                    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 2))
+                if file_limit:
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+                if mem_limit:
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+            except Exception:
+                pass  # limits are best-effort; never block execution over them
+        return _apply
+
+    def _kill_tree(self, proc) -> None:
+        """Kill the child and (on POSIX) its whole process group."""
+        if not self._is_windows:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+                return
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def _run_cmd(self, cmd, *, extra_env=None, label="cmd", timeout_override=None) -> SandboxResult:
         timeout = timeout_override if timeout_override is not None else self.timeout
         t0 = time.perf_counter()
 
-        env = os.environ.copy()
-        for key in list(env.keys()):
-            if key.startswith("AURALITE_") and "TOKEN" in key.upper():
-                env.pop(key, None)
-        if extra_env:
-            env.update({str(k): str(v) for k, v in extra_env.items()})
+        env = self._child_env(extra_env)
 
         try:
             kwargs = dict(
@@ -242,6 +355,9 @@ class Sandbox:
                 encoding="utf-8",
                 errors="replace",
             )
+            preexec = self._preexec()
+            if preexec is not None:
+                kwargs["preexec_fn"] = preexec
             if self._is_windows:
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             proc = subprocess.Popen(cmd, **kwargs)
@@ -258,10 +374,7 @@ class Sandbox:
             # Wait up to `timeout`; if the process has not finished by then, kill it.
             if not finished.wait(timeout=timeout):
                 watchdog_killed.set()
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                self._kill_tree(proc)
 
         wd = threading.Thread(target=_watchdog, daemon=True)
         wd.start()
@@ -270,7 +383,7 @@ class Sandbox:
         try:
             raw_stdout, raw_stderr = proc.communicate(timeout=timeout + 2)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            self._kill_tree(proc)
             raw_stdout, raw_stderr = proc.communicate()
             _did_timeout = True
         finally:

@@ -1,3 +1,52 @@
+# 🐛 Bug-fix pass (branch `fix/bugfixes`) — export, static INT8, sandbox, lm-eval
+
+Audit: `ruff --select F,E9,B` + runtime smokes on real checkpoints + source
+review. Functional bugs fixed:
+
+- **TorchScript export of real models crashed** with
+  `IndexError: index out of range in self`: `export.py` built the dummy input
+  from `getattr(model, "vocab_size", 1000)`, but `ModernTransformer` has no
+  `vocab_size` attribute (it lives on `embedding.num_embeddings`), so token ids
+  went up to 1000 against a real vocabulary of e.g. 138. The vocab size is now
+  resolved from every known location (`_resolve_vocab_size`).
+- **ONNX export**: GQA models failed with "conversion of
+  scaled_dot_product_attention not implemented if enable_gqa is True"; torch≥2.9
+  routed `torch.onnx.export` through the dynamo exporter (extra `onnxscript`
+  dependency); and `start_pos: int = 0` leaked into the graph as a *required*
+  input, so calling the model with `input_ids` alone raised
+  "Required inputs (['start_pos']) are missing from input feed". Now: native-GQA
+  fast path is temporarily disabled during export, the classic exporter is
+  preferred with a dynamo fallback, and the model is wrapped so the exported
+  signature is exactly `input_ids → logits`.
+- **Static INT8 quantization could never succeed on a real model** (whole-model
+  `prepare()` fails on the Embedding and on RMSNorm's custom float math; the
+  exception was swallowed and the *unquantized* model returned). Each
+  `nn.Linear` is now wrapped in its own `QuantStub → Linear → DeQuantStub`
+  block (`_StaticLinear`); the result stays a usable `ModernTransformer`
+  (~7× smaller, vanilla PPL unchanged on tiny checkpoints).
+- **Agent sandbox path escape**: the containment check used a string prefix
+  test, so sibling directories sharing the prefix (e.g. `/tmp/sbx` →
+  `/tmp/sbx_evil`) were readable. Replaced with real `Path.relative_to`
+  containment after `resolve()` (also blocks symlink escapes).
+- **`AuraLiteLM.loglikelihood` crashed on an empty context with a single-token
+  continuation** (`torch.tensor([[]])` produced an empty float tensor fed into
+  the embedding). Guarded and the tensor is now explicitly `torch.long`.
+- **Server version** is read from `model_engine.__version__` (was hardcoded
+  "2.6.2" while the package is 2.6.4).
+- Hardening: `zip(..., strict=True)` at 11 sites (LR schedulers, checkpoint
+  restore, EMA, chained optimizers, batched decoding, cosine similarity),
+  `raise ... from` chains, explicit loop-variable binding for the GPTQ input
+  hook, HF streamer fallback no longer re-generates after partial output, dead
+  variables removed, GUI f-string cleanup.
+- New regression tests: `tests/test_bugfixes_regression.py` (real
+  `ModernTransformer` export round-trips, static INT8, sandbox escapes,
+  lm-eval empty-context), plus updates to `tests/test_export.py`.
+
+Verified: full suite **553 passed, 2 skipped, 0 failed**; `ruff check .` clean;
+ONNX numeric parity vs PyTorch < 3e-6 on a real checkpoint.
+
+---
+
 # 🖼️ Changelog — AuraLite AI (2026-09-29) — from-scratch image generator (modern stack)
 
 Adds a new **Image** tab (right after **Train**) that trains your own image

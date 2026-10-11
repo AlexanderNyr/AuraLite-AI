@@ -64,7 +64,10 @@ class DummyModel(torch.nn.Module):
 def fake_app():
     with ExitStack() as stack:
         _apply_patches(stack)
-        stack.enter_context(patch("gui_app.HAS_MATPLOTLIB", False))
+        # v2.6.5: the tabs live in gui/tabs/* and read runtime flags from
+        # gui.common, so that is where the patch has to go (gui_app keeps
+        # the legacy names for backwards compatibility).
+        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
         app = AIApp(DummyTk())
         app.exp_log_text = MagicMock()
         app.exp_status = MagicMock()

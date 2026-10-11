@@ -5,6 +5,7 @@ Works with ANY backend (GGUF, HF, native torch).
 """
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
@@ -26,13 +27,27 @@ class AgentStep:
 class AuraLiteAgent:
     """Tool-calling agent powered by an AuraLiteEngine backend."""
 
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
     def __init__(
         self,
         engine,
         *,
         sandbox: Optional[Sandbox] = None,
         enabled_tools: Optional[list] = None,
-        max_iterations: int = 8,
+        max_iterations: int | None = None,
         max_tokens_per_step: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -40,8 +55,16 @@ class AuraLiteAgent:
         repetition_penalty: float = 1.1,
         on_step: Optional[Callable] = None,
         chat_template: str = "chatml",
-        timeout_per_tool: float = 15.0,
+        timeout_per_tool: float | None = None,
     ):
+        # v2.6.5: the loop budget and per-tool timeout can be configured via
+        # arguments or environment variables, so GUI/CLI/embeddings can tune
+        # them without patching code:
+        #   AURALITE_AGENT_MAX_ITERATIONS=12  AURALITE_AGENT_TOOL_TIMEOUT=30
+        if max_iterations is None:
+            max_iterations = self._env_int("AURALITE_AGENT_MAX_ITERATIONS", 8)
+        if timeout_per_tool is None:
+            timeout_per_tool = self._env_float("AURALITE_AGENT_TOOL_TIMEOUT", 15.0)
         self.engine = engine
         self.sandbox = sandbox or Sandbox(timeout=timeout_per_tool)
         self._owns_sandbox = sandbox is None
