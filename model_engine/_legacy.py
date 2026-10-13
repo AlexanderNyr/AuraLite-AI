@@ -693,9 +693,11 @@ class AuraLiteEngine:
                     stop=stop_strs,
                 )
                 try:
-                    return result["choices"][0]["message"]["content"]
+                    content = result["choices"][0]["message"]["content"] or ""
                 except Exception:
                     return ""
+                # Same contract as every other path (and as streaming): stripped.
+                return content.strip()
             else:
                 # Fallback to regular completion with formatted prompt
                 full = self._gguf_generate_text(
@@ -751,12 +753,16 @@ class AuraLiteEngine:
 
         Works with native AuraLite and GGUF (when streaming is supported).
 
-        v2.6.5: leading whitespace of the first emitted piece is trimmed, so
-        the streamed answer starts exactly like `generate_chat()`'s output
-        (previously the batch path returned "Hello" while streaming emitted
-        " Hello"). Internal spacing is untouched.
+        The concatenated pieces are exactly what `generate_chat()` returns,
+        which strips the answer: leading whitespace of the first piece is
+        trimmed (v2.6.5), and whitespace is held back until more text follows,
+        so whitespace at the very end is never emitted. Before this, an answer
+        that ended in a space came out as "Hello. " over streaming but "Hello."
+        from `generate_chat()` — visible only on machines whose float rounding
+        made the tiny test model end in a space. Internal spacing is untouched.
         """
         started = False
+        pending = ""          # trailing whitespace, emitted only if text follows
         for piece in self._generate_chat_streaming_raw(
                 messages, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p, chat_template, system_prompt,
@@ -768,7 +774,12 @@ class AuraLiteEngine:
                 if not piece:
                     continue
                 started = True
-            yield piece
+            text = pending + piece
+            body = text.rstrip()
+            pending = text[len(body):]
+            if body:
+                yield body
+        # Whatever is still pending was trailing whitespace: dropped, as strip() does.
 
     def _generate_chat_streaming_raw(
         self,

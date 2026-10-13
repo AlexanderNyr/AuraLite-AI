@@ -38,7 +38,9 @@ FRONT_ENDS = {"auralite_cli.py", "eval.py", "evaluation.py"}
 
 
 def _print_calls(path: pathlib.Path) -> list[int]:
-    tree = ast.parse(path.read_text())
+    # Explicit UTF-8: Windows reads with cp1252 by default and died on the CJK
+    # punctuation in web_tools.py's sentence splitter (U+FF01, bytes EF BC 81).
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     return [node.lineno for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "print"]

@@ -481,7 +481,8 @@ class TestAuraLiteEngine:
         engine = AuraLiteEngine()
         params = dict(tiny_params)
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w",
+                                         encoding="utf-8") as f:
             json.dump(params, f)
             path = f.name
 

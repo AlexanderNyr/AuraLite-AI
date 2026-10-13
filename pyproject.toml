@@ -25,6 +25,10 @@ auralite = "auralite_cli:main"
 [project.optional-dependencies]
 test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
         "fastapi>=0.111", "uvicorn>=0.30", "httpx>=0.27", "pydantic>=2",
+        # Starlette >= 1.6 deprecates plain httpx for TestClient
+        # (StarletteDeprecationWarning in every CI job) and uses httpx2 when it is
+        # installed; httpx stays for older Starlette and the importorskip guards.
+        "httpx2>=2",
         # The release/packaging tests parse the workflows and pyproject.toml.
         # Both used to arrive only by accident (a dev machine with PyYAML;
         # Python >= 3.11 for tomllib), which broke CI on clean runners.

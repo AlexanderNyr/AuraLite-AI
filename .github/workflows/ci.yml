@@ -42,6 +42,12 @@ jobs:
         #   B008 — idiomatic FastAPI `Depends(...)` defaults
         #   B017 — tests assert broad exceptions on purpose (pydantic/dataclass)
         run: ruff check --select E9,F,B --ignore E501,F401,B008,B017 .
+      - name: Text I/O names its encoding (blocking)
+        # Windows opens files as cp1252 unless told otherwise: a bare
+        # `Path.read_text()` broke the windows-latest leg on the CJK punctuation
+        # in web_tools.py. PLW1514 (unspecified-encoding) is still a preview rule,
+        # hence `--preview` — scoped to this one rule.
+        run: ruff check --preview --select PLW1514 .
       - name: Ruff format check (advisory)
         run: ruff format --check . || true
       - name: Pyright smoke
@@ -115,26 +121,12 @@ jobs:
             --cov-report=xml --cov-report=term
       - name: Report GUI coverage
         if: always()
+        # Advisory: the GUI modules still have the lowest numbers in the repo.
+        # Reads the JSON report: coverage.xml stores paths relative to each
+        # --cov package, so the previous "gui/" filter never matched anything.
         run: |
-          # Advisory: the tab modules still have the lowest numbers in the repo.
-          python - <<'EOF' || true
-          import xml.etree.ElementTree as ET
-          try:
-              root = ET.parse("coverage.xml").getroot()
-          except Exception as exc:
-              print(f"no coverage.xml ({exc})")
-              raise SystemExit(0)
-          rows = []
-          for cls in root.iter("class"):
-              filename = cls.get("filename", "")
-              if filename.startswith("gui/"):
-                  lines = cls.find("lines")
-                  hits = sum(1 for line in lines if int(line.get("hits", 0)))
-                  rows.append((filename, hits, len(lines)))
-          rows.sort(key=lambda row: (row[1] / row[2]) if row[2] else 1)
-          for filename, hit, total in rows[:12]:
-              print(f"{filename:42} {hit:5}/{total:<5} {100 * hit / total:5.1f}%")
-          EOF
+          python -m coverage json -q -o coverage.json || exit 0
+          python scripts/coverage_report.py coverage.json --prefix gui/ --limit 12 || true
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v7

@@ -171,6 +171,41 @@ def test_workflows_use_node24_action_majors(name):
             assert major >= NODE24_MAJORS[action], f"{name}: {uses} still runs on Node 20"
 
 
+def test_gui_coverage_report_reads_json_paths(tmp_path, capsys):
+    """The advisory GUI report printed nothing on every CI run: coverage.xml
+    stores paths relative to each --cov package, so "gui/" never matched."""
+    report = _load_script("coverage_report")
+    files = {
+        "gui/app.py": {"summary": {"num_statements": 10, "covered_lines": 7}},
+        "gui\\tabs\\model.py": {"summary": {"num_statements": 20, "covered_lines": 5}},
+        "gui/widgets.py": {"summary": {"num_statements": 0, "covered_lines": 0}},
+        "model_engine/model.py": {"summary": {"num_statements": 50, "covered_lines": 1}},
+    }
+    rows = report.least_covered(files, "gui/", 12)
+    assert [row[0] for row in rows] == ["gui/tabs/model.py", "gui/app.py"]
+    assert rows[0][3] == pytest.approx(25.0)
+
+    path = tmp_path / "coverage.json"
+    path.write_text(__import__("json").dumps({"files": files}), encoding="utf-8")
+    assert report.main([str(path), "--prefix", "gui/", "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "gui/tabs/model.py" in out and "gui/app.py" not in out
+    assert report.main([str(path), "--prefix", "nothing/"]) == 1
+
+    step = next(step for step in WORKFLOWS["ci.yml"]["jobs"]["coverage"]["steps"]
+                if step.get("name") == "Report GUI coverage")
+    assert "coverage json" in step["run"] and "scripts/coverage_report.py" in step["run"]
+    assert "coverage.xml" not in step["run"]
+
+
+def test_lint_job_blocks_unspecified_text_encodings():
+    """Windows defaults to cp1252; every text open() must name its encoding."""
+    steps = WORKFLOWS["ci.yml"]["jobs"]["lint"]["steps"]
+    runs = [str(step.get("run", "")) for step in steps]
+    gate = next(run for run in runs if "PLW1514" in run)
+    assert "--preview" in gate and "|| true" not in gate
+
+
 def test_workflow_dispatch_inputs_that_jobs_read_are_declared():
     workflow = WORKFLOWS["ci.yml"]
     triggers = workflow.get("on") or workflow.get(True)

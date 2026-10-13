@@ -21,7 +21,9 @@ Release of the improvement roadmap (P0 + P1 + actionable P2 items) on top of the
 - GGUF scoring: `engine.gguf_perplexity()` / `gguf_loglikelihood_rolling()`
   through llama.cpp per-token scores; `evaluation.py` uses lm-eval's llama.cpp
   wrapper and points to the perplexity helper when it is unavailable.
-- `generate_chat_streaming()` == `generate_chat()` (leading-space fix);
+- `generate_chat_streaming()` joins to exactly `generate_chat()` — leading *and*
+  trailing whitespace (the first version only fixed the leading space; see
+  "After the merge" below);
   `generate_batch()` deduplicates identical prompts.
 
 **GUI**
@@ -148,6 +150,69 @@ Release of the improvement roadmap (P0 + P1 + actionable P2 items) on top of the
   (optional dependencies and CUDA), `optional-deps` on 3.11: 103 passed with the
   ONNX/TorchScript exports really executed, `package`: the wheel installs into a
   clean venv and passes the smoke script.
+
+
+**After the merge — the first CI run of `30c9d52` (run 38398453687)**
+
+Green: lint, package, server-smoke, benchmark-smoke, `tests` 3.10 and 3.13. Red:
+`tests` 3.11 and 3.12, `coverage`, `optional-deps` (one test) and
+`tests (windows-latest, 3.11)` (another one); `docker` was skipped as a result.
+Both failures were real bugs that the local runs and the clean mirrors could not
+show.
+- **The chat stream did not match the batch answer.** The entry above promised
+  `generate_chat_streaming()` == `generate_chat()`, but only the leading space had
+  been fixed. `generate_chat()` strips the decoded answer; the stream never
+  stripped the end. So whenever the last token before the stop marker was
+  whitespace, an SSE client got `'laLiGLiGLU. '` and a plain JSON client
+  `'laLiGLiGLU.'`. The regression test compared the real output of a tiny model,
+  and that output depends on the CPU's floating-point details. With the same
+  torch 2.14.1 and the same seeds, the model ended in a space on four runners
+  (3.11, 3.12, `coverage`, `optional-deps`) and not on three (3.10, 3.13,
+  Windows). The red `tests` jobs were also about 1.5× slower (305–326 s against
+  191–212 s for the green ones), which points to a different CPU type. The model
+  did not end in a space locally or in the clean mirrors either, so the test
+  passed there. Fix: `generate_chat_streaming()` holds back trailing
+  whitespace and emits it only once more text follows, so whitespace at the very
+  end is never sent. The streamed text now equals `generate_chat()` on the native,
+  Hugging Face and GGUF paths. The GGUF chat-completion *batch* path did not strip
+  at all (the opposite mismatch); it strips now. New
+  `tests/test_chat_streaming_parity.py` (6 tests) scripts the sampled tokens
+  instead of relying on what random weights produce: trailing, leading, both ends
+  with internal runs, whitespace only, chunking preserved, and a fake llama.cpp
+  chat-completion model. These fail on any machine without the fix (4 of 6 did).
+  This is also the most likely cause of upstream's unexplained `tests (3.13)` and
+  `optional-deps` failures on `13d9f47` mentioned above. That cannot be checked
+  without those logs.
+- **Windows: source files were read as cp1252.**
+  `test_library_modules_do_not_print[web_tools.py]` called `Path.read_text()`
+  without an encoding, which means cp1252 on Windows. `web_tools.py` contains a
+  full-width `！` (U+FF01, UTF-8 `EF BC 81`) in its sentence-splitting regex, so
+  the read failed with `UnicodeDecodeError: 'charmap' codec can't decode byte
+  0x81`. Fixed there and in the two other test spots with the same pattern
+  (`tests/test_model_engine.py`, `tests/test_engine_api.py`). Library code
+  already passed `encoding=`. A new **blocking** lint step,
+  `ruff check --preview --select PLW1514 .` (unspecified-encoding), keeps it that
+  way. The bug can be reproduced on Linux too:
+  `python -X warn_default_encoding -W error::EncodingWarning -m pytest …` fails on
+  the old test and passes now.
+- **The advisory "Report GUI coverage" step never printed anything.** With several
+  `--cov` packages, `coverage.xml` stores each path relative to its own package
+  (`app.py`, not `gui/app.py`), so the step's `gui/` filter matched nothing on
+  every run. The step now reads the JSON report through `scripts/coverage_report.py`
+  (unit-tested in `tests/test_release.py`). For the record, the run itself
+  reached **84.06 %** total coverage, the same as locally.
+- `httpx2` joins the `test` extra. Starlette ≥ 1.6 deprecates plain `httpx` for
+  `TestClient`: every job printed `StarletteDeprecationWarning … install httpx2`,
+  and a later Starlette will remove the shim. With `httpx2` installed the warning
+  is gone and the three test files that use `TestClient` (143 tests) pass. `httpx` stays for older Starlette.
+- Heads-up, not acted on yet: torch 2.14 deprecates the TorchScript API used by
+  the `torchscript` export (`torch.jit.trace`/`freeze`/`optimize_for_inference`/
+  `load`, all `FutureWarning`) and `torch.ao.quantization`, which backs dynamic INT8
+  behind the guard in `quantization_backends.py`. Both still work on 2.14.1 and
+  are exercised by the suite, but a future torch will remove them. ONNX export
+  and the opt-in `torchao` backend are the ways forward.
+- Not yet run on GitHub: the `docker` job (skipped because `tests` failed) and
+  `release.yml` (there is no `v2.6.5` tag yet).
 
 **Training**
 - The anonymous corpus memmap (`--mmap` without `--corpus-cache`) is deleted when

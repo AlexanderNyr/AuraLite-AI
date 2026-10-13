@@ -87,7 +87,7 @@ class TestConfigManagement:
         e = AuraLiteEngine()
         path = tmp_path / "cfg.json"
         e.save_config(str(path), {"a": 1})
-        doc = json.loads(path.read_text())
+        doc = json.loads(path.read_text(encoding="utf-8"))
         assert doc["params"]["a"] == 1
         assert doc["version"] == "2.1"
 
