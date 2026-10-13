@@ -7,8 +7,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
+
+# v2.6.5: runnable straight from a fresh clone (`python benchmarks/benchmark_generation.py`)
+# — without the bootstrap this failed with `No module named 'model_engine'`, which
+# the CI job masked with `|| true`.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def main() -> None:
@@ -35,9 +43,22 @@ def main() -> None:
             logits = model(torch.tensor([[nxt]], device=device), start_pos=32+i, use_cache=True)
             nxt = int(logits[0, -1].argmax())
         if device.type == "cuda": torch.cuda.synchronize()
-    result = {"device": str(device), "decode_tokens_per_sec": n / (time.perf_counter() - t0)}
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    elapsed = time.perf_counter() - t0
+    result = {
+        "device": str(device),
+        "mode": "quick" if args.quick else "full",
+        "tokens": n,
+        "seconds": round(elapsed, 4),
+        "decode_tokens_per_sec": n / elapsed,
+    }
+    out = Path(args.out)
+    if not out.is_absolute():
+        out = _REPO_ROOT / out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(f"device: {device} | decode: {result['decode_tokens_per_sec']:.1f} tokens/s "
+          f"({n} tokens in {elapsed:.3f}s)")
+    print(f"written: {out}")
     print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":

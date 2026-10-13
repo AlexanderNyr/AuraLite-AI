@@ -1,3 +1,199 @@
+# 🚀 v2.6.5 — roadmap implementation, release engineering, honest status
+
+Release of the improvement roadmap (P0 + P1 + actionable P2 items) on top of the
+`fix/bugfixes` audit pass. Full details: commit `6814ea5` (accepted upstream as
+`13d9f47`) and `docs/` — this entry reflects what is *in the code today*.
+
+**Safety**
+- `model_engine/safe_io.py`: `.pt` checkpoints load with `weights_only=True`
+  (scoped numpy allowlist keeps pre-2.6.5 checkpoints working), pickle-free
+  `.safetensors` support (text + image models), RNG state stored as builtins.
+- Server: constant-time multi-key auth (`AURALITE_API_KEY=k1,k2`), `/metrics`
+  in Prometheus text format, graceful SSE shutdown that survives a restart.
+- Agent: AST-whitelisted `calculate` (no `eval`), hardened subprocess sandbox.
+
+**Features that were previously stubs — now real**
+- `generate_speculative`: prompt-lookup drafting + batched verification with
+  exact speculative sampling (token-identical to greedy `generate()`;
+  measured ×1.5 tokens/s on repetitive text, acceptance rate ~0.7).
+- `use_flex_attention=True`: real FlexAttention path with automatic SDPA
+  fallback; parity with SDPA verified ≤1e-4.
+- GGUF scoring: `engine.gguf_perplexity()` / `gguf_loglikelihood_rolling()`
+  through llama.cpp per-token scores; `evaluation.py` uses lm-eval's llama.cpp
+  wrapper and points to the perplexity helper when it is unavailable.
+- `generate_chat_streaming()` == `generate_chat()` (leading-space fix);
+  `generate_batch()` deduplicates identical prompts.
+
+**GUI**
+- Every tab is covered by a headless smoke suite (`tests/test_gui_tabs_smoke.py`,
+  20 tests): all nine tabs build, key widgets exist, no-model handlers return
+  early, result-view round-trips, and no tab raises on construction.
+- **Driver-level GUI tests** (`tests/_gui_harness.py` + `tests/test_gui_tab_flows.py`,
+  158 tests): each tab is *driven* end-to-end — a real `AIApp` with a real engine,
+  mocked tkinter, worker threads executed inline and dialogs faked — so training,
+  generation, evaluation, console, model, quantisation, image and chat flows are
+  asserted on their actual output. Three real bugs fell out of it:
+  `ImageTabMixin._parse_int_list` was written without `self` *and* without
+  `@staticmethod`, so `start_image_training()` always raised `TypeError` (the
+  image tab could not train at all); `_save_hf_lora` called
+  `filedialog.asksaveasdirectory`, which does not exist in tkinter, so the button
+  silently did nothing; and the training progress strip formatted `val_loss` with
+  `:.4f`, which raised `ValueError` as soon as the engine reported a string.
+- Session restore + `GuiConfig` persistence (atomic writes, tolerant of
+  corrupt/missing files), English/Русский UI with a live language switch,
+  `TkAsyncBridge` for background work with proper shutdown, and Chat-tab
+  insights: token-frequency bars and this layer's attention map
+  (`engine.attention_maps()` / `token_frequencies()`).
+
+**Performance**
+- `torch.compile` for inference is opt-in (`auralite generate --compile`,
+  `info --bench --bench-compile`) and routed to *prompt processing only*:
+  measured ×1.1–1.7 on prefill, and a measured slowdown on T=1 decode, so
+  decode stays eager. Kernels are cached in `$AURALITE_HOME/torch_inductor`.
+- `auralite info --bench N --bench-modes` compares fp32/fp16/int8 KV caches
+  on identical weights and prints tokens/s next to bytes per token.
+
+**Product / performance (P2)**
+- **GGUF `llama-server` backend**: `load_gguf_model("http://127.0.0.1:8080")`
+  or `AURALITE_LLAMA_SERVER_URL` talks to a running llama.cpp server, so one
+  model load serves the GUI and the API at once. Perplexity is explicitly
+  unsupported there (no per-token logits over HTTP) instead of being
+  approximated.
+- **Cached GGUF perplexity**: `auralite info --model m.gguf --perplexity
+  --text corpus.txt [--n-ctx N] [--no-cache] [--clear-cache]`, results keyed
+  by file identity + context window + corpus hash in
+  `$AURALITE_HOME/gguf_ppl_cache.json`.
+- **Server batching (P2.11) — queue, verified under real threads**: the
+  roadmap asked for a queue of independent requests instead of a `503` storm
+  from the generation-slot semaphore. That behaviour was already in place
+  (`AURALITE_QUEUE_TIMEOUT`, `Retry-After`), but it was only tested by poking
+  the semaphore by hand; `tests/test_server_openai.py` now fires six real
+  concurrent requests through `TestClient` and asserts that every one of them
+  answers `200`, that all of them reach the engine, and that the slot limit is
+  respected (`peak <= slots`, and exactly `1` with a single slot). Merging
+  *different* requests into one engine batch is documented as a deliberate
+  non-goal in `docs/faq.md` §9 — it would silently change sampling, delay
+  streaming clients and put two conversations into one KV cache.
+- **Release engineering**: `.github/workflows/release.yml` turns a `v*` tag into
+  a GitHub Release (verify → build → release → GHCR image). `verify` refuses
+  a tag whose number disagrees with the code: `scripts/check_version_consistency.py`
+  compares `pyproject.toml`, `model_engine.__version__`, the server's imported
+  version and the CHANGELOG heading, and `server/openai_server.py` no longer
+  carries a hardcoded `"2.6.4"` fallback. `build` runs `twine check` and
+  imports the built wheel in a clean venv; `release` attaches the artifacts
+  with generated notes; `image` pushes `ghcr.io/<owner>/auralite-ai:<version>`
+  (CPU runtime target) with `packages: write`.
+- **CI coverage now includes the user-facing surface**: `gui/`,
+  `image_engine.py` and `auralite_cli.py` are measured (84 % overall: engine
+  84 %, server 94 %, gui 86 %, image engine 89 %, CLI 87 %), the threshold is
+  60 %, and the job installs the Tcl/Tk runtime when tkinter is missing so the
+  GUI suite cannot silently skip. The twelve least-covered GUI files are
+  printed as an advisory.
+- **Documentation**: `docs/quickstart.md`, `docs/faq.md` (measured answers to
+  "why isn't it faster"), `docs/quantization.md`, plus a Russian README.
+  The FAQ states the numbers it argues with (e.g. compiled prefill ×1.43 at
+  B=4 T=64, compiled single-token decode ×0.86) and includes the commands to
+  reproduce them.
+
+**Distribution & CI — found by installing the wheel and mirroring CI on clean runners**
+- **The wheel shipped a dead `auralite` command.** `[tool.setuptools] py-modules`
+  listed neither `auralite_cli` (the console-script target) nor `image_engine`, so
+  after `pip install auralite-ai` (or `pip install .`) `auralite` died with
+  `ModuleNotFoundError` and the GUI silently lost its Image tab. CI never saw it:
+  every job uses an editable install, which puts the whole checkout on
+  `sys.path`, and `twine check` only reads metadata. Fixed, and guarded three
+  ways: `tests/test_packaging.py` (top-level modules/packages ⇄ `pyproject.toml`
+  in both directions, a real offline wheel build whose file list is checked, and
+  "every module the test suite imports is installed by `.[test]`"), a new CI
+  `package` job, and `scripts/smoke_installed_wheel.py`, which installs nothing
+  itself but proves an installed distribution is complete (every module imports
+  from site-packages, `auralite --version`/`--help` exit 0, metadata/package/CLI/
+  server versions agree). `auralite --version` is new.
+- **The release workflow could not have succeeded**: its smoke step installed the
+  wheel *without* `[serve]` and then imported the FastAPI server. It now installs
+  `"$(ls dist/*.whl)[serve]"` and runs the smoke script.
+- **CI could not collect the suite on a clean runner**: `tests/test_release.py`
+  imports PyYAML, which `.[test]` never installed (dev machines get it through
+  unrelated packages) — one collection error stops pytest before any test runs.
+  `pyyaml` is now in the `test` extra.
+- **Python 3.10 was red upstream**: `tomllib` is 3.11+, and GitHub CI on `13d9f47`
+  fails `tests (3.10)` with exactly the 4 `_pyproject()` failures reproduced in a
+  clean 3.10 environment. `tomli` fallback + `tomli; python_version < '3.11'` in
+  the `test` extra. Upstream's `tests (3.13)` and `optional-deps` failures on the
+  same commit did **not** reproduce in clean mirrors (3.13: 611 passed; 3.11 with
+  onnx 1.23.2 / onnxruntime 1.31.0: green) — the logs need repository access.
+- **The blocking lint gate was red on this branch**: CI's
+  `ruff check --select E9,F,B …` step flags `B009` in `gui/session.py` and a
+  duplicate `FakeAxis.imshow` (`F811`) in `tests/_gui_harness.py`, both from
+  earlier v2.6.5 commits that had only been checked with the default
+  `ruff check .`. Fixed; both ruff invocations are part of the checks now.
+- The suite is now seeded: an autouse fixture seeds `random`, NumPy and torch
+  before every test (`AURALITE_TEST_SEED`, default 0). Tiny random-weight models
+  used to draw new weights on every run, so a rare unlucky draw could turn one CI
+  job red without any way to reproduce it.
+- Every GitHub Action moved to its Node 24 major (checkout v7, setup-python v7,
+  upload-artifact v7, download-artifact v8, docker/* v4/v4/v6/v7,
+  action-gh-release v3; upstream CI already warns that Node 20 actions are being
+  forced onto Node 24); all inputs re-checked against each `action.yml`.
+  `actionlint` + `shellcheck`: clean. `server-smoke` prints the server log when
+  `/health` never answers; the documented `gh workflow run ci.yml -f pyinstaller=…`
+  now has its input declared (GitHub rejects undeclared inputs).
+- `project.license` is an SPDX string with `license-files` (setuptools ≥ 77): the
+  TOML-table form is deprecated and stops building after 2027-02-18.
+- **PyPI without a token**: an opt-in `pypi` job publishes the verified artifacts
+  through Trusted Publishing (OIDC). Off until the maintainer registers the
+  publisher and sets `PYPI_PUBLISH=true` — steps in `docs/releasing.md`.
+- Checks for this round: dev environment **1008 passed, 2 skipped**; clean CI
+  mirrors — `tests` on 3.10 and 3.13 with `.[test]`: 1004 passed / 6 skipped each
+  (optional dependencies and CUDA), `optional-deps` on 3.11: 103 passed with the
+  ONNX/TorchScript exports really executed, `package`: the wheel installs into a
+  clean venv and passes the smoke script.
+
+**Training**
+- The anonymous corpus memmap (`--mmap` without `--corpus-cache`) is deleted when
+  training ends — on success, Ctrl+C and errors alike (a file Windows still has
+  mapped is removed at interpreter exit). Its name was unique per run, so it was
+  never reusable, yet every run left one in the temp directory (on a tmpfs `/tmp`
+  that is RAM until reboot; a 1 GB char-level corpus becomes a file of up to
+  4 GB). The docs
+  had claimed the file was kept "for reuse" — no such reuse existed; they now say
+  so. An explicit `--corpus-cache PATH` is still kept.
+
+**Engineering**
+- `gui_app.py` (4 475 lines) split into `gui/common.py` + `gui/app.py` +
+  `gui/tabs/*` mixins (104/104 methods moved verbatim, legacy imports preserved).
+- `model_engine/_legacy.py` (4 989 lines) decomposed: tokenizers, layers, model,
+  schedulers, optimizers and the GGUF proxies now live in their own modules
+  (`model_engine/tokenizers.py`, `layers.py`, `model.py`, `scheduler.py`,
+  `optimizers.py`, `gguf_proxy.py`); the module keeps the engine plus the glue
+  and re-exports every name it used to define, so no import path changed.
+- `print()` → `logging`: the engine, `image_engine`, `hf_integration`, `export` and
+  `web_tools` report through the `auralite` logger (message wording unchanged,
+  INFO visible by default, `$AURALITE_LOG_LEVEL` respected). The CLI keeps its
+  historical output by pointing the logger at stdout (default level INFO,
+  `--quiet` silences it); `DynamicStreamHandler` re-resolves the stream per
+  record so the GUI console tab and pytest capture keep working.
+- Training can run from a memory-mapped token cache: `--mmap` /
+  `--corpus-cache PATH` (or `AURALITE_CORPUS_CACHE=mmap`) streams the corpus into
+  a `uint32` memmap instead of materialising it twice in RAM; identical seeds
+  give bit-identical losses/weights/generation versus the RAM path.
+- `quantization_backends.py`: single place for the deprecated `torch.ao`
+  quantization guard plus an opt-in `torchao` path (`AURALITE_QUANT_BACKEND`).
+- CLI: `--quiet`, `--log-level`, `info --bench N`, `info --backends`, safe
+  checkpoint reading; training prints the *actual* built parameter count.
+- `tests/conftest.py` with real tiny fixtures + `tests/test_improvements_v265.py`
+  (62 regression tests). Suite: 616 passed, 2 skipped.
+- Metrics: 1748 tokens/s CPU decode (d512/4L/256), full core coverage 68 %.
+- The GUI suites share `tests/_gui_harness.py`, whose `build_gui_app()` shuts the
+  app's `TkAsyncBridge` down on teardown. Its daemon asyncio thread plus the
+  executor keep the bridge alive, the bridge holds the Tk root and the root holds
+  the app, so every test leaked one whole app graph (engine, tensors, figures):
+  the GUI suite grew to ~1.3 GB peak RSS and the full run swap-thrashed on a 2 GB
+  machine. With the bridge stopped the suite stays flat (~0.5 GB peak).
+- Suite: **988 passed, 2 skipped** (previous round: 830/2); measured coverage
+  rose from 72 % to **84 %** overall, with `gui/` at 86 % (was 55 %) and the
+  image tab alone from 43 % to 88 %.
+
 # 🐛 Bug-fix pass (branch `fix/bugfixes`) — export, static INT8, sandbox, lm-eval
 
 Audit: `ruff --select F,E9,B` + runtime smokes on real checkpoints + source

@@ -20,6 +20,10 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
+import logging
+
+logger = logging.getLogger("auralite.webtools")
+
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -136,7 +140,7 @@ def wikipedia_search(query: str, max_results: int = 5,
             data = json.loads(resp.read().decode("utf-8"))
         search_results = data.get("query", {}).get("search", [])
     except Exception as e:
-        print(f"[Wikipedia Search] API request failed: {e}")
+        logger.warning(f"[Wikipedia Search] API request failed: {e}")
         return []
 
     results = []
@@ -219,14 +223,14 @@ def build_web_context(query: str, max_results: int = 4,
     try:
         results = duckduckgo_search(query, max_results=max_results, timeout=timeout)
     except Exception as e:
-        print(f"[AuraLite Web Search] DuckDuckGo search failed: {e}. Falling back to Wikipedia...")
+        logger.warning(f"[AuraLite Web Search] DuckDuckGo search failed: {e}. Falling back to Wikipedia...")
 
     # 2. Wikipedia fallback if DDG returned nothing or failed
     if not results:
         try:
             results = wikipedia_search(query, max_results=max_results, timeout=timeout)
         except Exception as e:
-            print(f"[AuraLite Web Search] Wikipedia fallback failed: {e}")
+            logger.warning(f"[AuraLite Web Search] Wikipedia fallback failed: {e}")
 
     if not results:
         return ""

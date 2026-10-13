@@ -435,9 +435,12 @@ class TestCLI:
 
     def test_generate_via_cli(self, trained_model, capsys):
         from auralite_cli import main
+        # --log-level WARNING: since v2.6.5 the engine logs its progress at INFO
+        # and the CLI prints that to stdout (as the old print()s did), which
+        # would otherwise end up in the captured output below.
         rc = main(["generate", "--model", trained_model,
                    "--prompt", "improvements", "--length", "3",
-                   "--temperature", "1.0", "--top-k", "1"])
+                   "--temperature", "1.0", "--top-k", "1", "--log-level", "WARNING"])
         assert rc == 0
         # Strip only the trailing newline added by print(); keep any generated
         # whitespace so the length check stays exact (char-level greedy decode

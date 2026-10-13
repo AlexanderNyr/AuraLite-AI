@@ -7,6 +7,7 @@ no network, no uvicorn process required.
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -34,19 +35,30 @@ class FakeEngine:
     def __init__(self):
         self.generate_calls = []
         self.chat_calls = []
+        self.generation_kwargs = []
+        self.streaming_kwargs = []
+        self.chat_kwargs = []
 
     def generate(self, prompt, length=50, temperature=0.8, top_k=50, top_p=0.9,
                  repetition_penalty=1.0, min_p=0.0, **kw):
         self.generate_calls.append(prompt)
+        self.generation_kwargs.append(dict(length=length, temperature=temperature,
+                                           top_k=top_k, top_p=top_p,
+                                           repetition_penalty=repetition_penalty,
+                                           min_p=min_p, **kw))
         return prompt + " world"
 
     def generate_streaming(self, prompt, length=50, temperature=0.8, **kw):
+        self.streaming_kwargs.append(dict(length=length, temperature=temperature, **kw))
         for tok in ["Hel", "lo", "!"]:
             yield tok
 
     def generate_chat(self, messages, max_new_tokens=256, temperature=0.7,
                       top_k=40, top_p=0.9, **kw):
         self.chat_calls.append(messages)
+        self.chat_kwargs.append(dict(max_new_tokens=max_new_tokens,
+                                     temperature=temperature, top_k=top_k,
+                                     top_p=top_p, **kw))
         return "chat answer"
 
     def generate_chat_streaming(self, messages, max_new_tokens=256,
@@ -206,3 +218,279 @@ class TestRateLimitAndErrors:
         body = r.json()
         assert body["error"]["type"] == "RuntimeError"
         assert "kaboom" in body["error"]["message"]
+
+
+# ----------------------------------------------------------------------
+#  v2.6.5: OpenAI parameter parity (stop / seed / top_k / usage)
+# ----------------------------------------------------------------------
+def _sse_payloads(lines):
+    return [json.loads(line[len("data: "):]) for line in lines
+            if line.startswith("data: ") and line != "data: [DONE]"]
+
+
+class TestSamplingParameters:
+    def test_sampling_kwargs_are_forwarded(self, client):
+        c, engine = client
+        r = c.post("/v1/completions", json={
+            "prompt": "hi", "max_tokens": 4, "temperature": 1.2, "top_p": 0.5,
+            "top_k": 7, "min_p": 0.1, "repetition_penalty": 1.3})
+        assert r.status_code == 200
+        kwargs = engine.generation_kwargs[-1]
+        assert kwargs["top_k"] == 7 and kwargs["min_p"] == pytest.approx(0.1)
+        assert kwargs["repetition_penalty"] == pytest.approx(1.3)
+        assert kwargs["temperature"] == pytest.approx(1.2)
+
+    def test_stop_sequences_truncate_batch_output(self, client):
+        c, _ = client
+        r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4,
+                                            "stop": [" world"]})
+        body = r.json()
+        assert body["choices"][0]["text"] == ""
+        assert body["choices"][0]["finish_reason"] == "stop"
+
+    def test_stop_sequences_cut_streamed_text(self, client):
+        c, _ = client
+        with c.stream("POST", "/v1/completions",
+                      json={"prompt": "hi", "max_tokens": 4, "stream": True,
+                            "stop": ["lo"]}) as resp:
+            lines = [line for line in resp.iter_lines() if line.startswith("data: ")]
+        texts = [p["choices"][0]["text"] for p in _sse_payloads(lines)]
+        assert "".join(texts) == "Hel", texts   # "lo" is never emitted
+        assert lines[-1] == "data: [DONE]"
+
+    def test_stop_does_not_break_stream_without_match(self, client):
+        c, _ = client
+        with c.stream("POST", "/v1/completions",
+                      json={"prompt": "hi", "max_tokens": 4, "stream": True,
+                            "stop": ["zzz"]}) as resp:
+            lines = [line for line in resp.iter_lines() if line.startswith("data: ")]
+        texts = [p["choices"][0]["text"] for p in _sse_payloads(lines)]
+        assert "".join(texts) == "Hello!"        # held-back tail is flushed
+
+    def test_stream_options_include_usage(self, client):
+        c, _ = client
+        with c.stream("POST", "/v1/completions",
+                      json={"prompt": "hi", "max_tokens": 4, "stream": True,
+                            "stream_options": {"include_usage": True}}) as resp:
+            lines = [line for line in resp.iter_lines() if line.startswith("data: ")]
+        payloads = _sse_payloads(lines)
+        assert payloads[-1]["choices"] == [] and "usage" in payloads[-1]
+        assert payloads[-1]["usage"]["total_tokens"] >= 0
+
+    def test_seed_is_reproducible_and_restores_rng(self, client):
+        torch = pytest.importorskip("torch")
+        c, _ = client
+        before = torch.get_rng_state().clone()
+        body = {"prompt": "hi", "max_tokens": 4, "temperature": 1.5, "seed": 1234}
+        first = c.post("/v1/completions", json=body).json()
+        second = c.post("/v1/completions", json=body).json()
+        assert first["choices"][0]["text"] == second["choices"][0]["text"]
+        assert torch.equal(torch.get_rng_state(), before), "RNG state leaked"
+
+    def test_chat_forwards_sampling_and_stop(self, client):
+        c, engine = client
+        r = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4,
+            "top_k": 3, "stop": ["END"], "seed": 5})
+        assert r.status_code == 200
+        kwargs = engine.chat_kwargs[-1]
+        assert kwargs["top_k"] == 3 and kwargs["stop_tokens"] == ["END"]
+
+
+class TestQueueAndLimits:
+    def test_busy_returns_503_with_retry_after(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "0")
+        sem = srv._gen_semaphore
+        acquired = [sem.acquire(blocking=False) for _ in range(4)]
+        try:
+            r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2})
+            assert r.status_code == 503
+            assert r.headers.get("retry-after") == "1"
+        finally:
+            for ok in acquired:
+                if ok:
+                    sem.release()
+
+    def test_requests_queue_instead_of_failing(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "3")
+        import threading as _threading
+        sem = srv._gen_semaphore
+        assert sem.acquire(blocking=False)
+        _threading.Timer(0.2, sem.release).start()      # slot frees up shortly
+        r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2})
+        assert r.status_code == 200
+
+    def test_rate_limit_returns_retry_after(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_RATE_LIMIT", "1")
+        srv._rate_bucket.clear()
+        assert c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2}).status_code == 200
+        r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2})
+        assert r.status_code == 429
+        assert int(r.headers["retry-after"]) >= 1
+
+    def test_rate_bucket_is_pruned(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_MAX_CLIENTS", "64")
+        srv._rate_bucket.clear()
+        stale = time.time() - 120
+        for i in range(200):
+            srv._rate_bucket[f"10.0.0.{i}"] = [stale]
+        # Any rate-limited endpoint triggers the amortized prune.
+        assert c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2}).status_code == 200
+        assert len(srv._rate_bucket) < 200, "stale buckets were not pruned"
+
+    def test_body_size_limit(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_MAX_BODY_MB", "0")
+        r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2})
+        assert r.status_code == 413
+        assert "larger than" in r.json()["error"]["message"]
+
+
+class TestMiddlewareAndHealth:
+    def test_cors_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("AURALITE_CORS_ORIGINS", raising=False)
+        app = srv.create_app()
+        assert not _has_cors(app)
+
+    def test_cors_enabled_via_env(self, monkeypatch):
+        monkeypatch.setenv("AURALITE_CORS_ORIGINS", "http://localhost:3000")
+        app = srv.create_app()
+        assert _has_cors(app)
+
+    def test_health_reports_backend_adapter(self, client):
+        c, _ = client
+        body = c.get("/health").json()
+        assert body["backend"] == "torch" and body["model_loaded"] is True
+
+
+def _has_cors(app) -> bool:
+    from starlette.middleware.cors import CORSMiddleware
+    return any(m.cls is CORSMiddleware for m in app.user_middleware)
+
+
+# ----------------------------------------------------------------------
+#  Ollama-compatible surface
+# ----------------------------------------------------------------------
+class TestOllamaCompat:
+    def test_version(self, client):
+        c, _ = client
+        r = c.get("/api/version")
+        assert r.status_code == 200 and r.json()["version"]
+
+    def test_tags_lists_the_model(self, client):
+        c, _ = client
+        body = c.get("/api/tags").json()
+        assert body["models"] and body["models"][0]["name"] == srv.MODEL_ID
+        assert "details" in body["models"][0]
+
+    def test_generate_non_stream(self, client):
+        c, engine = client
+        r = c.post("/api/generate", json={"model": "auralite", "prompt": "hi",
+                                          "stream": False,
+                                          "options": {"num_predict": 4, "top_k": 9}})
+        body = r.json()
+        assert body["done"] is True and body["response"] == " world"
+        assert body["eval_count"] >= 0
+        assert engine.generation_kwargs[-1]["top_k"] == 9
+
+    def test_generate_stream_ndjson(self, client):
+        c, _ = client
+        with c.stream("POST", "/api/generate",
+                      json={"prompt": "hi", "stream": True}) as resp:
+            assert resp.headers["content-type"].startswith("application/x-ndjson")
+            chunks = [json.loads(line) for line in resp.iter_lines() if line]
+        assert chunks[-1]["done"] is True
+        assert "".join(ch["response"] for ch in chunks[:-1]) == "Hello!"
+
+    def test_chat_non_stream_and_stream(self, client):
+        c, _ = client
+        r = c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}],
+                                      "stream": False})
+        assert r.json()["message"]["content"] == "chat answer"
+        with c.stream("POST", "/api/chat",
+                      json={"messages": [{"role": "user", "content": "hi"}],
+                            "stream": True}) as resp:
+            chunks = [json.loads(line) for line in resp.iter_lines() if line]
+        assert chunks[-1]["done"] is True
+        assert "".join(ch["message"]["content"] for ch in chunks[:-1]) == "chat stream"
+
+    def test_ollama_stop_option_is_honoured(self, client):
+        c, _ = client
+        r = c.post("/api/generate", json={"prompt": "hi", "stream": False,
+                                          "options": {"stop": [" world"]}})
+        assert r.json()["response"] == ""
+
+
+class TestConcurrentGenerationSlots:
+    """P2.11: bursty independent requests must queue (never overlap the engine)."""
+
+    @staticmethod
+    def _slow_engine(engine, delay: float = 0.15):
+        import threading
+
+        state = {"active": 0, "peak": 0, "calls": 0}
+        lock = threading.Lock()
+
+        def slow_generate(prompt, length=50, temperature=0.8, top_k=50, top_p=0.9,
+                          repetition_penalty=1.0, min_p=0.0, **kw):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+                state["calls"] += 1
+            try:
+                time.sleep(delay)
+                return f"{prompt} ok"
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+        engine.generate = slow_generate
+        return state
+
+    @staticmethod
+    def _burst(client, count: int):
+        import threading
+
+        codes: list[int] = []
+
+        def worker(index: int):
+            response = client.post("/v1/completions",
+                                   json={"prompt": f"q{index}", "max_tokens": 2})
+            codes.append(response.status_code)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        return codes
+
+    def test_burst_is_queued_not_rejected(self, client, monkeypatch):
+        c, engine = client
+        monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "15")
+        monkeypatch.setattr(srv, "_gen_semaphore", __import__("threading").BoundedSemaphore(2))
+        state = self._slow_engine(engine)
+
+        codes = self._burst(c, 6)
+
+        assert codes == [200] * 6, codes          # nobody got a 503
+        assert state["calls"] == 6                # every request reached the engine
+        assert state["peak"] <= 2, state          # the slot limit still holds
+
+    def test_single_slot_serialises_engine_calls(self, client, monkeypatch):
+        import threading
+
+        c, engine = client
+        monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "15")
+        monkeypatch.setattr(srv, "_gen_semaphore", threading.BoundedSemaphore(1))
+        state = self._slow_engine(engine)
+
+        codes = self._burst(c, 4)
+
+        assert codes == [200] * 4, codes
+        # One slot: the mutable KV cache is never touched twice at once.
+        assert state["peak"] == 1, state

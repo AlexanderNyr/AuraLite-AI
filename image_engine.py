@@ -42,6 +42,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
+import logging
+
+logger = logging.getLogger("auralite.image")
+
 
 try:  # Pillow is an optional extra used only for reading/writing image files.
     from PIL import Image
@@ -668,9 +672,9 @@ class ImageGenEngine:
                                         device=self.device)
                     _ = compiled(probe, torch.zeros(1, dtype=torch.long, device=self.device))
                 train_model = compiled
-                print("[AuraLite-Image] torch.compile enabled.")
+                logger.info("[AuraLite-Image] torch.compile enabled.")
             except Exception as e:
-                print(f"[AuraLite-Image] torch.compile disabled (eager): {e}")
+                logger.warning(f"[AuraLite-Image] torch.compile disabled (eager): {e}")
                 try:
                     torch._dynamo.reset()
                 except Exception:
@@ -684,11 +688,11 @@ class ImageGenEngine:
         epochs = cfg["epochs"]
         n_batches = max(1, len(loader))
         total_steps = epochs * n_batches
-        print(f"[AuraLite-Image] {len(dataset)} images, {cfg['img_size']}px, "
-              f"{cfg['channels']}ch | params: {model.count_parameters():,} | "
-              f"pred={cfg['prediction_type']} sched={cfg['schedule']} amp={amp_dtype} "
-              f"ema={cfg['use_ema']} | {epochs} epochs x {n_batches} = {total_steps} steps | "
-              f"device={self.device}")
+        logger.info(f"[AuraLite-Image] {len(dataset)} images, {cfg['img_size']}px, "
+                    f"{cfg['channels']}ch | params: {model.count_parameters():,} | "
+                    f"pred={cfg['prediction_type']} sched={cfg['schedule']} amp={amp_dtype} "
+                    f"ema={cfg['use_ema']} | {epochs} epochs x {n_batches} = {total_steps} steps | "
+                    f"device={self.device}")
 
         t0 = _time.time()
         last_report = 0.0
@@ -753,7 +757,7 @@ class ImageGenEngine:
                 try:
                     self.save_model(autosave_path)
                 except Exception as e:
-                    print(f"[AuraLite-Image] autosave failed: {e}")
+                    logger.warning(f"[AuraLite-Image] autosave failed: {e}")
             if progress_callback is not None:
                 progress_callback(epoch + 1, epochs, epoch_loss, None, info={
                     "phase": "epoch_end",

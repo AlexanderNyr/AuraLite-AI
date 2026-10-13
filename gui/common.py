@@ -67,6 +67,10 @@ import sys
 import io
 import time
 import json
+import logging
+
+#: Logger used by the GUI modules (`auralite.gui`, inherits the CLI/library setup).
+logger = logging.getLogger("auralite.gui")
 
 try:
     import matplotlib

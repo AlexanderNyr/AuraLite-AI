@@ -1,4 +1,5 @@
 import os
+import tempfile
 import time
 
 # -----------------------------------------------------------------------
@@ -35,37 +36,83 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import json
-import math
-import re
 import logging
+import math
 from collections import Counter, defaultdict
+from uuid import uuid4
 from pathlib import Path
 from typing import Callable, Iterator, Any, List, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 
+from model_engine.logging_utils import canonical_level, engine_logging
+
 logger = logging.getLogger("auralite")
-if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(_handler)
-logger.setLevel(os.environ.get("AURALITE_LOG_LEVEL", "INFO"))
+
+
+def _remove_file_quietly(path: str) -> None:
+    """atexit fallback for `AuraLiteEngine._release_corpus_tempfile`."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+# The engine used to `print()` its progress to stdout; v2.6.5 routes everything
+# through this logger instead. Messages keep their historical "[AuraLite] ..."
+# / "[AuraLite] WARNING: ..." wording, so terminal output stays recognisable
+# while applications can now silence or redirect it. DynamicStreamHandler
+# re-resolves sys.stderr on every record, which keeps pytest's `capsys` and the
+# GUI's console redirector working; `engine_logging()` is idempotent, so a
+# front-end (CLI, GUI, tests) may reconfigure the logger and restore it later.
+engine_logging(level=canonical_level(), stream_name="stderr")
 
 
 # Safe checkpoint I/O lives in model_engine/safe_io.py (shared with
 # image_engine). `.pt` files are loaded with weights_only=True by default.
-from model_engine.safe_io import (  # noqa: E402
+from model_engine.safe_io import (  # noqa: E402,F401
     numpy_rng_state_to_builtins as _numpy_rng_state_to_builtins,
     numpy_rng_state_from_builtins as _numpy_rng_state_from_builtins,
     safe_torch_load as _safe_torch_load,
     save_safetensors_checkpoint as _save_safetensors_checkpoint,
     load_safetensors_checkpoint as _load_safetensors_checkpoint,
 )
+
+
+# ---------------------------------------------------------------------------
+# Public re-exports (v2.6.5 decomposition)
+#
+# The classes below used to live in this file; they now have their own modules
+# (`model_engine/tokenizers.py`, `layers.py`, `model.py`, `dataset.py`,
+# `scheduler.py`, `optimizers.py`, `gguf_proxy.py`). They are imported back here
+# so `model_engine._legacy` — and therefore `model_engine` — keeps exposing
+# exactly the same names as before.
+# ---------------------------------------------------------------------------
+from model_engine.tokenizers import (  # noqa: E402,F401
+    UNK_TOKEN, BPETokenizer, CharTokenizer, tokenizer_from_dict,
+)
+from model_engine.layers import (  # noqa: E402,F401
+    _FLEX_COMPILED, Attention, FeedForward, HeadwiseRMSNorm, RMSNorm, Top2MoE,
+    TransformerBlock, _flex_attention_available, _flex_block_mask,
+    _get_flex_attention, _sdpa_supports_gqa,
+)
+from model_engine.model import (  # noqa: E402,F401
+    LoRALayer, ModernTransformer, estimate_n_params,
+)
+from model_engine.dataset import CharDataset  # noqa: E402,F401
+from model_engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
+from model_engine.optimizers import (  # noqa: E402,F401
+    Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
+    split_parameters_for_muon,
+)
+from model_engine.gguf_proxy import (  # noqa: E402,F401
+    is_gguf_like,
+    GGUFModelProxy, GGUFNotAvailableError, GGUFTokenizerProxy,
+    _gguf_rolling_loglikelihood,
+)
+
 
 # Optional Hugging Face + LoRA/QLoRA support
 try:
@@ -233,330 +280,16 @@ def validate_params(params: dict) -> list[str]:
 #  Tokenizers — character-level and BPE (Byte/Char Pair Encoding)
 # ===================================================================
 
-UNK_TOKEN = "\ufffd"  # Unicode replacement character
 
 
-class CharTokenizer:
-    """Simple character-level tokenizer (original AuraLite behaviour)."""
-
-    kind = "char"
-
-    def __init__(self):
-        self.vocab: list[str] = []
-        self.token_to_id: dict[str, int] = {}
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.vocab)
-
-    def train(self, text: str, vocab_size: int | None = None):
-        self.vocab = sorted(set(text))
-        self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
-
-    def encode(self, s: str) -> list[int]:
-        fb = self.token_to_id.get(" ", 0)
-        return [self.token_to_id.get(c, fb) for c in s]
-
-    def decode(self, ids) -> str:
-        return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else "?"
-                       for i in ids)
-
-    def to_dict(self) -> dict:
-        return {"kind": self.kind, "vocab": self.vocab}
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "CharTokenizer":
-        tok = cls()
-        tok.vocab = list(d["vocab"])
-        tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
-        return tok
 
 
-class BPETokenizer:
-    """Mini BPE tokenizer (classic word-frequency algorithm, GPT-2 style).
-
-    Trained on the corpus itself: starts from the character vocabulary and
-    greedily merges the most frequent adjacent pair until `vocab_size` is
-    reached. Merges never cross whitespace-split piece boundaries, and
-    encoding caches per-piece results, so both training and encoding stay
-    fast even on multi-megabyte texts.
-
-    IMPROVED (v2.1+):
-    - Uses stratified sampling for training on huge files (instead of prefix)
-    - Adds unk_token for out-of-vocabulary characters during encode
-    """
-
-    kind = "bpe"
-    unk_token = UNK_TOKEN  # Unicode replacement character
-
-    def __init__(self):
-        self.vocab: list[str] = []
-        self.token_to_id: dict[str, int] = {}
-        # ordered merge rules: (id_a, id_b) -> new_id, rank = list index
-        self.merges: list[tuple[int, int, int]] = []
-        self._ranks: dict[tuple[int, int], tuple[int, int]] = {}
-        self._cache: dict[str, list[int]] = {}
-        self._unk_id: int = 0
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.vocab)
-
-    # ---- helpers -----------------------------------------------------
-    @staticmethod
-    def _split_pieces(text: str) -> list[str]:
-        # keep whitespace runs as separate pieces so nothing is lost
-        return [p for p in re.split(r"(\s+)", text) if p]
-
-    def _build_ranks(self):
-        self._ranks = {(a, b): (r, nid) for r, (a, b, nid) in enumerate(self.merges)}
-        self._cache = {}
-
-    # ---- training ----------------------------------------------------
-    def train(self, text: str, vocab_size: int = 512):
-        # IMPROVED: stratified sampling for large files
-        # Instead of just taking the prefix, sample chunks spread across the text
-        sample = self._stratified_sample(text, max_chars=2_000_000, n_chunks=100)
-
-        base_chars = sorted(set(sample))
-        self.vocab = list(base_chars)
-        self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
-        self.merges = []
-
-        # Ensure unk_token is always in vocab
-        if self.unk_token not in self.token_to_id:
-            self.vocab.append(self.unk_token)
-            self.token_to_id[self.unk_token] = len(self.vocab) - 1
-
-        self._unk_id = self.token_to_id.get(self.unk_token, 0)
-
-        if vocab_size <= len(self.vocab):
-            self._build_ranks()
-            return
-
-        # word-frequency corpus: distinct pieces with counts
-        piece_counts = Counter(self._split_pieces(sample))
-        corpus: list[list[int]] = []
-        piece_cnts: list[int] = []
-        for piece, cnt in piece_counts.items():
-            corpus.append([self.token_to_id.get(c, self._unk_id) for c in piece])
-            piece_cnts.append(cnt)
-
-        # ---- Incremental merge trainer (v2.6.2) -------------------------
-        # The naive implementation rebuilt the full pair-count table and
-        # rescanned every piece for EVERY merge — O(merges x corpus). Here we
-        # keep the counts, the first-occurrence keys and the piece index
-        # up-to-date incrementally, and pull the best pair from a max-heap.
-        # Only the pieces that actually contain the merged pair are touched.
-        #
-        # The result is *bit-for-bit identical* to the naive trainer: the heap
-        # key (-count, first_key) reproduces Counter.most_common()'s tie-break
-        # by first insertion order, because first insertion during a full scan
-        # == the pair with the smallest (piece_index, position) key.
-        import heapq
-
-        M = max((len(ids) for ids in corpus), default=1) + 1  # bounds positions
-
-        pair_totals: Counter = Counter()
-        pair_pos: dict[tuple[int, int], dict[int, int]] = {}  # pair -> {piece: first_pos}
-        for pidx, ids in enumerate(corpus):
-            if len(ids) < 2:
-                continue
-            cnt = piece_cnts[pidx]
-            for i in range(len(ids) - 1):
-                pair = (ids[i], ids[i + 1])
-                pair_totals[pair] += cnt
-                entry = pair_pos.setdefault(pair, {})
-                if pidx not in entry:
-                    entry[pidx] = i  # positions are visited left-to-right
-
-        def _first_key(pair: tuple[int, int]) -> int:
-            entry = pair_pos.get(pair)
-            if not entry:
-                return (1 << 62)
-            return min(p * M + i for p, i in entry.items())
-
-        heap: list[tuple[int, int, tuple[int, int]]] = [
-            (-c, _first_key(pair), pair) for pair, c in pair_totals.items()
-        ]
-        heapq.heapify(heap)
-
-        def _refresh(pair: tuple[int, int]):
-            if pair_totals.get(pair, 0) > 0:
-                heapq.heappush(heap, (-pair_totals[pair], _first_key(pair), pair))
-
-        while len(self.vocab) < vocab_size:
-            # Pop stale heap entries until the top is current.
-            a = b = best_cnt = None
-            while heap:
-                neg_c, fk, pair = heap[0]
-                if (pair_totals.get(pair, 0) == -neg_c
-                        and _first_key(pair) == fk):
-                    a, b = pair
-                    best_cnt = -neg_c
-                    break
-                heapq.heappop(heap)
-            if best_cnt is None or best_cnt < 2:
-                break
-
-            new_id = len(self.vocab)
-            new_tok = self.vocab[a] + self.vocab[b]
-            self.vocab.append(new_tok)
-            self.token_to_id[new_tok] = new_id
-            self.merges.append((a, b, new_id))
-
-            touched: set[tuple[int, int]] = set()
-            # Apply the merge to every piece that contains the pair.
-            for pidx in sorted(pair_pos.get((a, b), ())):
-                ids = corpus[pidx]
-                cnt = piece_cnts[pidx]
-                # remove this piece's old pair contributions
-                for i in range(len(ids) - 1):
-                    old_pair = (ids[i], ids[i + 1])
-                    pair_totals[old_pair] -= cnt
-                    pos_map = pair_pos.get(old_pair)
-                    if pos_map is not None:
-                        pos_map.pop(pidx, None)
-                        if not pos_map:
-                            pair_pos.pop(old_pair, None)
-                    if pair_totals[old_pair] <= 0:
-                        pair_totals.pop(old_pair, None)
-                        pair_pos.pop(old_pair, None)
-                    touched.add(old_pair)
-                # apply the merge
-                i, out = 0, []
-                while i < len(ids):
-                    if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
-                        out.append(new_id)
-                        i += 2
-                    else:
-                        out.append(ids[i])
-                        i += 1
-                ids[:] = out
-                # add this piece's new pair contributions
-                for i in range(len(ids) - 1):
-                    new_pair = (ids[i], ids[i + 1])
-                    pair_totals[new_pair] += cnt
-                    entry = pair_pos.setdefault(new_pair, {})
-                    if pidx not in entry:
-                        entry[pidx] = i
-                    touched.add(new_pair)
-            for pair in touched:
-                _refresh(pair)
-
-        self._build_ranks()
-
-    @staticmethod
-    def _stratified_sample(text: str, max_chars: int = 2_000_000,
-                           n_chunks: int = 100) -> str:
-        """Take evenly-spaced chunks from the full text instead of just the prefix."""
-        if len(text) <= max_chars:
-            return text
-        chunk_size = max_chars // n_chunks
-        total_len = len(text)
-        step = total_len // n_chunks
-        parts = []
-        for i in range(n_chunks):
-            start = i * step
-            end = min(start + chunk_size, total_len)
-            parts.append(text[start:end])
-        return "".join(parts)
-
-    # ---- encode / decode ----------------------------------------------
-    def _encode_piece(self, piece: str) -> list[int]:
-        cached = self._cache.get(piece)
-        if cached is not None:
-            return cached
-
-        # Use unk_token for unknown characters instead of fallback to space
-        ids = [self.token_to_id.get(c, self._unk_id) for c in piece]
-        # repeatedly apply the lowest-rank merge present (GPT-2 algorithm)
-        while len(ids) > 1:
-            best_rank, best_pos, best_new = None, -1, -1
-            for i in range(len(ids) - 1):
-                r = self._ranks.get((ids[i], ids[i + 1]))
-                if r is not None and (best_rank is None or r[0] < best_rank):
-                    best_rank, best_pos, best_new = r[0], i, r[1]
-            if best_rank is None:
-                break
-            a, b = ids[best_pos], ids[best_pos + 1]
-            i, out = 0, []
-            while i < len(ids):
-                if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
-                    out.append(best_new)
-                    i += 2
-                else:
-                    out.append(ids[i])
-                    i += 1
-            ids = out
-
-        if len(self._cache) < 200_000:
-            self._cache[piece] = ids
-        return ids
-
-    def encode(self, s: str) -> list[int]:
-        out: list[int] = []
-        for piece in self._split_pieces(s):
-            out.extend(self._encode_piece(piece))
-        return out
-
-    def decode(self, ids) -> str:
-        return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else self.unk_token
-                       for i in ids)
-
-    # ---- (de)serialization ---------------------------------------------
-    def to_dict(self) -> dict:
-        return {"kind": self.kind, "vocab": self.vocab, "merges": self.merges,
-                "unk_token": self.unk_token}
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "BPETokenizer":
-        tok = cls()
-        tok.vocab = list(d["vocab"])
-        tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
-        tok.merges = [tuple(m) for m in d.get("merges", [])]
-        tok.unk_token = d.get("unk_token", UNK_TOKEN)
-        tok._unk_id = tok.token_to_id.get(tok.unk_token, 0)
-        tok._build_ranks()
-        return tok
 
 
 # ===================================================================
 #  Auto-recommendation helpers
 # ===================================================================
 
-def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
-                      d_ff: int, n_heads: int,
-                      n_kv_heads: int | None = None) -> int:
-    """Rough parameter count for a LLaMA-style decoder-only transformer.
-
-    Mirrors `ModernTransformer`, which by default keeps the input embedding and
-    the output LM head as two independent matrices (untied), so both are counted.
-    Accurate to within ~3% of `model.count_parameters()` for typical configs.
-    """
-    n_kv = n_kv_heads if (n_kv_heads and n_kv_heads > 0) else n_heads
-    head_dim = d_model // max(1, n_heads)
-
-    # Input embedding + separate output head (untied by default).
-    embed = vocab_size * d_model        # token embedding
-    head = vocab_size * d_model         # output projection (LM head)
-
-    # Per layer:
-    #   attn: W_q (d_model * n_heads*head_dim)
-    #         W_k (d_model * n_kv*head_dim)
-    #         W_v (d_model * n_kv*head_dim)
-    #         W_o (n_heads*head_dim * d_model)
-    attn = (d_model * n_heads * head_dim          # Q
-            + d_model * n_kv * head_dim * 2       # K + V
-            + n_heads * head_dim * d_model)       # O
-    # SwiGLU FFN: gate + up + down (all bias-free)
-    ffn  = 3 * d_model * d_ff
-    # RMSNorm has `d_model` params, two per block + one final
-    norms_per_layer = 2 * d_model
-
-    per_layer = attn + ffn + norms_per_layer
-    final_norm = d_model
-    return embed + head + n_layers * per_layer + final_norm
 
 
 def recommend_epochs(n_tokens: int, n_params: int,
@@ -673,53 +406,16 @@ def recommend_gen_length(seed_str: str,
     return max(1, raw)
 
 
-def tokenizer_from_dict(d: dict):
-    if d.get("kind") == "bpe":
-        return BPETokenizer.from_dict(d)
-    return CharTokenizer.from_dict(d)
 
 
 # ===================================================================
 #  Modern Building Blocks  (LLaMA / Mistral / Qwen heritage, 2025-26)
 # ===================================================================
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization — faster & more stable than LayerNorm."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x.float() * rms).type_as(x) * self.weight
 
 
 # -------------------------------------------------------------------
 
-class HeadwiseRMSNorm(nn.Module):
-    """Per-head RMSNorm for QK-norm (query/key normalization).
-
-    QK-norm was popularized for vision transformers (Dehghani et al., 2023,
-    "Scaling Vision Transformers to 22 Billion Parameters") and is now standard
-    in modern LLMs (OLMo-2, Gemma-2/3, Qwen3, GLM): normalizing q/k per head
-    before RoPE caps attention-logit growth and stabilizes training at high LR.
-
-    Weight shape is ``(num_heads, head_dim)`` so every head learns its own
-    scale, matching the head-wise formulations used in recent codebases.
-
-    Expected input layout: ``(batch, seq, num_heads, head_dim)``.
-    """
-
-    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_heads, head_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x.float() * rms).type_as(x) * self.weight
 
 
 # -------------------------------------------------------------------
@@ -727,948 +423,48 @@ class HeadwiseRMSNorm(nn.Module):
 _SDPA_GQA_SUPPORTED: bool | None = None
 
 
-def _sdpa_supports_gqa() -> bool:
-    """True when this torch supports SDPA `enable_gqa=True` (>= 2.5)."""
-    global _SDPA_GQA_SUPPORTED
-    if _SDPA_GQA_SUPPORTED is None:
-        try:
-            q = torch.zeros(1, 2, 1, 4)
-            kv = torch.zeros(1, 1, 1, 4)
-            F.scaled_dot_product_attention(q, kv, kv, enable_gqa=True)
-            F.scaled_dot_product_attention(q, kv, kv, is_causal=True, enable_gqa=True)
-            _SDPA_GQA_SUPPORTED = True
-        except (TypeError, RuntimeError):
-            _SDPA_GQA_SUPPORTED = False
-    return _SDPA_GQA_SUPPORTED
 
 
 # -------------------------------------------------------------------
 #  FlexAttention support (v2.6.5) — opt-in via use_flex_attention=True
 # -------------------------------------------------------------------
-_FLEX_COMPILED = None      # compiled flex_attention fn, or False when unavailable
-_FLEX_BLOCK_MASKS: dict = {}
-_FLEX_FAILED: set = set()  # module ids where flex raised → permanent SDPA fallback
 
 
-def _flex_attention_available() -> bool:
-    """True when torch provides FlexAttention (torch >= 2.5)."""
-    return _get_flex_attention() is not False
 
 
-def _get_flex_attention():
-    """Lazily import + compile `flex_attention` (compilation is one-off, ~seconds).
-
-    Returns the compiled callable, or False when unavailable. Compilation is
-    attempted at most once per process; any failure disables the path for good.
-    """
-    global _FLEX_COMPILED
-    if _FLEX_COMPILED is None:
-        try:
-            from torch.nn.attention.flex_attention import flex_attention
-            _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
-            logger.info(
-                "use_flex_attention=True: FlexAttention compiled on first use "
-                "(this can take a few seconds).")
-        except Exception as err:  # pragma: no cover - depends on torch build
-            logger.warning("FlexAttention unavailable (%s); falling back to SDPA.", err)
-            _FLEX_COMPILED = False
-    return _FLEX_COMPILED
 
 
-def _flex_block_mask(batch: int, heads: int, q_len: int, kv_len: int,
-                     start_pos: int, key_start_pos: int, window: int | None,
-                     device):
-    """Cached block mask for causal (+ optional sliding-window) attention.
 
-    `start_pos` / `key_start_pos` shift the causal diagonal: with a KV-cache the
-    query at absolute position `start_pos + i` may attend to keys at absolute
-    positions `key_start_pos + j <= start_pos + i`.
-    """
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    key = (batch, heads, q_len, kv_len, start_pos, key_start_pos, window, str(device))
-    mask = _FLEX_BLOCK_MASKS.get(key)
-    if mask is None:
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_abs = q_idx + start_pos
-            kv_abs = kv_idx + key_start_pos
-            keep = q_abs >= kv_abs
-            if window is not None:
-                keep = keep & ((q_abs - kv_abs) < window)
-            return keep
-
-        mask = create_block_mask(mask_mod, batch, heads, q_len, kv_len, device=device)
-        if len(_FLEX_BLOCK_MASKS) > 32:  # keep the cache bounded (decode steps)
-            _FLEX_BLOCK_MASKS.clear()
-        _FLEX_BLOCK_MASKS[key] = mask
-    return mask
-
-
-class Attention(nn.Module):
-    """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
-
-    Uses torch.nn.functional.scaled_dot_product_attention (Flash / memory-
-    efficient kernels when available) instead of a hand-rolled softmax.
-
-    IMPROVED (v2.1+):
-    - ALiBi (Attention with Linear Biases) support for better length extrapolation
-    - ALiBi path now keeps a *hard* causal mask (future tokens are forbidden)
-    """
-
-    def __init__(self, d_model: int, n_heads: int,
-                 n_kv_heads: int | None = None,
-                 max_seq_len: int = 4096,
-                 use_alibi: bool = False,
-                 rope_scaling: dict | None = None,
-                 sliding_window: int | None = None,
-                 kv_cache_dtype: str | None = None,
-                 use_flex_attention: bool = False,
-                 use_qk_norm: bool = False):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.n_kv_heads = (n_kv_heads or None) or n_heads
-        if self.n_heads % self.n_kv_heads != 0:
-            raise ValueError("n_heads must be divisible by n_kv_heads for GQA")
-        self.n_rep = self.n_heads // self.n_kv_heads
-        self.use_alibi = use_alibi
-        self.rope_scaling = rope_scaling or {}  # {'type': 'yarn'|'ntk'|'linear', 'factor': float}
-        self.sliding_window = int(sliding_window) if sliding_window else None
-        self.kv_cache_dtype = kv_cache_dtype
-        self.use_flex_attention = bool(use_flex_attention)
-        self.use_qk_norm = bool(use_qk_norm)
-        self.kv_cache_start_pos = 0
-
-        self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
-        self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-
-        # QK-norm (v2.6): per-head RMSNorm applied to q/k BEFORE RoPE.
-        # Stabilizes attention logits; standard in OLMo-2 / Gemma-2 / Qwen3.
-        if self.use_qk_norm:
-            self.q_norm = HeadwiseRMSNorm(n_heads, self.head_dim)
-            self.k_norm = HeadwiseRMSNorm(self.n_kv_heads, self.head_dim)
-
-        # Pre-compute RoPE cos / sin as persistent buffers (move with .to(device))
-        self.max_seq_len = max_seq_len
-        self._build_rope_buffers(max_seq_len)
-        # v2.6.3: native GQA in SDPA (torch>=2.5) removes the per-step
-        # repeat_interleave copy of the whole KV cache. Detect once per process.
-        self._sdpa_enable_gqa = _sdpa_supports_gqa() if self.n_rep > 1 else False
-
-        # ALiBi slopes (one per head)
-        if use_alibi:
-            self.register_buffer("alibi_slopes", self._get_alibi_slopes(), persistent=True)
-
-        self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
-
-    def _yarn_find_correction_dim(self, num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
-        """YaRN helper from the public formula: dimension where a frequency
-        performs `num_rotations` rotations over the original context length."""
-        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
-
-    def _yarn_linear_ramp_mask(self, low: float, high: float, dim: int) -> torch.Tensor:
-        if low == high:
-            high += 1e-3
-        linear = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
-        return torch.clamp(linear, 0.0, 1.0)
-
-    def _rope_inv_freq_and_scale(self) -> tuple[torch.Tensor, float]:
-        """Return inverse frequencies and post-scale for LLaMA-compatible RoPE.
-
-        Standard RoPE uses exactly `1 / theta ** (i / dim)` for even rotary
-        dimensions. Linear scaling divides positions by `factor`; dynamic NTK
-        changes theta for extrapolation; YaRN blends interpolated and extrapolated
-        frequencies with the public beta-fast/beta-slow ramp and mscale.
-        """
-        base = float((self.rope_scaling or {}).get("base", 10000.0))
-        scaling = self.rope_scaling or {}
-        scale_type = str(scaling.get("type", "none")).lower()
-        factor = float(scaling.get("factor", 1.0) or 1.0)
-        dim_range = torch.arange(0, self.head_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (base ** (dim_range / self.head_dim))
-        mscale = 1.0
-
-        if factor <= 1.0 or scale_type in {"none", ""}:
-            return inv_freq, mscale
-        if scale_type in {"ntk", "dynamic_ntk"}:
-            # Dynamic NTK scaling as used by LLaMA-family implementations.
-            # At the original context length this reduces to regular RoPE.
-            seq_len = max(self.max_seq_len, int(scaling.get("original_max_position_embeddings", self.max_seq_len)) + 1)
-            original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
-            ntk_base = base * (((factor * seq_len / max(1, original)) - (factor - 1.0)) ** (self.head_dim / max(1, self.head_dim - 2)))
-            inv_freq = 1.0 / (ntk_base ** (dim_range / self.head_dim))
-        elif scale_type == "yarn":
-            original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
-            beta_fast = float(scaling.get("beta_fast", 32.0))
-            beta_slow = float(scaling.get("beta_slow", 1.0))
-            low = math.floor(self._yarn_find_correction_dim(beta_fast, self.head_dim, base, original))
-            high = math.ceil(self._yarn_find_correction_dim(beta_slow, self.head_dim, base, original))
-            ramp = self._yarn_linear_ramp_mask(low, high, self.head_dim // 2)
-            extrapolation = inv_freq
-            interpolation = inv_freq / factor
-            inv_freq = interpolation * (1.0 - ramp) + extrapolation * ramp
-            # DeepSeek/LLaMA YaRN convention: attention_factor defaults to
-            # 0.1*ln(factor)+1.0 and scales both cos and sin.
-            mscale = float(scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0))
-        return inv_freq, mscale
-
-    def _build_rope_buffers(self, seq_len: int):
-        """Build LLaMA-compatible RoPE cos/sin buffers.
-
-        Buffers have shape `(seq_len, head_dim)`, not `(seq_len, head_dim/2)`,
-        so `_apply_rope` can use the canonical `x*cos + rotate_half(x)*sin`
-        formula and compare directly with Hugging Face/transformers outputs.
-        """
-        inv_freq, mscale = self._rope_inv_freq_and_scale()
-        scaling = self.rope_scaling or {}
-        scale_type = str(scaling.get("type", "none")).lower()
-        factor = float(scaling.get("factor", 1.0) or 1.0)
-        t = torch.arange(seq_len, dtype=torch.float32)
-        if scale_type == "linear" and factor != 1.0:
-            t = t / factor
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # NOTE (v2.6.1): buffers are NON-persistent. They are a pure function of
-        # (head_dim, theta, scaling, seq_len), rebuilt in __init__ and extended on
-        # demand by _apply_rope (RoPE extrapolation past max_seq_len). Persisting
-        # them poisoned checkpoints: after a long generation the buffers grew past
-        # max_seq_len and load_state_dict() failed with a size mismatch, making the
-        # saved model unloadable.
-        self.register_buffer("rope_cos", emb.cos() * mscale, persistent=False)
-        self.register_buffer("rope_sin", emb.sin() * mscale, persistent=False)
-
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """LLaMA/HF rotate_half: [-x2, x1] over the last dimension halves."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _get_alibi_slopes(self) -> torch.Tensor:
-        """Compute monotonic ALiBi slopes, one per attention head."""
-        n = self.n_heads
-        return 2 ** (-8 * torch.arange(1, n + 1).float() / n)
-
-    # ---- RoPE --------------------------------------------------------
-    def _apply_rope(self, x: torch.Tensor, start_pos: int, seq_len: int) -> torch.Tensor:
-        """Apply Rotary Position Embeddings using the official LLaMA formula.
-
-        `x` is `(batch, seq, heads, head_dim)`. The result matches
-        transformers' `apply_rotary_pos_emb` (unsqueeze_dim=2) for the same
-        cos/sin buffers to within normal floating point tolerance.
-        """
-        if start_pos + seq_len > len(self.rope_cos):
-            self._build_rope_buffers(start_pos + seq_len)
-            self.rope_cos = self.rope_cos.to(x.device)
-            self.rope_sin = self.rope_sin.to(x.device)
-        cos = self.rope_cos[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
-        sin = self.rope_sin[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-        xf = x.float()
-        return (xf * cos + self._rotate_half(xf) * sin).type_as(x)
-
-    def _get_causal_keep_mask(self, q_len: int, k_len: int,
-                              device: torch.device, start_pos: int = 0,
-                              key_start_pos: int = 0) -> torch.Tensor:
-        """Boolean causal/sliding-window keep-mask for SDPA (True = allowed)."""
-        q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
-        k_pos = torch.arange(key_start_pos, key_start_pos + k_len, device=device)
-        keep = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-        if self.sliding_window is not None and self.sliding_window > 0:
-            keep = keep & (k_pos.unsqueeze(0) > (q_pos.unsqueeze(1) - self.sliding_window))
-        return keep
-
-    # ---- ALiBi bias --------------------------------------------------
-    def _get_alibi_bias(self, q_len: int, k_len: int,
-                        device: torch.device, start_pos: int = 0,
-                        key_start_pos: int = 0) -> torch.Tensor:
-        """Create an ALiBi attention bias with a hard causal mask.
-
-        Returned shape: (n_heads, q_len, k_len). Past/current positions get a
-        finite ALiBi bias, future positions are set to -inf and therefore
-        cannot be attended to. This fixes the old behaviour where ALiBi merely
-        penalised the future instead of forbidding it.
-        """
-        q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
-        k_pos = torch.arange(key_start_pos, key_start_pos + k_len, device=device)
-        rel_pos = k_pos.unsqueeze(0) - q_pos.unsqueeze(1)  # <= 0 for allowed keys
-        future = rel_pos > 0
-
-        bias = self.alibi_slopes[:, None, None] * rel_pos.to(torch.float32)
-        blocked = future
-        if self.sliding_window is not None and self.sliding_window > 0:
-            blocked = blocked | (k_pos.unsqueeze(0) <= (q_pos.unsqueeze(1) - self.sliding_window))
-        bias = bias.masked_fill(blocked.unsqueeze(0), float("-inf"))
-        return bias
-
-    # ---- KV cache helpers -------------------------------------------
-    def _pack_cache_tensor(self, t: torch.Tensor):
-        """Optionally store KV-cache in a lower precision format.
-
-        INT8 uses a per-tensor scale (simple and educational); FP8 uses native
-        torch float8 dtypes when available. Dequantization happens immediately
-        before attention, so correctness is preserved with graceful fallback.
-        """
-        dtype = (self.kv_cache_dtype or "").lower()
-        if dtype in {"", "none", "fp16", "bf16"}:
-            return t
-        if dtype in {"fp8", "fp8_e4m3"} and hasattr(torch, "float8_e4m3fn"):
-            return t.to(torch.float8_e4m3fn)
-        if dtype == "fp8_e5m2" and hasattr(torch, "float8_e5m2"):
-            return t.to(torch.float8_e5m2)
-        if dtype in {"int8", "i8"}:
-            scale = t.detach().abs().amax().clamp_min(1e-8) / 127.0
-            return (torch.clamp(torch.round(t / scale), -128, 127).to(torch.int8), scale)
-        return t
-
-    def _unpack_cache_tensor(self, packed, dtype: torch.dtype) -> torch.Tensor:
-        if isinstance(packed, tuple) and len(packed) == 2 and getattr(packed[0], "dtype", None) is torch.int8:
-            return (packed[0].to(dtype=torch.float32) * packed[1]).to(dtype)
-        if isinstance(packed, torch.Tensor) and str(packed.dtype).startswith("torch.float8"):
-            return packed.to(dtype)
-        return packed
-
-    def _get_cached_kv(self, dtype: torch.dtype):
-        if self.kv_cache is None:
-            return None
-        cached_k, cached_v = self.kv_cache
-        return self._unpack_cache_tensor(cached_k, dtype), self._unpack_cache_tensor(cached_v, dtype)
-
-    def _set_cached_kv(self, k: torch.Tensor, v: torch.Tensor):
-        self.kv_cache = (self._pack_cache_tensor(k.detach()), self._pack_cache_tensor(v.detach()))
-
-    # ---- Forward -----------------------------------------------------
-    def forward(self, x: torch.Tensor,
-                start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
-        B, T, _ = x.shape
-
-        q = self.W_q(x).view(B, T, self.n_heads,    self.head_dim)
-        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
-
-        # QK-norm: normalize per head BEFORE rotary embeddings.
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-        q = self._apply_rope(q, start_pos, T)
-        k = self._apply_rope(k, start_pos, T)
-
-        q = q.transpose(1, 2)   # (B, n_heads, T, hd)
-        k = k.transpose(1, 2)   # (B, n_kv_heads, T, hd) — cache stays unrepeated
-        v = v.transpose(1, 2)
-
-        key_start_pos = 0
-        if use_cache:
-            cached = self._get_cached_kv(k.dtype)
-            if cached is not None:
-                cached_k, cached_v = cached
-                key_start_pos = self.kv_cache_start_pos
-                k = torch.cat([cached_k, k], dim=2)
-                v = torch.cat([cached_v, v], dim=2)
-            # Sliding-window eviction: drop oldest tokens from the KV cache.
-            # key_start_pos tracks the absolute sequence position of cache[0].
-            if self.sliding_window is not None and self.sliding_window > 0 and k.shape[2] > self.sliding_window:
-                overflow = k.shape[2] - self.sliding_window
-                k = k[:, :, overflow:, :]
-                v = v[:, :, overflow:, :]
-                key_start_pos = key_start_pos + overflow  # absolute position of new cache[0]
-            # Always update stored start position *before* writing cache
-            self.kv_cache_start_pos = key_start_pos
-            self._set_cached_kv(k, v)
-
-        # Repeat KV *after* concatenating/evicting the cache. This preserves
-        # GQA memory savings in the cache and exactly matches LLaMA grouping.
-        # v2.6.3: when SDPA natively supports GQA (torch>=2.5) we skip the
-        # materialized repeat entirely — one less full-KV copy per layer per
-        # token, the dominant RAM-bandwidth cost of CPU decoding with GQA.
-        # Every code path here (causal / bool / float-bias / decode) is
-        # numerically identical to the repeated variant.
-        use_native_gqa = self.n_rep > 1 and self._sdpa_enable_gqa
-        if self.n_rep > 1 and not use_native_gqa:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
-
-        S = k.shape[2]
-        sdpa_gqa_kw = {"enable_gqa": True} if use_native_gqa else {}
-        # v2.6.5: real FlexAttention path when the model was built with
-        # use_flex_attention=True and the runtime supports it. It is used for
-        # prefill-shaped calls (T > 1) where the block mask can be cached;
-        # single-token decode steps stay on SDPA (a fresh block mask per token
-        # costs more than it saves on CPU). Any failure falls back to SDPA for
-        # that module permanently, so the flag can never break generation.
-        if (self.use_flex_attention and T > 1 and not self.use_alibi
-                and id(self) not in _FLEX_FAILED):
-            flex = _get_flex_attention()
-            if flex is not False:
-                try:
-                    mask = _flex_block_mask(
-                        B, self.n_heads, T, S, start_pos, key_start_pos,
-                        self.sliding_window, x.device)
-                    out = flex(q, k, v, block_mask=mask, enable_gqa=use_native_gqa)
-                    out = out.transpose(1, 2).contiguous().view(B, T, -1)
-                    return self.W_o(out)
-                except Exception as err:  # noqa: BLE001 - fall back, never crash
-                    _FLEX_FAILED.add(id(self))
-                    logger.warning(
-                        "FlexAttention failed (%s); module falls back to SDPA "
-                        "for the rest of the session.", err)
-        # Flash / memory-efficient attention via PyTorch SDPA.
-        if self.use_alibi:
-            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, **sdpa_gqa_kw)
-        elif T == S and start_pos == 0 and self.sliding_window is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **sdpa_gqa_kw)
-        elif T == 1 and self.sliding_window is None:
-            out = F.scaled_dot_product_attention(q, k, v, **sdpa_gqa_kw)
-        else:
-            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, **sdpa_gqa_kw)
-
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.W_o(out)
-
-    def reset_cache(self):
-        self.kv_cache = None
-        self.kv_cache_start_pos = 0
 
 
 # -------------------------------------------------------------------
 
-class FeedForward(nn.Module):
-    """SwiGLU Feed-Forward Network — standard in LLaMA / Qwen / Mistral.
-
-    IMPROVED (v2.1+):
-    - Optional LoRA adapters on gate / up / down projections. When `lora`
-      is set (an nn.ModuleDict via enable_lora()), the low-rank deltas are
-      actually applied during the forward pass.
-    """
-
-    def __init__(self, d_model: int, d_ff: int):
-        super().__init__()
-        self.gate = nn.Linear(d_model, d_ff, bias=False)
-        self.up   = nn.Linear(d_model, d_ff, bias=False)
-        self.down = nn.Linear(d_ff, d_model, bias=False)
-        # LoRA adapters (None until enable_lora is called on the parent model)
-        self.lora: nn.ModuleDict | None = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.lora is None:
-            return self.down(F.silu(self.gate(x)) * self.up(x))
-        # LoRA path: add low-rank deltas to each projection
-        g = self.gate(x) + self.lora["gate"](x)
-        u = self.up(x)   + self.lora["up"](x)
-        h = F.silu(g) * u
-        return self.down(h) + self.lora["down"](h)
 
 
-class Top2MoE(nn.Module):
-    """Educational top-2 Mixture-of-Experts feed-forward layer.
-
-    Each token is routed to its two highest-scoring SwiGLU experts. The layer
-    exposes `last_load_balance_loss` so the trainer can add a small auxiliary
-    penalty and avoid expert collapse. It is intentionally simple (dense expert
-    evaluation) for clarity and CPU fallback; production kernels can replace it
-    later without changing the public API.
-    """
-
-    def __init__(self, d_model: int, d_ff: int, num_experts: int = 4,
-                 top_k: int = 2, load_balance_weight: float = 0.01):
-        super().__init__()
-        self.num_experts = int(num_experts)
-        self.top_k = min(int(top_k), self.num_experts)
-        self.load_balance_weight = float(load_balance_weight)
-        self.router = nn.Linear(d_model, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([FeedForward(d_model, d_ff) for _ in range(self.num_experts)])
-        self.last_load_balance_loss: torch.Tensor | None = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        router_logits = self.router(x)
-        router_probs = torch.softmax(router_logits.float(), dim=-1)
-        top_prob, top_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
-        top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-
-        # Dense expert evaluation keeps the implementation readable and robust;
-        # top-k masks ensure only selected experts contribute to each token.
-        out = torch.zeros_like(x)
-        for expert_id, expert in enumerate(self.experts):
-            expert_out = expert(x)
-            weights = torch.zeros(B, T, device=x.device, dtype=expert_out.dtype)
-            for slot in range(self.top_k):
-                weights = weights + torch.where(top_idx[..., slot] == expert_id, top_prob[..., slot].to(expert_out.dtype), torch.zeros_like(weights))
-            out = out + expert_out * weights.unsqueeze(-1)
-
-        importance = router_probs.mean(dim=(0, 1))
-        load = torch.nn.functional.one_hot(top_idx, self.num_experts).float().sum(dim=-2).mean(dim=(0, 1)) / self.top_k
-        self.last_load_balance_loss = self.load_balance_weight * self.num_experts * torch.sum(importance * load.to(importance.device))
-        return out
 
 
 # -------------------------------------------------------------------
 
-class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: RMSNorm → Attention → RMSNorm → SwiGLU FFN.
-
-    IMPROVED (v2.3+):
-    - Optional gradient checkpointing for memory-efficient training
-    """
-
-    def __init__(self, d_model: int, n_heads: int, d_ff: int,
-                 n_kv_heads: int | None, max_seq_len: int,
-                 dropout: float = 0.0, use_alibi: bool = False,
-                 use_checkpoint: bool = False,
-                 rope_scaling: dict | None = None,
-                 sliding_window: int | None = None,
-                 kv_cache_dtype: str | None = None,
-                 use_flex_attention: bool = False,
-                 use_moe: bool = False,
-                 num_experts: int = 4,
-                 use_qk_norm: bool = False):
-        super().__init__()
-        self.attn_norm = RMSNorm(d_model)
-        self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
-                                   use_alibi=use_alibi,
-                                   rope_scaling=rope_scaling,
-                                   sliding_window=sliding_window,
-                                   kv_cache_dtype=kv_cache_dtype,
-                                   use_flex_attention=use_flex_attention,
-                                   use_qk_norm=use_qk_norm)
-        self.ffn_norm  = RMSNorm(d_model)
-        self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
-        self.dropout   = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.use_checkpoint = use_checkpoint
-
-    def _forward_impl(self, x: torch.Tensor,
-                      start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
-        """Internal forward pass (used by checkpointing)."""
-        x = x + self.dropout(self.attn(self.attn_norm(x), start_pos, use_cache))
-        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
-        return x
-
-    def forward(self, x: torch.Tensor,
-                start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
-        if self.use_checkpoint and self.training and not use_cache:
-            # Gradient checkpointing: trade compute for memory
-            return torch.utils.checkpoint.checkpoint(
-                self._forward_impl, x, start_pos, use_cache,
-                use_reentrant=False
-            )
-        return self._forward_impl(x, start_pos, use_cache)
 
 
 # ===================================================================
 
-class ModernTransformer(nn.Module):
-    """Modern decoder-only Transformer (LLaMA-style, 2025-2026).
-
-    Key architectural choices
-    ─────────────────────────
-    • RMSNorm  (Pre-norm)          — stable, efficient
-    • RoPE     (Rotary Pos. Emb.)  — generalises to unseen lengths
-    • SwiGLU   activation          — better than plain ReLU / GELU
-    • Multi-Head Attn w/ opt. GQA  — flexible efficiency
-    • Flash Attention (SDPA)       — fused, memory-efficient kernels
-    • Untied input/output (default) — the token embedding (read/context) and the
-      LM head (write/classification) are two mathematically distinct layers.
-      Sharing one matrix forces it to both cluster synonyms (for the input) and
-      separate them (for the output); the opposing gradients partially cancel,
-      which slows convergence. They are kept as independent parameters by
-      default. Legacy weight tying is still available via
-      ``tie_word_embeddings=True`` / ``tie_weights()``.
-    • No bias in linear layers     — modern practice
-    • KV-cache for fast generation — O(1) per token after prompt
-    • Configurable depth (n_layers)
-
-    IMPROVED (v2.1+):
-    • Optional ALiBi for better length extrapolation
-    • LoRA adapter support
-
-    IMPROVED (v2.3+):
-    • Gradient checkpointing support (use_gradient_checkpointing)
-    """
-
-    def __init__(self, vocab_size: int, d_model: int, n_heads: int,
-                 n_layers: int, d_ff: int,
-                 max_seq_len: int = 4096,
-                 n_kv_heads: int | None = None,
-                 dropout: float = 0.0,
-                 use_alibi: bool = False,
-                 use_gradient_checkpointing: bool = False,
-                 rope_scaling: dict | None = None,
-                 sliding_window: int | None = None,
-                 kv_cache_dtype: str | None = None,
-                 use_flex_attention: bool = False,
-                 use_moe: bool = False,
-                 num_experts: int = 4,
-                 tie_word_embeddings: bool = False,
-                 use_qk_norm: bool = False):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        # n_kv_heads == 0 means "no GQA" (use MHA, i.e. n_kv_heads = n_heads).
-        # Normalise here so the %-modulo below never divides by zero.
-        if n_kv_heads in (0, "0"):
-            n_kv_heads = None
-        if n_kv_heads is not None:
-            assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
-
-        self.d_model     = d_model
-        self.n_heads     = n_heads
-        self.n_layers    = n_layers
-        self.d_ff        = d_ff
-        self.n_kv_heads  = n_kv_heads
-        self.max_seq_len = max_seq_len
-        self.dropout     = dropout
-        self.use_alibi   = use_alibi
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.rope_scaling = rope_scaling or {}
-        self.sliding_window = int(sliding_window) if sliding_window else None
-        self.kv_cache_dtype = kv_cache_dtype
-        self.use_flex_attention = bool(use_flex_attention)
-        self.use_moe = bool(use_moe)
-        self.num_experts = int(num_experts)
-        self.tie_word_embeddings = bool(tie_word_embeddings)
-        self.use_qk_norm = bool(use_qk_norm)
-
-        self.embedding   = nn.Embedding(vocab_size, d_model)
-        self.layers      = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, n_kv_heads, max_seq_len, dropout,
-                             use_alibi=use_alibi,
-                             use_checkpoint=use_gradient_checkpointing,
-                             rope_scaling=rope_scaling,
-                             sliding_window=sliding_window,
-                             kv_cache_dtype=kv_cache_dtype,
-                             use_flex_attention=use_flex_attention,
-                             use_moe=use_moe,
-                             num_experts=num_experts,
-                             use_qk_norm=use_qk_norm)
-            for _ in range(n_layers)
-        ])
-        self.final_norm  = RMSNorm(d_model)
-        self.head        = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Modern weight init (GPT-2 / LLaMA style)
-        self.apply(self._init_weights)
-
-        # Weight tying: output head shares the embedding matrix when enabled.
-        # Gradients from both the input embedding path and LM-head path accumulate
-        # into the single shared Parameter exactly as in GPT/LLaMA models.
-        if self.tie_word_embeddings:
-            self.tie_weights()
-
-        # LoRA adapters (initially None, enabled via enable_lora())
-        self.lora_adapters: list | None = None
-        self.lora_rank = 0
-
-    def tie_weights(self):
-        """Tie output projection and token embedding weights in-place.
-
-        This is safe for autograd: both modules point at the same Parameter, so
-        gradients are summed into one tensor before the optimizer step. Calling
-        it after loading an older checkpoint preserves AuraLite's historic tied
-        embedding behavior.
-        """
-        self.head.weight = self.embedding.weight
-        self.tie_word_embeddings = True
-
-    def untie_weights(self):
-        """Clone the LM head for research runs that need untied embeddings."""
-        new_head = nn.Linear(self.d_model, self.embedding.num_embeddings, bias=False).to(self.embedding.weight.device)
-        new_head.weight.data.copy_(self.embedding.weight.data)
-        self.head = new_head
-        self.tie_word_embeddings = False
-
-    @staticmethod
-    def _init_weights(module: nn.Module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, x: torch.Tensor,
-                start_pos: int = 0, use_cache: bool = False) -> torch.Tensor:
-        """Returns logits for ALL positions: (B, T, vocab_size).
-
-        Training uses every position (dense next-token loss, nanoGPT-style);
-        generation simply takes the last position: logits[:, -1, :].
-        """
-        h = self.embedding(x)
-        for layer in self.layers:
-            h = layer(h, start_pos, use_cache)
-        h = self.final_norm(h)
-        return self.head(h)
-
-    def get_aux_loss(self) -> torch.Tensor | None:
-        """Return summed auxiliary losses (currently MoE load balancing)."""
-        losses = []
-        for layer in self.layers:
-            loss = getattr(getattr(layer, "ffn", None), "last_load_balance_loss", None)
-            if loss is not None:
-                losses.append(loss)
-        if not losses:
-            return None
-        return torch.stack([l.to(losses[0].device) for l in losses]).sum()
-
-    def reset_cache(self):
-        for layer in self.layers:
-            layer.attn.reset_cache()
-
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-    def count_trainable_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    # ---- LoRA Support ------------------------------------------------
-    def enable_lora(self, rank: int = 8, target_modules: list[str] | None = None):
-        """Enable LoRA adapters on the FFN linear layers.
-
-        Freezes the whole base model and adds trainable low-rank adapters
-        that are actually applied in FeedForward.forward(). The adapters are
-        registered as submodules (`self.lora_adapters`) so they move with
-        `.to(device)` and are saved/loaded via the state dict.
-
-        Args:
-            rank: LoRA rank (default 8)
-            target_modules: Names of FFN projections to adapt
-                            (default: ["gate", "up", "down"]).
-        """
-        if target_modules is None:
-            target_modules = ["gate", "up", "down"]
-
-        self.lora_rank = rank
-        # plain list (NOT nn.ModuleList) so the adapters are registered only
-        # once — via layer.ffn.lora — and don't appear twice in state_dict.
-        self.lora_adapters = []
-
-        # Freeze every base-model parameter
-        for param in self.parameters():
-            param.requires_grad = False
-
-        for layer in self.layers:
-            # nn.ModuleDict keys must NOT contain dots — use the plain
-            # projection name ("gate"/"up"/"down").
-            layer_lora = nn.ModuleDict()
-            for name in target_modules:
-                mod = getattr(layer.ffn, name, None)
-                if isinstance(mod, nn.Linear):
-                    lora = LoRALayer(mod.in_features, mod.out_features, rank)
-                    # LoRA params are created with requires_grad=True by default
-                    layer_lora[name] = lora
-            # wire the adapters into the FFN so forward() actually uses them
-            # (this also registers them as proper submodules of the model)
-            layer.ffn.lora = layer_lora
-            self.lora_adapters.append(layer_lora)
-
-    def disable_lora(self):
-        """Disable LoRA and restore full training."""
-        self.lora_rank = 0
-        self.lora_adapters = None
-        for layer in self.layers:
-            layer.ffn.lora = None
-        for param in self.parameters():
-            param.requires_grad = True
 
 
-class LoRALayer(nn.Module):
-    """LoRA (Low-Rank Adaptation) adapter for a linear layer.
-
-    Replaces W with W + (lora_B @ lora_A) / rank
-    """
-    def __init__(self, in_features: int, out_features: int, rank: int = 8,
-                 alpha: float | None = None):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha or rank  # default: alpha = rank (scaling = 1)
-        self.scaling = self.alpha / self.rank
-
-        self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.02)
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., in_features)
-        # lora_A: (rank, in_features), lora_B: (out_features, rank)
-        # result: x @ lora_A.T @ lora_B.T * scaling
-        return (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
 
 # ===================================================================
 #  Dataset
 # ===================================================================
 
-class CharDataset(Dataset):
-    """Sliding-window token-level dataset backed by one in-memory LongTensor.
-
-    The full corpus is tokenised exactly once before training and stored as a
-    single `torch.LongTensor`. We then create window *views* via `unfold()` so
-    the DataLoader reads pre-tokenised tensors instead of repeatedly slicing raw
-    Python text/list data on the hot path.
-    """
-
-    def __init__(self, encoded: torch.Tensor, seq_length: int):
-        self.data = encoded.contiguous()
-        self.seq_length = seq_length
-
-        if len(self.data) <= self.seq_length:
-            self.x = self.data.new_empty((0, self.seq_length))
-            self.y = self.data.new_empty((0, self.seq_length))
-        else:
-            windows = self.data.unfold(0, self.seq_length + 1, 1)
-            self.x = windows[:, :-1]
-            self.y = windows[:, 1:]
-
-    def __len__(self):
-        return self.x.shape[0]
-
-    def __getitem__(self, idx: int):
-        return self.x[idx], self.y[idx]
 
 
 # ===================================================================
 #  Cosine Learning-Rate Schedule with Linear Warmup
 # ===================================================================
 
-class CosineWarmupScheduler:
-    """Cosine decay with linear warmup — standard in modern LLM training."""
-
-    def __init__(self, optimizer, warmup_steps: int, max_steps: int,
-                 min_lr: float = 1e-5):
-        self.optimizer    = optimizer
-        self.warmup_steps = warmup_steps
-        self.max_steps    = max_steps
-        self.min_lr       = min_lr
-        self.base_lrs     = [pg["lr"] for pg in optimizer.param_groups]
-        self.step_count   = 0
-
-    def step(self):
-        self.step_count += 1
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            if self.step_count < self.warmup_steps:
-                lr = base_lr * self.step_count / self.warmup_steps
-            else:
-                progress = (self.step_count - self.warmup_steps) / max(
-                    1, self.max_steps - self.warmup_steps
-                )
-                lr = self.min_lr + 0.5 * (base_lr - self.min_lr) * (
-                    1 + math.cos(math.pi * progress)
-                )
-            pg["lr"] = lr
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict:
-        return {
-            "warmup_steps": self.warmup_steps,
-            "max_steps": self.max_steps,
-            "min_lr": self.min_lr,
-            "base_lrs": list(self.base_lrs),
-            "step_count": self.step_count,
-            "current_lrs": [pg["lr"] for pg in self.optimizer.param_groups],
-        }
-
-    def load_state_dict(self, state: dict):
-        self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
-        self.max_steps = state.get("max_steps", self.max_steps)
-        self.min_lr = state.get("min_lr", self.min_lr)
-        self.base_lrs = list(state.get("base_lrs", self.base_lrs))
-        self.step_count = int(state.get("step_count", self.step_count))
-        current_lrs = state.get("current_lrs")
-        if current_lrs is not None:
-            for pg, lr in zip(self.optimizer.param_groups, current_lrs, strict=True):
-                pg["lr"] = lr
 
 
-class WSDScheduler:
-    """Warmup-Stable-Decay (WSD / trapezoidal) LR schedule.
-
-    Modern alternative to pure cosine decay (MiniCPM 2024, DeepSeek V3 style):
-      1. **Warmup**  — linear ramp from 0 to the base LR,
-      2. **Stable**  — constant LR until ``stable_ratio`` of training,
-      3. **Decay**   — short decay phase (cosine/linear/sqrt) down to
-         ``min_lr_ratio`` of the base LR.
-
-    Advantages over cosine: you can keep a model in the stable phase
-    indefinitely, branch a new decay run from any stable-phase checkpoint,
-    and empirical convergence matches or beats cosine at equal compute.
-
-    API-compatible with :class:`CosineWarmupScheduler` (step / get_lr /
-    state_dict / load_state_dict) so the training loop needs no changes.
-    """
-
-    VALID_DECAYS = ("cosine", "linear", "sqrt")
-
-    def __init__(self, optimizer, warmup_steps: int, max_steps: int,
-                 stable_ratio: float = 0.8, min_lr_ratio: float = 0.2,
-                 decay_type: str = "cosine"):
-        self.optimizer    = optimizer
-        self.warmup_steps = max(1, warmup_steps)
-        self.max_steps    = max(1, max_steps)
-        self.stable_ratio = float(min(max(stable_ratio, 0.0), 0.99))
-        self.min_lr_ratio = float(min(max(min_lr_ratio, 0.0), 1.0))
-        self.decay_type   = decay_type if decay_type in self.VALID_DECAYS else "cosine"
-        self.base_lrs     = [pg["lr"] for pg in optimizer.param_groups]
-        self.step_count   = 0
-
-    def _decay_start(self) -> int:
-        return max(self.warmup_steps, int(self.max_steps * self.stable_ratio))
-
-    def _multiplier(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / self.warmup_steps
-        decay_start = self._decay_start()
-        if step < decay_start:
-            return 1.0
-        decay_steps = max(1, self.max_steps - decay_start)
-        progress = min(1.0, (step - decay_start) / decay_steps)
-        if self.decay_type == "linear":
-            scale = 1.0 - progress
-        elif self.decay_type == "sqrt":
-            # 1 - sqrt(p): spends more of the decay at a useful LR
-            scale = 1.0 - math.sqrt(progress)
-        else:  # cosine decay inside the decay phase (MiniCPM-style)
-            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * scale
-
-    def step(self):
-        self.step_count += 1
-        mult = self._multiplier(self.step_count)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * mult
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict:
-        return {
-            "schedule": "wsd",
-            "warmup_steps": self.warmup_steps,
-            "max_steps": self.max_steps,
-            "stable_ratio": self.stable_ratio,
-            "min_lr_ratio": self.min_lr_ratio,
-            "decay_type": self.decay_type,
-            "base_lrs": list(self.base_lrs),
-            "step_count": self.step_count,
-            "current_lrs": [pg["lr"] for pg in self.optimizer.param_groups],
-        }
-
-    def load_state_dict(self, state: dict):
-        self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
-        self.max_steps = state.get("max_steps", self.max_steps)
-        self.stable_ratio = float(state.get("stable_ratio", self.stable_ratio))
-        self.min_lr_ratio = float(state.get("min_lr_ratio", self.min_lr_ratio))
-        self.decay_type = state.get("decay_type", self.decay_type)
-        self.base_lrs = list(state.get("base_lrs", self.base_lrs))
-        self.step_count = int(state.get("step_count", self.step_count))
-        current_lrs = state.get("current_lrs")
-        if current_lrs is not None:
-            for pg, lr in zip(self.optimizer.param_groups, current_lrs, strict=True):
-                pg["lr"] = lr
 
 
 
@@ -1684,456 +480,26 @@ class WSDScheduler:
 # all norm/scalar parameters must stay on AdamW — see
 # :func:`split_parameters_for_muon`.
 
-def _newton_schulz_ortho(grad: torch.Tensor, ns_steps: int, eps: float) -> torch.Tensor:
-    """Quintic Newton–Schulz iteration approximating the nearest
-    semi-orthogonal matrix (the UV^T factor) of ``grad``.
-
-    Runs in bf16 on CUDA (as in the reference implementation) and in fp32 on
-    CPU, where bf16 matmul throughput is poor and precision is cheap.
-    """
-    a, b, c = 3.4445, -4.7750, 2.0315
-    compute_dtype = torch.bfloat16 if (grad.is_cuda and torch.cuda.is_bf16_supported()) else torch.float32
-    X = grad.to(compute_dtype)
-
-    transpose = X.size(-2) > X.size(-1)
-    if transpose:
-        X = X.mT
-
-    # clamp the spectral norm below 1 so the iteration converges
-    X = X / (X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
-
-    for _ in range(ns_steps):
-        gram = X @ X.mT
-        B = b * gram + c * (gram @ gram)
-        X = a * X + B @ X
-
-    if transpose:
-        X = X.mT
-    return X
 
 
-def _muon_adjust_lr(lr: float, adjust_lr_fn: str, shape: torch.Size) -> float:
-    """Shape-aware LR scaling for Muon updates.
-
-    - ``"original"``        : lr * sqrt(max(1, fan_out / fan_in)) — Keller Jordan
-    - ``"match_rms_adamw"`` : lr * 0.2 * sqrt(max(fan_out, fan_in)) — matches the
-      update RMS of AdamW, so AdamW-tuned LRs transfer (Moonlight default)
-    - ``"spectral_unclamped"`` : lr * sqrt(fan_out / fan_in)
-    """
-    out_dim, in_dim = shape[:2]
-    if adjust_lr_fn == "match_rms_adamw":
-        return lr * 0.2 * math.sqrt(max(out_dim, in_dim))
-    if adjust_lr_fn == "spectral_unclamped":
-        return lr * math.sqrt(out_dim / in_dim)
-    return lr * math.sqrt(max(1.0, out_dim / in_dim))
 
 
-class Muon(optim.Optimizer):
-    """Muon: MomentUm Orthogonalized by Newton–Schulz.
-
-    Accepts ONLY 2-D parameters (hidden weight matrices). Pair with an AdamW
-    group for embeddings / LM head / norms / LoRA — conveniently produced by
-    :func:`split_parameters_for_muon`.
-    """
-
-    def __init__(self, params, lr: float = 0.02, weight_decay: float = 0.0,
-                 momentum: float = 0.95, nesterov: bool = True,
-                 ns_steps: int = 5, eps: float = 1e-7,
-                 adjust_lr_fn: str = "match_rms_adamw"):
-        if adjust_lr_fn not in ("original", "match_rms_adamw", "spectral_unclamped"):
-            raise ValueError(f"Unknown adjust_lr_fn: {adjust_lr_fn!r}")
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
-                        nesterov=nesterov, ns_steps=ns_steps, eps=eps,
-                        adjust_lr_fn=adjust_lr_fn)
-        super().__init__(params, defaults)
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.ndim != 2:
-                    raise ValueError(
-                        f"Muon only supports 2-D parameters, got shape {tuple(p.shape)}. "
-                        "Use split_parameters_for_muon(model) to separate embeddings/"
-                        "norms/scalars into an AdamW group."
-                    )
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr         = group["lr"]
-            wd         = group["weight_decay"]
-            momentum   = group["momentum"]
-            nesterov   = group["nesterov"]
-            ns_steps   = group["ns_steps"]
-            eps        = group["eps"]
-            adjust_fn  = group["adjust_lr_fn"]
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("Muon does not support sparse gradients")
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(grad)
-                buf = state["momentum_buffer"]
-
-                # buf = buf * momentum + grad * (1 - momentum) in fp32
-                buf.lerp_(grad.to(torch.float32), 1.0 - momentum)
-                update = grad.to(torch.float32).lerp_(buf, momentum) if nesterov else buf
-
-                ortho = _newton_schulz_ortho(update, ns_steps, eps)
-                adjusted_lr = _muon_adjust_lr(lr, adjust_fn, p.shape)
-
-                if wd:
-                    p.mul_(1.0 - lr * wd)
-                p.add_(ortho.to(p.dtype), alpha=-adjusted_lr)
-
-        return loss
 
 
-def split_parameters_for_muon(model: nn.Module):
-    """Split trainable parameters into (muon_params, adam_decay, adam_no_decay).
-
-    - Embeddings, norms, scalars (ndim < 2)  -> AdamW without weight decay
-    - 2-D matrices inside transformer blocks -> Muon
-    - everything else (e.g. an untied LM head) -> AdamW with weight decay
-
-    With tied embeddings the shared matrix is registered under
-    ``embedding.weight`` and therefore correctly lands in the AdamW group.
-    """
-    muon_params, adam_decay, adam_no_decay = [], [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "norm" in name or "embedding" in name or param.ndim < 2:
-            adam_no_decay.append(param)
-        elif param.ndim == 2 and "layers." in name:
-            muon_params.append(param)
-        else:
-            adam_decay.append(param)
-    return muon_params, adam_decay, adam_no_decay
 
 
-class _ChainedOptimizers:
-    """Thin wrapper that steps several optimizers as one (Muon + AdamW).
-
-    Exposes just what the training loop touches: zero_grad, step, state_dict
-    and load_state_dict (with scalar optimizer states moved to device by
-    ``_move_optimizer_state_to_device``).
-    """
-
-    def __init__(self, *optimizers):
-        self.optimizers = [o for o in optimizers if o is not None]
-        self.param_groups = [pg for o in self.optimizers for pg in o.param_groups]
-
-    def zero_grad(self, set_to_none: bool = True):
-        for opt in self.optimizers:
-            opt.zero_grad(set_to_none=set_to_none)
-
-    def step(self, closure=None):
-        loss = None
-        for opt in self.optimizers:
-            out = opt.step(closure) if closure is not None else opt.step()
-            if out is not None:
-                loss = out
-        return loss
-
-    def state_dict(self):
-        return [opt.state_dict() for opt in self.optimizers]
-
-    def load_state_dict(self, state):
-        if not isinstance(state, (list, tuple)) or len(state) != len(self.optimizers):
-            raise ValueError("Chained optimizer state does not match the optimizer layout")
-        for opt, sub in zip(self.optimizers, state, strict=True):
-            opt.load_state_dict(sub)
 
 
 # ===================================================================
 #  GGUF / llama.cpp backend (inference-only)
 # ===================================================================
 
-class GGUFNotAvailableError(ImportError):
-    """Raised when llama-cpp-python is required but not installed."""
-    pass
 
 
-class GGUFTokenizerProxy:
-    """Tokenizer adapter around llama.cpp's native GGUF tokenizer."""
-
-    kind = "gguf"
-
-    def __init__(self, llama):
-        self.llama = llama
-
-    @property
-    def vocab_size(self) -> int:
-        try:
-            n_vocab = getattr(self.llama, "n_vocab", None)
-            return int(n_vocab() if callable(n_vocab) else n_vocab)
-        except Exception:
-            return 0
-
-    def encode(self, s: str) -> list[int]:
-        data = s.encode("utf-8", errors="ignore")
-        try:
-            return list(self.llama.tokenize(data, add_bos=False, special=True))
-        except TypeError:
-            return list(self.llama.tokenize(data, add_bos=False))
-
-    def decode(self, ids) -> str:
-        try:
-            data = self.llama.detokenize([int(i) for i in ids])
-            return data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
-        except Exception:
-            return ""
-
-    def train(self, text: str, vocab_size: int | None = None):
-        raise RuntimeError("GGUF tokenizer is loaded from the model and cannot be trained.")
-
-    def to_dict(self) -> dict:
-        return {"kind": self.kind}
 
 
-def _gguf_rolling_loglikelihood(llama, text: str, n_ctx: int, tokenizer,
-                                return_count: bool = False):
-    """Sum log P(token_i | token_<i) for a GGUF model via llama.cpp scores.
-
-    The numeric core behind `GGUFModelProxy.loglikelihood_rolling` and
-    `.perplexity()`. Kept as a module-level function so it can be unit-tested
-    against a fake llama object without the optional llama-cpp-python package.
-
-    Requires the llama instance to expose per-token logits (`llama.scores`),
-    which llama-cpp-python provides when loaded with `logits_all=True`.
-    """
-    token_ids = list(tokenizer.encode(text))
-    if len(token_ids) < 2:
-        return (0.0, 0) if return_count else 0.0
-
-    window = max(2, int(n_ctx) - 1)
-    total_logprob = 0.0
-    scored = 0
-    first_window = True
-    try:
-        llama.reset()
-        for start in range(0, len(token_ids) - 1, window):
-            chunk = token_ids[start:start + window + 1]
-            llama.eval(chunk)
-            scores = llama.scores
-            rows = len(scores)
-            # Row i holds the logits that predict chunk[i+1]; the very first
-            # token of every window after the first has no left context.
-            skip_first = 0 if first_window else 1
-            for i in range(skip_first, min(len(chunk) - 1, rows - 1)):
-                row = scores[i]
-                logits = torch.as_tensor(row, dtype=torch.float32)
-                log_probs = torch.log_softmax(logits, dim=-1)
-                total_logprob += float(log_probs[int(chunk[i + 1])].item())
-                scored += 1
-            first_window = False
-            llama.reset()
-    except AttributeError as err:
-        raise RuntimeError(
-            "This llama-cpp-python version does not expose per-token scores "
-            "(`llama.scores`). Load the model with logits_all=True or upgrade "
-            "llama-cpp-python to compute GGUF perplexity."
-        ) from err
-
-    if return_count:
-        return total_logprob, scored
-    return total_logprob
 
 
-class GGUFModelProxy:
-    """Small adapter that exposes a llama-cpp-python GGUF model through the
-    subset of attributes AuraLite's GUI expects.
-
-    GGUF models are quantized inference artifacts. They can be loaded and used
-    for generation/streaming/batch prompting, but they cannot be trained or
-    saved as AuraLite `.pt` checkpoints.
-    """
-
-    backend = "gguf"
-
-    def __init__(self, path: str, *, n_ctx: int = 4096,
-                 n_threads: int | None = None, n_gpu_layers: int = -1,
-                 seed: int = -1, chat_format: str | None = None,
-                 use_chat_completion: bool = False,
-                 n_batch: int = 512, use_mmap: bool = True,
-                 use_mlock: bool = False,
-                 verbose: bool = False, extra_kwargs: dict[str, Any] | None = None):
-        try:
-            from llama_cpp import Llama
-        except Exception as e:  # pragma: no cover - depends on optional package
-            raise GGUFNotAvailableError(
-                "To load .gguf install llama-cpp-python: "
-                "pip install llama-cpp-python"
-            ) from e
-
-        self.path = str(path)
-        self.max_seq_len = int(n_ctx)
-        self.n_threads = n_threads
-        self.n_gpu_layers = int(n_gpu_layers)
-        self.seed = int(seed)
-        self.chat_format = chat_format
-        self.use_chat_completion = bool(use_chat_completion)
-        self.n_batch = int(n_batch)
-        self.use_mmap = bool(use_mmap)
-        self.use_mlock = bool(use_mlock)
-        self.verbose = bool(verbose)
-
-        kwargs: dict[str, Any] = {
-            "model_path": self.path,
-            "n_ctx": self.max_seq_len,
-            "n_gpu_layers": self.n_gpu_layers,
-            "seed": self.seed,
-            "n_batch": self.n_batch,
-            "use_mmap": self.use_mmap,
-            "use_mlock": self.use_mlock,
-            "verbose": self.verbose,
-        }
-        if n_threads:
-            kwargs["n_threads"] = int(n_threads)
-        if chat_format:
-            kwargs["chat_format"] = chat_format
-        if extra_kwargs:
-            kwargs.update(extra_kwargs)
-
-        self._load_kwargs = dict(kwargs)
-        self.llama = Llama(**kwargs)
-        self.tokenizer = GGUFTokenizerProxy(self.llama)
-        self.metadata = getattr(self.llama, "metadata", {}) or {}
-
-    def _perplexity_llama(self):
-        """Return (llama_instance, owns_instance) able to report per-token scores.
-
-        llama.cpp only keeps per-token logits when the model was loaded with
-        `logits_all=True`, which the normal generation path does not need (it
-        costs one logits row per prompt token). For perplexity we spin up a
-        second instance with that flag and free it afterwards.
-        """
-        if self.llama is not None and getattr(self.llama, "logits_all", False):
-            return self.llama, False
-        try:
-            from llama_cpp import Llama
-        except Exception as err:  # pragma: no cover - optional dependency
-            raise GGUFNotAvailableError(
-                "llama-cpp-python is required for GGUF perplexity. "
-                "Install with: pip install llama-cpp-python"
-            ) from err
-        kwargs = dict(self._load_kwargs)
-        kwargs["logits_all"] = True
-        return Llama(**kwargs), True
-
-    # ---- perplexity scoring (v2.6.5) ---------------------------------
-    def _loglikelihood_rolling_with_count(self, text: str) -> tuple[float, int]:
-        """(total logprob, scored-token count) for `text`.
-
-        Uses llama.cpp's per-token scores: the model is evaluated in windows of
-        `n_ctx - 1` tokens, and each token is scored from the logits of its
-        predecessor. One token per window boundary has no left context, so it
-        is not scored (the standard no-overlap approximation); windows are
-        processed independently to keep the KV cache within `n_ctx`.
-        """
-        llama, owns = self._perplexity_llama()
-        try:
-            return _gguf_rolling_loglikelihood(
-                llama, text, self.max_seq_len, self.tokenizer, return_count=True)
-        finally:
-            if owns:
-                close = getattr(llama, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
-
-    def loglikelihood_rolling(self, text: str) -> float:
-        """Total log-probability of `text` under the model (for perplexity)."""
-        total, _ = self._loglikelihood_rolling_with_count(text)
-        return total
-
-    def perplexity(self, text: str) -> float:
-        """Exponentiated per-token negative log-likelihood of `text`."""
-        total, n_scored = self._loglikelihood_rolling_with_count(text)
-        if n_scored == 0:
-            return float("nan")
-        return math.exp(-total / n_scored)
-
-    def eval(self):
-        return self
-
-    def reset_cache(self):
-        # llama-cpp-python keeps KV-cache internally per completion; reset if the
-        # installed version exposes a method, otherwise each call is still safe.
-        reset = getattr(self.llama, "reset", None)
-        if callable(reset):
-            try:
-                reset()
-            except Exception:
-                pass
-
-    def count_parameters(self) -> int:
-        for key in ("general.parameter_count",):
-            val = self.metadata.get(key)
-            if val is not None:
-                try:
-                    return int(val)
-                except (TypeError, ValueError):
-                    pass
-        return 0
-
-    def count_trainable_parameters(self) -> int:
-        return 0
-
-    @property
-    def vocab_size(self) -> int:
-        return self.tokenizer.vocab_size
-
-    def create_completion(self, prompt: str, *, max_tokens: int = 50,
-                          temperature: float = 0.8, top_k: int = 50,
-                          top_p: float = 0.9, repeat_penalty: float = 1.0,
-                          min_p: float = 0.0, stream: bool = False,
-                          stop: list[str] | None = None):
-        kwargs: dict[str, Any] = {}
-        if stop:
-            kwargs["stop"] = list(stop)
-        return self.llama.create_completion(
-            prompt=prompt,
-            max_tokens=max(0, int(max_tokens)),
-            temperature=max(float(temperature), 0.0),
-            top_k=max(0, int(top_k)),
-            top_p=float(top_p),
-            min_p=float(min_p),
-            repeat_penalty=float(repeat_penalty),
-            stream=stream,
-            **kwargs,
-        )
-
-    def create_chat_completion(self, messages: list[dict], *, max_tokens: int = 50,
-                               temperature: float = 0.8, top_k: int = 50,
-                               top_p: float = 0.9, repeat_penalty: float = 1.0,
-                               min_p: float = 0.0, stream: bool = False,
-                               stop: list[str] | None = None):
-        """Use llama.cpp chat formatting for instruction/chat GGUF models."""
-        kwargs: dict[str, Any] = {}
-        if stop:
-            kwargs["stop"] = list(stop)
-        return self.llama.create_chat_completion(
-            messages=messages,
-            max_tokens=max(0, int(max_tokens)),
-            temperature=max(float(temperature), 0.0),
-            top_k=max(0, int(top_k)),
-            top_p=float(top_p),
-            min_p=float(min_p),
-            repeat_penalty=float(repeat_penalty),
-            stream=stream,
-            **kwargs,
-        )
 
 # ===================================================================
 #  Engine
@@ -2164,6 +530,8 @@ class AuraLiteEngine:
         self.tokenizer   = None              # CharTokenizer | BPETokenizer | GGUFTokenizerProxy | HF tokenizer
         self.vocab_size  = 0
         self.params_used: dict = {}          # remember last training/load params
+        self._compiled_inference_model = None  # torch.compile for generation (v2.6.5)
+        self._compile_seconds = 0.0
         self.last_val_loss: float | None = None
         # v2.6.2: chat template persisted with the checkpoint; generate_chat()
         # uses it when the caller does not pass `chat_template` explicitly.
@@ -2208,14 +576,14 @@ class AuraLiteEngine:
                 self.local_rank = local_rank
                 self.world_size = world_size
 
-                print(f"[AuraLite] DDP initialized: rank={rank}, world_size={world_size}, "
-                      f"local_rank={local_rank}, device={self.device}")
+                logger.info(f"[AuraLite] DDP initialized: rank={rank}, world_size={world_size}, "
+                            f"local_rank={local_rank}, device={self.device}")
             except Exception as e:
-                print(f"[AuraLite] WARNING: Failed to initialize DDP: {e}")
+                logger.warning(f"[AuraLite] WARNING: Failed to initialize DDP: {e}")
                 self.is_distributed = False
 
     def is_gguf_model(self) -> bool:
-        return self.backend == "gguf" or isinstance(self.model, GGUFModelProxy)
+        return self.backend == "gguf" or is_gguf_like(self.model)
 
     def is_hf_model(self) -> bool:
         return self.backend == "huggingface" or isinstance(self.model, HuggingFaceProxy)
@@ -2538,7 +906,7 @@ class AuraLiteEngine:
         with torch.inference_mode():
             # Process prompt
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self.model(t, start_pos=0, use_cache=True)
+            logits = self._infer(t, start_pos=0, use_cache=True)
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                      repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
@@ -2558,7 +926,7 @@ class AuraLiteEngine:
                 if pos + 1 >= hard_cap:
                     break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self.model(t, start_pos=pos, use_cache=True)
+                logits = self._infer(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                          repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
@@ -2598,6 +966,36 @@ class AuraLiteEngine:
         if n_threads is None:
             n_threads = self.num_threads
 
+        # v2.6.5: a running `llama-server` can be used as the backend instead of
+        # loading the file in-process — pass an http(s) URL, or point
+        # AURALITE_LLAMA_SERVER_URL at one. The proxy exposes the same surface,
+        # so the generation paths below do not care which one they talk to.
+        server_url = str(path) if str(path).startswith(("http://", "https://")) else \
+            os.environ.get("AURALITE_LLAMA_SERVER_URL", "")
+        if server_url:
+            from model_engine.gguf_proxy import LlamaServerProxy
+            model = LlamaServerProxy(
+                server_url, n_ctx=n_ctx, chat_format=chat_format,
+                api_key=os.environ.get("AURALITE_LLAMA_SERVER_API_KEY") or None,
+            )
+            self.model = model
+            self.backend = "gguf"          # same generation paths, remote runtime
+            self.gguf_path = model.path or server_url
+            self.hf_path = None
+            self._ddp_model = None
+            self.tokenizer = model.tokenizer
+            self.vocab_size = model.vocab_size
+            self.params_used = {"backend": "gguf-server", **model.describe()}
+            self.optimizer = None
+            self.scheduler = None
+            self.scaler = None
+            self._resume_optimizer_state = None
+            self._resume_scheduler_state = None
+            self._resume_scaler_state = None
+            logger.info("[AuraLite] Using a llama.cpp server backend at %s (n_ctx=%s)",
+                        model.base_url, model.max_seq_len)
+            return
+
         model = GGUFModelProxy(
             path, n_ctx=n_ctx, n_threads=n_threads,
             n_gpu_layers=n_gpu_layers, seed=seed,
@@ -2634,9 +1032,9 @@ class AuraLiteEngine:
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
         chat = ", chat=on" if use_chat_completion else ""
-        print(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
-              f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
-              f"batch={n_batch}{chat})")
+        logger.info(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
+                    f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
+                    f"batch={n_batch}{chat})")
 
     # ===================================================================
     #  NEW: Hugging Face + LoRA / QLoRA support (any model)
@@ -2735,9 +1133,9 @@ class AuraLiteEngine:
         self.scaler = None
 
         mode = "LOCAL (offline)" if local_files_only else "Hub"
-        print(f"[AuraLite] Loaded Hugging Face model ({mode}): {model_name_or_path}")
+        logger.info(f"[AuraLite] Loaded Hugging Face model ({mode}): {model_name_or_path}")
         if apply_lora:
-            print(f"[AuraLite] LoRA applied (rank={lora_rank}) — ready for QLoRA fine-tuning")
+            logger.info(f"[AuraLite] LoRA applied (rank={lora_rank}) — ready for QLoRA fine-tuning")
 
     def apply_lora_to_hf(
         self,
@@ -2787,10 +1185,10 @@ class AuraLiteEngine:
                 texts = [texts]  # fallback
 
         if not self.hf_proxy.is_peft:
-            print("[AuraLite] No LoRA adapter found — applying default LoRA for fine-tuning...")
+            logger.info("[AuraLite] No LoRA adapter found — applying default LoRA for fine-tuning...")
             self.hf_proxy.apply_lora(rank=16)
 
-        print(f"[AuraLite] Starting LoRA/QLoRA fine-tuning on {len(texts)} examples...")
+        logger.info(f"[AuraLite] Starting LoRA/QLoRA fine-tuning on {len(texts)} examples...")
 
         return self.hf_proxy.finetune(
             texts,
@@ -2908,7 +1306,7 @@ class AuraLiteEngine:
                             repetition_penalty: float = 1.0,
                             min_p: float = 0.0,
                             stop: list[str] | None = None) -> str:
-        if not isinstance(self.model, GGUFModelProxy):
+        if not is_gguf_like(self.model):
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
             out = self.model.create_chat_completion(
@@ -2945,6 +1343,305 @@ class AuraLiteEngine:
         if self.tokenizer is None:
             raise ValueError("No tokenizer — train or load a model first!")
         return self.tokenizer.decode(ids)
+
+    # ---- Inference speed (v2.6.5) --------------------------------------
+    def _infer(self, *args, **kwargs):
+        """Forward pass used by every generation path.
+
+        When `enable_inference_compile()` was called, *prompt/batch* forwards
+        (sequence length > 1, i.e. the compute-heavy prefill) run through the
+        compiled module while single-token decode steps stay eager. That split
+        is measured, not guessed: on CPU, compilation speeds prefill up by
+        ×1.1–1.7 but *slows down* T=1 decoding, because each new KV length
+        makes Dynamo re-check (and sometimes re-trace) its guards.
+
+        Training and checkpointing never go through here, so a compiled module
+        can never leak into a `.pt` file.
+        """
+        compiled = self._compiled_inference_model
+        x = args[0] if args else kwargs.get("x")
+        if compiled is not None and getattr(x, "ndim", 0) >= 2 and x.shape[1] > 1:
+            return compiled(*args, **kwargs)
+        return self.model(*args, **kwargs)
+
+    def enable_inference_compile(self, mode: str = "default",
+                                 warmup_tokens: int = 2) -> float:
+        """Compile the model for generation; returns the compile time in seconds.
+
+        `torch.compile` trades a slow first call for faster decoding afterwards,
+        which only pays off for long generations — `bench_generation_modes()`
+        measures the actual numbers instead of guessing. Failure is never fatal:
+        the engine logs a warning and keeps running eagerly.
+
+        The inductor cache is redirected to `$AURALITE_HOME/torch_inductor`, so
+        the second process start reuses the compiled kernels instead of paying
+        the ~5–10 s again.
+        """
+        model = self._native_model()
+        if model is None:
+            raise RuntimeError("enable_inference_compile needs a native AuraLite "
+                               "model (GGUF/Hugging Face backends run in their own runtime)")
+        if self._compiled_inference_model is not None:
+            return float(getattr(self, "_compile_seconds", 0.0))
+        cache_dir = Path(os.environ.get("AURALITE_HOME", Path.home() / ".auralite")) / "torch_inductor"
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_dir))
+        if os.environ.get("AURALITE_COMPILE_DEBUG"):
+            os.environ.setdefault("TORCH_LOGS", "output_code")
+        start = time.perf_counter()
+        try:
+            compiled = torch.compile(model, mode=mode, dynamic=False)
+        except Exception as exc:                  # noqa: BLE001 - optional feature
+            logger.warning("[AuraLite] torch.compile unavailable (%s); staying eager.", exc)
+            return 0.0
+        if warmup_tokens:
+            try:
+                with torch.inference_mode():
+                    probe = torch.zeros((1, max(1, int(warmup_tokens))), dtype=torch.long,
+                                        device=self.device)
+                    compiled(probe, start_pos=0, use_cache=False)
+            except Exception as exc:              # noqa: BLE001
+                logger.warning("[AuraLite] torch.compile warm-up failed (%s); staying eager.", exc)
+                return 0.0
+        self._compiled_inference_model = compiled
+        self._compile_seconds = time.perf_counter() - start
+        logger.info("[AuraLite] torch.compile enabled (mode=%s) in %.2fs; "
+                    "kernels cached in %s", mode, self._compile_seconds, cache_dir)
+        return self._compile_seconds
+
+    def disable_inference_compile(self) -> bool:
+        """Drop the compiled module (returns True when one was installed)."""
+        had = self._compiled_inference_model is not None
+        self._compiled_inference_model = None
+        return had
+
+    def _native_model(self):
+        """The eager `ModernTransformer`, or None for GGUF/HF/external engines."""
+        model = getattr(self.model, "module", self.model)      # unwrap DDP
+        if model is None or not isinstance(model, nn.Module):
+            return None
+        if self.is_gguf_model() or getattr(self, "hf_proxy", None) is not None:
+            return None
+        return model
+
+    @staticmethod
+    def _model_arch_kwargs(model) -> dict:
+        """Architecture kwargs of `model` — used to clone it with another KV dtype."""
+        return {
+            "vocab_size": model.embedding.num_embeddings,
+            "d_model": model.d_model, "n_heads": model.n_heads,
+            "n_layers": model.n_layers, "d_ff": model.d_ff,
+            "max_seq_len": model.max_seq_len,
+            "n_kv_heads": model.n_kv_heads, "dropout": model.dropout,
+            "use_alibi": model.use_alibi, "rope_scaling": model.rope_scaling,
+            "sliding_window": model.sliding_window,
+            "use_flex_attention": model.use_flex_attention,
+            "use_moe": getattr(model, "use_moe", False),
+            "num_experts": getattr(model, "num_experts", 4),
+            "tie_word_embeddings": getattr(model, "tie_word_embeddings", False),
+            "use_qk_norm": getattr(model, "use_qk_norm", False),
+        }
+
+    def bench_prefill(self, shapes: tuple = ((1, 64), (4, 64), (1, 256), (4, 256)),
+                      repeats: int = 3) -> list[dict]:
+        """Compare eager vs `torch.compile`d prompt processing (prefill).
+
+        Prefill is where compilation actually pays off: one big matmul-heavy
+        forward per prompt. Decode steps (T=1) are measured by
+        `bench_generation_modes()` and stay eager on purpose.
+
+        Returns `[{shape, batch, tokens, eager_tokens_per_sec,
+        compiled_tokens_per_sec, speedup, compile_seconds}]`.
+        """
+        model = self._native_model()
+        if model is None:
+            raise RuntimeError("bench_prefill needs a native AuraLite model")
+        vocab = model.embedding.num_embeddings
+        repeats = max(1, int(repeats))
+
+        def _measure(fn, x):
+            best = 1e9
+            for _ in range(repeats):
+                start = time.perf_counter()
+                with torch.inference_mode():
+                    fn(x)
+                best = min(best, time.perf_counter() - start)
+            return best
+
+        rows = []
+        self.disable_inference_compile()
+        eager_times = {}
+        for batch, tokens in shapes:
+            x = torch.randint(0, vocab, (int(batch), int(tokens)), device=self.device)
+            eager_times[(int(batch), int(tokens))] = _measure(self.model, x)
+        compile_seconds = self.enable_inference_compile()
+        for batch, tokens in shapes:
+            key = (int(batch), int(tokens))
+            x = torch.randint(0, vocab, key, device=self.device)
+            compiled_time = _measure(self._infer, x)
+            eager_time = eager_times[key]
+            rows.append({
+                "shape": f"B={key[0]} T={key[1]}",
+                "batch": key[0], "tokens": key[1],
+                "eager_tokens_per_sec": key[0] * key[1] / max(1e-9, eager_time),
+                "compiled_tokens_per_sec": key[0] * key[1] / max(1e-9, compiled_time),
+                "speedup": eager_time / max(1e-9, compiled_time),
+                "compile_seconds": compile_seconds,
+            })
+        self.disable_inference_compile()
+        return rows
+
+    def bench_generation_modes(self, tokens: int = 32, prompt: str = "hello",
+                               modes: tuple = ("fp32", "fp16", "int8"),
+                               include_compile: bool = False,
+                               repeats: int = 2) -> list[dict]:
+        """Measure decode speed and KV-cache size per configuration.
+
+        Returns `[{mode, tokens_per_sec, seconds, kv_bytes_per_token, notes}]`
+        for every requested KV-cache dtype (the model is rebuilt with the same
+        weights and a different `kv_cache_dtype`) and, when `include_compile`,
+        for the `torch.compile`d variant. The loaded model is restored before
+        returning, so callers can keep using the engine.
+        """
+        model = self._native_model()
+        if model is None:
+            raise RuntimeError("bench_generation_modes needs a native AuraLite model")
+        tokens = max(1, int(tokens))
+        repeats = max(1, int(repeats))
+        arch = self._model_arch_kwargs(model)
+        head_dim = arch["d_model"] // arch["n_heads"]
+        kv_heads = arch["n_kv_heads"] or arch["n_heads"]
+        bytes_per_element = {"fp32": 4, "fp16": 2, "bf16": 2, "int8": 1}
+        state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        original = self.model
+        results: list[dict] = []
+        try:
+            for mode in modes:
+                mode_key = str(mode).lower()
+                variant = type(model)(**arch, kv_cache_dtype=("none" if mode_key == "fp32" else mode_key))
+                variant.load_state_dict(state)
+                variant.to(self.device)
+                variant.eval()
+                self.model = variant
+                self._compiled_inference_model = None
+                speeds = []
+                for _ in range(repeats):
+                    self.generate(prompt, 1, temperature=0.0, top_k=1)      # warm-up
+                    start = time.perf_counter()
+                    self.generate(prompt, tokens, temperature=0.0, top_k=1)
+                    speeds.append(tokens / max(1e-9, time.perf_counter() - start))
+                results.append({
+                    "mode": f"kv={mode_key}",
+                    "tokens_per_sec": max(speeds) if repeats > 1 else speeds[0],
+                    "seconds": tokens / (max(speeds) if repeats > 1 else speeds[0]),
+                    "kv_bytes_per_token": (bytes_per_element.get(mode_key, 4)
+                                           * 2 * arch["n_layers"] * kv_heads * head_dim),
+                    "notes": "",
+                })
+            if include_compile:
+                self.model = original
+                self.disable_inference_compile()
+                compile_seconds = self.enable_inference_compile()
+                speeds = []
+                for _ in range(repeats):
+                    self.generate(prompt, 1, temperature=0.0, top_k=1)
+                    start = time.perf_counter()
+                    self.generate(prompt, tokens, temperature=0.0, top_k=1)
+                    speeds.append(tokens / max(1e-9, time.perf_counter() - start))
+                best = max(speeds)
+                results.append({
+                    "mode": "kv=fp32+compile",
+                    "tokens_per_sec": best,
+                    "seconds": tokens / best,
+                    "kv_bytes_per_token": bytes_per_element["fp32"] * 2 * arch["n_layers"] * kv_heads * head_dim,
+                    "notes": f"compile={compile_seconds:.1f}s (cached for later runs)",
+                })
+        finally:
+            self._compiled_inference_model = None
+            self.model = original
+        return results
+
+    # ---- Diagnostics (GUI visualisations, v2.6.5) ----------------------
+    def attention_maps(self, text: str, layer: int = 0, head: int | None = None,
+                       max_tokens: int = 256) -> "np.ndarray":
+        """Attention probabilities of the *native* model for ``text``.
+
+        Returns a ``(n_heads, T, T)`` float32 array (or ``(T, T)`` when ``head``
+        is given), where ``T`` is the number of tokens actually fed to the model
+        (the last ``max_tokens`` of ``text``). Row ``i`` answers "how much did
+        position *i* attend to each earlier position" — the Chat tab's heatmap.
+
+        Implementation: one forward pass with `capture` set on the model, then
+        softmax over the captured RoPE-rotated q/k of that layer, in float32.
+        Diagnostics only — generation never pays for this (``capture=None``).
+
+        Raises `RuntimeError` for GGUF/Hugging Face models, which have no native
+        attention modules to inspect.
+        """
+        model = getattr(self.model, "module", self.model)   # unwrap DDP
+        model = getattr(model, "_orig_mod", model)           # unwrap torch.compile
+        if model is None or not isinstance(model, nn.Module):
+            raise RuntimeError("attention_maps needs a loaded native model "
+                               "(train() or load_model() a .pt checkpoint first)")
+        if self.is_gguf_model() or getattr(self, "hf_proxy", None) is not None:
+            raise RuntimeError("attention_maps is only available for native "
+                               "AuraLite checkpoints, not GGUF/Hugging Face models")
+        layers = getattr(model, "layers", None)
+        if not layers:
+            raise RuntimeError("loaded model exposes no transformer layers")
+        layer_index = int(layer)
+        if not 0 <= layer_index < len(layers):
+            raise ValueError(f"layer must be in [0, {len(layers) - 1}] for this model")
+
+        ids = list(self.encode(text))[-max(1, int(max_tokens)):]
+        if not ids:
+            raise ValueError("text produced no tokens")
+        was_training = model.training
+        model.eval()
+        capture: dict = {}
+        try:
+            with torch.inference_mode():
+                x = torch.tensor([ids], dtype=torch.long, device=self.device)
+                model(x, capture=capture)
+        finally:
+            if was_training:
+                model.train()
+
+        cap = capture.get(layer_index)
+        if not cap or "q" not in cap:
+            raise RuntimeError(f"layer {layer_index} did not capture attention")
+        q, k = cap["q"], cap["k"]                       # (1, H, T, hd) / (1, Hk, T, hd)
+        n_rep = int(cap.get("n_rep", 1))
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+        head_dim = q.shape[-1]
+        scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(head_dim)
+        t_q, t_k = scores.shape[-2], scores.shape[-1]
+        mask = torch.triu(torch.ones(t_q, t_k, dtype=torch.bool,
+                                     device=scores.device), diagonal=1)
+        window = cap.get("sliding_window") or 0
+        if window:
+            offsets = torch.arange(t_k, device=scores.device).unsqueeze(0) - \
+                torch.arange(t_q, device=scores.device).unsqueeze(1)
+            mask |= offsets < -(window - 1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)
+        if head is not None:
+            head_index = int(head)
+            if not 0 <= head_index < probs.shape[1]:
+                raise ValueError(f"head must be in [0, {probs.shape[1] - 1}]")
+            probs = probs[0, head_index]
+        else:
+            probs = probs[0]
+        return probs.cpu().numpy()
+
+    def token_frequencies(self, text: str) -> list[tuple[str, int]]:
+        """`[(token_text, count), …]` sorted by count — the Chat tab bar chart."""
+        if self.tokenizer is None:
+            raise ValueError("No tokenizer — train or load a model first!")
+        ids = self.encode(text)
+        counts = Counter(ids)
+        decode = self.decode
+        return [(decode([tid]), n) for tid, n in counts.most_common()]
 
     def _scaler_unscale_optimizer(self):
         """GradScaler.unscale_ that also supports chained (Muon + AdamW) optimizers."""
@@ -3014,7 +1711,7 @@ class AuraLiteEngine:
         with torch.inference_mode():
             # --- Process full seed in one pass --------------------------
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self.model(t, start_pos=0, use_cache=True)
+            logits = self._infer(t, start_pos=0, use_cache=True)
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                      repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
@@ -3030,7 +1727,7 @@ class AuraLiteEngine:
                 if pos + 1 >= hard_cap:
                     break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self.model(t, start_pos=pos, use_cache=True)
+                logits = self._infer(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                          repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
@@ -3103,6 +1800,29 @@ class AuraLiteEngine:
         if info.get("is_epoch_end") and int(epoch) > 0:
             progress_callback(epoch, total_epochs, train_loss, val_loss)
 
+    def _iter_token_chunks(self, text: str, chunk_chars: int = 2_000_000,
+                           overlap_chars: int = 256):
+        """Yield token ids in chunks — the mmap corpus path never holds them all.
+
+        Each chunk is encoded with a small overlap before its start; the tokens
+        produced by that overlap are dropped again, so chunk boundaries do not
+        duplicate text. For the char tokenizer this is *exact* (a char is a
+        token); for BPE a few boundary merges can differ from encoding the whole
+        text at once, which is the documented trade-off of streaming corpora.
+        """
+        if not text:
+            return
+        step = max(1, int(chunk_chars))
+        overlap = max(0, int(overlap_chars))
+        for start in range(0, len(text), step):
+            left = max(0, start - overlap)
+            chunk = text[left:start + step]
+            ids = self.encode(chunk)
+            if start > 0 and left != start:
+                prefix_ids = self.encode(text[left:start])
+                ids = ids[len(prefix_ids):]
+            yield ids
+
     def train(self, training_text: str, params: dict,
               progress_callback=None, stop_event=None):
         """Train (or continue training) the model.
@@ -3133,6 +1853,52 @@ class AuraLiteEngine:
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
+        try:
+            return self._train_impl(training_text, params, progress_callback, stop_event)
+        finally:
+            # Success, Ctrl+C/stop_event and exceptions alike: never leave the
+            # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
+            self._release_corpus_tempfile()
+
+    def _release_corpus_tempfile(self) -> None:
+        """Delete the temp-dir corpus memmap that `train()` created for this run.
+
+        Only the anonymous ``corpus_cache="mmap"`` file is removed: its name is
+        unique per run, so no later run could ever reuse it, and on a tmpfs
+        ``/tmp`` it would pin RAM until reboot (a 1 GB char-level corpus becomes
+        a uint32 file of up to 4 GB). An explicit ``corpus_cache_path`` is the
+        user's file and is kept.
+        """
+        path = getattr(self, "_corpus_tmp_file", None)
+        self._corpus_tmp_file = None
+        if not path:
+            return
+        for attempt in (1, 2):
+            try:
+                os.remove(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                if attempt == 1:
+                    # Windows refuses to delete a file that is still memory-mapped:
+                    # drop memmap views that only a reference cycle keeps alive.
+                    import gc
+                    gc.collect()
+                    continue
+                # Still mapped (e.g. by a DataLoader worker that has not exited).
+                import atexit
+                logger.debug(f"[AuraLite] corpus memmap {path} still in use ({exc}); "
+                             f"removing it at interpreter exit")
+                atexit.register(_remove_file_quietly, path)
+                return
+        if getattr(self, "_corpus_cache_path", None) == path:
+            self._corpus_cache_path = None
+        logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
+
+    def _train_impl(self, training_text: str, params: dict,
+                    progress_callback=None, stop_event=None):
+        """Body of :meth:`train`, split out so its temp files are released on every exit."""
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
             raise ValueError(
@@ -3235,7 +2001,12 @@ class AuraLiteEngine:
         if seed is not None:
             torch.manual_seed(int(seed))
             np.random.seed(int(seed))
-            print(f"[AuraLite] Seed set: {seed} (torch & numpy RNG)")
+            logger.info(f"[AuraLite] Seed set: {seed} (torch & numpy RNG)")
+
+        # A compiled module must never be trained: torch.compile captures the
+        # inference graph, and the weights belong to the wrapper.
+        if self._compiled_inference_model is not None:
+            self.disable_inference_compile()
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
@@ -3353,8 +2124,8 @@ class AuraLiteEngine:
                     n_heads=n_heads, n_kv_heads=n_kv_heads)
             note = (f"; pre-tokenizer estimate was {estimated:,}" if estimated is not None
                     and estimated != actual_params else "")
-            print(f"[AuraLite] Model built: {actual_params:,} params "
-                  f"(vocab={self.vocab_size:,}{note})")
+            logger.info(f"[AuraLite] Model built: {actual_params:,} params "
+                        f"(vocab={self.vocab_size:,}{note})")
 
         self._ddp_model = None
 
@@ -3365,14 +2136,14 @@ class AuraLiteEngine:
         # are trained by a companion AdamW, following Moonlight et al.
         has_lora = bool(getattr(self.model, "lora_adapters", None))
         if optimizer_name == "muon" and has_lora:
-            print("[AuraLite] WARNING: LoRA adapters are trained with AdamW "
-                  "(Muon is not recommended for low-rank adapters). Falling back to AdamW.")
+            logger.warning("[AuraLite] WARNING: LoRA adapters are trained with AdamW "
+                           "(Muon is not recommended for low-rank adapters). Falling back to AdamW.")
             optimizer_name = "adamw"
 
         if optimizer_name == "muon":
             muon_params, adam_decay_params, adam_no_decay_params = split_parameters_for_muon(self.model)
             if not muon_params:
-                print("[AuraLite] WARNING: no eligible 2-D matrices for Muon (LoRA-only?). Using AdamW.")
+                logger.warning("[AuraLite] WARNING: no eligible 2-D matrices for Muon (LoRA-only?). Using AdamW.")
                 optimizer_name = "adamw"
             else:
                 sub_optimizers = [
@@ -3387,9 +2158,9 @@ class AuraLiteEngine:
                 if adam_groups:
                     sub_optimizers.append(optim.AdamW(adam_groups, lr=lr, betas=(0.9, 0.95)))
                 self.optimizer = _ChainedOptimizers(*sub_optimizers)
-                print(f"[AuraLite] Optimizer: Muon ({len(muon_params)} matrices, "
-                      f"lr={muon_lr}, momentum={muon_momentum}, adjust_lr={muon_adjust_lr}) + "
-                      f"AdamW ({len(adam_decay_params) + len(adam_no_decay_params)} params, lr={lr})")
+                logger.info(f"[AuraLite] Optimizer: Muon ({len(muon_params)} matrices, "
+                            f"lr={muon_lr}, momentum={muon_momentum}, adjust_lr={muon_adjust_lr}) + "
+                            f"AdamW ({len(adam_decay_params) + len(adam_no_decay_params)} params, lr={lr})")
 
         if optimizer_name != "muon":
             self.optimizer = optim.AdamW(
@@ -3401,9 +2172,9 @@ class AuraLiteEngine:
             try:
                 self.optimizer.load_state_dict(optimizer_state_to_restore)
                 self._move_optimizer_state_to_device(self.optimizer, self.device)
-                print("[AuraLite] Restored optimizer state.")
+                logger.info("[AuraLite] Restored optimizer state.")
             except Exception as e:
-                print(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
+                logger.warning(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
         criterion = nn.CrossEntropyLoss()
 
         # Mixed precision. History: fp16 autocast + GradScaler on CUDA only.
@@ -3425,29 +2196,57 @@ class AuraLiteEngine:
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=bool(use_amp and amp_t is torch.float16))
         if use_amp:
-            print(f"[AuraLite] AMP: {amp_dtype} autocast on {amp_device}")
+            logger.info(f"[AuraLite] AMP: {amp_dtype} autocast on {amp_device}")
         if scaler_state_to_restore is not None:
             try:
                 self.scaler.load_state_dict(scaler_state_to_restore)
-                print("[AuraLite] Restored AMP scaler state.")
+                logger.info("[AuraLite] Restored AMP scaler state.")
             except Exception as e:
-                print(f"[AuraLite] WARNING: could not restore AMP scaler state: {e}")
+                logger.warning(f"[AuraLite] WARNING: could not restore AMP scaler state: {e}")
 
         # ---- Dataset / DataLoader ------------------------------------
+        # v2.6.5: `corpus_cache="mmap"` (or AURALITE_CORPUS_CACHE=mmap) streams
+        # the corpus into a uint32 memmap instead of holding an int64 tensor in
+        # RAM. Measured cost of the RAM path: ~16 MiB per 1 MiB of text, i.e.
+        # a 500 MiB corpus needs ~8 GiB peak; memmap+uint32 cuts that by ~4x
+        # and never materialises the token list.
         _setup_progress("Tokenizing corpus (encode)…", 0.45)
-        encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
-        encoded_bytes = encoded.numel() * encoded.element_size()
-        print(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
-              f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
+        cache_mode = str(params.get("corpus_cache")
+                         or os.environ.get("AURALITE_CORPUS_CACHE", "")).strip().lower()
+        use_mmap = cache_mode in ("1", "true", "yes", "on", "mmap", "memmap")
+        corpus_file = None
+        encoded = None
+        if use_mmap:
+            from model_engine.dataset import write_tokens_memmap
+            cache_path = params.get("corpus_cache_path")
+            if cache_path:
+                corpus_file = Path(cache_path)
+            else:
+                corpus_file = Path(tempfile.gettempdir()) / (
+                    f"auralite_corpus_{uuid4().hex}.uint32.bin")
+                # Unique name, so never reusable: train() deletes it when it returns.
+                self._corpus_tmp_file = str(corpus_file)
+            total_tokens = write_tokens_memmap(
+                corpus_file, self._iter_token_chunks(training_text), dtype="uint32")
+            size_mib = corpus_file.stat().st_size / (1024 * 1024)
+            logger.info(f"[AuraLite] Tokenized corpus once into {total_tokens:,} tokens "
+                        f"({size_mib:.2f} MiB uint32 memmap: {corpus_file}).")
+            self._corpus_cache_path = str(corpus_file)
+        else:
+            encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
+            encoded_bytes = encoded.numel() * encoded.element_size()
+            logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
+                        f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
+        token_count = total_tokens if use_mmap else len(encoded)
         _setup_progress(
-            f"Corpus tokenized: {len(encoded):,} tokens", 0.55,
+            f"Corpus tokenized: {token_count:,} tokens", 0.55,
         )
 
         # ---- Train / validation split -------------------------------------
         # Goal: both train and val slices must produce at least one full
         # (x, y) window. CharDataset of length L gives max(0, L - seq_length)
         # samples, so each slice needs L >= seq_length + 1.
-        total_tokens = len(encoded)
+        total_tokens = token_count
         n_val_target = int(total_tokens * val_split) if val_split > 0 else 0
 
         # Minimum tokens we need overall:
@@ -3458,13 +2257,15 @@ class AuraLiteEngine:
 
         val_data = None
         train_data = encoded
+        split_at = total_tokens
+        n_train_tokens = total_tokens
 
         if val_split > 0:
             if total_tokens < min_train_tokens + min_val_tokens:
-                print(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
-                      f"encoding, need at least {min_train_tokens + min_val_tokens} "
-                      f"for seq_length={seq_length} with validation. "
-                      f"Validation DISABLED for this run.")
+                logger.warning(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
+                               f"encoding, need at least {min_train_tokens + min_val_tokens} "
+                               f"for seq_length={seq_length} with validation. "
+                               f"Validation DISABLED for this run.")
             else:
                 # Take at least min_val_tokens; honour val_split but never starve train.
                 val_tokens = max(min_val_tokens, n_val_target + seq_length)
@@ -3473,16 +2274,22 @@ class AuraLiteEngine:
                 val_tokens = min(val_tokens, max_val_tokens)
 
                 split_at   = total_tokens - val_tokens
-                train_data = encoded[:split_at]
-                val_data   = encoded[split_at:]
+                n_train_tokens = split_at
+                if encoded is not None:
+                    train_data = encoded[:split_at]
+                    val_data   = encoded[split_at:]
 
-                n_val_samples = max(0, len(val_data) - seq_length)
-                n_train_samples = max(0, len(train_data) - seq_length)
-                print(f"[AuraLite] Split: {len(train_data)} train tokens "
-                      f"({n_train_samples} samples), {len(val_data)} val tokens "
-                      f"({n_val_samples} samples), seq_length={seq_length}")
+                n_val_samples = max(0, val_tokens - seq_length)
+                n_train_samples = max(0, n_train_tokens - seq_length)
+                logger.info(f"[AuraLite] Split: {n_train_tokens} train tokens "
+                            f"({n_train_samples} samples), {val_tokens} val tokens "
+                            f"({n_val_samples} samples), seq_length={seq_length}")
 
-        dataset = CharDataset(train_data, seq_length)
+        if use_mmap:
+            from model_engine.dataset import PagedDataset
+            dataset = PagedDataset(corpus_file, seq_length, offset=0, limit=split_at)
+        else:
+            dataset = CharDataset(train_data, seq_length)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
@@ -3513,20 +2320,25 @@ class AuraLiteEngine:
         loader = DataLoader(dataset, **loader_kwargs)
 
         val_loader = None
-        if val_data is not None:
-            val_ds = CharDataset(val_data, seq_length)
+        if use_mmap:
+            val_ds = (PagedDataset(corpus_file, seq_length, offset=split_at,
+                                   limit=total_tokens - split_at)
+                      if split_at < total_tokens else None)
+        else:
+            val_ds = CharDataset(val_data, seq_length) if val_data is not None else None
+        if val_ds is not None:
             if len(val_ds) > 0:
                 # Use a batch size that's guaranteed not to drop everything;
                 # never larger than the val set itself.
                 val_bs = max(1, min(batch_size, len(val_ds)))
                 val_loader = DataLoader(val_ds, batch_size=val_bs,
                                         shuffle=False, drop_last=False)
-                print(f"[AuraLite] Validation loader: {len(val_ds)} samples, "
-                      f"batch_size={val_bs}, {len(val_loader)} batches")
+                logger.info(f"[AuraLite] Validation loader: {len(val_ds)} samples, "
+                            f"batch_size={val_bs}, {len(val_loader)} batches")
             else:
-                print(f"[AuraLite] WARNING: val dataset is empty after windowing "
-                      f"(val_data has {len(val_data)} tokens, need > {seq_length}). "
-                      f"Validation DISABLED.")
+                logger.warning(f"[AuraLite] WARNING: val dataset is empty after windowing "
+                               f"(val slice has {total_tokens - split_at} tokens, need > "
+                               f"{seq_length}). Validation DISABLED.")
 
         total_steps  = epochs * len(loader)
         warmup_steps = min(200, total_steps // 10)
@@ -3540,13 +2352,13 @@ class AuraLiteEngine:
                 min_lr_ratio=wsd_min_lr_ratio,
                 decay_type=wsd_decay,
             )
-            print(f"[AuraLite] LR schedule: WSD (stable={wsd_stable_ratio:.0%}, "
-                  f"min_lr_ratio={wsd_min_lr_ratio}, decay={wsd_decay})")
+            logger.info(f"[AuraLite] LR schedule: WSD (stable={wsd_stable_ratio:.0%}, "
+                        f"min_lr_ratio={wsd_min_lr_ratio}, decay={wsd_decay})")
         else:
             self.scheduler = CosineWarmupScheduler(
                 self.optimizer, warmup_steps, total_steps, min_lr=lr * 0.1
             )
-            print("[AuraLite] LR schedule: cosine + warmup")
+            logger.info("[AuraLite] LR schedule: cosine + warmup")
         if scheduler_state_to_restore is not None:
             try:
                 self.scheduler.load_state_dict(scheduler_state_to_restore)
@@ -3557,9 +2369,9 @@ class AuraLiteEngine:
                     self.scheduler.max_steps,
                     self.scheduler.step_count + total_steps,
                 )
-                print("[AuraLite] Restored scheduler state.")
+                logger.info("[AuraLite] Restored scheduler state.")
             except Exception as e:
-                print(f"[AuraLite] WARNING: could not restore scheduler state: {e}")
+                logger.warning(f"[AuraLite] WARNING: could not restore scheduler state: {e}")
 
         # ---- torch.compile (optional, speeds up the training loop) ----
         # NOTE: torch.compile() returns lazily — Dynamo/Inductor errors (e.g. a
@@ -3572,7 +2384,7 @@ class AuraLiteEngine:
             try:
                 compiled = torch.compile(self.model)
                 # Trial forward to force compilation now and catch backend errors
-                sample_len = min(seq_length, len(train_data) - 1)
+                sample_len = min(seq_length, max(1, n_train_tokens - 1))
                 probe = torch.zeros((1, max(1, sample_len)),
                                     dtype=torch.long, device=self.device)
                 with torch.no_grad():
@@ -3582,7 +2394,7 @@ class AuraLiteEngine:
                 train_model = compiled
             except Exception as e:
                 # graceful fallback — training continues in plain eager mode
-                print(f"[AuraLite] torch.compile disabled (falling back to eager): {e}")
+                logger.warning(f"[AuraLite] torch.compile disabled (falling back to eager): {e}")
                 train_model = self.model
                 try:
                     torch._dynamo.reset()
@@ -3594,7 +2406,7 @@ class AuraLiteEngine:
                 train_model,
                 device_ids=[self.local_rank] if torch.cuda.is_available() else None,
             )
-            print(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
+            logger.info(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
 
         # ---- Epoch loop -----------------------------------------------
         # Use DDP-wrapped model if available
@@ -4266,7 +3078,7 @@ class AuraLiteEngine:
             raise ValueError("Train or load a model first!")
 
         if self.is_gguf_model():
-            if not isinstance(self.model, GGUFModelProxy):
+            if not is_gguf_like(self.model):
                 return
             if self.model.use_chat_completion:
                 stream = self.model.create_chat_completion(
@@ -4329,7 +3141,7 @@ class AuraLiteEngine:
         with torch.inference_mode():
             # Process seed
             t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self.model(t, start_pos=0, use_cache=True)
+            logits = self._infer(t, start_pos=0, use_cache=True)
             nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                      repetition_penalty, result_ids, min_p=min_p)
             result_ids.append(nxt)
@@ -4341,7 +3153,7 @@ class AuraLiteEngine:
                 if pos + 1 >= hard_cap:
                     break
                 t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self.model(t, start_pos=pos, use_cache=True)
+                logits = self._infer(t, start_pos=pos, use_cache=True)
                 nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
                                          repetition_penalty, result_ids, min_p=min_p)
                 result_ids.append(nxt)
@@ -4371,7 +3183,7 @@ class AuraLiteEngine:
         hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
 
         with torch.inference_mode():
-            logits = self.model(batch, start_pos=0, use_cache=True)
+            logits = self._infer(batch, start_pos=0, use_cache=True)
             last_logits = logits[:, -1, :]
 
             next_tokens = []
@@ -4387,7 +3199,7 @@ class AuraLiteEngine:
                     break
 
                 next_input = torch.tensor(next_tokens, dtype=torch.long).unsqueeze(1).to(self.device)
-                logits = self.model(next_input, start_pos=pos, use_cache=True)
+                logits = self._infer(next_input, start_pos=pos, use_cache=True)
 
                 next_tokens = []
                 for b in range(B):
@@ -4874,9 +3686,9 @@ class AuraLiteEngine:
 
         if not result.errors:
             self.model = q_model
-            print(f"[AuraLite] Quantization complete: {result.method} {result.bits} "
-                  f"({result.original_size_mb:.2f} → {result.quantized_size_mb:.2f} MB, "
-                  f"{result.compression_ratio:.2f}×)")
+            logger.info(f"[AuraLite] Quantization complete: {result.method} {result.bits} "
+                        f"({result.original_size_mb:.2f} → {result.quantized_size_mb:.2f} MB, "
+                        f"{result.compression_ratio:.2f}×)")
 
         return q_model, result
 

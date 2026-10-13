@@ -226,7 +226,14 @@ class ImageTabMixin:
             text=f"Status: preset '{self.img_preset_var.get()}' applied ✅")
 
 
+    @staticmethod
     def _parse_int_list(text):
+        """Parse "16,32,64" / "16;32" into a list; None for auto/none/empty.
+
+        v2.6.5: this lived without `self` *and* without `@staticmethod`, so every
+        call site (`self._parse_int_list(...)`) passed the instance as the first
+        argument and raised TypeError — the image tab could never start training.
+        """
         text = (text or "").strip().lower()
         if text in ("", "auto", "none"):
             return None

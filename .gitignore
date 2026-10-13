@@ -7,3 +7,6 @@ __pycache__/
 coverage.xml
 htmlcov/
 *.egg-info/
+
+# Benchmark output (generated)
+benchmarks/latest_generation.json

@@ -3,7 +3,9 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
-from ..common import (AuraLiteAgent, CHAT_TEMPLATES, HAS_CHAT_SUPPORT, Sandbox, TOOL_REGISTRY, messagebox, threading, tk, ttk)
+from .. import visualizations
+from ..i18n import tr
+from ..common import (AuraLiteAgent, CHAT_TEMPLATES, Figure, FigureCanvasTkAgg, HAS_CHAT_SUPPORT, Sandbox, TOOL_REGISTRY, messagebox, threading, tk, ttk)
 
 class ChatTabMixin:
     def _build_chat_tab(self):
@@ -132,6 +134,9 @@ class ChatTabMixin:
         )
         self.agent_stop_btn.pack(anchor=tk.E, pady=(2, 0))
 
+        # ── Insights: token distribution + attention map (v2.6.5) ───────────
+        self._build_chat_insights(tab)
+
         # Status
         self.chat_status = ttk.Label(tab, text="Chat ready. Load a model to start.", style="Sub.TLabel")
         self.chat_status.pack(anchor=tk.W, pady=4)
@@ -144,6 +149,118 @@ class ChatTabMixin:
         self._agent_sandbox: "Sandbox | None" = None
         self._agent_stop_event = threading.Event()
 
+
+
+    # ── Insights panel (token distribution / attention map) ─────────────
+    def _build_chat_insights(self, tab):
+        """Bar chart of token frequencies + attention heatmap for the last turn.
+
+        Both plots need `matplotlib` (optional dependency); without it the panel
+        explains how to enable it instead of failing at first click.
+        """
+        frame = ttk.LabelFrame(tab, text="  📊  Insights  ", padding="6")
+        frame.pack(fill=tk.X, pady=(4, 0))
+
+        controls = ttk.Frame(frame)
+        controls.pack(fill=tk.X)
+        self.chat_insights_btn = ttk.Button(controls, text=tr("btn.insights"),
+                                            command=self._plot_token_distribution)
+        self.chat_insights_btn.pack(side=tk.LEFT, padx=2)
+        self.chat_attention_btn = ttk.Button(controls, text=tr("btn.attention"),
+                                             command=self._plot_attention_map)
+        self.chat_attention_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(controls, text=tr("lbl.attention_layer")).pack(side=tk.LEFT, padx=(12, 2))
+        self.chat_attention_layer_var = tk.StringVar(
+            value=str(getattr(self.gui_config, "attention_layer", 0)))
+        ttk.Entry(controls, textvariable=self.chat_attention_layer_var,
+                  width=4).pack(side=tk.LEFT)
+
+        self.chat_plot_ax = None
+        if gui_common.HAS_MATPLOTLIB:
+            self.chat_fig = Figure(figsize=(6, 2.6), dpi=80)
+            self.chat_plot_ax = self.chat_fig.add_subplot(111)
+            self.chat_plot_canvas = FigureCanvasTkAgg(self.chat_fig, master=frame)
+            self.chat_plot_canvas.get_tk_widget().pack(fill=tk.X, expand=True)
+            self.chat_plot_canvas.draw()
+        else:
+            ttk.Label(frame, text=tr("msg.plots_unavailable"),
+                      style="Sub.TLabel").pack(anchor=tk.W)
+
+    def _last_response_text(self) -> str:
+        for message in reversed(getattr(self, "chat_history", []) or []):
+            if message.get("role") == "assistant" and message.get("content"):
+                return str(message["content"])
+        return ""
+
+    def _last_exchange_text(self) -> str:
+        parts = [m.get("content", "") for m in getattr(self, "chat_history", []) or []
+                 if m.get("role") in ("user", "assistant") and m.get("content")]
+        return "\n".join(parts[-2:])
+
+    def _plot_token_distribution(self):
+        """Bar chart of the token frequencies of the last assistant reply."""
+        if not self._ensure_native_model(need_tokens=True):
+            return
+        text = self._last_response_text()
+        if not text.strip():
+            messagebox.showinfo(tr("btn.insights"), tr("msg.empty_output"))
+            return
+        try:
+            pairs = self.engine.token_frequencies(text)
+        except Exception as exc:
+            messagebox.showwarning(tr("btn.insights"), str(exc))
+            return
+        visualizations.plot_token_distribution(
+            self.chat_plot_ax, pairs,
+            top=int(getattr(self.gui_config, "plot_top_tokens", 20)),
+            title=tr("msg.tokens_title"))
+        self._refresh_chat_plot()
+        self.chat_status.config(text=f"{tr('lbl.tokens')}: {len(pairs)} unique / {len(text)} chars")
+
+    def _plot_attention_map(self):
+        """Heatmap of this layer's attention over the last user+assistant turn."""
+        if not self._ensure_native_model():
+            return
+        text = self._last_exchange_text()
+        if not text.strip():
+            messagebox.showinfo(tr("btn.attention"), tr("msg.empty_output"))
+            return
+        try:
+            layer = int(self.chat_attention_layer_var.get())
+        except (TypeError, ValueError):
+            layer = 0
+        try:
+            matrix = self.engine.attention_maps(text, layer=layer)
+            ids = self.engine.encode(text)[-matrix.shape[-1]:]
+            tokens = [self.engine.decode([i]) for i in ids]
+        except Exception as exc:
+            messagebox.showwarning(tr("btn.attention"), str(exc))
+            return
+        visualizations.plot_attention_heatmap(
+            self.chat_plot_ax, matrix, tokens=tokens,
+            title=tr("msg.attention_title", layer=layer))
+        self._refresh_chat_plot()
+        self.gui_config = self.gui_config.update(attention_layer=layer)
+
+    def _ensure_native_model(self, need_tokens: bool = False) -> bool:
+        """Shared guard for the insight plots."""
+        if not getattr(self.engine, "model", None):
+            messagebox.showwarning(tr("lbl.status"), tr("msg.no_model"))
+            return False
+        if self.chat_plot_ax is None:
+            messagebox.showinfo(tr("btn.insights"), tr("msg.plots_unavailable"))
+            return False
+        return True
+
+    def _refresh_chat_plot(self):
+        canvas = getattr(self, "chat_plot_canvas", None)
+        if canvas is None:
+            return
+        try:
+            self.chat_fig.tight_layout()
+        except Exception:
+            pass
+        canvas.draw()
 
     def _send_chat_message(self):
         if not self.engine.model:

@@ -6,6 +6,10 @@
     auralite serve     --model out.pt [--host 0.0.0.0] [--port 8000]
     auralite info      --model out.pt
 
+`--mmap` (or `--corpus-cache PATH`) streams the corpus into a uint32 memory map
+instead of an in-RAM int64 tensor — the same tokens, ~4x less memory and no
+Python list of the whole corpus.
+
 `--params` JSON accepts every key of `AuraLiteEngine.train()` (d_model,
 n_heads, n_layers, d_ff, seq_length, epochs, batch_size, lr, tokenizer,
 optimizer, muon_lr, lr_schedule, use_qk_norm, sliding_window, seed,
@@ -20,6 +24,8 @@ import os
 import sys
 import time
 
+from model_engine.logging_utils import reset_engine_logging
+
 DEFAULT_TRAIN_PARAMS: dict = {
     "d_model": 128, "n_heads": 4, "n_layers": 4, "d_ff": 256,
     "seq_length": 64, "epochs": 10, "batch_size": 16,
@@ -32,35 +38,39 @@ def _add_common_flags(parser: argparse.ArgumentParser, *,
     """`--quiet` / `--log-level` shared by the root parser and every subcommand."""
     quiet_default = argparse.SUPPRESS if suppress_defaults else False
     level_default = (argparse.SUPPRESS if suppress_defaults
-                     else os.environ.get("AURALITE_LOG_LEVEL", "WARNING"))
+                     else os.environ.get("AURALITE_LOG_LEVEL", "INFO"))
     parser.add_argument("--quiet", action="store_true", default=quiet_default,
                         help="suppress progress output (results are still printed)")
     parser.add_argument("--log-level", default=level_default,
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                        help="library log level (default: WARNING or $AURALITE_LOG_LEVEL)")
+                        help="library log level (default: INFO or $AURALITE_LOG_LEVEL)")
 
 
 def _configure_logging(args: argparse.Namespace) -> None:
     """Apply --quiet/--log-level (and $AURALITE_LOG_LEVEL) to library loggers.
+
+    Since v2.6.5 the engine reports its progress through the ``auralite``
+    logger instead of `print()`. The CLI preserves the historical UX: messages
+    go to **stdout** (so `auralite train ... > log.txt` still captures them),
+    the default level is INFO, and ``--quiet`` silences the library entirely.
+    The handler re-resolves ``sys.stdout`` on every record so a later
+    redirection (tests, wrappers, the GUI) is honoured.
 
     The level is also exported through ``AURALITE_LOG_LEVEL`` so that modules
     imported *later* (``model_engine`` reads the variable at import time) keep
     the level requested on the command line instead of resetting it to INFO.
     """
     level = "CRITICAL" if getattr(args, "quiet", False) else str(
-        getattr(args, "log_level", "WARNING")).upper()
+        getattr(args, "log_level", "INFO")).upper()
     os.environ["AURALITE_LOG_LEVEL"] = level
-    logger = logging.getLogger("auralite")
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-        logger.addHandler(handler)
-    # The library installs its own StreamHandler; without this the same record
-    # would also reach the root logger and be printed twice.
+
+    logger = reset_engine_logging(level=level, stream_name="stdout")
+    # The library installs its own stderr handler at import time; replacing it
+    # keeps a single copy of every line, and `propagate = False` stops records
+    # from reaching the root logger (and being printed a second time).
     logger.propagate = False
     if not logging.getLogger().handlers:
-        logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+        logging.basicConfig(level=level, format="%(message)s")
 
 
 def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
@@ -113,6 +123,19 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.params:
         with open(args.params, "r", encoding="utf-8") as f:
             params.update(json.load(f))
+    if getattr(args, "mmap", False) or getattr(args, "corpus_cache", None):
+        params["corpus_cache"] = "mmap"
+    if getattr(args, "corpus_cache", None):
+        params["corpus_cache_path"] = os.path.abspath(args.corpus_cache)
+    # v2.6.5: validate the merged params against the typed config so typos in
+    # --params (e.g. "epoch" instead of "epochs") fail loudly instead of being
+    # silently ignored by train().
+    try:
+        from model_engine.config import AuraLiteConfig
+        AuraLiteConfig(**{k: v for k, v in params.items()})
+    except Exception as err:
+        print(f"error: invalid training parameters: {err}", file=sys.stderr)
+        return 2
     engine = AuraLiteEngine()
     engine.train(text, params,
                  progress_callback=None if getattr(args, "quiet", False) else _progress)
@@ -125,6 +148,13 @@ def cmd_generate(args: argparse.Namespace) -> int:
     from model_engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(args.model)
+    if getattr(args, "compile", False):
+        seconds = engine.enable_inference_compile()
+        if seconds:
+            print(f"torch.compile: ready in {seconds:.2f}s "
+                  f"(kernels cached in $AURALITE_HOME/torch_inductor)")
+        else:
+            print("torch.compile unavailable — running eagerly", file=sys.stderr)
     out = engine.generate(args.prompt, args.length,
                           temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
     print(out)
@@ -135,6 +165,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
     from model_engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(args.model)
+    if getattr(args, "compile", False):
+        engine.enable_inference_compile()
     history: list[dict] = []
     if args.system:
         history.append({"role": "system", "content": args.system})
@@ -177,8 +209,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _bench(model_path: str, n_tokens: int) -> int:
-    """Measure generation speed and weight memory for the loaded checkpoint."""
+def _bench(model_path: str, n_tokens: int, modes: bool = False,
+           compile_bench: bool = False) -> int:
+    """Measure generation speed, weight memory and (optionally) KV-cache modes.
+
+    `--bench-modes` rebuilds the model with fp16/int8 KV caches and reports
+    tokens/s next to the cache size per token; `--bench-compile` compares prompt
+    processing (prefill) eager vs `torch.compile`. Both are *measurements*, not
+    expectations — on CPU the compiled decode path is slower, which is exactly
+    why the engine only routes prefill through it.
+    """
     from model_engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(model_path)
@@ -197,10 +237,81 @@ def _bench(model_path: str, n_tokens: int) -> int:
     for attr in ("kv_cache_dtype", "sliding_window", "use_flex_attention",
                  "use_alibi", "lora_rank"):
         print(f"{attr}: {getattr(model, attr, None)}")
+
+    if modes:
+        try:
+            rows = engine.bench_generation_modes(tokens=max(8, n_tokens), repeats=2)
+        except RuntimeError as err:
+            print(f"bench-modes: n/a ({err})", file=sys.stderr)
+            return 1
+        print("kv-cache modes (same weights, rebuilt model):")
+        print(f"  {'mode':<10} {'tokens/s':>10} {'kv B/token':>12}")
+        for row in rows:
+            print(f"  {row['mode']:<10} {row['tokens_per_sec']:>10.1f} "
+                  f"{row['kv_bytes_per_token']:>12}")
+        print("  note: lower precision saves KV memory; on CPU it does not "
+              "speed up decoding.")
+    if compile_bench:
+        try:
+            rows = engine.bench_prefill(repeats=2)
+        except RuntimeError as err:
+            print(f"bench-compile: n/a ({err})", file=sys.stderr)
+            return 1
+        compile_seconds = rows[0]["compile_seconds"] if rows else 0.0
+        print(f"torch.compile prefill (first compile {compile_seconds:.1f}s, "
+              f"kernels cached in $AURALITE_HOME/torch_inductor):")
+        print(f"  {'shape':<10} {'eager tok/s':>12} {'compiled tok/s':>15} {'speedup':>8}")
+        for row in rows:
+            print(f"  {row['shape']:<10} {row['eager_tokens_per_sec']:>12.0f} "
+                  f"{row['compiled_tokens_per_sec']:>15.0f} {row['speedup']:>7.2f}×")
+        print("  note: single-token decode stays eager on purpose (compilation "
+              "re-checks guards per KV length and loses).")
+    return 0
+
+
+def _gguf_perplexity(args) -> int:
+    """Score a `.gguf` model on a text file, with caching (roadmap P2.12)."""
+    from model_engine.gguf_proxy import (GGUFNotAvailableError, bench_gguf_perplexity,
+                                         clear_perplexity_cache, perplexity_cache_path)
+    if not os.path.exists(args.text):
+        print(f"error: text file not found: {args.text}", file=sys.stderr)
+        return 2
+    try:
+        text = open(args.text, "r", encoding="utf-8", errors="replace").read()
+    except OSError as err:
+        print(f"error: cannot read {args.text}: {err}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear_cache", False):
+        removed = clear_perplexity_cache()
+        print(f"perplexity cache cleared: {removed} ({perplexity_cache_path()})")
+    if not text.strip():
+        print("error: the text file is empty", file=sys.stderr)
+        return 2
+
+    try:
+        result = bench_gguf_perplexity(
+            args.model, text, n_ctx=int(getattr(args, "n_ctx", 2048) or 2048),
+            use_cache=not getattr(args, "no_cache", False),
+            n_threads=getattr(args, "threads", None),
+        )
+    except GGUFNotAvailableError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 3
+    source = "cache" if result["cached"] else f"{result['seconds']:.2f}s"
+    print(f"perplexity: {result['perplexity']:.4f}  ({source})")
+    print(f"bits_per_token: {result['bits_per_token']:.4f}")
+    print(f"scored_tokens: {result['n_tokens']}  text_chars: {result['text_chars']}  "
+          f"n_ctx: {result['n_ctx']}")
+    print(f"cache_key: {result['key']}")
+    if not result["cached"]:
+        print(f"cache_file: {perplexity_cache_path()}")
     return 0
 
 
 def cmd_info(args: argparse.Namespace) -> int:
+    # GGUF scoring never touches the checkpoint reader (a .gguf is not a .pt).
+    if getattr(args, "perplexity", False):
+        return _gguf_perplexity(args)
     # v2.6.5: checkpoints are read with the safe unpickler (see safe_io.py).
     from model_engine.safe_io import safe_torch_load
     if not os.path.exists(args.model):
@@ -234,12 +345,18 @@ def cmd_info(args: argparse.Namespace) -> int:
         for key, value in describe_backends().items():
             print(f"  {key}: {value}")
     if getattr(args, "bench", 0):
-        return _bench(args.model, int(args.bench))
+        return _bench(args.model, int(args.bench),
+                      modes=bool(getattr(args, "bench_modes", False)),
+                      compile_bench=bool(getattr(args, "bench_compile", False)))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from model_engine import __version__
+
     parser = argparse.ArgumentParser(prog="auralite", description="AuraLite AI CLI")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
+                        help="print the installed AuraLite version and exit")
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -248,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", required=True, help="training text file (UTF-8)")
     p.add_argument("--params", help="JSON file with training params")
     p.add_argument("--model", default="model.pt", help="output checkpoint")
+    p.add_argument("--mmap", action="store_true",
+                   help="stream the corpus into a uint32 memmap (low RAM use; "
+                        "required for corpora that do not fit in memory). The "
+                        "temporary file is deleted when training ends")
+    p.add_argument("--corpus-cache", metavar="PATH",
+                   help="where to keep the tokenised corpus (implies --mmap)")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("generate", help="generate text from a checkpoint")
@@ -258,6 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model for prompt processing "
+                        "(kernel cache in $AURALITE_HOME/torch_inductor)")
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("chat", help="chat with a checkpoint (interactive or one-shot)")
@@ -270,6 +396,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model for prompt processing")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("serve", help="start the OpenAI-compatible API server")
@@ -286,6 +414,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also print the quantization backend diagnostics")
     p.add_argument("--bench", type=int, default=0, metavar="N",
                    help="generate N tokens and report tokens/s + memory")
+    p.add_argument("--bench-modes", action="store_true",
+                   help="also compare fp32/fp16/int8 KV-cache modes (tokens/s + memory)")
+    p.add_argument("--bench-compile", action="store_true",
+                   help="also compare eager vs torch.compile prompt processing (prefill)")
+    p.add_argument("--perplexity", action="store_true",
+                   help="score a .gguf model on --text and report perplexity (cached)")
+    p.add_argument("--text", metavar="FILE", help="text file used by --perplexity")
+    p.add_argument("--n-ctx", type=int, default=2048,
+                   help="context window used by --perplexity (default 2048)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="ignore and do not write the perplexity cache")
+    p.add_argument("--clear-cache", action="store_true",
+                   help="drop the perplexity cache before scoring")
     p.set_defaults(func=cmd_info)
     return parser
 

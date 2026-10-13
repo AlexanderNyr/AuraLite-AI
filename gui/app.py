@@ -16,7 +16,29 @@ from .tabs.console import ConsoleTabMixin
 from .tabs.chat import ChatTabMixin
 from .tabs.result_view import ResultViewMixin
 from . import common as gui_common
+from . import session as gui_session
+from .async_ops import TkAsyncBridge
+from .config import load_config
+from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
 from .common import (AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, sys, threading, tk, ttk)
+
+
+def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
+    """Return ``"WxH"`` if the stored geometry is usable, else an empty string."""
+    if not geometry or not isinstance(geometry, str):
+        return ""
+    width, _, height = geometry.partition("x")
+    try:
+        win_w, win_h = int(width), int(height.split("+")[0])
+    except (TypeError, ValueError):
+        return ""
+    if win_w < 400 or win_h < 300:
+        return ""
+    if avail_w and win_w > avail_w:      # saved on a bigger monitor
+        return ""
+    if avail_h and win_h > avail_h:
+        return ""
+    return f"{win_w}x{win_h}"
 
 
 class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
@@ -24,9 +46,21 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             ChatTabMixin, ResultViewMixin):
     """AuraLite desktop app: tabs live in `gui/tabs/*`, shared state here."""
 
+    #: Notebook tab names, in build order — used for titles and for the
+    #: session snapshot (`gui/session.py` stores the active tab by name).
+    _TAB_NAMES = ("train", "image", "gen", "chat", "model", "quant", "eval",
+                  "export", "console")
+
     def __init__(self, root):
         self.root = root
-        self.root.title("AuraLite AI v2.3 — Modern Transformer Edition")
+
+        # ---- persisted settings (v2.6.5) --------------------------------
+        self.gui_config = load_config()
+        self.language = set_language(self.gui_config.language)
+        self.last_prompt = ""
+        self._tab_names = list(self._TAB_NAMES)
+
+        self.root.title("AuraLite AI v2.6.5 — Modern Transformer Edition")
         # Default 800x600, clamped to the physical screen so the window (and its
         # content) never exceeds what the monitor can show. The scrollable tabs
         # handle the rest, so nothing is clipped on 1280x720 / 1280x800 / 1280x1024.
@@ -41,7 +75,10 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             win_h = max(400, avail_h - 72)
         if avail_w and avail_w < win_w + 40:
             win_w = max(560, avail_w - 72)
-        self.root.geometry(f"{win_w}x{win_h}")
+        # A geometry saved by a previous run wins, as long as it is a plausible
+        # WxH string and fits the current screen.
+        saved_geometry = _sanitize_geometry(self.gui_config.geometry, avail_w, avail_h)
+        self.root.geometry(saved_geometry or f"{win_w}x{win_h}")
         self.root.minsize(min(560, win_w), min(420, win_h))
         self.root.configure(bg="#f5f6f7")
 
@@ -109,21 +146,14 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         # clipped on small screens. self.tab_* stays the inner frame, so the
         # existing _build_*_tab() methods keep working unchanged.
         self._scroll_canvases = []  # keep refs so we can theme their background
-        for _name, _text in (
-            ("train",   " Train "),
-            ("image",   " Image "),
-            ("gen",     " Generate "),
-            ("chat",    " Chat "),
-            ("model",   " Model "),
-            ("quant",   " Quant "),
-            ("eval",    " Eval "),
-            ("export",  " Export "),
-            ("console", " Console "),
-        ):
+        self._tab_widgets: dict[str, object] = {}
+        for _name in self._tab_names:
             container, canvas, inner = self._make_scrollable_tab()
             setattr(self, f"tab_{_name}", inner)
             self._scroll_canvases.append((container, canvas, inner))
-            self.notebook.add(container, text=_text)
+            self.notebook.add(container, text=tr(f"tab.{_name}"))
+            self._tab_widgets[_name] = container
+        self._active_tab_name = self._tab_names[0]
 
         self._build_training_tab()
         self._build_image_tab()
@@ -135,6 +165,19 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._build_export_tab()
         self._build_console_tab()
 
+        # Language selector (v2.6.5): tabs are re-labelled in place, the choice
+        # is remembered in gui_config.json.
+        try:
+            self.language_var = tk.StringVar(value=language_name(self.language))
+            lang_menu = ttk.OptionMenu(info_row, self.language_var,
+                                       language_name(self.language),
+                                       *[language_name(code) for code in available_languages()],
+                                       command=self._on_language_change)
+            lang_menu.pack(side=tk.RIGHT, padx=8)
+            ttk.Label(info_row, text=tr("btn.language"), style="Sub.TLabel").pack(side=tk.RIGHT)
+        except Exception as exc:      # pragma: no cover - exotic Tk builds
+            gui_common.logger.debug("language selector unavailable: %s", exc)
+
         # Hook stdout/stderr into the console tab. Do it AFTER the widget
         # exists. Keep references so we can restore them on shutdown.
         self._orig_stdout = sys.stdout
@@ -143,6 +186,16 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         sys.stderr = ConsoleRedirector(self.console_text, self.root, self._orig_stderr)
         print(f"[AuraLite] Console attached. Device: {self.engine.device}, "
               f"threads: {self.engine.num_threads}")
+
+        # Background-work bridge (training/generation callbacks on the Tk thread).
+        try:
+            self.bridge = TkAsyncBridge(self.root)
+        except Exception as exc:      # pragma: no cover - defensive
+            gui_common.logger.debug("async bridge unavailable: %s", exc)
+            self.bridge = None
+
+        # Restore the previous session (last corpus, active tab, …).
+        self._restore_session()
 
         # Restore original streams on window close.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -259,8 +312,66 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._apply_theme(light=not is_dark)
 
 
+    # ---- language / session (v2.6.5) ---------------------------------
+    def _on_language_change(self, display_name):
+        """Switch the UI language and re-label the notebook tabs in place."""
+        code = next((c for c, name in LANGUAGES.items() if name == display_name), "en")
+        self.language = set_language(code)
+        self.gui_config = self.gui_config.update(language=self.language)
+        for name, widget in getattr(self, "_tab_widgets", {}).items():
+            try:
+                self.notebook.tab(widget, text=tr(f"tab.{name}"))
+            except Exception:      # tab already gone / mocked notebook
+                pass
+        self._save_session(quiet=True)
+
+    def _restore_session(self):
+        """Apply the last session snapshot, if the user left one behind."""
+        if not getattr(self.gui_config, "restore_session", True):
+            return []
+        try:
+            restored = gui_session.restore_to_app(self)
+        except Exception as exc:      # pragma: no cover - defensive
+            gui_common.logger.warning("session restore failed: %s", exc)
+            return []
+        if restored:
+            print(tr("msg.session_restored", what=", ".join(restored)))
+        return restored
+
+    def _save_session(self, quiet: bool = False):
+        """Persist paths/choices so the next start feels continuous."""
+        if not getattr(self.gui_config, "autosave_session", True):
+            return None
+        try:
+            state = gui_session.snapshot_from_app(self)
+            path = gui_session.save_session(state)
+        except Exception as exc:
+            gui_common.logger.warning("session save failed: %s", exc)
+            return None
+        if not quiet:
+            print(tr("msg.session_saved", path=path))
+        return path
+
     def _on_close(self):
-        """Restore stdout/stderr and close the window cleanly."""
+        """Persist the session, restore stdout/stderr and close the window."""
+        # Remember the window size for the next run before Tk goes away.
+        try:
+            geometry = self.root.geometry()
+            if isinstance(geometry, str) and "x" in geometry:
+                self.gui_config = self.gui_config.update(geometry=geometry.split("+")[0])
+        except Exception:
+            pass
+        self._save_session()
+        try:
+            self.gui_config.save()
+        except Exception as exc:      # pragma: no cover - read-only home
+            gui_common.logger.warning("could not save GUI config: %s", exc)
+        bridge = getattr(self, "bridge", None)
+        if bridge is not None:
+            try:
+                bridge.shutdown()
+            except Exception:         # pragma: no cover - defensive
+                pass
         try:
             sys.stdout = self._orig_stdout
             sys.stderr = self._orig_stderr

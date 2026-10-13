@@ -355,10 +355,12 @@ def test_speculative_sampling_smoke(trained_engine):
 #  7. FlexAttention parity
 # ======================================================================
 def test_flex_attention_matches_sdpa():
-    import model_engine._legacy as legacy
+    # The flex-attention helpers (and their caches) live in model_engine.layers
+    # since the v2.6.5 decomposition; _legacy re-exports them.
     from model_engine import ModernTransformer
+    from model_engine import layers as layers_mod
 
-    if legacy._get_flex_attention() is False:
+    if layers_mod._get_flex_attention() is False:
         pytest.skip("FlexAttention is not available in this runtime")
 
     kwargs = dict(vocab_size=48, d_model=32, n_heads=4, n_kv_heads=2,
@@ -372,7 +374,7 @@ def test_flex_attention_matches_sdpa():
     with torch.inference_mode():
         out_base = base(ids)
         out_flex = flex(ids)
-    if id(flex) in legacy._FLEX_FAILED:
+    if id(flex) in layers_mod._FLEX_FAILED:
         pytest.skip("FlexAttention raised at runtime; SDPA fallback was used")
 
     delta = (out_base.float() - out_flex.float()).abs().max().item()
@@ -497,7 +499,9 @@ def test_train_reports_actual_model_size(capsys, tiny_text):
         "optimizer": "adamw", "lr_schedule": "cosine", "amp_dtype": "none",
         "weight_decay": 0.0,
     })
-    out = capsys.readouterr().out
+    # v2.6.5: the engine reports through the `auralite` logger (stderr by
+    # default), not with print() — see tests/test_logging_migration.py.
+    out = capsys.readouterr().err
     assert "[AuraLite] Model built:" in out
     assert "params" in out
     actual = engine.model.count_parameters()
@@ -560,7 +564,10 @@ def test_gui_main_guards_multiprocessing():
 #  13. Packaging hygiene
 # ======================================================================
 def _pyproject() -> dict:
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10: `tomli` comes with the test extra
+        tomllib = pytest.importorskip("tomli")
     with open(os.path.join(REPO_ROOT, "pyproject.toml"), "rb") as fh:
         return tomllib.load(fh)
 
@@ -714,7 +721,8 @@ def test_cli_global_and_subcommand_flags_parse():
     root = parser.parse_args(["--quiet", "--log-level", "INFO", "info", "--model", "x.pt"])
     assert root.quiet is True and root.log_level == "INFO"
     default = parser.parse_args(["generate", "--model", "m.pt", "--prompt", "hi"])
-    assert default.quiet is False and default.log_level == "WARNING"
+    # v2.6.5: engine progress is logged at INFO and the CLI shows it by default
+    assert default.quiet is False and default.log_level == "INFO"
 
 
 def test_cli_logging_configuration(monkeypatch):
@@ -809,3 +817,135 @@ def test_gui_shim_exposes_the_legacy_namespace():
     if hasattr(common, "HAS_MATPLOTLIB"):
         assert gui_app.HAS_MATPLOTLIB == common.HAS_MATPLOTLIB
     assert gui_app.AIApp is __import__("gui.app", fromlist=["AIApp"]).AIApp
+
+
+# ======================================================================
+#  18. Server: reproducible seeded generation on a real engine
+# ======================================================================
+def test_seeded_server_requests_are_reproducible(trained_engine, monkeypatch):
+    """The request-level `seed` makes sampling reproducible on the real engine."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    import server.openai_server as srv
+
+    monkeypatch.setattr(srv, "_engine", trained_engine)
+    body = {"prompt": "AuraLite", "max_tokens": 6, "temperature": 1.5, "seed": 99}
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        first = client.post("/v1/completions", json=body).json()
+        second = client.post("/v1/completions", json=body).json()
+    assert first["choices"][0]["text"] == second["choices"][0]["text"]
+    assert first["usage"]["completion_tokens"] > 0
+
+
+# ======================================================================
+#  19. Low-RAM corpora: token chunks + PagedDataset in train()
+# ======================================================================
+def test_token_chunks_are_exact_for_char_tokenizer(tiny_tokenizer, tiny_text):
+    """Chunked tokenization must reproduce whole-text encoding exactly."""
+    from model_engine import AuraLiteEngine
+
+    engine = AuraLiteEngine()
+    engine.tokenizer = tiny_tokenizer
+    chunks = list(engine._iter_token_chunks(tiny_text, chunk_chars=97, overlap_chars=16))
+    assert len(chunks) > 3, "chunking did not actually split the corpus"
+    assert sum(len(c) for c in chunks) == len(tiny_text)
+    assert [i for c in chunks for i in c] == list(tiny_tokenizer.encode(tiny_text))
+
+
+def test_write_tokens_memmap_and_paged_view(tmp_path):
+    from model_engine.dataset import PagedDataset, write_tokens_memmap
+
+    path = tmp_path / "tokens.bin"
+    total = write_tokens_memmap(path, [list(range(100)), list(range(100, 160))],
+                                dtype="uint32")
+    assert total == 160
+    assert path.stat().st_size == 160 * 4          # exact, no reserved tail
+
+    full = PagedDataset(path, seq_length=8)
+    assert len(full) == 160 - 8
+    x, y = full[0]
+    assert x.tolist() == list(range(8)) and y.tolist() == list(range(1, 9))
+
+    head = PagedDataset(path, seq_length=8, offset=0, limit=100)
+    tail = PagedDataset(path, seq_length=8, offset=100, limit=60)
+    assert head.n_tokens == 100 and tail.n_tokens == 60
+    assert len(head) == 92 and len(tail) == 52
+    assert tail[0][0].tolist() == list(range(100, 108))   # second half starts at 100
+
+
+def test_train_with_mmap_corpus_matches_ram(tiny_text, tmp_path):
+    """Same seed, same tokens → identical weights, loss history and output."""
+    from model_engine import AuraLiteEngine
+
+    params = {
+        "tokenizer": "char", "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
+        "n_kv_heads": 2, "seq_length": 16, "batch_size": 8, "lr": 2e-2, "epochs": 1,
+        "val_split": 0.0, "seed": 0, "optimizer": "adamw", "lr_schedule": "cosine",
+        "amp_dtype": "none", "weight_decay": 0.0,
+    }
+    ram = AuraLiteEngine()
+    ram.train(tiny_text, dict(params))
+
+    cache = tmp_path / "corpus.uint32.bin"
+    mmap_engine = AuraLiteEngine()
+    mmap_engine.train(tiny_text, {**params, "corpus_cache": "mmap",
+                                  "corpus_cache_path": str(cache)})
+
+    assert cache.exists() and cache.stat().st_size > 0
+    assert mmap_engine._corpus_cache_path == str(cache)
+    ram_state = ram.model.state_dict()
+    mmap_state = mmap_engine.model.state_dict()
+    assert ram_state.keys() == mmap_state.keys()
+    for key in ram_state:
+        assert torch.equal(ram_state[key], mmap_state[key]), key
+    assert ram.generate("AuraLite", 8, temperature=0.0, top_k=1) == \
+        mmap_engine.generate("AuraLite", 8, temperature=0.0, top_k=1)
+
+
+def test_train_mmap_reports_memmap_and_honours_env(tiny_text, tmp_path, monkeypatch, capsys):
+    from model_engine import AuraLiteEngine
+
+    monkeypatch.setenv("AURALITE_CORPUS_CACHE", "mmap")   # env switch, no params key
+    cache = tmp_path / "env_corpus.bin"
+    engine = AuraLiteEngine()
+    engine.train(tiny_text, {
+        "tokenizer": "char", "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
+        "seq_length": 16, "batch_size": 8, "lr": 2e-2, "epochs": 1, "val_split": 0.0,
+        "seed": 0, "amp_dtype": "none", "corpus_cache_path": str(cache),
+    })
+    out = capsys.readouterr().err        # library messages now go through logging
+    assert "uint32 memmap" in out and cache.exists()
+
+
+def test_cli_train_mmap_flag(tiny_text, tmp_path, capsys):
+    from auralite_cli import main
+
+    text_file = tmp_path / "corpus.txt"
+    text_file.write_text(tiny_text, encoding="utf-8")
+    params = tmp_path / "params.json"
+    params.write_text(json.dumps({
+        "tokenizer": "char", "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
+        "seq_length": 16, "batch_size": 8, "lr": 2e-2, "epochs": 1, "val_split": 0.0,
+        "seed": 0, "amp_dtype": "none",
+    }), encoding="utf-8")
+    out_ckpt = tmp_path / "mmap_cli.pt"
+    cache = tmp_path / "cli_corpus.bin"
+    rc = main(["train", "--text", str(text_file), "--params", str(params),
+               "--model", str(out_ckpt), "--corpus-cache", str(cache), "--quiet"])
+    assert rc == 0, capsys.readouterr().err
+    assert out_ckpt.exists() and cache.exists()
+
+
+def test_cli_rejects_unknown_training_parameter(tiny_text, tmp_path, capsys):
+    from auralite_cli import main
+
+    text_file = tmp_path / "corpus.txt"
+    text_file.write_text(tiny_text, encoding="utf-8")
+    params = tmp_path / "bad.json"
+    params.write_text(json.dumps({"epoch": 3, "d_model": "big"}), encoding="utf-8")
+    rc = main(["train", "--text", str(text_file), "--params", str(params),
+               "--model", str(tmp_path / "x.pt")])
+    assert rc == 2
+    assert "invalid training parameters" in capsys.readouterr().err

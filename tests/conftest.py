@@ -35,6 +35,60 @@ def pytest_configure(config):
         "integration: requires optional dependencies (onnx, transformers, lm_eval, …)")
 
 
+#: Seed used by `_deterministic_rng`; override to hunt for seed-sensitive tests:
+#: ``AURALITE_TEST_SEED=7 pytest tests/``.
+TEST_SEED = int(os.environ.get("AURALITE_TEST_SEED", "0"))
+
+
+def pytest_report_header(config):
+    return f"auralite: RNG seed {TEST_SEED} (AURALITE_TEST_SEED)"
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_rng():
+    """Seed Python, NumPy and torch before every test.
+
+    Many tests build tiny models with random weights and then compare outputs
+    within a tolerance or against a threshold. Unseeded, every CI run draws
+    different weights (and the outcome depends on which tests ran earlier), so
+    a rare unlucky draw shows up as a one-off red job nobody can reproduce.
+    Seeded, the suite is deterministic and a failure reproduces with
+    ``pytest <node id>``.
+    """
+    import random
+
+    random.seed(TEST_SEED)
+    try:
+        import numpy as np
+        np.random.seed(TEST_SEED)
+    except ImportError:  # pragma: no cover - numpy is a core dependency
+        pass
+    torch = sys.modules.get("torch")  # a fresh `import torch` is deterministic already
+    if torch is not None:
+        torch.manual_seed(TEST_SEED)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _canonical_engine_logging(monkeypatch):
+    """Keep the ``auralite`` logger in its documented state for every test.
+
+    The CLI tests call `auralite_cli.main([...])` *in-process*, and the CLI
+    reconfigures the logger (stdout, level from the flags) and exports the level
+    through ``$AURALITE_LOG_LEVEL`` — with ``--quiet`` that is CRITICAL. Without
+    this reset the library would stay muted — and pointing at the wrong stream —
+    for every test that happens to run afterwards, which made the suite
+    order-dependent.
+    """
+    from model_engine.logging_utils import reset_engine_logging
+
+    monkeypatch.delenv("AURALITE_LOG_LEVEL", raising=False)
+    reset_engine_logging()
+    yield
+    monkeypatch.undo()
+    reset_engine_logging()
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> str:
     return REPO_ROOT

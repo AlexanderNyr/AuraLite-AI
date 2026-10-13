@@ -140,6 +140,29 @@ class TestUtils:
 #  backends facade
 # ----------------------------------------------------------------------
 class TestBackends:
+    def test_get_backend_picks_adapter_by_engine(self):
+        """v2.6.5: `get_backend` routes GGUF/HF/plain engines to the right adapter."""
+        from model_engine.backends import GGUFBackend, HFBackend, TorchBackend, get_backend
+
+        class Plain:
+            model = object()
+
+            def generate(self, prompt, **kw):
+                return prompt
+
+        class GGUF(Plain):
+            def is_gguf_model(self):
+                return True
+
+        class HF(Plain):
+            def is_hf_model(self):
+                return True
+
+        assert isinstance(get_backend(Plain()), TorchBackend)
+        assert isinstance(get_backend(GGUF()), GGUFBackend)
+        assert isinstance(get_backend(HF()), HFBackend)
+        assert get_backend(Plain()).health()["model_loaded"] is True
+
     def test_torch_backend_delegates(self):
         from model_engine.backends import TorchBackend
 

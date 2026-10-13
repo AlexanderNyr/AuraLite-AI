@@ -406,7 +406,11 @@ class ModelTabMixin:
     def _save_hf_lora(self):
         if not self.engine.is_hf_model():
             return
-        path = filedialog.asksaveasdirectory(title="Choose folder to save LoRA adapter")
+        # tkinter has no `asksaveasdirectory` (that call raised AttributeError
+        # before v2.6.5, so the button silently did nothing): ask for a folder
+        # and allow a new one, since LoRA adapters are written to a fresh dir.
+        path = filedialog.askdirectory(
+            title="Choose folder to save LoRA adapter", mustexist=False)
         if not path:
             return
         try:

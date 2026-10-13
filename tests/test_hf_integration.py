@@ -201,7 +201,7 @@ class TestHuggingFaceProxyLoadingAndGeneration:
         proxy.load_model("model", load_in_4bit=True, verbose=True)
 
         assert proxy.is_quantized is False
-        assert "requires CUDA" in capsys.readouterr().out
+        assert "requires CUDA" in capsys.readouterr().err  # logged, not printed
         assert "quantization_config" not in FakeAutoModelForCausalLM.calls[0][1]
 
     def test_generate_forwards_sampling_parameters(self):

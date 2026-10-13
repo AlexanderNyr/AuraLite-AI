@@ -24,6 +24,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import logging
+
+logger = logging.getLogger("auralite.hf")
+
 
 # Optional heavy dependencies — gracefully degrade if missing
 try:
@@ -159,9 +163,9 @@ class HuggingFaceProxy:
 
         if verbose:
             if is_local:
-                print(f"[AuraLite-HF] Loading LOCAL / already downloaded model from: {model_name_or_path}")
+                logger.info(f"[AuraLite-HF] Loading LOCAL / already downloaded model from: {model_name_or_path}")
             else:
-                print(f"[AuraLite-HF] Loading model from Hub: {model_name_or_path}")
+                logger.info(f"[AuraLite-HF] Loading model from Hub: {model_name_or_path}")
 
         # Determine quantization config
         bnb_config = None
@@ -172,7 +176,7 @@ class HuggingFaceProxy:
 
         if load_in_4bit or load_in_8bit:
             if not torch.cuda.is_available():
-                print("[AuraLite-HF] WARNING: 4/8-bit quantization requires CUDA. Falling back to full-precision CPU loading.")
+                logger.warning("[AuraLite-HF] WARNING: 4/8-bit quantization requires CUDA. Falling back to full-precision CPU loading.")
                 load_in_4bit = False
                 load_in_8bit = False
             else:
@@ -187,7 +191,7 @@ class HuggingFaceProxy:
                 load_kwargs["quantization_config"] = bnb_config
                 self.is_quantized = True
                 if verbose:
-                    print(f"[AuraLite-HF] Using {'4-bit' if load_in_4bit else '8-bit'} quantization (QLoRA ready)")
+                    logger.info(f"[AuraLite-HF] Using {'4-bit' if load_in_4bit else '8-bit'} quantization (QLoRA ready)")
 
         if torch_dtype is None:
             if load_in_4bit or load_in_8bit:
@@ -212,7 +216,7 @@ class HuggingFaceProxy:
                 model_name_or_path, **tokenizer_kwargs
             )
         except Exception as e:
-            print(f"[AuraLite-HF] Tokenizer warning: {e}. Trying without fast tokenizer...")
+            logger.info(f"[AuraLite-HF] Tokenizer warning: {e}. Trying without fast tokenizer...")
             tokenizer_kwargs["use_fast"] = False
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name_or_path, **tokenizer_kwargs
@@ -222,7 +226,7 @@ class HuggingFaceProxy:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token or "<|endoftext|>"
             if verbose:
-                print("[AuraLite-HF] Set pad_token = eos_token")
+                logger.info("[AuraLite-HF] Set pad_token = eos_token")
 
         # Load model (with local/offline support)
         if local_files_only:
@@ -244,8 +248,8 @@ class HuggingFaceProxy:
 
         if verbose:
             n_params = sum(p.numel() for p in self.model.parameters())
-            print(f"[AuraLite-HF] Model loaded. Parameters: {n_params / 1e6:.1f}M")
-            print(f"[AuraLite-HF] Device: {self.device}, dtype: {self.model.dtype}")
+            logger.info(f"[AuraLite-HF] Model loaded. Parameters: {n_params / 1e6:.1f}M")
+            logger.info(f"[AuraLite-HF] Device: {self.device}, dtype: {self.model.dtype}")
 
     # ------------------------------------------------------------------
     # LoRA / QLoRA
@@ -272,17 +276,17 @@ class HuggingFaceProxy:
             raise ValueError("Load a model first with load_model()")
 
         if self.is_peft:
-            print("[AuraLite-HF] LoRA already applied. Skipping.")
+            logger.info("[AuraLite-HF] LoRA already applied. Skipping.")
             return
 
         if verbose:
-            print(f"[AuraLite-HF] Applying LoRA (rank={rank}, alpha={alpha})...")
+            logger.info(f"[AuraLite-HF] Applying LoRA (rank={rank}, alpha={alpha})...")
 
         # Prepare for k-bit training if quantized
         if self.is_quantized:
             self.model = prepare_model_for_kbit_training(self.model)
             if verbose:
-                print("[AuraLite-HF] Model prepared for k-bit (QLoRA) training")
+                logger.info("[AuraLite-HF] Model prepared for k-bit (QLoRA) training")
 
         if target_modules is None:
             # Common targets for modern decoder-only models
@@ -319,9 +323,9 @@ class HuggingFaceProxy:
                 self.model = self.model.merge_and_unload()
             self.is_peft = False
             self.lora_config = None
-            print("[AuraLite-HF] LoRA adapters merged and removed.")
+            logger.info("[AuraLite-HF] LoRA adapters merged and removed.")
         except Exception as e:
-            print(f"[AuraLite-HF] Could not merge LoRA: {e}")
+            logger.warning(f"[AuraLite-HF] Could not merge LoRA: {e}")
 
     # ------------------------------------------------------------------
     # Generation (compatible interface)
@@ -466,7 +470,7 @@ class HuggingFaceProxy:
             raise ValueError("Load a model first!")
 
         if not self.is_peft:
-            print("[AuraLite-HF] No LoRA applied — applying default LoRA before fine-tuning...")
+            logger.info("[AuraLite-HF] No LoRA applied — applying default LoRA before fine-tuning...")
             self.apply_lora(rank=16, alpha=32, dropout=0.05)
 
         # Prepare dataset
@@ -528,14 +532,14 @@ class HuggingFaceProxy:
             data_collator=data_collator,
         )
 
-        print("[AuraLite-HF] Starting fine-tuning with Hugging Face Trainer...")
+        logger.info("[AuraLite-HF] Starting fine-tuning with Hugging Face Trainer...")
         trainer.train()
-        print("[AuraLite-HF] Training finished.")
+        logger.info("[AuraLite-HF] Training finished.")
 
         # Save adapter
         self.model.save_pretrained(kwargs["output_dir"])
         self.tokenizer.save_pretrained(kwargs["output_dir"])
-        print(f"[AuraLite-HF] LoRA adapter saved to: {kwargs['output_dir']}")
+        logger.info(f"[AuraLite-HF] LoRA adapter saved to: {kwargs['output_dir']}")
 
         return kwargs["output_dir"]
 
@@ -592,10 +596,10 @@ class HuggingFaceProxy:
             if progress_callback:
                 progress_callback(epoch + 1, epochs, avg_loss, None)
 
-            print(f"[AuraLite-HF] Epoch {epoch+1}/{epochs} — loss: {avg_loss:.4f}")
+            logger.info(f"[AuraLite-HF] Epoch {epoch+1}/{epochs} — loss: {avg_loss:.4f}")
 
         self.model.eval()
-        print("[AuraLite-HF] Manual fine-tuning complete.")
+        logger.info("[AuraLite-HF] Manual fine-tuning complete.")
 
         # Save
         out_dir = "hf_lora_manual"
@@ -615,7 +619,7 @@ class HuggingFaceProxy:
         self.model.save_pretrained(path)
         if self.tokenizer:
             self.tokenizer.save_pretrained(path)
-        print(f"[AuraLite-HF] LoRA adapter saved to {path}")
+        logger.info(f"[AuraLite-HF] LoRA adapter saved to {path}")
 
     def load_lora_adapter(self, adapter_path: str):
         """Load a previously saved LoRA adapter on top of the current base model."""
@@ -626,7 +630,7 @@ class HuggingFaceProxy:
 
         self.model = PeftModel.from_pretrained(self.model, adapter_path)
         self.is_peft = True
-        print(f"[AuraLite-HF] LoRA adapter loaded from {adapter_path}")
+        logger.info(f"[AuraLite-HF] LoRA adapter loaded from {adapter_path}")
 
     # ------------------------------------------------------------------
     # Utility / Info
@@ -690,7 +694,7 @@ class HuggingFaceProxy:
         if token:
             login(token=token)
 
-        print(f"[AuraLite-HF] Pushing model to https://huggingface.co/{repo_id} ...")
+        logger.info(f"[AuraLite-HF] Pushing model to https://huggingface.co/{repo_id} ...")
 
         self.model.push_to_hub(
             repo_id=repo_id,
@@ -704,7 +708,7 @@ class HuggingFaceProxy:
             private=private,
         )
 
-        print(f"[AuraLite-HF] ✅ Successfully pushed to {repo_id}")
+        logger.info(f"[AuraLite-HF] ✅ Successfully pushed to {repo_id}")
 
     def from_pretrained(
         self,

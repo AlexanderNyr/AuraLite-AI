@@ -1,5 +1,14 @@
 # 🌟 AuraLite AI
 
+[![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Version](https://img.shields.io/badge/version-2.6.5-orange)
+![Tests](https://img.shields.io/badge/tests-1008%20passed-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-84%25-green)
+
+**English** · [Русская версия](README.ru.md) · [Quickstart](docs/quickstart.md) · [FAQ](docs/faq.md) · [Quantization](docs/quantization.md)
+
 **AuraLite AI** is a lightweight, educational Large Language Model (LLM) implemented using **PyTorch**. It is designed to demonstrate the inner workings of the Transformer architecture (the foundation of models like GPT-4) in a way that is accessible and runnable on consumer hardware.
 
 
@@ -138,8 +147,15 @@ Honest status of the features that are easy to over-promise. Everything marked
 | OpenAI-compatible server | **implemented, single worker** | API-key auth (`AURALITE_API_KEY`, comma-separated keys, constant-time compare), SSE streaming with graceful shutdown, `/metrics` (Prometheus text format). Single worker is deliberate: engine, KV-cache and rate-limiter live in process memory. |
 | Streaming chat text | **implemented** | `generate_chat_streaming()` and `generate_chat()` now produce the same text (leading whitespace of the first piece is trimmed). |
 | Batch generation | **implemented** | Mixed-length prompts are grouped by length, identical prompts are deduplicated (a repeated question costs one forward pass). |
+| Inference speed | **measured** | `auralite info --bench N --bench-modes --bench-compile` reports decode tokens/s, KV-cache bytes/token for fp32/fp16/int8 (same weights, rebuilt model) and eager vs `torch.compile` prefill. CPU measurement (d512/4L/256): decode 1748 tok/s; `torch.compile` ×1.1–1.7 on prefill (B=4 T=64: 40k→58k tok/s), 0.0× on single-token decode — hence decode stays eager, and `--compile` only speeds up prompts. Kernel cache lives in `$AURALITE_HOME/torch_inductor`. |
+| GGUF backends | **implemented** | Two runtimes behind one API: in-process `llama-cpp-python` (tokenisation, generation, perplexity) and a shared `llama-server` (`AURALITE_LLAMA_SERVER_URL` / `load_gguf_model("http://…")`) that keeps one model load per machine. Perplexity is refused on the server backend instead of being approximated, and in-process scores are cached in `$AURALITE_HOME/gguf_ppl_cache.json` (keyed by file identity + n_ctx + corpus hash) — `auralite info --model m.gguf --perplexity --text F`. |
+| Server concurrency | **implemented** | No 503 storm under burst: requests queue for `AURALITE_QUEUE_TIMEOUT` seconds (default 10) on top of the generation-slot semaphore (`AURALITE_MAX_CONCURRENT`, default 4) and only then get `503` + `Retry-After`; `/metrics` exposes the in-flight gauge. |
+| Module layout | **implemented** | `model_engine/_legacy.py` is down to the engine itself; layers/model/dataset/tokenizers/optimizers/scheduler/gguf_proxy/safe_io/logging_utils own their code, `model_engine.X` still resolves every historical name — and `tests/test_module_layout.py` fails if a module turns back into a re-export shim. |
 | GUI code layout | **implemented** | `gui_app.py` is a thin entry point; `gui/app.py` holds the app core and `gui/tabs/*.py` one module per tab (mixins). `python gui_app.py` and `from gui_app import AIApp` keep working. |
-| Library logging | **partially migrated** | The CLI honors `--quiet` / `--log-level` (and `$AURALITE_LOG_LEVEL`); core modules log through the `auralite` logger. Some training/progress lines are still `print()`ed to stdout (they are asserted by existing tests and the GUI console redirector reads stdout). |
+| GUI session & i18n | **implemented** | `gui/config.py` persists settings (`$AURALITE_HOME/gui_config.json`), `gui/session.py` keeps a crash-safe snapshot (atomic write, last corpus/tab/language restored on start, saved on close). UI language: English/Русский (`gui/i18n.py`, switched from the toolbar or `$AURALITE_GUI_LANG`). |
+| GUI insights | **implemented** | Chat tab plots the last reply's token frequencies and this layer's attention map (`engine.token_frequencies()`, `engine.attention_maps()` → `gui/visualizations.py`); visible when matplotlib is installed, hidden with an explanatory label otherwise. |
+| GUI background work | **implemented** | `gui/async_ops.TkAsyncBridge` runs blocking functions/coroutines off the Tk thread and delivers results (or errors) back through `root.after`, and is shut down when the window closes. |
+| Library logging | **implemented** | No library module prints any more: the engine logs through the `auralite` logger (sub-loggers `auralite.hf`, `auralite.image`, `auralite.export`, `auralite.webtools`), "[AuraLite] …" wording unchanged, INFO visible by default, `$AURALITE_LOG_LEVEL` respected. The CLI keeps the historical UX by pointing that logger at stdout (`--quiet` → CRITICAL, `--log-level` honoured); the GUI console tab shows the same lines because the handler re-resolves `sys.stderr` on every record. The CLI/eval reports and the benchmarks still print — that is their output. |
 
 ### Diagnostics
 
@@ -147,8 +163,22 @@ Honest status of the features that are easy to over-promise. Everything marked
 auralite info --model model.pt --backends        # quantization backend availability
 auralite info --model model.pt --bench 128       # tokens/s, weight memory, KV-cache mode
 auralite info --model model.pt --quiet           # no progress/library noise
+auralite train --text corpus.txt --params p.json  # engine logs go to stdout
+AURALITE_LOG_LEVEL=WARNING auralite generate ...  # or silence INFO library lines
 AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 python gui_app.py
 ```
+
+## 📚 Documentation
+
+| File | Contents |
+|---|---|
+| [docs/quickstart.md](docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
+| [docs/faq.md](docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
+| [docs/quantization.md](docs/quantization.md) | every method (dynamic/static INT8, QAT, GPTQ, AWQ, HQQ, half), what it actually buys, GGUF paths |
+| [docs/releasing.md](docs/releasing.md) | for maintainers: tag → verified GitHub Release, GHCR image and (opt-in, tokenless) PyPI upload |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | module map and engine data flow |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in v2.6.5 and why |
+| [README.ru.md](README.ru.md) | то же самое по-русски |
 
 ## 🛠 Technical Specifications
 - **Framework**: PyTorch (Tensors, Autograd, AMP on CUDA, optional `torch.compile`).

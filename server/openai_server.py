@@ -10,6 +10,12 @@ Environment:
     AURALITE_MAX_CONCURRENT max in-flight generation requests (default 4);
                             excess requests get HTTP 503 `server is busy`
     AURALITE_RATE_LIMIT     requests per minute per client (default 60)
+    AURALITE_QUEUE_TIMEOUT  seconds a request may wait for a free generation
+                            slot before HTTP 503 (default 10; 0 = fail fast)
+    AURALITE_CORS_ORIGINS   comma-separated origins to allow (default: none)
+    AURALITE_MAX_BODY_MB    maximum request body size in MB (default 16)
+    AURALITE_MAX_CLIENTS    max distinct rate-limit buckets kept in memory
+                            (default 10000; expired buckets are pruned)
     AURALITE_CPU_INT8       =1 to dynamically INT8-quantize the model at load
                             (inference-only; faster on VNNI-class CPUs, can be
                             slower on tiny containers — benchmark first)
@@ -26,8 +32,8 @@ import os
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Iterator
 
 try:
     from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -40,6 +46,21 @@ except Exception as e:  # pragma: no cover - optional dependency
 from model_engine import AuraLiteEngine
 from model_engine.utils import sanitize_prompt
 
+try:  # backend adapter (Torch / GGUF / HF) used for routing and /health
+    from model_engine.backends import BaseBackend, get_backend
+except Exception:  # pragma: no cover - defensive: engine always ships backends
+    BaseBackend = None  # type: ignore[assignment]
+    get_backend = None  # type: ignore[assignment]
+
+try:  # Ollama-compatible payload builders (/api/*)
+    from server.ollama_compat import (
+        ollama_chat_response, ollama_error, ollama_generate_response, ollama_tags,
+    )
+except Exception:  # pragma: no cover - running as a loose script
+    from ollama_compat import (  # type: ignore[no-redef]
+        ollama_chat_response, ollama_error, ollama_generate_response, ollama_tags,
+    )
+
 try:  # chat-interface support for exact chat-usage accounting
     from chat_interface import ChatHistory, apply_chat_template
     HAS_CHAT = True
@@ -51,10 +72,25 @@ try:  # hashed bag-of-words embeddings shared with the RAG stack
 except Exception:  # pragma: no cover - optional
     hash_embedding = None
 
-try:
-    from model_engine import __version__ as _AURALITE_VERSION
-except Exception:  # pragma: no cover - model_engine must be importable normally
-    _AURALITE_VERSION = "2.6.4"
+def _package_version() -> str:
+    """The one version source: `model_engine.__version__`.
+
+    v2.6.5: the old fallback hardcoded "2.6.4", which is precisely the drift the
+    release checklist exists to prevent — if the package metadata is unavailable
+    we ask the installed distribution instead, and never invent a number.
+    """
+    try:
+        from model_engine import __version__ as version
+        return version
+    except Exception:  # pragma: no cover - packaging/metadata problems only
+        try:
+            from importlib.metadata import version as _dist_version
+            return _dist_version("auralite-ai")
+        except Exception:
+            return "0.0.0+unknown"
+
+
+_AURALITE_VERSION = _package_version()
 
 # ---------------------------------------------------------------------------
 # Shutdown coordination + minimal Prometheus-style metrics (no extra deps)
@@ -127,35 +163,94 @@ async def lifespan(_: FastAPI):
         _shutdown.set()
 
 
-app = FastAPI(title="AuraLite OpenAI-Compatible Server", version=_AURALITE_VERSION,
-              lifespan=lifespan)
 _engine: AuraLiteEngine | None = None
 _rate_bucket: dict[str, list[float]] = {}
+_rate_bucket_pruned_at = 0.0
 _gen_semaphore = threading.BoundedSemaphore(
     max(1, int(os.environ.get("AURALITE_MAX_CONCURRENT", "4"))))
 
 
-@app.middleware("http")
-async def _count_requests(request: Request, call_next):
-    _metric("requests_total", key=request.url.path)
-    try:
-        response = await call_next(request)
-    except Exception:
-        _metric("errors_total")
-        raise
-    if response.status_code >= 500:
-        _metric("errors_total")
-    return response
+def _cors_origins() -> list[str]:
+    """Origins from ``AURALITE_CORS_ORIGINS`` (comma-separated, empty = disabled)."""
+    return [o.strip() for o in os.environ.get("AURALITE_CORS_ORIGINS", "").split(",") if o.strip()]
+
+
+def create_app() -> FastAPI:
+    """Build the FastAPI app (a factory so tests can vary env-driven middleware)."""
+    application = FastAPI(title="AuraLite OpenAI-Compatible Server",
+                          version=_AURALITE_VERSION, lifespan=lifespan)
+
+    origins = _cors_origins()
+    if origins:
+        # Off by default: browsers are only allowed in when the operator opts in.
+        from fastapi.middleware.cors import CORSMiddleware
+        application.add_middleware(CORSMiddleware, allow_origins=origins,
+                                   allow_methods=["*"], allow_headers=["*"])
+
+    @application.middleware("http")
+    async def _count_requests(request: Request, call_next):
+        _metric("requests_total", key=request.url.path)
+        try:
+            response = await call_next(request)
+        except Exception:
+            _metric("errors_total")
+            raise
+        if response.status_code >= 500:
+            _metric("errors_total")
+        return response
+
+    @application.middleware("http")
+    async def _limit_body_size(request: Request, call_next):
+        max_bytes = int(float(os.environ.get("AURALITE_MAX_BODY_MB", "16")) * 1024 * 1024)
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={"error": {"message": f"request body larger than "
+                                            f"{max_bytes // (1024 * 1024)} MB",
+                                   "type": "invalid_request_error"}},
+            )
+        return await call_next(request)
+
+    return application
+
+
+app = create_app()
 
 MODEL_ID = os.environ.get("AURALITE_MODEL_ID", "auralite")
 
 
-class CompletionRequest(BaseModel):
+class _SamplingOptions(BaseModel):
+    """Sampling knobs shared by both OpenAI-shaped endpoints.
+
+    v2.6.5: `stop`, `seed`, `top_k`, `repetition_penalty` and
+    `stream_options.include_usage` were accepted-nowhere before; clients that
+    relied on them silently got default behaviour.
+    """
+
+    temperature: float = Field(default=0.8, ge=0.0, le=5.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0, le=1000)
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    repetition_penalty: float = Field(default=1.0, gt=0.0, le=4.0)
+    seed: int | None = Field(default=None, ge=0)
+    stop: str | list[str] | None = None
+    stream_options: dict[str, Any] | None = None
+
+    def stops(self) -> list[str]:
+        if self.stop is None:
+            return []
+        stops = [self.stop] if isinstance(self.stop, str) else list(self.stop)
+        return [s for s in stops if s]
+
+    def include_usage(self) -> bool:
+        return bool((self.stream_options or {}).get("include_usage"))
+
+
+class CompletionRequest(_SamplingOptions):
     model: str = MODEL_ID
     prompt: str | list[str]
     max_tokens: int = Field(default=128, ge=0, le=8192)
-    temperature: float = Field(default=0.8, ge=0.0, le=5.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     stream: bool = False
 
 
@@ -164,13 +259,26 @@ class ChatMessage(BaseModel):
     content: str
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(_SamplingOptions):
     model: str = MODEL_ID
     messages: list[ChatMessage]
     max_tokens: int = Field(default=128, ge=0, le=8192)
-    temperature: float = Field(default=0.8, ge=0.0, le=5.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    temperature: float = Field(default=0.7, ge=0.0, le=5.0)
     stream: bool = False
+
+
+class OllamaGenerateRequest(BaseModel):
+    model: str = MODEL_ID
+    prompt: str = ""
+    stream: bool = True
+    options: dict[str, Any] | None = None      # ollama-style sampling options
+
+
+class OllamaChatRequest(BaseModel):
+    model: str = MODEL_ID
+    messages: list[ChatMessage]
+    stream: bool = True
+    options: dict[str, Any] | None = None
 
 
 class EmbeddingRequest(BaseModel):
@@ -228,28 +336,64 @@ def require_api_key(credentials: HTTPAuthorizationCredentials | None = Depends(_
 # ---------------------------------------------------------------------------
 # Rate limit + concurrency guard
 # ---------------------------------------------------------------------------
+def _prune_rate_bucket(now: float) -> None:
+    """Drop expired/empty buckets so the limiter cannot leak memory.
+
+    Before v2.6.5 `_rate_bucket` grew forever: every new client IP added a list
+    that was never removed, so a long-running server could be pushed out of
+    memory by scanning traffic alone.
+    """
+    global _rate_bucket_pruned_at
+    _rate_bucket_pruned_at = now
+    for key in [k for k, stamps in _rate_bucket.items()
+                if not stamps or now - stamps[-1] >= 60.0]:
+        _rate_bucket.pop(key, None)
+
+
 def check_rate_limit(request: Request, max_per_minute: int | None = None) -> None:
     if max_per_minute is None:
         max_per_minute = int(os.environ.get("AURALITE_RATE_LIMIT", "60"))
+    max_clients = max(64, int(os.environ.get("AURALITE_MAX_CLIENTS", "10000")))
     key = request.client.host if request.client else "local"
     now = time.time()
+
     events = [t for t in _rate_bucket.get(key, []) if now - t < 60]
     if len(events) >= max_per_minute:
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
+        oldest = min(events)
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded",
+            headers={"Retry-After": str(max(1, int(60 - (now - oldest)) + 1))},
+        )
     events.append(now)
     _rate_bucket[key] = events
 
+    # Amortized cleanup: at most once a minute, or immediately once the table
+    # grows past `AURALITE_MAX_CLIENTS` distinct clients.
+    if len(_rate_bucket) > max_clients or (now - _rate_bucket_pruned_at) >= 60.0:
+        _prune_rate_bucket(now)
+
 
 class _Busy:
-    """Context manager: acquire the generation semaphore or fail fast with 503.
+    """Context manager: wait for a free generation slot, then 503.
 
     The torch engine keeps mutable KV-cache state, so unbounded concurrent
     generations on one engine would interleave caches. A small semaphore keeps
-    throughput predictable; extra requests get a clear "try again" answer.
+    throughput predictable.
+
+    v2.6.5: instead of rejecting immediately when all slots are taken, a request
+    queues for ``AURALITE_QUEUE_TIMEOUT`` seconds (default 10). Bursty clients
+    get answers instead of a 503 storm; only genuinely saturated servers answer
+    `server is busy`.
     """
 
     def __enter__(self):
-        if not _gen_semaphore.acquire(blocking=False):
+        timeout = float(os.environ.get("AURALITE_QUEUE_TIMEOUT", "10"))
+        if timeout <= 0:
+            acquired = _gen_semaphore.acquire(blocking=False)
+        else:
+            acquired = _gen_semaphore.acquire(timeout=timeout)
+        if not acquired:
             raise HTTPException(
                 status_code=503,
                 detail={"error": {"message": "server is busy, retry later",
@@ -263,6 +407,93 @@ class _Busy:
         _metric("inflight", -1)
         _gen_semaphore.release()
         return False
+
+
+def _backend(engine: AuraLiteEngine):
+    """Backend adapter for `engine` (falls back to the engine itself)."""
+    if get_backend is None:  # pragma: no cover - defensive
+        return engine
+    return get_backend(engine)
+
+
+def cut_at_stop(text: str, stops: list[str]) -> str:
+    """Truncate `text` at the earliest occurrence of any stop sequence."""
+    hits = [text.find(s) for s in stops if s and s in text]
+    return text[: min(hits)] if hits else text
+
+
+class StopCollector:
+    """Streaming stop-sequence filter for engines without native `stop`.
+
+    Holds back up to ``max(len(stop)) - 1`` trailing characters so a stop
+    sequence split across two tokens is never emitted, and flushes the tail when
+    generation ends without a match.
+    """
+
+    def __init__(self, stops: list[str]):
+        self.stops = [s for s in stops if s]
+        self.max_len = max((len(s) for s in self.stops), default=0)
+        self.buffer = ""
+        self.hit = False
+
+    def feed(self, piece: str) -> str:
+        self.buffer += piece
+        cut = cut_at_stop(self.buffer, self.stops)
+        if cut is not self.buffer:          # a stop sequence is present
+            self.hit = True
+            self.buffer = ""
+            return cut
+        keep = max(0, self.max_len - 1)
+        if len(self.buffer) <= keep:
+            return ""
+        out, self.buffer = self.buffer[:-keep] if keep else self.buffer, self.buffer[-keep:] if keep else ""
+        return out
+
+    def flush(self) -> str:
+        if self.hit:
+            return ""
+        out, self.buffer = self.buffer, ""
+        return out
+
+
+@contextmanager
+def seeded_rng(seed: int | None) -> Iterator[None]:
+    """Make one request reproducible and leave the process RNG untouched.
+
+    The native engine samples with the global torch/numpy generators, so a
+    request-level seed is implemented by seeding those around the call and
+    restoring the previous state afterwards (`AURALITE_SEED_SUPPORT` note:
+    with a single worker this is exact; concurrent workers would interleave).
+    """
+    if seed is None:
+        yield
+        return
+    try:
+        import numpy as np
+        import torch
+    except Exception:  # pragma: no cover - torch is a hard dependency in practice
+        yield
+        return
+    torch_state, numpy_state = torch.get_rng_state(), np.random.get_state()
+    try:
+        torch.manual_seed(int(seed))
+        np.random.seed(int(seed) % (2 ** 32))
+        yield
+    finally:
+        torch.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _sampling_kwargs(req: _SamplingOptions) -> dict[str, Any]:
+    return {"top_k": req.top_k, "top_p": req.top_p,
+            "repetition_penalty": req.repetition_penalty, "min_p": req.min_p}
+
+
+def _usage_chunk(object_name: str, model: str, usage: dict[str, int]) -> str:
+    """Final SSE chunk carrying usage (OpenAI `stream_options.include_usage`)."""
+    chunk = {"id": f"{object_name}-{uuid.uuid4().hex}", "object": object_name,
+             "created": int(time.time()), "model": model, "choices": [], "usage": usage}
+    return json.dumps(chunk, ensure_ascii=False)
 
 
 def _usage(engine: AuraLiteEngine, prompt_text: str | None, completion_text: str) -> dict[str, int]:
@@ -286,7 +517,9 @@ def metrics() -> Response:
 @app.get("/health")
 def health() -> dict[str, Any]:
     engine = get_engine()
-    return {"ok": True, "backend": engine.backend, "model_loaded": engine.model is not None}
+    backend = _backend(engine)
+    name = getattr(backend, "name", None) or getattr(engine, "backend", "torch")
+    return {"ok": True, "backend": name, "model_loaded": engine.model is not None}
 
 
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
@@ -310,35 +543,66 @@ def list_models() -> dict[str, Any]:
 def completions(req: CompletionRequest, request: Request):
     check_rate_limit(request)
     engine = get_engine()
+    backend = _backend(engine)
     prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+    stops = req.stops()
+    sampling = _sampling_kwargs(req)
+
     if req.stream and len(prompts) == 1:
         def gen():
+            collector = StopCollector(stops)
+            completion_text = ""
+
+            def frame(piece: str) -> str:
+                """Count the piece and wrap it into one SSE data frame."""
+                chunk = {"id": f"cmpl-{uuid.uuid4().hex}", "object": "text_completion",
+                         "created": int(time.time()), "model": req.model,
+                         "choices": [{"text": piece, "index": 0,
+                                      "finish_reason": None}]}
+                return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
             with _Busy():
-                for tok in engine.generate_streaming(sanitize_prompt(prompts[0]), req.max_tokens, req.temperature, top_p=req.top_p):
-                    if _shutdown.is_set():
-                        break  # server shutting down: stop generating cleanly
-                    _metric("tokens_generated_total")
-                    chunk = {"id": f"cmpl-{uuid.uuid4().hex}", "object": "text_completion",
-                             "created": int(time.time()), "model": req.model,
-                             "choices": [{"text": tok, "index": 0, "finish_reason": None}]}
-                    # SSE payloads must be valid JSON; f"{dict}" produced Python
-                    # repr with single quotes, which OpenAI clients cannot parse.
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                with seeded_rng(req.seed):
+                    for tok in backend.generate_streaming(
+                            sanitize_prompt(prompts[0]), length=req.max_tokens,
+                            temperature=req.temperature, **sampling):
+                        if _shutdown.is_set():
+                            break  # server shutting down: stop generating cleanly
+                        piece = collector.feed(tok)
+                        if piece:
+                            _metric("tokens_generated_total")
+                            completion_text += piece
+                            yield frame(piece)
+                        if collector.hit:
+                            break
+                    tail = collector.flush()   # held-back characters (no stop hit)
+                    if tail:
+                        _metric("tokens_generated_total")
+                        completion_text += tail
+                        yield frame(tail)
+                if req.include_usage():
+                    usage = _usage(engine, prompts[0], completion_text)
+                    yield f"data: {_usage_chunk('text_completion', req.model, usage)}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
+
     choices = []
     prompt_tokens = 0
     completion_text_all = ""
     with _Busy():
-        for i, prompt in enumerate(prompts):
-            text = engine.generate(sanitize_prompt(prompt), req.max_tokens, req.temperature, top_p=req.top_p)
-            out = text[len(prompt):] if text.startswith(prompt) else text
-            choices.append({"text": out, "index": i, "finish_reason": "length"})
-            try:
-                prompt_tokens += len(engine.encode(prompt))
-            except Exception:
-                pass
-            completion_text_all += out
+        with seeded_rng(req.seed):
+            for i, prompt in enumerate(prompts):
+                text = backend.generate(sanitize_prompt(prompt), length=req.max_tokens,
+                                        temperature=req.temperature, **sampling)
+                out = text[len(prompt):] if text.startswith(prompt) else text
+                out = cut_at_stop(out, stops)
+                choices.append({"text": out, "index": i,
+                                "finish_reason": "stop" if stops else "length"})
+                try:
+                    prompt_tokens += len(engine.encode(prompt))
+                except Exception:
+                    pass
+                completion_text_all += out
     usage = _usage(engine, None, completion_text_all)
     usage["prompt_tokens"] = prompt_tokens
     usage["total_tokens"] = prompt_tokens + usage["completion_tokens"]
@@ -352,20 +616,41 @@ def completions(req: CompletionRequest, request: Request):
 def chat_completions(req: ChatCompletionRequest, request: Request):
     check_rate_limit(request)
     engine = get_engine()
+    backend = _backend(engine)
     messages = [m.model_dump() for m in req.messages]
+    stops = req.stops()
+    sampling = _sampling_kwargs(req)
+    # The native chat path understands stop sequences itself (v2.6.5), so the
+    # streamed text is cut inside the engine instead of by a post-filter.
+    chat_kwargs = {**sampling, "max_new_tokens": req.max_tokens,
+                   "temperature": req.temperature, "stop_tokens": stops or None}
+
     if req.stream:
         def gen():
+            completion_text = ""
+
+            def frame(piece: str) -> str:
+                chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}",
+                         "object": "chat.completion.chunk",
+                         "created": int(time.time()), "model": req.model,
+                         "choices": [{"delta": {"content": piece}, "index": 0,
+                                      "finish_reason": None}]}
+                return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
             with _Busy():
-                for tok in engine.generate_chat_streaming(messages, req.max_tokens, req.temperature, top_p=req.top_p):
-                    if _shutdown.is_set():
-                        break  # server shutting down: stop generating cleanly
-                    _metric("tokens_generated_total")
-                    chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
-                             "created": int(time.time()), "model": req.model,
-                             "choices": [{"delta": {"content": tok}, "index": 0, "finish_reason": None}]}
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                with seeded_rng(req.seed):
+                    for tok in backend.generate_chat_streaming(messages, **chat_kwargs):
+                        if _shutdown.is_set():
+                            break  # server shutting down: stop generating cleanly
+                        _metric("tokens_generated_total")
+                        completion_text += tok
+                        yield frame(tok)
+                if req.include_usage():
+                    usage = _usage(engine, None, completion_text)
+                    yield f"data: {_usage_chunk('chat.completion.chunk', req.model, usage)}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
+
     # Usage accounting: rebuild the exact prompt the engine will use, so
     # prompt_tokens matches what the model actually saw.
     prompt_for_usage: str | None = None
@@ -380,18 +665,177 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     if prompt_for_usage is None:
         prompt_for_usage = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
     with _Busy():
-        try:
-            content = engine.generate_chat(messages, req.max_tokens, req.temperature, top_p=req.top_p)
-        except Exception:
-            full = engine.generate(prompt_for_usage, req.max_tokens, req.temperature, top_p=req.top_p)
-            content = full[len(prompt_for_usage):] if full.startswith(prompt_for_usage) else full
+        with seeded_rng(req.seed):
+            try:
+                content = backend.generate_chat(messages, **chat_kwargs)
+            except Exception:
+                full = backend.generate(prompt_for_usage, length=req.max_tokens,
+                                        temperature=req.temperature, **sampling)
+                content = full[len(prompt_for_usage):] if full.startswith(prompt_for_usage) else full
+    content = cut_at_stop(content, stops)
     chat_usage = _usage(engine, prompt_for_usage, content)
     _metric("tokens_generated_total", chat_usage["completion_tokens"])
     return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
             "created": int(time.time()), "model": req.model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                         "finish_reason": "length"}],
+                         "finish_reason": "stop" if stops else "length"}],
             "usage": chat_usage}
+
+
+# ---------------------------------------------------------------------------
+# Ollama-compatible surface (/api/*) — lets Ollama clients (Open WebUI,
+# LangChain ChatOllama, the `ollama` CLI) talk to AuraLite unchanged.
+# ---------------------------------------------------------------------------
+@app.get("/api/version", dependencies=[Depends(require_api_key)])
+def ollama_version() -> dict[str, str]:
+    return {"version": _AURALITE_VERSION}
+
+
+@app.get("/api/tags", dependencies=[Depends(require_api_key)])
+def ollama_list_models() -> dict[str, Any]:
+    engine = get_engine()
+    size = 0
+    try:
+        size = sum(p.numel() * p.element_size() for p in engine.model.parameters())
+    except Exception:
+        pass
+    return ollama_tags(MODEL_ID, size=size)
+
+
+def _ollama_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    """Map Ollama sampling options onto engine kwargs (unknown keys ignored)."""
+    options = options or {}
+    out: dict[str, Any] = {}
+    if "num_predict" in options:
+        out["max_tokens"] = max(0, int(options["num_predict"]))
+    for src, dst in (("temperature", "temperature"), ("top_k", "top_k"),
+                     ("top_p", "top_p"), ("repeat_penalty", "repetition_penalty"),
+                     ("min_p", "min_p")):
+        if src in options:
+            try:
+                out[dst] = float(options[src]) if dst != "top_k" else int(options[src])
+            except (TypeError, ValueError):
+                continue
+    if "stop" in options and options["stop"]:
+        stop = options["stop"]
+        out["stop"] = [stop] if isinstance(stop, str) else list(stop)
+    if "seed" in options:
+        try:
+            out["seed"] = int(options["seed"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+@app.post("/api/generate", dependencies=[Depends(require_api_key)])
+def ollama_generate(req: OllamaGenerateRequest, request: Request):
+    check_rate_limit(request)
+    engine = get_engine()
+    backend = _backend(engine)
+    opts = _ollama_options(req.options)
+    max_tokens = int(opts.pop("max_tokens", 128))
+    temperature = float(opts.pop("temperature", 0.8))
+    sampling = {k: v for k, v in opts.items() if k in ("top_k", "top_p",
+                                                       "repetition_penalty", "min_p")}
+    stops = opts.get("stop") or []
+    seed = opts.get("seed")
+    prompt = sanitize_prompt(req.prompt)
+
+    def ndjson(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    if req.stream:
+        def gen():
+            collector = StopCollector(stops)
+            completion_text = ""
+
+            def frame(piece: str) -> str:
+                return ndjson(ollama_generate_response(req.model, req.prompt, piece,
+                                                       done=False))
+
+            with _Busy():
+                with seeded_rng(seed):
+                    for tok in backend.generate_streaming(
+                            prompt, length=max_tokens, temperature=temperature, **sampling):
+                        if _shutdown.is_set():
+                            break
+                        piece = collector.feed(tok)
+                        if piece:
+                            completion_text += piece
+                            yield frame(piece)
+                        if collector.hit:
+                            break
+                    tail = collector.flush()
+                    if tail:
+                        completion_text += tail
+                        yield frame(tail)
+                _metric("tokens_generated_total")
+                yield ndjson(ollama_generate_response(req.model, req.prompt, "",
+                                                      prompt_eval_count=_safe_len(engine, prompt),
+                                                      eval_count=_safe_len(engine, completion_text)))
+        return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+    with _Busy():
+        with seeded_rng(seed):
+            text = backend.generate(prompt, length=max_tokens, temperature=temperature, **sampling)
+    out = text[len(prompt):] if text.startswith(prompt) else text
+    out = cut_at_stop(out, stops)
+    _metric("tokens_generated_total", _safe_len(engine, out))
+    return ollama_generate_response(req.model, req.prompt, out,
+                                    prompt_eval_count=_safe_len(engine, prompt),
+                                    eval_count=_safe_len(engine, out))
+
+
+@app.post("/api/chat", dependencies=[Depends(require_api_key)])
+def ollama_chat(req: OllamaChatRequest, request: Request):
+    check_rate_limit(request)
+    engine = get_engine()
+    backend = _backend(engine)
+    messages = [m.model_dump() for m in req.messages]
+    opts = _ollama_options(req.options)
+    max_tokens = int(opts.pop("max_tokens", 128))
+    temperature = float(opts.pop("temperature", 0.7))
+    sampling = {k: v for k, v in opts.items() if k in ("top_k", "top_p",
+                                                       "repetition_penalty", "min_p")}
+    chat_kwargs = {**sampling, "max_new_tokens": max_tokens,
+                   "temperature": temperature, "stop_tokens": opts.get("stop") or None}
+
+    def ndjson(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    if req.stream:
+        def gen():
+            completion_text = ""
+            with _Busy():
+                with seeded_rng(opts.get("seed")):
+                    for tok in backend.generate_chat_streaming(messages, **chat_kwargs):
+                        if _shutdown.is_set():
+                            break
+                        completion_text += tok
+                        yield ndjson(ollama_chat_response(req.model, tok, done=False))
+                _metric("tokens_generated_total", _safe_len(engine, completion_text))
+                yield ndjson(ollama_chat_response(
+                    req.model, "", prompt_eval_count=0,
+                    eval_count=_safe_len(engine, completion_text)))
+        return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+    with _Busy():
+        with seeded_rng(opts.get("seed")):
+            try:
+                content = backend.generate_chat(messages, **chat_kwargs)
+            except Exception:
+                content = ""
+    _metric("tokens_generated_total", _safe_len(engine, content))
+    return ollama_chat_response(req.model, content,
+                                eval_count=_safe_len(engine, content))
+
+
+def _safe_len(engine, text: str) -> int:
+    """Token count that never raises (untrained engines have no tokenizer)."""
+    try:
+        return len(engine.encode(text)) if text else 0
+    except Exception:
+        return 0
 
 
 @app.post("/v1/embeddings", dependencies=[Depends(require_api_key)])

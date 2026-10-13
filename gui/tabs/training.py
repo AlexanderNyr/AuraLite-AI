@@ -513,7 +513,15 @@ class TrainTabMixin:
             except (TypeError, ValueError):
                 pass
 
-        val_part = f"  |  Val: {val_loss:.4f}" if val_loss is not None else ""
+        # `info`/progress values come from a worker thread (and from the engine's
+        # own payloads), so they are treated as untrusted input: a string here
+        # used to raise ValueError and freeze the progress strip mid-training.
+        val_part = ""
+        if val_loss is not None:
+            try:
+                val_part = f"  |  Val: {float(val_loss):.4f}"
+            except (TypeError, ValueError):
+                val_part = f"  |  Val: {val_loss}"
         loss_part = ""
         try:
             if loss is not None and float(loss) > 0:
@@ -570,8 +578,12 @@ class TrainTabMixin:
             # Avoid duplicate epoch rows if engine somehow double-fires
             if not self.loss_history or self.loss_history[-1][0] != current:
                 self.loss_history.append((current, float(loss) if loss is not None else 0.0, val_loss))
+                try:
+                    train_txt = f"{float(loss):.4f}"
+                except (TypeError, ValueError):
+                    train_txt = str(loss)
                 self._append_loss_line(
-                    f"epoch {current:>4}/{total}   train {float(loss):.4f}   "
+                    f"epoch {current:>4}/{total}   train {train_txt}   "
                     f"val {vtxt or '  —  '}   eta {eta_str}")
                 self._update_loss_plot()
 

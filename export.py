@@ -13,6 +13,10 @@ from typing import Optional, Tuple, Any
 import torch
 import torch.nn as nn
 from pathlib import Path
+import logging
+
+logger = logging.getLogger("auralite.export")
+
 
 
 class _OnnxForwardWrapper(nn.Module):
@@ -149,7 +153,7 @@ class ModelExporter:
             scripted = torch.jit.optimize_for_inference(scripted)
 
         scripted.save(path)
-        print(f"[AuraLite-Export] TorchScript model saved to {path}")
+        logger.info(f"[AuraLite-Export] TorchScript model saved to {path}")
         return path
 
     # ------------------------------------------------------------------
@@ -237,7 +241,7 @@ class ModelExporter:
         onnx_model = onnx.load(path)
         onnx.checker.check_model(onnx_model)
 
-        print(f"[AuraLite-Export] ONNX model saved to {path}")
+        logger.info(f"[AuraLite-Export] ONNX model saved to {path}")
         return path
 
     # ------------------------------------------------------------------
