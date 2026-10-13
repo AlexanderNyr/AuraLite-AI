@@ -314,3 +314,71 @@ def test_smoke_script_reports_a_dead_console_script():
     problems, notes = [], []
     smoke._check_console_scripts(_FakeDist(), problems, notes)
     assert problems and "auralite_cli" in problems[0] and "does not load" in problems[0]
+
+
+# ----------------------------------------------------------------------
+#  v2.6.6: install without compiling — extras and requirements.txt
+# ----------------------------------------------------------------------
+def _load_print_requirements():
+    spec = importlib.util.spec_from_file_location(
+        "print_requirements", REPO_ROOT / "scripts" / "print_requirements.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _requirement_names(requirements) -> set[str]:
+    return {_canonical(re.split(r"[\s\[<>=!~;]", req.strip(), maxsplit=1)[0])
+            for req in requirements}
+
+
+def test_requirements_txt_is_exactly_the_core_dependencies():
+    lines = [line.strip() for line in
+             (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()]
+    pinned = [line for line in lines if line and not line.startswith("#")]
+    assert pinned == PYPROJECT["project"]["dependencies"]
+
+
+def test_no_default_install_path_compiles_llama_cpp():
+    """PyPI has only the sdist of llama-cpp-python: it must stay opt-in (`gguf`)."""
+    extras = PYPROJECT["project"]["optional-dependencies"]
+    assert _requirement_names(extras["gguf"]) == {"llama-cpp-python"}
+    for name, reqs in extras.items():
+        if name != "gguf":
+            assert "llama-cpp-python" not in _requirement_names(reqs), name
+
+
+def test_bitsandbytes_is_only_needed_for_qlora():
+    extras = PYPROJECT["project"]["optional-dependencies"]
+    assert "bitsandbytes" not in _requirement_names(extras["hf"])
+    qlora = extras["qlora"]
+    assert "auralite-ai[hf]" in qlora
+    assert any(req.startswith("bitsandbytes") and "Darwin" in req for req in qlora)
+
+
+def test_print_requirements_expands_extras_and_self_references(capsys):
+    script = _load_print_requirements()
+    project = PYPROJECT["project"]
+    core = script.requirements(project, [])
+    assert core == project["dependencies"]
+    qlora = script.requirements(project, ["qlora"])
+    assert not [req for req in qlora if req.startswith("auralite-ai")]   # never itself
+    assert {"transformers", "peft", "accelerate", "bitsandbytes"} <= _requirement_names(qlora)
+    assert len(qlora) == len(set(qlora))
+    assert script.main(["serve"]) == 0
+    out = capsys.readouterr().out.split()
+    assert "fastapi>=0.111" in out and "torch>=2.1" in out
+    with pytest.raises(SystemExit, match="unknown extra"):
+        script.requirements(project, ["no-such-extra"])
+
+
+def test_print_requirements_works_where_the_dockerfile_puts_it(tmp_path):
+    """The images copy pyproject.toml and the script into one directory."""
+    for name in ("pyproject.toml", "scripts/print_requirements.py"):
+        shutil.copy2(REPO_ROOT / name, tmp_path / pathlib.Path(name).name)
+    out = subprocess.run([sys.executable, "print_requirements.py", "serve"], cwd=tmp_path,
+                         capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "fastapi>=0.111" in out.stdout.split()
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert dockerfile.count("print_requirements.py --pyproject pyproject.toml") == 2

@@ -6,13 +6,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.6.5"
+version = "2.6.6"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "AuraLite AI contributors"}]
+# Keep the Python list in sync with the CI test matrix (tests/test_release.py
+# checks it). No "License ::" classifier: with an SPDX `license` string (PEP 639)
+# setuptools rejects license classifiers.
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Education",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "torch>=2.1",
   "numpy>=1.24",
@@ -36,8 +55,13 @@ test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
         # tests/test_packaging.py builds a real wheel offline (no isolation).
         "setuptools>=77"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
-full = ["llama-cpp-python>=0.2.90", "transformers>=4.40", "peft>=0.11",
-        "bitsandbytes>=0.43; platform_system != 'Darwin'", "safetensors>=0.4", "accelerate>=0.30", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
+# v2.6.6: llama-cpp-python left `full` for its own `gguf` extra. PyPI only has its
+# source distribution, so every `pip install '.[full]'` compiled llama.cpp (and
+# failed on Windows without build tools). Install `gguf` with the prebuilt
+# wheels instead — README → "`.gguf` models".
+full = ["transformers>=4.46", "peft>=0.13",
+        "bitsandbytes>=0.43; platform_system != 'Darwin'", "safetensors>=0.4", "accelerate>=1.1", "sentencepiece>=0.2", "protobuf>=4.21", "tiktoken>=0.7", "pydantic>=2"]
+gguf = ["llama-cpp-python>=0.3"]
 # NOTE (v2.6.5): `auto-gptq`, `optimum` and `chromadb` were listed here but are
 # not imported anywhere in the codebase — GPTQ/AWQ are implemented natively in
 # quantization.py and the RAG stack uses the built-in hashed embeddings. The
@@ -47,7 +71,10 @@ vllm = ["vllm>=0.5; platform_system == 'Linux'"]
 rag = ["sentence-transformers>=3", "faiss-cpu>=1.8"]
 safetensors = ["safetensors>=0.4"]
 export = ["onnx>=1.15", "onnxruntime>=1.17"]
-hf = ["transformers>=4.40", "peft>=0.11", "accelerate>=0.30"]
+# Lower bounds = the oldest stack CI tests for real (integrations job, "minimum").
+hf = ["transformers>=4.46", "peft>=0.13", "accelerate>=1.1"]
+# 4-/8-bit QLoRA loading — the only feature that needs bitsandbytes (2.6.6).
+qlora = ["auralite-ai[hf]", "bitsandbytes>=0.43; platform_system != 'Darwin'"]
 dev = ["auralite-ai[test,lint,full,serve,rag]"]
 
 [tool.setuptools]

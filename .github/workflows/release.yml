@@ -15,6 +15,11 @@ name: Release
 #                 anywhere). Off by default; see docs/releasing.md to enable it:
 #                 register the publisher on pypi.org, create the `pypi`
 #                 environment, set the repository variable PYPI_PUBLISH=true.
+#
+# Dry run (v2.6.6): Actions → Release → "Run workflow" with `dry_run` ticked (the
+# default for manual runs) executes verify + build + the image build on the
+# selected branch, and publishes nothing — no GitHub Release, no image push, no
+# PyPI upload. That is how this workflow gets exercised before the first tag.
 on:
   push:
     tags:
@@ -22,8 +27,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (must already exist)"
-        required: true
+        description: "Existing tag to release (leave empty for a dry run of the selected branch)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: verify and build only, publish nothing"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -41,6 +51,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0        # release notes walk the history
+          # A manual run with `tag` must test the tagged commit, not the branch
+          # the button was pressed on (until 2.6.5 it checked out the branch).
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
@@ -52,11 +65,26 @@ jobs:
           pip install -e '.[test,serve]' --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Resolve the version being released
         id: version
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          if [ -n "$TAG_INPUT" ]; then
+            ref="$TAG_INPUT"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            ref="$REF_NAME"
+          elif [ "$DRY_RUN" = "true" ]; then
+            # No tag on a dry run: release-check whatever pyproject.toml says.
+            ref="v$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          else
+            echo "::error::not a tag push and no 'tag' input: nothing to release"
+            exit 1
+          fi
           version="${ref#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "releasing $version (from $ref)"
+          echo "releasing $version (from $ref, dry run: ${DRY_RUN:-false})"
       - name: Version strings must agree with the tag
         run: python scripts/check_version_consistency.py "${{ steps.version.outputs.version }}"
       - name: Ruff gate (same selectors as CI)
@@ -72,6 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
@@ -103,6 +133,7 @@ jobs:
 
   release:
     needs: [verify, build]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write         # create the Release and its tag
@@ -126,11 +157,14 @@ jobs:
             Built and tested by CI on this commit.
 
             Artifacts: `auralite_ai-${{ needs.verify.outputs.version }}-py3-none-any.whl`
-            and the source distribution. Install with:
+            and the source distribution. Install the wheel attached to this
+            release (AuraLite is not on PyPI yet):
 
             ```bash
-            pip install auralite-ai[serve]==${{ needs.verify.outputs.version }}
+            pip install "auralite-ai[serve] @ https://github.com/${{ github.repository }}/releases/download/v${{ needs.verify.outputs.version }}/auralite_ai-${{ needs.verify.outputs.version }}-py3-none-any.whl"
             ```
+
+            Docker: `docker pull ghcr.io/${{ github.repository }}:${{ needs.verify.outputs.version }}`
 
             What changed: see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/v${{ needs.verify.outputs.version }}/CHANGELOG.md)
             and the docs in [`docs/`](https://github.com/${{ github.repository }}/tree/v${{ needs.verify.outputs.version }}/docs).
@@ -143,8 +177,11 @@ jobs:
       packages: write         # push to GHCR
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -163,7 +200,7 @@ jobs:
         with:
           context: .
           target: runtime-cpu
-          push: true
+          push: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -176,7 +213,7 @@ jobs:
     # (where required reviewers can be added). Publishes exactly the artifacts
     # that `build` produced and smoke-tested.
     needs: [verify, build]
-    if: vars.PYPI_PUBLISH == 'true'
+    if: vars.PYPI_PUBLISH == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
     runs-on: ubuntu-latest
     environment:
       name: pypi

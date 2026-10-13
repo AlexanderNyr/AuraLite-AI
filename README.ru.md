@@ -1,9 +1,9 @@
 # 🌟 AuraLite AI
 
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.6.5-orange)
+![Version](https://img.shields.io/badge/version-2.6.6-orange)
 
 **English version: [README.md](README.md)** · Быстрый старт: [docs/quickstart.md](docs/quickstart.md)
 
@@ -79,13 +79,43 @@ engine.train(text, {
 ## 📦 Установка
 
 ```bash
-pip install -e .              # ядро: torch + numpy
-pip install -e '.[serve]'     # + FastAPI/uvicorn (сервер)
-pip install -e '.[full]'      # + llama-cpp-python, transformers, peft, safetensors
-pip install -e '.[test]'      # + pytest
+git clone https://github.com/AlexanderNyr/AuraLite-AI.git && cd AuraLite-AI
+pip install -e .              # ядро: torch, numpy, matplotlib (обучение, генерация, GUI)
+pip install -e '.[serve]'     # + сервер, совместимый с OpenAI/Ollama (FastAPI, uvicorn)
+pip install -e '.[hf]'        # + модели Hugging Face и дообучение LoRA (transformers, peft)
+pip install -e '.[qlora]'     # + загрузка в 4/8 бит для QLoRA (bitsandbytes; не на macOS)
+pip install -e '.[test]'      # + набор тестов
 ```
 
-Требуется Python 3.10+; GPU не обязателен.
+`pip install -r requirements.txt` ставит те же зависимости ядра без установки пакета — этого хватает для `python gui_app.py` из клона.
+
+Требуется Python 3.10–3.14. Поддержка Python 3.10 закончилась 01.10.2026: линейка 2.6.x — последняя, которая его поддерживает, 2.7 потребует 3.11+. GPU не обязателен; CUDA Toolkit не нужен, достаточно драйвера NVIDIA.
+
+### Модели `.gguf` (llama.cpp)
+
+На PyPI у `llama-cpp-python` есть только исходники. Поэтому обычный `pip install` компилирует llama.cpp: это минуты ожидания, а на Windows без Visual C++ Build Tools — ошибка. Поставьте готовое колесо:
+
+```bash
+# CPU: Linux x86-64/arm64, Windows x64, Apple Silicon
+pip install -e '.[gguf]' --only-binary llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# NVIDIA GPU, CUDA 12.5+: Linux x86-64, Windows x64
+pip install -e '.[gguf]' --only-binary llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
+```
+
+С `--only-binary` отсутствие подходящего колеса сразу даёт ошибку вместо долгой сборки из исходников.
+
+### Docker
+
+```bash
+docker build --target runtime-cpu -t auralite-ai:cpu .
+# положить чекпойнт в том с данными (каталогом /data владеет пользователь контейнера)
+docker run --rm -v auralite-data:/data -v "$PWD":/in:ro auralite-ai:cpu cp /in/model.pt /data/
+docker run -p 8000:8000 -v auralite-data:/data -e AURALITE_MODEL=/data/model.pt auralite-ai:cpu
+```
+
+Образ работает от непривилегированного пользователя и хранит модели, кэши и состояние в `/data` (`AURALITE_HOME`). `--target runtime-cuda` — вариант для GPU (`docker run --gpus all …`).
 
 ## 📖 Как пользоваться
 

@@ -1007,7 +1007,7 @@ class TestModelTab:
 
         assert seen == {"name": "tiny-model", "load_in_4bit": True, "load_in_8bit": False,
                         "apply_lora": True, "lora_rank": 8, "local_files_only": True,
-                        "verbose": True}
+                        "trust_remote_code": False, "verbose": True}
         assert "HF model loaded" in app.status_label.config.call_args.kwargs["text"]
         assert app.train_btn.config.call_args.kwargs["state"] == "disabled"
         assert app.save_btn.config.call_args.kwargs["state"] == "disabled"
@@ -1129,6 +1129,89 @@ class TestModelTab:
         app._load_hf_from_hub()
         assert seen["name"] == "user/model" and seen["local_files_only"] is False
         assert "Loaded from Hub" in app.status_label.config.call_args.kwargs["text"]
+
+    @pytest.mark.parametrize("confirmed", [False, True])
+    def test_trust_remote_code_needs_confirmation(self, app, monkeypatch, confirmed):
+        """v2.6.6: remote code is opt-in and confirmed — it executes repo code."""
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        seen = {}
+
+        def fake_load(name, **kwargs):
+            seen.update(name=name, **kwargs)
+            app.engine.model = type("M", (), {
+                "count_parameters": lambda self: 1,
+                "count_trainable_parameters": lambda self: 1})()
+
+        monkeypatch.setattr(app.engine, "load_hf_model", fake_load)
+        assert app.hf_trust_remote_var.get() is False          # off by default
+        app.hf_model_var.set("someone/custom-arch")
+        app.hf_4bit_var.set(False)
+        app.hf_trust_remote_var.set(True)
+        ask = MagicMock(return_value=confirmed)
+        monkeypatch.setattr(sys.modules["tkinter.messagebox"], "askyesno", ask)
+
+        app._load_hf_model()
+
+        assert ask.call_args.args[0] == "Trust remote code?"
+        if confirmed:
+            assert seen["trust_remote_code"] is True
+        else:
+            assert seen == {}, "declining the warning must not load anything"
+
+    def test_hf_finetune_asks_for_a_folder_reports_progress_and_can_stop(
+            self, app, monkeypatch, tmp_path):
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        monkeypatch.setattr(type(app.engine), "is_hf_model", lambda self: True)
+        corpus = tmp_path / "corpus.txt"
+        corpus.write_text("A paragraph that is long enough to train on.\n\n" * 4,
+                          encoding="utf-8")
+        app.selected_file_path = str(corpus)
+        monkeypatch.setattr(sys.modules["tkinter.messagebox"], "askyesno",
+                            MagicMock(return_value=True))
+        statuses, seen = [], {}
+        real_config = app.status_label.config
+
+        def track(*a, **k):
+            if "text" in k:
+                statuses.append(k["text"])
+            return real_config(*a, **k)
+
+        monkeypatch.setattr(app.status_label, "config", track)
+
+        def fake_finetune(texts, **kwargs):
+            seen.update(kwargs, n=len(texts))
+            kwargs["progress_callback"](1, 3, 1.25, None)
+            app._stop_hf_finetune()                 # user presses "Stop"
+            assert kwargs["stop_event"].is_set()
+            return kwargs["output_dir"]
+
+        monkeypatch.setattr(app.engine, "finetune_hf", fake_finetune)
+        out = tmp_path / "adapter-out"
+        info = sys.modules["tkinter.messagebox"].showinfo
+        info.reset_mock()
+        with dialog_double("filedialog.askdirectory", str(out)):
+            app._finetune_hf_from_gui()
+
+        assert seen["output_dir"] == str(out) and seen["n"] == 4
+        assert any("epoch 1/3, loss 1.2500" in text for text in statuses)
+        assert info.call_args.args[0] == "Fine-tuning stopped"
+        assert app.hf_finetune_btn.config.call_args.kwargs["state"] == "normal"
+        assert app.hf_stop_ft_btn.config.call_args.kwargs["state"] == "disabled"
+
+    def test_hf_finetune_without_an_output_folder_is_cancelled(self, app, monkeypatch, tmp_path):
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        monkeypatch.setattr(type(app.engine), "is_hf_model", lambda self: True)
+        corpus = tmp_path / "corpus.txt"
+        corpus.write_text("A paragraph that is long enough to train on.\n\n" * 2,
+                          encoding="utf-8")
+        app.selected_file_path = str(corpus)
+        monkeypatch.setattr(sys.modules["tkinter.messagebox"], "askyesno",
+                            MagicMock(return_value=True))
+        called = []
+        monkeypatch.setattr(app.engine, "finetune_hf", lambda *a, **k: called.append(k))
+        with dialog_double("filedialog.askdirectory", ""):
+            app._finetune_hf_from_gui()
+        assert called == []
 
     def test_hf_finetune_without_a_model_warns(self, app):
         warning = sys.modules["tkinter.messagebox"].showwarning

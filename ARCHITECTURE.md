@@ -29,9 +29,14 @@ status table) and `CHANGELOG.md`.
 ## Distribution
 
 `pyproject.toml` holds the version, extras and the `auralite` console script.
-`.github/workflows/ci.yml` runs lint / tests (3.10–3.13 + Windows) / coverage /
-optional-deps / package / server-smoke / benchmark-smoke / docker / PyInstaller
-smoke. `package` is the only job that does not use an editable install: it builds
+`.github/workflows/ci.yml` runs lint / tests (3.10–3.14, Windows, ubuntu-26.04) /
+coverage / optional-deps / integrations / package / server-smoke / benchmark-smoke /
+docker / PyInstaller smoke. `integrations` runs real transformers + peft and a
+real llama.cpp model (`stories260K.gguf`) with `AURALITE_REQUIRE_INTEGRATIONS=1`,
+so it cannot pass by skipping; `docker` builds the CPU image *and runs it*
+(non-root, trains a tiny model in a volume, serves it). Dependencies live only in
+`pyproject.toml`: `requirements.txt` mirrors the core list and the images install
+from `scripts/print_requirements.py`. `package` is the only job that does not use an editable install: it builds
 the wheel, installs it into a clean venv and runs
 `scripts/smoke_installed_wheel.py` (every module imports from site-packages,
 `auralite --version` works); `tests/test_packaging.py` keeps the flat-layout
@@ -42,7 +47,8 @@ a laptop: `verify` refuses a tag whose number disagrees with the code
 (`scripts/check_version_consistency.py` — one version source), `build` checks the
 artifacts with `twine` and smoke-tests the installed wheel, `release` attaches
 them with generated notes, and `pypi` (opt-in, Trusted Publishing — no token)
-uploads the same files. Maintainer steps: `docs/releasing.md`. `docs/` is the
+uploads the same files; a manual run with `dry_run` (the default) builds
+everything and publishes nothing. Maintainer steps: `docs/releasing.md`. `docs/` is the
 user-facing layer on top.
 
 ## Data flow

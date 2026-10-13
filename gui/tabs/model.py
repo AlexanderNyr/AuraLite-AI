@@ -63,6 +63,11 @@ class ModelTabMixin:
         self.hf_apply_lora_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(hf_opts, text="Apply LoRA on load", variable=self.hf_apply_lora_var).pack(side=tk.LEFT)
 
+        # v2.6.6: off by default — on means "execute Python code from the repo".
+        self.hf_trust_remote_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(hf_opts, text="Trust remote code (runs code from the repo)",
+                        variable=self.hf_trust_remote_var).pack(side=tk.LEFT, padx=12)
+
         lora_row = ttk.Frame(hf_frame)
         lora_row.pack(fill=tk.X, pady=2)
         ttk.Label(lora_row, text="LoRA rank:").pack(side=tk.LEFT)
@@ -93,6 +98,11 @@ class ModelTabMixin:
         self.hf_finetune_btn = ttk.Button(hf_btn_row, text="🚀 Fine-tune (LoRA/QLoRA)",
                                           command=self._finetune_hf_from_gui, state=tk.DISABLED)
         self.hf_finetune_btn.pack(side=tk.LEFT, padx=4)
+
+        self.hf_stop_ft_btn = ttk.Button(hf_btn_row, text="⏹ Stop fine-tune",
+                                         command=self._stop_hf_finetune, state=tk.DISABLED)
+        self.hf_stop_ft_btn.pack(side=tk.LEFT, padx=4)
+        self._hf_stop_event = threading.Event()
 
         # NEW: Hub push/pull buttons
         hub_row = ttk.Frame(hf_btn_row)
@@ -291,10 +301,9 @@ class ModelTabMixin:
                 self.n_kv_heads_var.set(str(p["n_kv_heads"]))
             self._refresh_model_info()
         except GGUFNotAvailableError as e:
-            messagebox.showerror(
-                "GGUF support is not installed",
-                f"{e}\n\nInstall it with:\n  pip install llama-cpp-python"
-            )
+            # The engine's message already carries the prebuilt-wheel command
+            # (a bare `pip install llama-cpp-python` compiles llama.cpp).
+            messagebox.showerror("GGUF support is not installed", str(e))
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
@@ -308,6 +317,17 @@ class ModelTabMixin:
             self.hf_model_var.set(folder)
             self.hf_local_only_var.set(True)   # automatically enable offline mode
             self.status_label.config(text=f"Status: Selected local model: {os.path.basename(folder)}")
+
+
+    def _confirm_trust_remote_code(self, name: str) -> bool:
+        """Ask before loading with trust_remote_code (it executes repo code)."""
+        if not self.hf_trust_remote_var.get():
+            return True
+        return bool(messagebox.askyesno(
+            "Trust remote code?",
+            f"'{name}' will be loaded with trust_remote_code=True.\n\n"
+            "Python code shipped in that repository will run on this computer "
+            "with your permissions. Continue only if you trust its author."))
 
 
     def _load_hf_model(self):
@@ -330,6 +350,10 @@ class ModelTabMixin:
         except ValueError:
             lora_rank = 16
 
+        if not self._confirm_trust_remote_code(model_name):
+            return
+        trust_remote = bool(self.hf_trust_remote_var.get())
+
         self.hf_load_btn.config(state=tk.DISABLED)
         self.status_label.config(text=f"Status: Loading HF model {model_name}…")
         self.root.update_idletasks()
@@ -343,6 +367,7 @@ class ModelTabMixin:
                     apply_lora=apply_lora,
                     lora_rank=lora_rank,
                     local_files_only=local_only,
+                    trust_remote_code=trust_remote,
                     verbose=True,
                 )
 
@@ -372,7 +397,7 @@ class ModelTabMixin:
                 err = str(e)
                 self.root.after(0, lambda err=err: messagebox.showerror(
                     "HF support missing",
-                    f"{err}\n\nRun: pip install -r requirements.txt"
+                    f"{err}\n\nRun: pip install \"auralite-ai[hf]\""
                 ))
             except Exception as e:
                 err = str(e)
@@ -500,6 +525,10 @@ class ModelTabMixin:
         except ValueError:
             lora_rank = 16
 
+        if not self._confirm_trust_remote_code(repo_id):
+            return
+        trust_remote = bool(self.hf_trust_remote_var.get())
+
         self.status_label.config(text=f"Status: Loading {repo_id} from Hub...")
         self.hf_load_btn.config(state=tk.DISABLED)
 
@@ -512,6 +541,7 @@ class ModelTabMixin:
                     apply_lora=apply_lora,
                     lora_rank=lora_rank,
                     local_files_only=False,
+                    trust_remote_code=trust_remote,
                     verbose=True,
                 )
 
@@ -587,31 +617,61 @@ class ModelTabMixin:
             messagebox.showwarning("No data", "Not enough text for fine-tuning.")
             return
 
+        # v2.6.6: the adapter goes where the user says. It used to land in a
+        # hard-coded "hf_lora_finetuned" relative to the current directory —
+        # for a frozen .exe that is its install folder (often read-only).
+        out_dir = filedialog.askdirectory(
+            title="Choose a folder for the fine-tuned LoRA adapter", mustexist=False)
+        if not out_dir:
+            messagebox.showinfo("Info", "Fine-tuning cancelled.")
+            return
+
+        self._hf_stop_event = threading.Event()
+        stop_event = self._hf_stop_event
         self.hf_finetune_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Status: Fine-tuning with LoRA/QLoRA… (see console)")
+        self.hf_stop_ft_btn.config(state=tk.NORMAL)
+        self.status_label.config(text="Status: Fine-tuning with LoRA/QLoRA… starting")
+
+        def on_progress(epoch, total, loss, _val_loss=None):
+            text = f"Status: Fine-tuning… epoch {epoch}/{total}, loss {loss:.4f}"
+            self.root.after(0, lambda: self.status_label.config(text=text))
 
         def run():
             try:
-                out_dir = self.engine.finetune_hf(
+                saved = self.engine.finetune_hf(
                     texts,
-                    output_dir="hf_lora_finetuned",
+                    output_dir=out_dir,
                     epochs=3,
                     learning_rate=2e-4,
                     batch_size=2,                    # small for consumer GPUs
                     max_length=512,
                     gradient_accumulation_steps=8,
+                    progress_callback=on_progress,
+                    stop_event=stop_event,
                 )
+                stopped = stop_event.is_set()
+                title = "Fine-tuning stopped" if stopped else "Fine-tuning complete"
+                note = " (stopped early)" if stopped else ""
                 self.root.after(0, lambda: messagebox.showinfo(
-                    "Fine-tuning complete",
-                    f"LoRA adapter saved to:\n{out_dir}\n\nYou can now load it with 'Load LoRA Adapter'."
+                    title,
+                    f"LoRA adapter saved to:\n{saved}{note}\n\n"
+                    "You can now load it with 'Load LoRA Adapter'."
                 ))
                 self.root.after(0, lambda: self.status_label.config(
-                    text=f"Status: Fine-tuning complete ✅ Adapter in {out_dir}"))
+                    text=f"Status: Fine-tuning {'stopped' if stopped else 'complete'} ✅ Adapter in {saved}"))
             except Exception as e:
                 err = str(e)
                 self.root.after(0, lambda err=err: messagebox.showerror("Fine-tune Error", err))
             finally:
                 self.root.after(0, lambda: self.hf_finetune_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.hf_stop_ft_btn.config(state=tk.DISABLED))
 
         threading.Thread(target=run, daemon=True).start()
+
+
+    def _stop_hf_finetune(self):
+        """Ask the running fine-tune to stop after the current step."""
+        self._hf_stop_event.set()
+        self.hf_stop_ft_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="Status: Stopping fine-tune after the current step…")
 

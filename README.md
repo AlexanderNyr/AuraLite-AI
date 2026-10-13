@@ -1,10 +1,9 @@
 # 🌟 AuraLite AI
 
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.6.5-orange)
-![Tests](https://img.shields.io/badge/tests-1008%20passed-brightgreen)
+![Version](https://img.shields.io/badge/version-2.6.6-orange)
 ![Coverage](https://img.shields.io/badge/coverage-84%25-green)
 
 **English** · [Русская версия](README.ru.md) · [Quickstart](docs/quickstart.md) · [FAQ](docs/faq.md) · [Quantization](docs/quantization.md)
@@ -190,16 +189,40 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 python gui_app.p
 ## 📦 Installation & Setup
 
 ### Prerequisites
-- **Python 3.10+** (Recommended)
-- **NVIDIA GPU** (Optional, for CUDA acceleration. Requires CUDA Toolkit installed).
+- **Python 3.10 – 3.14.** Python 3.10 reached end-of-life on 2026-10-01; AuraLite 2.6.x is the last series that supports it (2.7 will need 3.11+).
+- **NVIDIA GPU** (optional). No CUDA Toolkit is needed — only the driver: on Linux the default `torch` wheel from PyPI already contains CUDA; on Windows pick the CUDA build on [pytorch.org](https://pytorch.org/get-started/locally/).
 
-### Manual Installation
-1. Clone or download this repository.
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   (or for native AuraLite training only: `pip install torch numpy`; `.gguf` loading additionally needs `llama-cpp-python`.)
+### Install
+```bash
+git clone https://github.com/AlexanderNyr/AuraLite-AI.git && cd AuraLite-AI
+pip install -e .              # core: torch, numpy, matplotlib (training, generation, GUI)
+pip install -e '.[serve]'     # + OpenAI/Ollama-compatible server (FastAPI, uvicorn)
+pip install -e '.[hf]'        # + Hugging Face models and LoRA fine-tuning (transformers, peft)
+pip install -e '.[qlora]'     # + 4-/8-bit QLoRA loading (bitsandbytes; not on macOS)
+pip install -e '.[test]'      # + the test suite
+```
+`pip install -r requirements.txt` installs the same core dependencies without installing the package (enough for `python gui_app.py` from the checkout).
+
+### `.gguf` models (llama.cpp)
+PyPI only has the *source* of `llama-cpp-python`, so a plain `pip install` compiles llama.cpp — minutes of waiting, and an error on Windows without Visual C++ build tools. Use the prebuilt wheels instead:
+```bash
+# CPU: Linux x86-64/arm64, Windows x64, Apple Silicon
+pip install -e '.[gguf]' --only-binary llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# NVIDIA GPU, CUDA 12.5+: Linux x86-64, Windows x64
+pip install -e '.[gguf]' --only-binary llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
+```
+`--only-binary` turns a missing wheel into an immediate error instead of a long source build. For other accelerators see the [llama-cpp-python installation guide](https://github.com/abetlen/llama-cpp-python#installation).
+
+### Docker
+```bash
+docker build --target runtime-cpu -t auralite-ai:cpu .
+# copy a checkpoint into the data volume (the container user owns /data)
+docker run --rm -v auralite-data:/data -v "$PWD":/in:ro auralite-ai:cpu cp /in/model.pt /data/
+docker run -p 8000:8000 -v auralite-data:/data -e AURALITE_MODEL=/data/model.pt auralite-ai:cpu
+```
+The image serves the OpenAI-compatible API on port 8000. It runs as an unprivileged user and keeps models, caches and state in `/data` (`AURALITE_HOME`). `--target runtime-cuda` builds the GPU variant (`docker run --gpus all …`). Tagged releases publish `ghcr.io/alexandernyr/auralite-ai:<version>`.
 
 ## 📖 How to Use
 1. **Launch the App**:

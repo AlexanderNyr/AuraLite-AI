@@ -1,31 +1,20 @@
-# Core runtime (minimal)
+# AuraLite AI — core runtime dependencies.
+#
+# Enough to run the GUI and the native engine straight from a checkout:
+#     pip install -r requirements.txt && python gui_app.py
+#
+# pyproject.toml is the source of truth; tests/test_packaging.py keeps this file
+# identical to its `dependencies`. Optional features are extras of the package:
+#     pip install -e '.[serve]'    OpenAI/Ollama-compatible server (FastAPI, uvicorn)
+#     pip install -e '.[hf]'       Hugging Face models + LoRA fine-tuning
+#     pip install -e '.[qlora]'    + 4-/8-bit QLoRA (bitsandbytes; not on macOS)
+#     pip install -e '.[gguf]'     .gguf models via llama.cpp — use the prebuilt
+#                                  wheels, see README → "`.gguf` models"
+#     pip install -e '.[test]'     the test suite
+#
+# (Until 2.6.5 this file also listed llama-cpp-python, transformers, bitsandbytes,
+# faiss, sentence-transformers, …: `pip install -r requirements.txt` compiled
+# llama.cpp from source and failed on Windows machines without build tools.)
 torch>=2.1
 numpy>=1.24
 matplotlib>=3.5
-
-# Development / tests
-pytest>=7.0
-pytest-cov>=4.0
-hypothesis>=6.0
-
-# Optional: GGUF / llama.cpp backend
-llama-cpp-python>=0.2.90
-
-# Optional: Hugging Face + LoRA/QLoRA
-transformers>=4.40.0
-peft>=0.11.0
-accelerate>=0.30.0
-bitsandbytes>=0.43.0; platform_system != "Darwin"
-sentencepiece>=0.2.0
-protobuf>=4.21.0
-tiktoken>=0.7.0
-
-# Optional: from-scratch image generator (Image tab, DDPM diffusion)
-Pillow>=10.0
-
-# Optional: serving / RAG / typed config
-fastapi>=0.111
-uvicorn[standard]>=0.30
-pydantic>=2
-sentence-transformers>=3.0
-faiss-cpu>=1.8

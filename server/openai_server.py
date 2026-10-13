@@ -40,6 +40,7 @@ try:
     from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
     from pydantic import BaseModel, Field
+    from starlette.exceptions import HTTPException as StarletteHTTPException
 except Exception as e:  # pragma: no cover - optional dependency
     raise ImportError("Install serving dependencies: pip install fastapi uvicorn pydantic") from e
 
@@ -252,6 +253,13 @@ class CompletionRequest(_SamplingOptions):
     prompt: str | list[str]
     max_tokens: int = Field(default=128, ge=0, le=8192)
     stream: bool = False
+    # Declared so that requests asking for them get an honest 400 instead of
+    # being silently ignored (see `_unsupported`); the defaults are accepted.
+    n: int = 1
+    best_of: int | None = None
+    logprobs: int | None = None
+    echo: bool = False
+    suffix: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -265,6 +273,14 @@ class ChatCompletionRequest(_SamplingOptions):
     max_tokens: int = Field(default=128, ge=0, le=8192)
     temperature: float = Field(default=0.7, ge=0.0, le=5.0)
     stream: bool = False
+    n: int = 1
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
+    response_format: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    functions: list[dict[str, Any]] | None = None
+    function_call: str | dict[str, Any] | None = None
 
 
 class OllamaGenerateRequest(BaseModel):
@@ -272,6 +288,7 @@ class OllamaGenerateRequest(BaseModel):
     prompt: str = ""
     stream: bool = True
     options: dict[str, Any] | None = None      # ollama-style sampling options
+    format: str | dict[str, Any] | None = None
 
 
 class OllamaChatRequest(BaseModel):
@@ -279,6 +296,54 @@ class OllamaChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = True
     options: dict[str, Any] | None = None
+    format: str | dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+
+
+def _unsupported(req: BaseModel) -> list[tuple[str, str]]:
+    """(param, reason) for every requested feature this server cannot honour.
+
+    Before v2.6.6 these parameters were dropped by pydantic and the client got
+    HTTP 200 with something it had not asked for — one choice instead of `n`,
+    no `logprobs`, plain text instead of JSON, no `tool_calls`. Default values
+    (n=1, logprobs=false, tools=[], response_format text, …) stay accepted so
+    ordinary OpenAI clients keep working.
+    """
+    problems: list[tuple[str, str]] = []
+    get = lambda name: getattr(req, name, None)  # noqa: E731 - tiny local accessor
+
+    if (get("n") or 1) != 1:
+        problems.append(("n", "only n=1 is supported"))
+    if (get("best_of") or 1) != 1:
+        problems.append(("best_of", "only best_of=1 is supported"))
+    if get("logprobs") not in (None, False, 0):
+        problems.append(("logprobs", "log-probabilities are not returned by this server"))
+    if get("top_logprobs"):
+        problems.append(("top_logprobs", "log-probabilities are not returned by this server"))
+    if get("echo"):
+        problems.append(("echo", "echo is not supported"))
+    if get("suffix"):
+        problems.append(("suffix", "suffix (fill-in-the-middle) is not supported"))
+    response_format = get("response_format")
+    if response_format and response_format.get("type", "text") != "text":
+        problems.append(("response_format", "structured output (JSON mode / json_schema) "
+                                            "is not supported; omit response_format"))
+    tool_choice = get("tool_choice")
+    if (get("tools") or get("functions")) and tool_choice != "none":
+        problems.append(("tools", "tool / function calling is not supported"))
+    if get("format"):
+        problems.append(("format", "structured output (format) is not supported"))
+    return problems
+
+
+def reject_unsupported(req: BaseModel) -> None:
+    problems = _unsupported(req)
+    if problems:
+        param, reason = problems[0]
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"Unsupported parameter '{param}': {reason}.",
+            "type": "invalid_request_error", "param": param,
+            "code": "unsupported_parameter"}})
 
 
 class EmbeddingRequest(BaseModel):
@@ -489,11 +554,29 @@ def _sampling_kwargs(req: _SamplingOptions) -> dict[str, Any]:
             "repetition_penalty": req.repetition_penalty, "min_p": req.min_p}
 
 
-def _usage_chunk(object_name: str, model: str, usage: dict[str, int]) -> str:
+def _usage_chunk(object_name: str, model: str, usage: dict[str, int],
+                 chunk_id: str | None = None) -> str:
     """Final SSE chunk carrying usage (OpenAI `stream_options.include_usage`)."""
-    chunk = {"id": f"{object_name}-{uuid.uuid4().hex}", "object": object_name,
+    chunk = {"id": chunk_id or f"{object_name}-{uuid.uuid4().hex}", "object": object_name,
              "created": int(time.time()), "model": model, "choices": [], "usage": usage}
     return json.dumps(chunk, ensure_ascii=False)
+
+
+def _chat_prompt_text(engine: AuraLiteEngine, messages: list[dict[str, str]]) -> str:
+    """The prompt the engine sees for `messages` — used for `prompt_tokens`.
+
+    Shared by the streaming and non-streaming chat paths (and Ollama /api/chat):
+    until v2.6.6 the streaming paths reported `prompt_tokens: 0`.
+    """
+    if HAS_CHAT:
+        try:
+            return apply_chat_template(
+                ChatHistory.from_list(messages),
+                template_name=getattr(engine, "default_chat_template", "chatml"),
+                add_generation_prompt=True)
+        except Exception:
+            pass
+    return "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
 
 
 def _usage(engine: AuraLiteEngine, prompt_text: str | None, completion_text: str) -> dict[str, int]:
@@ -542,6 +625,7 @@ def list_models() -> dict[str, Any]:
 @app.post("/v1/completions", dependencies=[Depends(require_api_key)])
 def completions(req: CompletionRequest, request: Request):
     check_rate_limit(request)
+    reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
     prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
@@ -549,16 +633,18 @@ def completions(req: CompletionRequest, request: Request):
     sampling = _sampling_kwargs(req)
 
     if req.stream and len(prompts) == 1:
+        stream_id = f"cmpl-{uuid.uuid4().hex}"     # one id for the whole stream
+
         def gen():
             collector = StopCollector(stops)
             completion_text = ""
 
-            def frame(piece: str) -> str:
-                """Count the piece and wrap it into one SSE data frame."""
-                chunk = {"id": f"cmpl-{uuid.uuid4().hex}", "object": "text_completion",
+            def frame(piece: str, finish_reason: str | None = None) -> str:
+                """Wrap one piece into an SSE data frame."""
+                chunk = {"id": stream_id, "object": "text_completion",
                          "created": int(time.time()), "model": req.model,
                          "choices": [{"text": piece, "index": 0,
-                                      "finish_reason": None}]}
+                                      "finish_reason": finish_reason}]}
                 return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
             with _Busy():
@@ -580,9 +666,11 @@ def completions(req: CompletionRequest, request: Request):
                         _metric("tokens_generated_total")
                         completion_text += tail
                         yield frame(tail)
+                # Final frame carries finish_reason, like OpenAI's streams.
+                yield frame("", "stop" if (collector.hit or stops) else "length")
                 if req.include_usage():
                     usage = _usage(engine, prompts[0], completion_text)
-                    yield f"data: {_usage_chunk('text_completion', req.model, usage)}\n\n"
+                    yield f"data: {_usage_chunk('text_completion', req.model, usage, stream_id)}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -615,6 +703,7 @@ def completions(req: CompletionRequest, request: Request):
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 def chat_completions(req: ChatCompletionRequest, request: Request):
     check_rate_limit(request)
+    reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
     messages = [m.model_dump() for m in req.messages]
@@ -625,16 +714,24 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_kwargs = {**sampling, "max_new_tokens": req.max_tokens,
                    "temperature": req.temperature, "stop_tokens": stops or None}
 
+    # Usage accounting: rebuild the exact prompt the engine will use, so
+    # prompt_tokens matches what the model actually saw (streaming included).
+    prompt_for_usage = _chat_prompt_text(engine, messages)
+    finish_reason = "stop" if stops else "length"
+
     if req.stream:
+        stream_id = f"chatcmpl-{uuid.uuid4().hex}"   # one id for the whole stream
+
         def gen():
             completion_text = ""
+            first = True
 
-            def frame(piece: str) -> str:
-                chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}",
+            def frame(delta: dict[str, str], reason: str | None = None) -> str:
+                chunk = {"id": stream_id,
                          "object": "chat.completion.chunk",
                          "created": int(time.time()), "model": req.model,
-                         "choices": [{"delta": {"content": piece}, "index": 0,
-                                      "finish_reason": None}]}
+                         "choices": [{"delta": delta, "index": 0,
+                                      "finish_reason": reason}]}
                 return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
             with _Busy():
@@ -644,26 +741,20 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                             break  # server shutting down: stop generating cleanly
                         _metric("tokens_generated_total")
                         completion_text += tok
-                        yield frame(tok)
+                        # The first delta names the role, as OpenAI's streams do.
+                        yield frame({"role": "assistant", "content": tok} if first
+                                    else {"content": tok})
+                        first = False
+                if first:   # nothing generated: still announce the role
+                    yield frame({"role": "assistant", "content": ""})
+                yield frame({}, finish_reason)
                 if req.include_usage():
-                    usage = _usage(engine, None, completion_text)
-                    yield f"data: {_usage_chunk('chat.completion.chunk', req.model, usage)}\n\n"
+                    usage = _usage(engine, prompt_for_usage, completion_text)
+                    yield (f"data: {_usage_chunk('chat.completion.chunk', req.model, usage, stream_id)}"
+                           "\n\n")
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    # Usage accounting: rebuild the exact prompt the engine will use, so
-    # prompt_tokens matches what the model actually saw.
-    prompt_for_usage: str | None = None
-    if HAS_CHAT:
-        try:
-            prompt_for_usage = apply_chat_template(
-                ChatHistory.from_list(messages),
-                template_name=getattr(engine, "default_chat_template", "chatml"),
-                add_generation_prompt=True)
-        except Exception:
-            prompt_for_usage = None
-    if prompt_for_usage is None:
-        prompt_for_usage = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
     with _Busy():
         with seeded_rng(req.seed):
             try:
@@ -678,7 +769,7 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
             "created": int(time.time()), "model": req.model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                         "finish_reason": "stop" if stops else "length"}],
+                         "finish_reason": finish_reason}],
             "usage": chat_usage}
 
 
@@ -730,6 +821,7 @@ def _ollama_options(options: dict[str, Any] | None) -> dict[str, Any]:
 @app.post("/api/generate", dependencies=[Depends(require_api_key)])
 def ollama_generate(req: OllamaGenerateRequest, request: Request):
     check_rate_limit(request)
+    reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
     opts = _ollama_options(req.options)
@@ -789,9 +881,11 @@ def ollama_generate(req: OllamaGenerateRequest, request: Request):
 @app.post("/api/chat", dependencies=[Depends(require_api_key)])
 def ollama_chat(req: OllamaChatRequest, request: Request):
     check_rate_limit(request)
+    reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
     messages = [m.model_dump() for m in req.messages]
+    prompt_text = _chat_prompt_text(engine, messages)
     opts = _ollama_options(req.options)
     max_tokens = int(opts.pop("max_tokens", 128))
     temperature = float(opts.pop("temperature", 0.7))
@@ -815,7 +909,7 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
                         yield ndjson(ollama_chat_response(req.model, tok, done=False))
                 _metric("tokens_generated_total", _safe_len(engine, completion_text))
                 yield ndjson(ollama_chat_response(
-                    req.model, "", prompt_eval_count=0,
+                    req.model, "", prompt_eval_count=_safe_len(engine, prompt_text),
                     eval_count=_safe_len(engine, completion_text)))
         return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -824,9 +918,15 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
             try:
                 content = backend.generate_chat(messages, **chat_kwargs)
             except Exception:
-                content = ""
+                # Same fallback as /v1/chat/completions: engines without a chat
+                # path answer the rendered prompt. Until v2.6.6 every error was
+                # swallowed here and the client got HTTP 200 with "" as answer.
+                full = backend.generate(prompt_text, length=max_tokens,
+                                        temperature=temperature, **sampling)
+                content = full[len(prompt_text):] if full.startswith(prompt_text) else full
     _metric("tokens_generated_total", _safe_len(engine, content))
     return ollama_chat_response(req.model, content,
+                                prompt_eval_count=_safe_len(engine, prompt_text),
                                 eval_count=_safe_len(engine, content))
 
 
@@ -864,6 +964,31 @@ def embeddings(req: EmbeddingRequest, request: Request):
                 pass
     return {"object": "list", "data": data, "model": req.model,
             "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens}}
+
+
+_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
+                403: "permission_error", 404: "not_found_error", 413: "invalid_request_error",
+                429: "rate_limit_error", 501: "not_implemented_error", 503: "server_busy"}
+
+
+@app.exception_handler(StarletteHTTPException)   # FastAPI's HTTPException + 404/405
+def http_errors(_: Request, exc: StarletteHTTPException):
+    """OpenAI-shaped error bodies: `{"error": {...}}` at the top level.
+
+    FastAPI's default wraps the detail as `{"detail": ...}`, which OpenAI client
+    libraries do not read; the 401/429/503 bodies were shaped that way until
+    v2.6.6.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict) and "error" in detail:
+        body = detail
+    else:
+        body = {"error": {"message": str(detail),
+                          "type": _ERROR_TYPES.get(exc.status_code, "server_error"
+                                                   if exc.status_code >= 500
+                                                   else "invalid_request_error")}}
+    return JSONResponse(status_code=exc.status_code, content=body,
+                        headers=getattr(exc, "headers", None))
 
 
 @app.exception_handler(Exception)

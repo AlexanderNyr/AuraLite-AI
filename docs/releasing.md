@@ -34,7 +34,21 @@ built or uploaded from a laptop.
    cd /tmp && /tmp/wheel-venv/bin/python ~/AuraLite-AI/scripts/smoke_installed_wheel.py
    ```
 
-3. **Tag and push.**
+3. **Dry run of the release workflow** (v2.6.6). *Actions → Release → Run
+   workflow* on `main`, leave `tag` empty and `dry_run` ticked (the default). The
+   run executes `verify`, `build` and the Docker image build exactly as a tag
+   would, and publishes nothing: no GitHub Release, no image push, no PyPI upload.
+   From the command line:
+
+   ```bash
+   gh workflow run release.yml -f dry_run=true
+   ```
+
+   A real release can also be started by hand for an existing tag:
+   `gh workflow run release.yml -f tag=v2.6.6 -f dry_run=false` — the jobs then
+   check out that tag, not the branch the button was pressed on.
+
+4. **Tag and push.**
 
    ```bash
    git tag v2.6.6
@@ -47,11 +61,18 @@ built or uploaded from a laptop.
 |---|---|---|
 | `verify` | version strings vs. the tag, ruff gate, fast test suite | the tag and the code disagree, lint or tests fail |
 | `build` | sdist + wheel, `twine check`, clean-venv install + smoke script | metadata is invalid, a module is not shipped, `auralite --version` fails |
-| `release` | GitHub Release with the artifacts and generated notes | — |
-| `image` | `ghcr.io/<owner>/auralite-ai:<version>` and `:latest` (CPU runtime) | the Docker build fails |
-| `pypi` | uploads the *same* artifacts to PyPI | only runs when enabled (below) |
+| `release` | GitHub Release with the artifacts and generated notes | — (skipped on a dry run) |
+| `image` | `ghcr.io/<owner>/auralite-ai:<version>` and `:latest` (CPU runtime); built but not pushed on a dry run | the Docker build fails |
+| `pypi` | uploads the *same* artifacts to PyPI | only runs when enabled (below), never on a dry run |
 
 ## Enabling PyPI (one time, no token)
+
+> **Wait for 2.7.0.** The wheel still installs 16 top-level modules with generic
+> names (`server`, `agent`, `gui`, `export`, `kernels`, …). Hugging Face's
+> [`kernels`](https://pypi.org/project/kernels/) package already owns the
+> import name `kernels`, so installing both would overwrite files. 2.7.0 moves
+> everything under one `auralite` package; enable PyPI after that. GitHub
+> Releases and the GHCR image are unaffected.
 
 Publishing uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/):
 PyPI trusts this workflow's OpenID Connect identity, so there is no API token to

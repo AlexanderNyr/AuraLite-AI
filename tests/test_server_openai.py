@@ -134,12 +134,14 @@ class TestCompletions:
             assert resp.headers["content-type"].startswith("text/event-stream")
             chunks = [line for line in resp.iter_lines() if line.startswith("data: ")]
         assert chunks[-1] == "data: [DONE]"
-        texts = []
-        for line in chunks[:-1]:
-            payload = json.loads(line[len("data: "):])  # must be valid JSON
-            assert payload["object"] == "text_completion"
-            texts.append(payload["choices"][0]["text"])
-        assert texts == ["Hel", "lo", "!"]
+        payloads = [json.loads(line[len("data: "):]) for line in chunks[:-1]]  # valid JSON
+        assert all(p["object"] == "text_completion" for p in payloads)
+        texts = [p["choices"][0]["text"] for p in payloads]
+        assert texts == ["Hel", "lo", "!", ""]
+        # v2.6.6: one id per stream, and the last frame carries finish_reason.
+        assert len({p["id"] for p in payloads}) == 1
+        assert [p["choices"][0]["finish_reason"] for p in payloads] == [None, None, None,
+                                                                         "length"]
 
     def test_max_tokens_out_of_range_rejected(self, client):
         c, _ = client
@@ -175,12 +177,15 @@ class TestChatCompletions:
             assert resp.status_code == 200
             chunks = [line for line in resp.iter_lines() if line.startswith("data: ")]
         assert chunks[-1] == "data: [DONE]"
-        deltas = []
-        for line in chunks[:-1]:
-            payload = json.loads(line[len("data: "):])
-            assert payload["object"] == "chat.completion.chunk"
-            deltas.append(payload["choices"][0]["delta"]["content"])
-        assert deltas == ["chat", " ", "stream"]
+        payloads = [json.loads(line[len("data: "):]) for line in chunks[:-1]]
+        assert all(p["object"] == "chat.completion.chunk" for p in payloads)
+        deltas = [p["choices"][0]["delta"] for p in payloads]
+        assert [d.get("content") for d in deltas] == ["chat", " ", "stream", None]
+        # v2.6.6: OpenAI framing — role in the first delta, empty final delta
+        # with finish_reason, and the same id on every chunk.
+        assert deltas[0]["role"] == "assistant" and deltas[-1] == {}
+        assert payloads[-1]["choices"][0]["finish_reason"] == "length"
+        assert len({p["id"] for p in payloads}) == 1
 
     def test_chat_empty_messages_validation(self, client):
         c, _ = client
@@ -494,3 +499,154 @@ class TestConcurrentGenerationSlots:
         assert codes == [200] * 4, codes
         # One slot: the mutable KV cache is never touched twice at once.
         assert state["peak"] == 1, state
+
+
+# ----------------------------------------------------------------------
+#  v2.6.6: honest server — usage in streams, 400 for unsupported features,
+#  OpenAI-shaped error bodies
+# ----------------------------------------------------------------------
+class CountingEngine(FakeEngine):
+    """FakeEngine with a tokenizer: one character = one token."""
+
+    def encode(self, text):
+        return list(text)
+
+
+@pytest.fixture()
+def counting_client(monkeypatch):
+    engine = CountingEngine()
+    monkeypatch.setattr(srv, "_engine", engine)
+    monkeypatch.setattr(srv, "_rate_bucket", {})
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        yield client, engine
+
+
+class TestStreamingUsage:
+    def test_streamed_chat_reports_the_same_prompt_tokens(self, counting_client):
+        c, _ = counting_client
+        body = {"messages": [{"role": "user", "content": "how many tokens?"}],
+                "max_tokens": 8}
+        plain = c.post("/v1/chat/completions", json=body).json()["usage"]
+        with c.stream("POST", "/v1/chat/completions",
+                      json={**body, "stream": True,
+                            "stream_options": {"include_usage": True}}) as resp:
+            payloads = _sse_payloads(list(resp.iter_lines()))
+        streamed = payloads[-1]["usage"]
+        assert plain["prompt_tokens"] > 0
+        assert streamed["prompt_tokens"] == plain["prompt_tokens"]   # was 0 before 2.6.6
+        assert streamed["completion_tokens"] == len("chat stream")
+        assert streamed["total_tokens"] == streamed["prompt_tokens"] + len("chat stream")
+        assert len({p["id"] for p in payloads}) == 1
+
+    def test_ollama_chat_counts_the_prompt(self, counting_client):
+        c, _ = counting_client
+        msgs = [{"role": "user", "content": "hello there"}]
+        final = c.post("/api/chat", json={"messages": msgs, "stream": False}).json()
+        assert final["prompt_eval_count"] > 0
+        with c.stream("POST", "/api/chat", json={"messages": msgs, "stream": True}) as resp:
+            lines = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+        assert lines[-1]["done"] is True
+        assert lines[-1]["prompt_eval_count"] == final["prompt_eval_count"]
+
+    def test_ollama_chat_no_longer_hides_errors(self, counting_client, monkeypatch):
+        c, engine = counting_client
+
+        def broken_chat(*a, **k):
+            raise RuntimeError("no chat template")
+
+        monkeypatch.setattr(engine, "generate_chat", broken_chat)
+        r = c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}],
+                                      "stream": False})
+        assert r.status_code == 200
+        assert r.json()["message"]["content"] == " world"   # fallback to generate()
+
+        def broken_generate(*a, **k):
+            raise RuntimeError("model exploded")
+
+        monkeypatch.setattr(engine, "generate", broken_generate)
+        r = c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}],
+                                      "stream": False})
+        assert r.status_code == 500 and "model exploded" in r.text
+
+
+CHAT = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
+
+
+class TestUnsupportedParameters:
+    @pytest.mark.parametrize("extra,param", [
+        ({"n": 2}, "n"),
+        ({"logprobs": True}, "logprobs"),
+        ({"top_logprobs": 3}, "top_logprobs"),
+        ({"response_format": {"type": "json_object"}}, "response_format"),
+        ({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}},
+         "response_format"),
+        ({"tools": [{"type": "function", "function": {"name": "f"}}]}, "tools"),
+        ({"functions": [{"name": "f"}]}, "tools"),
+    ])
+    def test_chat_rejects_what_it_cannot_do(self, client, extra, param):
+        c, engine = client
+        r = c.post("/v1/chat/completions", json={**CHAT, **extra})
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["param"] == param and error["code"] == "unsupported_parameter"
+        assert error["type"] == "invalid_request_error"
+        assert engine.chat_calls == []          # rejected before generating
+
+    @pytest.mark.parametrize("extra", [
+        {"n": 1}, {"logprobs": False}, {"tools": []}, {"response_format": {"type": "text"}},
+        {"tools": [{"type": "function", "function": {"name": "f"}}], "tool_choice": "none"},
+        {"presence_penalty": 0, "frequency_penalty": 0, "user": "u1"},
+    ])
+    def test_chat_accepts_the_default_values(self, client, extra):
+        c, _ = client
+        assert c.post("/v1/chat/completions", json={**CHAT, **extra}).status_code == 200
+
+    @pytest.mark.parametrize("extra,param", [
+        ({"n": 3}, "n"), ({"best_of": 2}, "best_of"), ({"logprobs": 2}, "logprobs"),
+        ({"echo": True}, "echo"), ({"suffix": "tail"}, "suffix"),
+    ])
+    def test_completions_reject_what_they_cannot_do(self, client, extra, param):
+        c, _ = client
+        r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 2, **extra})
+        assert r.status_code == 400 and r.json()["error"]["param"] == param
+
+    def test_streaming_requests_are_rejected_before_the_stream_starts(self, client):
+        c, _ = client
+        r = c.post("/v1/chat/completions", json={**CHAT, "stream": True, "n": 2})
+        assert r.status_code == 400
+        assert r.headers["content-type"].startswith("application/json")
+
+    @pytest.mark.parametrize("path,body", [
+        ("/api/chat", {"messages": CHAT["messages"], "stream": False, "format": "json"}),
+        ("/api/chat", {"messages": CHAT["messages"], "stream": False,
+                       "tools": [{"type": "function", "function": {"name": "f"}}]}),
+        ("/api/generate", {"prompt": "hi", "stream": False, "format": "json"}),
+    ])
+    def test_ollama_endpoints_reject_structured_output(self, client, path, body):
+        c, _ = client
+        r = c.post(path, json=body)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "unsupported_parameter"
+
+
+class TestErrorBodies:
+    def test_auth_errors_use_the_openai_shape(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setenv("AURALITE_API_KEY", "secret")
+        r = c.get("/v1/models")
+        assert r.status_code == 401
+        assert r.json() == {"error": {"message": "invalid or missing API key",
+                                      "type": "authentication_error"}}
+        assert r.headers["www-authenticate"] == "Bearer"
+
+    def test_rate_limit_body_and_retry_after(self, client):
+        c, _ = client
+        srv._rate_bucket["testclient"] = [__import__("time").time()] * 60
+        r = c.post("/v1/completions", json={"prompt": "x"})
+        assert r.status_code == 429
+        assert r.json()["error"]["type"] == "rate_limit_error"
+        assert int(r.headers["retry-after"]) >= 1
+
+    def test_unknown_routes_are_openai_shaped_too(self, client):
+        c, _ = client
+        r = c.get("/v1/does-not-exist")
+        assert r.status_code == 404 and r.json()["error"]["type"] == "not_found_error"

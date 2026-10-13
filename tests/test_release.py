@@ -130,7 +130,7 @@ def test_pypi_publishing_is_tokenless_and_opt_in():
     jobs = WORKFLOWS["release.yml"]["jobs"]
     pypi = jobs["pypi"]
     # Opt-in: nothing is uploaded until the maintainer sets the repo variable.
-    assert pypi["if"] == "vars.PYPI_PUBLISH == 'true'"
+    assert pypi["if"].startswith("vars.PYPI_PUBLISH == 'true'")
     # Only artifacts that were verified, built and smoke-tested are published.
     assert set(pypi["needs"]) == {"verify", "build"}
     # Trusted Publishing (OIDC): the job may mint an identity token, nothing else.
@@ -153,7 +153,7 @@ NODE24_MAJORS = {
     "actions/upload-artifact": 6, "actions/download-artifact": 7,
     "docker/setup-buildx-action": 4, "docker/login-action": 4,
     "docker/metadata-action": 6, "docker/build-push-action": 7,
-    "softprops/action-gh-release": 3,
+    "softprops/action-gh-release": 3, "actions/cache": 5,
 }
 
 
@@ -206,11 +206,12 @@ def test_lint_job_blocks_unspecified_text_encodings():
     assert "--preview" in gate and "|| true" not in gate
 
 
-def test_workflow_dispatch_inputs_that_jobs_read_are_declared():
-    workflow = WORKFLOWS["ci.yml"]
+@pytest.mark.parametrize("name", ["ci.yml", "release.yml"])
+def test_workflow_dispatch_inputs_that_jobs_read_are_declared(name):
+    workflow = WORKFLOWS[name]
     triggers = workflow.get("on") or workflow.get(True)
     declared = set((triggers["workflow_dispatch"] or {}).get("inputs", {}))
-    text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
     used = set(re.findall(r"inputs\.([A-Za-z_][\w-]*)", text))
     assert used <= declared, f"undeclared workflow_dispatch inputs: {sorted(used - declared)}"
 
@@ -302,3 +303,122 @@ def test_scripts_are_executable_and_documented():
     arch = (REPO_ROOT / "ARCHITECTURE.md").read_text(encoding="utf-8")
     assert "release.yml" in arch
     assert "check_version_consistency" in arch
+
+
+# ----------------------------------------------------------------------
+#  v2.6.6: release dry run, Python/OS matrix, real integrations, container smoke
+# ----------------------------------------------------------------------
+DRY = "!(github.event_name == 'workflow_dispatch' && inputs.dry_run)"
+
+
+def test_release_workflow_has_a_publish_nothing_dry_run():
+    workflow = WORKFLOWS["release.yml"]
+    triggers = workflow.get("on") or workflow.get(True)
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["dry_run"]["type"] == "boolean" and inputs["dry_run"]["default"] is True
+    assert inputs["tag"]["required"] is False
+
+    jobs = workflow["jobs"]
+    assert DRY in jobs["release"]["if"]
+    assert DRY in jobs["pypi"]["if"]
+    image_steps = jobs["image"]["steps"]
+    login = next(step for step in image_steps if "login-action" in str(step.get("uses", "")))
+    push = next(step for step in image_steps if "build-push-action" in str(step.get("uses", "")))
+    assert DRY in login["if"]
+    assert DRY in str(push["with"]["push"])
+    # verify/build still run on a dry run — that is the point of it.
+    assert "if" not in jobs["verify"] and "if" not in jobs["build"]
+
+
+def test_manual_release_checks_out_the_tag_it_releases():
+    jobs = WORKFLOWS["release.yml"]["jobs"]
+    for name in ("verify", "build", "image"):
+        checkout = next(step for step in jobs[name]["steps"]
+                        if str(step.get("uses", "")).startswith("actions/checkout"))
+        assert checkout["with"]["ref"] == "${{ inputs.tag || github.ref }}", name
+
+
+def test_release_notes_do_not_promise_a_pypi_package():
+    jobs = WORKFLOWS["release.yml"]["jobs"]
+    body = next(step for step in jobs["release"]["steps"]
+                if "action-gh-release" in str(step.get("uses", "")))["with"]["body"]
+    assert "pip install auralite-ai[serve]==" not in body
+    assert "releases/download/v" in body
+
+
+def _matrix_pythons():
+    matrix = WORKFLOWS["ci.yml"]["jobs"]["tests"]["strategy"]["matrix"]
+    return set(matrix["python"]) | {row["python"] for row in matrix.get("include", [])}
+
+
+def test_python_classifiers_match_the_ci_matrix():
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        tomllib = pytest.importorskip("tomli")
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    classifiers = project["classifiers"]
+    classified = {c.rsplit(" :: ", 1)[1] for c in classifiers
+                  if re.fullmatch(r"Programming Language :: Python :: 3\.\d+", c)}
+    assert classified == _matrix_pythons()
+    assert "3.14" in classified
+    # PEP 639: with an SPDX `license` string setuptools rejects license classifiers.
+    assert not [c for c in classifiers if c.startswith("License ::")]
+
+
+def test_ci_tries_ubuntu_26_04_before_ubuntu_latest_moves():
+    matrix = WORKFLOWS["ci.yml"]["jobs"]["tests"]["strategy"]["matrix"]
+    assert {"os": "ubuntu-26.04", "python": "3.14"} in matrix["include"]
+
+
+def test_linux_test_legs_refuse_to_silently_skip_the_gui_suite():
+    for job in ("tests", "coverage"):
+        steps = WORKFLOWS["ci.yml"]["jobs"][job]["steps"]
+        guard = next(step for step in steps if step.get("name") == "Ensure tkinter is importable")
+        assert 'python -c "import tkinter; print' in guard["run"]
+        assert "libtk8.6" in guard["run"] and "python3-tk" in guard["run"]
+
+
+def test_integrations_job_runs_real_hf_and_llama_cpp_without_skipping():
+    job = WORKFLOWS["ci.yml"]["jobs"]["integrations"]
+    assert job["env"]["AURALITE_REQUIRE_INTEGRATIONS"] == "1"
+    assert job["env"]["AURALITE_TEST_GGUF"].endswith("stories260K.gguf")
+    joined = "\n".join(str(step.get("run", "")) for step in job["steps"])
+    assert ".[test,serve,hf,gguf]" in joined
+    assert "--only-binary llama-cpp-python" in joined          # never compile llama.cpp
+    assert "abetlen.github.io/llama-cpp-python/whl/cpu" in joined
+    assert "find_spec('bitsandbytes') is None" in joined       # HF must work without it
+    for suite in ("tests/test_hf_real.py", "tests/test_gguf_real.py"):
+        assert suite in joined
+    # The "minimum" leg installs exactly the lower bounds the `hf` extra promises.
+    assert job["strategy"]["matrix"]["hf"] == ["latest", "minimum"]
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    hf_extra = re.search(r"^hf = \[(.*)\]$", text, re.M).group(1)
+    for package, floor in re.findall(r'"([a-z]+)>=([\d.]+)"', hf_extra):
+        assert f'"{package}=={floor}.' in joined, (package, floor)
+
+
+def test_docker_job_runs_the_image_it_builds():
+    job = WORKFLOWS["ci.yml"]["jobs"]["docker"]
+    assert job["needs"] == ["lint"]                  # no longer waits for every test leg
+    build = next(step for step in job["steps"] if "build-push-action" in str(step.get("uses")))
+    assert build["with"]["load"] is True
+    smoke = next(step for step in job["steps"] if "docker run" in str(step.get("run", "")))
+    run = smoke["run"]
+    assert 'test "$uid" != "0"' in run               # not root
+    assert "/health" in run and "/v1/completions" in run
+    assert "AURALITE_MODEL=/data/tiny.pt" in run
+
+
+def test_dockerfile_runtime_images_are_non_root_and_not_editable():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    stages = re.split(r"^FROM ", dockerfile, flags=re.M)[1:]
+    runtimes = {stage.split(" AS ")[1].split()[0]: stage for stage in stages if " AS runtime-" in stage}
+    assert set(runtimes) == {"runtime-cpu", "runtime-cuda"}
+    for name, stage in runtimes.items():
+        assert "USER auralite" in stage, name
+        assert "pip install -e" not in stage, name
+        assert "print_requirements.py" in stage, name          # cached dependency layer
+        assert stage.index("print_requirements.py") < stage.index("COPY . "), name
+    assert "|| true" not in dockerfile
+    assert "llama-cpp-python" not in dockerfile.split("FROM base AS runtime-cuda")[1].split("RUN")[1]

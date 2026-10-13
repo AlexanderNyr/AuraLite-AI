@@ -373,9 +373,11 @@ class TestServerV262:
         r = client.get("/v1/models")
         assert r.status_code == 401
 
-    def test_busy_semaphore_returns_503(self):
+    def test_busy_semaphore_returns_503(self, monkeypatch):
         pytest.importorskip("fastapi")
         import threading
+        # Only the 503 is under test, not the default 10-second queue wait.
+        monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "0.2")
         from fastapi.testclient import TestClient
         import server.openai_server as srv
         srv._engine = _FakeEngine()

@@ -36,9 +36,12 @@ def small_model():
     return model
 
 
+SMALL_TEXT = "hello world this is a test of the aura lite ai model " * 100
+
+
 @pytest.fixture
 def small_text():
-    return "hello world this is a test of the aura lite ai model " * 100
+    return SMALL_TEXT
 
 
 @pytest.fixture
@@ -48,8 +51,13 @@ def char_tokenizer(small_text):
     return tok
 
 
-@pytest.fixture
-def trained_engine(small_text):
+@pytest.fixture(scope="module")
+def _trained_checkpoint(tmp_path_factory):
+    """Train once per module and give every test a fresh engine loaded from disk.
+
+    The engine tests quantize in place, so each needs its own copy — but they
+    used to *retrain* for it: 4 × ~6.5 s of fixture setup on every CI leg.
+    """
     engine = AuraLiteEngine()
     params = {
         "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
@@ -60,7 +68,16 @@ def trained_engine(small_text):
         "continue_training": False, "n_kv_heads": None,
         "accumulation_steps": 1, "use_alibi": False, "lora_rank": 0,
     }
-    engine.train(small_text, params)
+    engine.train(SMALL_TEXT, params)
+    path = tmp_path_factory.mktemp("quantization") / "trained.pt"
+    engine.save_model(str(path))
+    return path
+
+
+@pytest.fixture
+def trained_engine(_trained_checkpoint):
+    engine = AuraLiteEngine()
+    engine.load_model(str(_trained_checkpoint))
     return engine
 
 

@@ -17,6 +17,16 @@ import torch
 logger = logging.getLogger("auralite")
 
 
+#: How to install llama.cpp support *without* compiling it (v2.6.6): PyPI only
+#: carries the sdist, so a bare `pip install llama-cpp-python` builds llama.cpp
+#: from source — and fails on Windows machines without build tools.
+LLAMA_CPP_INSTALL_HINT = (
+    "pip install llama-cpp-python --only-binary llama-cpp-python "
+    "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu\n"
+    "(NVIDIA GPU, CUDA 12.5+: use .../whl/cu125 instead of .../whl/cpu)"
+)
+
+
 class GGUFNotAvailableError(ImportError):
     """Raised when llama-cpp-python is required but not installed."""
     pass
@@ -127,8 +137,8 @@ class GGUFModelProxy:
             from llama_cpp import Llama
         except Exception as e:  # pragma: no cover - depends on optional package
             raise GGUFNotAvailableError(
-                "To load .gguf install llama-cpp-python: "
-                "pip install llama-cpp-python"
+                "To load .gguf install llama-cpp-python (prebuilt wheel):\n"
+                + LLAMA_CPP_INSTALL_HINT
             ) from e
 
         self.path = str(path)
@@ -179,8 +189,8 @@ class GGUFModelProxy:
             from llama_cpp import Llama
         except Exception as err:  # pragma: no cover - optional dependency
             raise GGUFNotAvailableError(
-                "llama-cpp-python is required for GGUF perplexity. "
-                "Install with: pip install llama-cpp-python"
+                "llama-cpp-python is required for GGUF perplexity. Install it with:\n"
+                + LLAMA_CPP_INSTALL_HINT
             ) from err
         kwargs = dict(self._load_kwargs)
         kwargs["logits_all"] = True

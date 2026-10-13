@@ -1,3 +1,146 @@
+# 🔧 v2.6.6 — real integrations, honest server, install without compiling
+
+Everything in this release came out of running the code paths that CI only
+ever exercised through fakes: Hugging Face with real transformers 5.19 / peft
+0.21 *and* 4.46 / 0.13, llama.cpp with a real GGUF model, Python 3.14, and the
+Docker image.
+
+**Hugging Face / LoRA — bugs a real transformers 5 run exposed**
+- The integration no longer needs `bitsandbytes`. An unused `import bitsandbytes`
+  shared a `try` block with transformers/peft, so a missing bitsandbytes set
+  `HAS_HF_SUPPORT = False`. That covered the `[hf]` extra (which never listed it)
+  and the `[full]` extra on macOS (where its marker excludes it). bitsandbytes is
+  now checked only for 4-/8-bit loading, with a clear error and the new
+  `[qlora]` extra.
+- Trainer precision: `fp16=cuda_available, bf16=bf16_supported` set both flags
+  on every bf16-capable GPU, and transformers refuses that ("At most one of fp16
+  and bf16 can be True") before the first step. Now bf16 is used when the GPU
+  supports it natively (`including_emulation=False`), otherwise fp16, never
+  both.
+- `trust_remote_code` defaults to **False** (it was True, and nothing in the
+  GUI or CLI overrode it, so loading a repository executed its Python code).
+  The GUI has an opt-in checkbox that asks for confirmation.
+- Loading a LoRA adapter on top of an applied one (the GUI's default "Apply
+  LoRA on load") nested a second `PeftModel`: peft reported "missing adapter
+  keys" and the saved weights were silently not loaded. The current adapter is
+  now replaced. The loaded adapter stays trainable, and a test compares every
+  loaded tensor with the saved file.
+- `dtype` instead of the deprecated `torch_dtype` on transformers ≥ 4.56 (with
+  a version gate for older releases).
+- The manual training loop ignored `output_dir` and wrote to
+  `./hf_lora_manual`. It now saves where asked.
+- Trainer: `dataloader_num_workers=0` (worker processes forked from the
+  multi-threaded GUI process can deadlock) and `pin_memory` only with CUDA.
+- Trainer progress and stop: `progress_callback` and `stop_event` now reach
+  the Trainer through a `TrainerCallback`.
+- The GUI fine-tune asks for the output folder (it was a hard-coded relative
+  path, read-only for an installed `.exe`), shows epoch/loss and has a
+  **Stop** button.
+- `generate_streaming` re-raises an exception from the generation thread
+  instead of waiting on the streamer forever.
+- Greedy decoding no longer sends sampling knobs (transformers warned about
+  each one), and `pad_token_id=0` is respected.
+- Only `input_ids` and `attention_mask` reach `generate()`. Tokenizers without
+  explicit `model_input_names` also return `token_type_ids`, which transformers
+  4.x rejects for decoder models — every generation failed on such tokenizers.
+- The `hf` extra's lower bounds are now the oldest stack CI actually tests
+  (transformers ≥ 4.46, peft ≥ 0.13, accelerate ≥ 1.1; was 4.40 / 0.11 / 0.30,
+  never tested).
+- Padding positions are `-100` in the manual loop's labels.
+- `finetune_hf("short text")` trained on `[[]]`; it now trains on the text.
+- `from_pretrained(revision=, token=)` were ignored and are now forwarded.
+- `push_to_hub(token=)` no longer calls `huggingface_hub.login()`, which
+  stored the token on disk for every later process.
+
+**Server — honest OpenAI/Ollama compatibility**
+- Streamed chat reported `usage.prompt_tokens = 0`; it now reports the same
+  count as the non-streamed answer. Ollama `/api/chat` counts the prompt too.
+- `n>1`, `logprobs`/`top_logprobs`, `response_format` (JSON mode / schema),
+  `tools`/`functions`, `best_of`, `echo`, `suffix` and Ollama's `format`/`tools`
+  used to be dropped silently with HTTP 200. They are now rejected with **400**
+  and `code: unsupported_parameter`; default values stay accepted.
+- Streams use OpenAI framing: one id per stream, `role` in the first delta, and
+  a final chunk carrying `finish_reason`.
+- Error bodies are OpenAI-shaped (`{"error": {...}}` at the top level) for 401,
+  429, 503 and 404 too.
+- Ollama `/api/chat` no longer turns every generation error into an empty 200
+  answer. It falls back to plain generation like `/v1/chat/completions`, and
+  real errors return 500.
+
+**Install without compiling**
+- `llama-cpp-python` moved from `full` to its own `gguf` extra. PyPI only has
+  its source, so `.[full]` and `pip install -r requirements.txt` compiled
+  llama.cpp, which failed on Windows without build tools. README, quickstart and
+  every GGUF error message now give the prebuilt-wheel command
+  (`--only-binary llama-cpp-python --extra-index-url …/whl/cpu`, `cu125` for
+  CUDA).
+- `requirements.txt` is the core dependency list only. A test keeps it equal
+  to `pyproject.toml`.
+- New extras: `gguf` and `qlora` (`[hf]` + bitsandbytes).
+- README (EN/RU) install sections were rewritten, with a Docker section.
+
+**Platform**
+- Python 3.14 joins the CI matrix (the full suite passed locally on 3.14.8 +
+  torch 2.14.1), together with the classifiers. A test keeps them equal to the
+  matrix.
+- An `ubuntu-26.04` test leg: `ubuntu-latest` moves to 26.04 between
+  2026-10-19 and 2026-11-19.
+- Linux test legs fail instead of silently skipping ~90 GUI tests when tkinter
+  is missing; the fallback also handles Tk-9-only images.
+- **Python 3.10 reached end-of-life on 2026-10-01.** 2.6.x is the last series
+  that supports it; 2.7.0 will require Python ≥ 3.11 (onnxruntime ≥ 1.31
+  already does).
+
+**CI and release**
+- New `integrations` job, in two legs: the latest transformers/peft and the
+  extra's minimum versions. It runs real transformers + peft (a tiny random
+  Llama built in the test, no network) and real llama.cpp (`stories260K.gguf`,
+  1.2 MB, cached). It runs without bitsandbytes, and
+  `AURALITE_REQUIRE_INTEGRATIONS=1` turns any skip into a failure.
+- The `docker` job runs the image it builds. It checks that the container is
+  not root, trains a tiny model in a volume, serves it and probes `/health` and
+  `/v1/completions`. It needs only `lint` now, instead of waiting ~9 minutes for
+  the Windows leg.
+- `release.yml` gets a **dry run** (the default for manual runs): verify +
+  build + image build, nothing published. Manual releases now check out the
+  tag they release, not the branch. The release notes no longer advertise a
+  PyPI package that does not exist.
+- Faster suite:
+  - quantization and engine tests train once per module instead of once per
+    test;
+  - the busy-server test no longer waits out the 10-second queue;
+  - both `compile_for_inference` branches are tested deterministically
+    instead of paying for a real Inductor compile (~17 s per leg).
+
+**Docker**
+- Both images run as the unprivileged user `auralite`, with state in `/data`
+  (`AURALITE_HOME`).
+- AuraLite is installed as a regular package, no longer editable.
+- Dependencies get their own cached layer, derived from `pyproject.toml` by
+  `scripts/print_requirements.py`.
+- `runtime-cuda` no longer compiles llama.cpp on an end-of-life Ubuntu
+  22.04 / Python 3.10 base. It uses `python:3.12-slim` with the CUDA-bundling
+  torch wheel; the dead `builder-cuda` stage and its `|| true` are gone.
+
+**Tests that pin behaviour, not just "no exception"**
+- `tests/test_learning_sanity.py`:
+  - one epoch must bring the validation loss from ~3.4 to < 0.5 (measured
+    0.037);
+  - the next character must be predicted correctly ≥ 90 % of the time, and a
+    memorised sentence must continue greedily;
+  - a negative control with re-initialised weights must fail the same bar.
+- Golden checkpoints: `tests/data/golden_v2_6_4.pt` was written by the 2.6.4
+  code itself (commit `26baeb8`) and `golden_v2_6_6.safetensors` by this
+  release. Both must load with identical tokenisation and logits
+  (|Δ| ≤ 1e-4; measured 5e-7).
+
+**Not in this release (2.7.0)**
+- One `auralite` package instead of 16 top-level modules. This is required
+  before PyPI: Hugging Face's `kernels` package owns the same import name.
+- Dropping Python 3.10.
+- `torch.export` instead of TorchScript, and torchao instead of the deprecated
+  `torch.ao.quantization`.
+
 # 🚀 v2.6.5 — roadmap implementation, release engineering, honest status
 
 Release of the improvement roadmap (P0 + P1 + actionable P2 items) on top of the

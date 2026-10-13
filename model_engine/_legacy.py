@@ -1066,6 +1066,9 @@ class AuraLiteEngine:
         lora_dropout: float = 0.05,
         lora_target_modules: list[str] | None = None,
         local_files_only: bool = False,
+        trust_remote_code: bool = False,
+        revision: str | None = None,
+        token: str | None = None,
         verbose: bool = True,
     ):
         """
@@ -1085,12 +1088,15 @@ class AuraLiteEngine:
         - Generate text
         - Fine-tune with LoRA/QLoRA using `finetune_hf()`
         - Save only the tiny LoRA adapter
+
+        `trust_remote_code` is off by default (v2.6.6): enabling it executes
+        Python code from the model repository.
         """
         if not HAS_HF_SUPPORT:
             raise HFNotAvailableError(
-                "Hugging Face + LoRA/QLoRA support is not available.\n"
-                "Install extra dependencies:\n"
-                "  pip install transformers peft accelerate bitsandbytes sentencepiece"
+                "Hugging Face + LoRA support is not available.\n"
+                "Install the extra dependencies:\n"
+                "  pip install \"auralite-ai[hf]\"     (4-/8-bit QLoRA: \"auralite-ai[qlora]\")"
             )
 
         if self.hf_proxy is None:
@@ -1108,6 +1114,9 @@ class AuraLiteEngine:
             device_map=device_map,
             max_seq_len=max_seq_len,
             local_files_only=local_files_only,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            token=token,
             verbose=verbose,
         )
 
@@ -1190,10 +1199,15 @@ class AuraLiteEngine:
             raise ValueError("Load a Hugging Face model first with load_hf_model()")
 
         if isinstance(texts, str):
-            # Split into reasonable chunks
-            texts = [t.strip() for t in texts.split("\n\n") if len(t.strip()) > 50]
-            if not texts:
-                texts = [texts]  # fallback
+            # Split into reasonable chunks; a short text is used as one example.
+            # (Until 2.6.5 the fallback was `[texts]` *after* `texts` had been
+            # rebound to the empty list, i.e. `[[]]`.)
+            raw_text = texts
+            texts = [t.strip() for t in raw_text.split("\n\n") if len(t.strip()) > 50]
+            if not texts and raw_text.strip():
+                texts = [raw_text.strip()]
+        if not texts:
+            raise ValueError("finetune_hf() needs at least one non-empty training text")
 
         if not self.hf_proxy.is_peft:
             logger.info("[AuraLite] No LoRA adapter found — applying default LoRA for fine-tuning...")

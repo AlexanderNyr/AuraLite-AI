@@ -196,12 +196,31 @@ class TestFallbacks:
                                      temperature=1.0, top_k=1, top_p=1.0)
         assert out == "abcde"  # foreign-vocab draft ignored, prompt + 2 chars
 
-    def test_compile_for_inference_graceful(self):
+    def test_compile_for_inference_success_branch(self, monkeypatch):
+        """Both branches, deterministically. A real Inductor compile here cost
+        ~17 s per CI leg and only ever exercised whichever branch the runner
+        happened to support; the real compile keeps its own test in
+        tests/test_inference_speed.py."""
+        compiled = []
+        monkeypatch.setattr(torch, "compile",
+                            lambda model, **kw: compiled.append(kw) or model)
         e = make_fake_engine()
-        ok = e.compile_for_inference()
-        assert ok in (True, False)  # must not raise either way
+        assert e.compile_for_inference() is True
+        assert compiled == [{"mode": "reduce-overhead"}]
         out = e.generate("ab", length=2, temperature=1.0, top_k=1, top_p=1.0)
         assert out == "abcd"  # prompt + 2 new chars
+
+    def test_compile_for_inference_falls_back_to_eager(self, monkeypatch):
+        def broken_compile(model, **kw):
+            raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found")
+
+        monkeypatch.setattr(torch, "compile", broken_compile)
+        e = make_fake_engine()
+        eager = e.model
+        assert e.compile_for_inference() is False
+        assert e.model is eager          # reverted, not half-compiled
+        out = e.generate("ab", length=2, temperature=1.0, top_k=1, top_p=1.0)
+        assert out == "abcd"
 
     def test_compile_for_inference_returns_false_for_gguf(self):
         e = make_fake_engine()

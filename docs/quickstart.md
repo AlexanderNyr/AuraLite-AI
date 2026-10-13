@@ -8,13 +8,18 @@ a CUDA GPU is used automatically when present.
 ```bash
 pip install -e .                 # core: torch + numpy            (training, generation, GUI)
 pip install -e '.[serve]'        # + FastAPI/uvicorn              (OpenAI-compatible server)
-pip install -e '.[full]'         # + llama-cpp-python, transformers, peft, safetensors, …
+pip install -e '.[hf]'           # + transformers, peft           (Hugging Face models, LoRA)
+pip install -e '.[qlora]'        # + bitsandbytes                 (4-/8-bit QLoRA; not macOS)
 pip install -e '.[test]'         # + pytest, hypothesis, httpx    (running the test suite)
+# .gguf models: prebuilt llama.cpp wheel — never a 10-minute source build
+pip install -e '.[gguf]' --only-binary llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
 
 Native AuraLite training needs **torch + numpy only**. `llama-cpp-python` is
-required only for `.gguf` inference, `transformers`/`peft` only for Hugging Face
-export, `Pillow` only for the image generator.
+required only for `.gguf` inference (CUDA wheels: replace `cpu` with `cu125`),
+`transformers`/`peft` only for Hugging Face models, `bitsandbytes` only for 4-/8-bit
+loading, `Pillow` only for the image generator.
 
 ## 2. Train a small model
 

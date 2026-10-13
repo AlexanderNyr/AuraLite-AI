@@ -413,3 +413,17 @@ def test_cli_perplexity_clears_the_cache(tmp_path, monkeypatch, capsys):
                  "--clear-cache", "--no-cache", "--quiet"]) == 0
     out = capsys.readouterr().out
     assert "cache cleared: True" in out
+
+
+def test_missing_llama_cpp_points_at_the_prebuilt_wheels(monkeypatch, tmp_path):
+    """v2.6.6: a bare `pip install llama-cpp-python` compiles llama.cpp from source."""
+    import sys
+
+    from model_engine.gguf_proxy import GGUFModelProxy, GGUFNotAvailableError
+
+    monkeypatch.setitem(sys.modules, "llama_cpp", None)      # import fails like a missing package
+    with pytest.raises(GGUFNotAvailableError) as exc:
+        GGUFModelProxy(str(tmp_path / "model.gguf"))
+    message = str(exc.value)
+    assert "--only-binary llama-cpp-python" in message
+    assert "abetlen.github.io/llama-cpp-python/whl/cpu" in message

@@ -408,6 +408,34 @@ class TestCosineWarmupScheduler:
 #  Engine Tests
 # ======================================================================
 
+SMALL_TEXT = "hello world this is a test of the aura lite ai model " * 50
+TINY_PARAMS = {
+    "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
+    "seq_length": 16, "batch_size": 4, "lr": 0.001, "epochs": 3,
+    "dropout": 0.0, "grad_clip": 1.0, "weight_decay": 0.01,
+    "tokenizer": "char", "bpe_vocab_size": 64, "val_split": 0.1,
+    "use_compile": False, "autosave_every": 0,
+    "continue_training": False, "n_kv_heads": None,
+    "accumulation_steps": 1, "use_alibi": False, "lora_rank": 0,
+}
+
+
+@pytest.fixture(scope="module")
+def trained_small_engine():
+    """One trained engine for the read-only generation/persistence tests.
+
+    test_generate / _streaming / _batch / test_save_load_model each trained an
+    identical model of their own (~5 s apiece on CI) before reading from it.
+    """
+    engine = AuraLiteEngine()
+    engine.train(SMALL_TEXT, dict(TINY_PARAMS))
+    return engine
+
+
+def test_shared_fixture_matches_the_function_fixtures(small_text, tiny_params):
+    assert SMALL_TEXT == small_text and TINY_PARAMS == tiny_params
+
+
 class TestAuraLiteEngine:
     def test_train_char_tokenizer(self, small_text, tiny_params, device):
         engine = AuraLiteEngine()
@@ -434,30 +462,26 @@ class TestAuraLiteEngine:
         assert engine.tokenizer.kind == "bpe"
         assert engine.model is not None
 
-    def test_generate(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, tiny_params)
+    def test_generate(self, trained_small_engine):
+        engine = trained_small_engine
         result = engine.generate("hello ", length=20)
         assert isinstance(result, str)
         assert len(result) > 0
 
-    def test_generate_streaming(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, tiny_params)
+    def test_generate_streaming(self, trained_small_engine):
+        engine = trained_small_engine
         tokens = list(engine.generate_streaming("hello ", length=10))
         assert len(tokens) == 10
 
-    def test_generate_batch(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, tiny_params)
+    def test_generate_batch(self, trained_small_engine):
+        engine = trained_small_engine
         prompts = ["hello ", "world ", "test "]
         results = engine.generate_batch(prompts, length=10)
         assert len(results) == len(prompts)
         assert all(isinstance(r, str) for r in results)
 
-    def test_save_load_model(self, small_text, tiny_params):
-        engine = AuraLiteEngine()
-        engine.train(small_text, tiny_params)
+    def test_save_load_model(self, trained_small_engine):
+        engine = trained_small_engine
 
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
             path = f.name
