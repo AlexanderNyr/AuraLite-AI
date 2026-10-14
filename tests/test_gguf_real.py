@@ -26,7 +26,7 @@ MESSAGES = [{"role": "user", "content": "Tell me a story."}]
 
 @pytest.fixture(scope="module")
 def engine():
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.load_gguf_model(GGUF, n_ctx=256)
@@ -61,7 +61,7 @@ def server(monkeypatch, engine):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
-    import server.openai_server as srv
+    import auralite.server.openai_server as srv
 
     monkeypatch.setattr(srv, "_engine", engine)
     monkeypatch.setattr(srv, "_rate_bucket", {})

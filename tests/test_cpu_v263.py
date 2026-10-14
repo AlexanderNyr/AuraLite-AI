@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import AuraLiteEngine
-from model_engine import _legacy as L
+from auralite.engine import AuraLiteEngine
+from auralite.engine import _legacy as L
 
 
 TINY = dict(tokenizer="char", d_model=32, n_heads=4, n_layers=1, d_ff=64,

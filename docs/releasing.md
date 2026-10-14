@@ -7,12 +7,12 @@ built or uploaded from a laptop.
 ## Checklist
 
 1. **One version everywhere.** Bump `pyproject.toml` (`[project] version`),
-   `model_engine/__init__.py` (`__version__`) and add the `CHANGELOG.md` heading.
+   `auralite/__init__.py` (`__version__`) and add the `CHANGELOG.md` heading.
    The server imports the package version, so there is no third place to edit.
 
    ```bash
    python scripts/check_version_consistency.py          # all strings agree?
-   python scripts/check_version_consistency.py v2.6.6   # ...and match the tag you will push?
+   python scripts/check_version_consistency.py v2.7.0   # ...and match the tag you will push?
    ```
 
 2. **Green CI on the commit you will tag**, including the `package` job: it
@@ -45,14 +45,14 @@ built or uploaded from a laptop.
    ```
 
    A real release can also be started by hand for an existing tag:
-   `gh workflow run release.yml -f tag=v2.6.6 -f dry_run=false` — the jobs then
+   `gh workflow run release.yml -f tag=v2.7.0 -f dry_run=false` — the jobs then
    check out that tag, not the branch the button was pressed on.
 
 4. **Tag and push.**
 
    ```bash
-   git tag v2.6.6
-   git push origin v2.6.6
+   git tag v2.7.0
+   git push origin v2.7.0
    ```
 
 ## What the workflow does
@@ -67,12 +67,12 @@ built or uploaded from a laptop.
 
 ## Enabling PyPI (one time, no token)
 
-> **Wait for 2.7.0.** The wheel still installs 16 top-level modules with generic
-> names (`server`, `agent`, `gui`, `export`, `kernels`, …). Hugging Face's
-> [`kernels`](https://pypi.org/project/kernels/) package already owns the
-> import name `kernels`, so installing both would overwrite files. 2.7.0 moves
-> everything under one `auralite` package; enable PyPI after that. GitHub
-> Releases and the GHCR image are unaffected.
+> **Ready since 2.7.0.** Up to 2.6 the wheel installed 16 top-level modules with
+> generic names (`server`, `agent`, `gui`, `export`, `kernels`, …); Hugging Face's
+> [`kernels`](https://pypi.org/project/kernels/) package owns the import name
+> `kernels`, so installing both would have overwritten files. 2.7.0 ships the one
+> `auralite` package and nothing else — the CI `package` job and
+> `tests/test_packaging.py` fail if anything else appears at the top level.
 
 Publishing uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/):
 PyPI trusts this workflow's OpenID Connect identity, so there is no API token to
@@ -96,7 +96,7 @@ The next pushed tag publishes. When this page was written (2026-10-12) the name
 
 - A failed job can be re-run from the Actions page; the tag stays.
 - A bad tag can be removed before anything was published:
-  `git push --delete origin v2.6.6 && git tag -d v2.6.6`.
+  `git push --delete origin v2.7.0 && git tag -d v2.7.0`.
 - PyPI never accepts the same file name twice. If a broken version reached PyPI,
   *yank* it on pypi.org and release the next patch version — do not try to
   re-upload the same number.

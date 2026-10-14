@@ -11,10 +11,14 @@ sdist) was installed — never from an editable install or the source tree:
 
 It checks what ``twine check`` and an editable install cannot see:
 
-* every top-level module and package of the distribution imports, and is
-  imported from the installed files (not from a checkout that happens to be on
-  ``sys.path``);
+* the distribution installs exactly one top-level name, ``auralite`` (2.7.0) —
+  none of the deprecated flat names (``model_engine``, ``server``, …) that only
+  exist as aliases in a source checkout;
+* every module of the package imports, from the installed files (not from a
+  checkout that happens to be on ``sys.path``); a missing *optional* dependency
+  is reported as a note, anything else is a failure;
 * every console script resolves, and ``auralite --version`` / ``--help`` exit 0;
+  the ``auralite-gui`` entry point resolves (it is not started);
 * the versions reported by the metadata, the package, the CLI and the API server
   agree.
 
@@ -30,6 +34,7 @@ import importlib
 import json
 import os
 import pathlib
+import pkgutil
 import shutil
 import subprocess
 import sys
@@ -38,15 +43,31 @@ from importlib import metadata
 DIST_NAME = "auralite-ai"
 SOURCE_TREE = pathlib.Path(__file__).resolve().parent.parent
 
-#: Top-level names a usable install cannot lack: the CLI, the engines behind the GUI
-#: tabs, the server. (The full list is enforced statically by tests/test_packaging.py;
-#: this is the last line of defence on the built artifact itself.)
-EXPECTED_TOP_LEVEL = {"auralite_cli", "model_engine", "image_engine", "gui", "server",
-                      "agent", "quantization", "export"}
+#: The one top-level name of the distribution (2.7.0). tests/test_packaging.py
+#: enforces the same statically; this is the check on the built artifact itself.
+EXPECTED_TOP_LEVEL = {"auralite"}
 
-#: Imports that may legitimately be missing on a headless/slim interpreter.
-#: Anything else that fails to import is a packaging bug.
+#: Modules a usable install cannot lack: the CLI, the engines behind the GUI tabs,
+#: the server.
+REQUIRED_MODULES = {"auralite.cli", "auralite.engine", "auralite.image_engine",
+                    "auralite.gui.app", "auralite.server.openai_server",
+                    "auralite.agent", "auralite.quantization", "auralite.export"}
+
+#: Pre-2.7 top-level names. They must not be importable from an installed
+#: AuraLite: on PyPI they would collide with other distributions.
+DEPRECATED_ALIASES = {"model_engine", "auralite_cli", "gui_app", "gui", "server", "agent",
+                      "kernels", "quantization", "quantization_backends", "export", "eval",
+                      "evaluation", "image_engine", "hf_integration", "chat_interface",
+                      "web_tools"}
+
+#: Imports that may legitimately be missing: system modules of a headless/slim
+#: interpreter and optional dependencies (extras). Anything else that fails to
+#: import is a packaging bug.
 OPTIONAL_SYSTEM_MODULES = {"tkinter", "_tkinter"}
+OPTIONAL_DEPENDENCIES = {"fastapi", "uvicorn", "starlette", "pydantic", "httpx", "transformers",
+                         "peft", "accelerate", "bitsandbytes", "llama_cpp", "onnx", "onnxruntime",
+                         "onnxscript", "safetensors", "lm_eval", "sentence_transformers", "faiss",
+                         "torchao", "tiktoken", "sentencepiece", "vllm"}
 
 
 def _inside(path: str | os.PathLike | None, root: pathlib.Path) -> bool:
@@ -89,18 +110,43 @@ def _top_level_names(dist: metadata.Distribution) -> list[str]:
     return sorted(names)
 
 
+def _package_modules(problems: list[str]) -> list[str]:
+    """Every module of the installed ``auralite`` package (``__main__`` excluded)."""
+    try:
+        package = importlib.import_module("auralite")
+    except ImportError as exc:
+        problems.append(f"import auralite failed: {exc!r}")
+        return []
+    names = ["auralite"]
+    for info in pkgutil.walk_packages(package.__path__, "auralite.",
+                                      onerror=lambda name: problems.append(
+                                          f"cannot scan {name}: {sys.exc_info()[1]!r}")):
+        if info.name.rsplit(".", 1)[-1] != "__main__":
+            names.append(info.name)
+    return sorted(names)
+
+
 def _check_imports(dist: metadata.Distribution, problems: list[str], notes: list[str]) -> None:
     location = pathlib.Path(dist.locate_file("")).resolve()
-    names = _top_level_names(dist)
-    for missing in sorted(EXPECTED_TOP_LEVEL - set(names)):
+    top_level = set(_top_level_names(dist))       # from the distribution's own RECORD
+    for alias in sorted(top_level & DEPRECATED_ALIASES):
+        problems.append(f"the deprecated alias `{alias}` is shipped: it belongs to the "
+                        "source checkout only")
+    if top_level - DEPRECATED_ALIASES != EXPECTED_TOP_LEVEL:
+        problems.append(f"top-level names {sorted(top_level)}, expected only "
+                        f"{sorted(EXPECTED_TOP_LEVEL)}")
+    names = _package_modules(problems)
+    for missing in sorted(REQUIRED_MODULES - set(names)):
         problems.append(f"{missing} is not shipped in the distribution")
+    skipped = 0
     for name in names:
         try:
             module = importlib.import_module(name)
         except ImportError as exc:  # includes ModuleNotFoundError
-            missing = getattr(exc, "name", None) or ""
-            if missing.split(".")[0] in OPTIONAL_SYSTEM_MODULES:
-                notes.append(f"skip {name}: needs {missing} (not available on this interpreter)")
+            missing = (getattr(exc, "name", None) or "").split(".")[0]
+            if missing in OPTIONAL_SYSTEM_MODULES | OPTIONAL_DEPENDENCIES:
+                notes.append(f"skip {name}: needs {missing} (optional, not installed)")
+                skipped += 1
                 continue
             problems.append(f"import {name} failed: {exc!r}")
             continue
@@ -110,8 +156,8 @@ def _check_imports(dist: metadata.Distribution, problems: list[str], notes: list
                             "not from the installed distribution")
         elif origin and not _inside(origin, location):
             problems.append(f"{name} resolved outside the distribution: {origin}")
-        else:
-            notes.append(f"ok   import {name}")
+    notes.append(f"ok   {len(names) - skipped} of {len(names)} modules import "
+                 f"({skipped} need optional extras)")
 
 
 def _check_console_scripts(dist: metadata.Distribution, problems: list[str],
@@ -143,18 +189,41 @@ def _check_console_scripts(dist: metadata.Distribution, problems: list[str],
                 notes.append(f"ok   {ep.name} {' '.join(args)}")
 
 
-def _check_versions(dist: metadata.Distribution, problems: list[str], notes: list[str]) -> None:
-    import model_engine
+def _check_gui_scripts(dist: metadata.Distribution, problems: list[str],
+                       notes: list[str]) -> None:
+    """``auralite-gui`` must resolve; it is never started (it would open a window)."""
+    gui_scripts = [ep for ep in dist.entry_points if ep.group == "gui_scripts"]
+    if not gui_scripts:
+        problems.append("no gui_scripts entry points (expected `auralite-gui`)")
+    for ep in gui_scripts:
+        try:
+            ep.load()
+        except ImportError as exc:
+            missing = (getattr(exc, "name", None) or "").split(".")[0]
+            if missing in OPTIONAL_SYSTEM_MODULES:
+                notes.append(f"skip gui script {ep.name}: needs {missing}")
+                continue
+            problems.append(f"gui script {ep.name} = {ep.value} does not load: {exc!r}")
+        except Exception as exc:  # noqa: BLE001 - any failure is a broken entry point
+            problems.append(f"gui script {ep.name} = {ep.value} does not load: {exc!r}")
+        else:
+            notes.append(f"ok   gui script {ep.name} resolves")
 
-    if model_engine.__version__ != dist.version:
-        problems.append(f"model_engine.__version__={model_engine.__version__} "
-                        f"but the metadata says {dist.version}")
+
+def _check_versions(dist: metadata.Distribution, problems: list[str], notes: list[str]) -> None:
+    import auralite
+    import auralite.engine
+
+    for name, value in (("auralite", auralite.__version__),
+                        ("auralite.engine", auralite.engine.__version__)):
+        if value != dist.version:
+            problems.append(f"{name}.__version__={value} but the metadata says {dist.version}")
     try:
         import fastapi  # noqa: F401  (only installed with the `serve` extra)
     except ImportError:
         notes.append("skip server version: install the wheel with [serve] to check it")
         return
-    from server import openai_server
+    from auralite.server import openai_server
 
     if openai_server._AURALITE_VERSION != dist.version:
         problems.append(f"server reports {openai_server._AURALITE_VERSION}, "
@@ -183,6 +252,7 @@ def main() -> int:
     notes: list[str] = []
     _check_imports(dist, problems, notes)
     _check_console_scripts(dist, problems, notes)
+    _check_gui_scripts(dist, problems, notes)
     _check_versions(dist, problems, notes)
 
     print(f"{DIST_NAME} {dist.version} at {dist.locate_file('')}")

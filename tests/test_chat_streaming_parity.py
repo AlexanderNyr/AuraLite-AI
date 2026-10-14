@@ -87,7 +87,7 @@ class _FakeChatCompletionModel:
 
 
 def test_gguf_chat_completion_paths_agree(monkeypatch):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.model = _FakeChatCompletionModel("  Hello there.  \n")

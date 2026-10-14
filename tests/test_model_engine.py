@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 torch = pytest.importorskip("torch")
-from model_engine import (
+from auralite.engine import (
     CharTokenizer, BPETokenizer, tokenizer_from_dict,
     RMSNorm, Attention, FeedForward, TransformerBlock,
     ModernTransformer, CharDataset, CosineWarmupScheduler,
@@ -689,7 +689,7 @@ class TestAuraLiteEngine:
     def test_compile_fallback_on_broken_backend(self, small_text, tiny_params):
         """Regression: a failing torch.compile backend must fall back to eager
         instead of crashing training (the 'backend resolved to None' error)."""
-        import model_engine
+        import auralite.engine as model_engine
         engine = AuraLiteEngine()
         params = dict(tiny_params)
         params["use_compile"] = True

@@ -28,9 +28,12 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install linters
+        # pyright is pinned: the ratchet below compares error counts, which
+        # change between pyright releases (.github/pyright-baseline.json).
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[lint]'
+          pip install -e '.[lint]' 'pyright==1.1.414' \
+            --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Ruff critical lint
         run: ruff check .
       - name: Ruff extended hygiene (blocking)
@@ -50,8 +53,12 @@ jobs:
         run: ruff check --preview --select PLW1514 .
       - name: Ruff format check (advisory)
         run: ruff format --check . || true
-      - name: Pyright smoke
-        run: pyright || true
+      - name: Pyright ratchet (blocking)
+        # 2.7.0: was `pyright || true` — hundreds of advisory errors, so a new one
+        # was invisible. Now the count may only go down (scripts/pyright_ratchet.py).
+        run: |
+          pyright --outputjson > pyright.json || true
+          python scripts/pyright_ratchet.py pyright.json
 
   tests:
     runs-on: ${{ matrix.os }}
@@ -60,9 +67,9 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         # Keep in sync with the classifiers in pyproject.toml (checked by
-        # tests/test_release.py). 3.10 is end-of-life since 2026-10-01 and goes
-        # in 2.7.0; 3.15 joins once torch publishes cp315 wheels.
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # tests/test_release.py). 3.10 (end-of-life 2026-10-01) left in 2.7.0;
+        # 3.15 joins once torch publishes cp315 wheels.
+        python: ["3.11", "3.12", "3.13", "3.14"]
         include:
           # Windows sanity (agent sandbox covers win paths) — one interpreter only
           - os: windows-latest
@@ -123,21 +130,15 @@ jobs:
           python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
       - name: Coverage run
         run: |
-          # v2.6.5: the threshold makes coverage regressions fail the job.
-          # v2.6.5 P2: gui/, image_engine.py and auralite_cli.py joined the list,
-          # so the numbers now include the whole user-facing surface. Measured
-          # with tkinter available: 84 % overall (model_engine 84 %, server 94 %,
-          # gui 86 %, image_engine 89 %, cli 87 %) after the driver-level GUI
-          # suites landed. The gate sits at 60 %: still a
-          # hard regression tripwire, but it survives a runner where tkinter is
-          # unavailable and the GUI tests skip.
+          # The threshold makes coverage regressions fail the job. 2.7.0:
+          # everything is one package, so one --cov measures it all (GUI, image
+          # engine, CLI and kernels included): 86 % locally, 85.2 % in the last
+          # 2.6.6 run. The gate moved from 60 % to 80 %: the step above fails
+          # when tkinter cannot be installed, so the GUI suites cannot skip
+          # silently and drag the number down any more.
           pytest tests/ -q --tb=line --ignore=tests/bench_generation.py \
-            --cov=model_engine --cov=server --cov=agent \
-            --cov=quantization --cov=quantization_backends \
-            --cov=chat_interface --cov=web_tools \
-            --cov=eval --cov=evaluation --cov=export --cov=hf_integration \
-            --cov=gui --cov=image_engine --cov=auralite_cli \
-            --cov-fail-under=60 \
+            --cov=auralite \
+            --cov-fail-under=80 \
             --cov-report=xml --cov-report=term
       - name: Report GUI coverage
         if: always()
@@ -146,7 +147,7 @@ jobs:
         # --cov package, so the previous "gui/" filter never matched anything.
         run: |
           python -m coverage json -q -o coverage.json || exit 0
-          python scripts/coverage_report.py coverage.json --prefix gui/ --limit 12 || true
+          python scripts/coverage_report.py coverage.json --prefix auralite/gui/ --limit 12 || true
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v7
@@ -172,17 +173,33 @@ jobs:
       - name: Install with optional dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[test,serve,safetensors,export]' --extra-index-url https://download.pytorch.org/whl/cpu
+          # (the CPU index serves torchao's pure-Python "+cpu" build — the PyPI
+          # wheel's CUDA extensions cannot load on CPU-only torch)
+          pip install -e '.[test,serve,safetensors,export,torchao]' --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Optional-dependency test suites
         run: |
           pytest tests/test_export.py tests/test_bugfixes_regression.py \
                  tests/test_improvements_v265.py tests/test_hf_integration.py \
                  tests/test_learning_sanity.py \
                  -q --tb=short -rs
-      - name: Verify ONNX/TS export actually ran (not skipped)
+      - name: torchao backend for real (not skipped)
+        # 2.7.0: torchao is the successor of the deprecated torch.ao.quantization;
+        # until 2.6 its path was never executed and had silently broken.
+        env:
+          AURALITE_REQUIRE_INTEGRATIONS: "1"
         run: |
-          pytest tests/test_bugfixes_regression.py -q -rs \
-            -k "torchscript_export_roundtrip or onnx_export_roundtrip or onnx_numeric_parity"
+          python -c "import torchao; print('torchao', torchao.__version__)"
+          pytest tests/test_quantization_torchao.py -q -rs
+          AURALITE_QUANT_BACKEND=torchao pytest tests/test_quantization.py -q -rs -k "dynamic"
+      - name: Verify the real exports ran (not skipped)
+        # 2.7.0: .pt2 (torch.export) and the torch.export-based ONNX exporter
+        # (onnxscript comes with the `export` extra); the TorchScript paths stay
+        # covered while PyTorch ships them. A missing onnx/onnxscript fails here.
+        env:
+          AURALITE_REQUIRE_INTEGRATIONS: "1"
+        run: |
+          pytest tests/test_bugfixes_regression.py tests/test_export.py -q -rs \
+            -k "pt2 or torchscript_export_roundtrip or onnx_export_roundtrip or onnx_numeric_parity or torch_export_based or ExportCommand"
 
   integrations:
     # v2.6.6: transformers/peft and llama.cpp for real. Everything else talks to
@@ -276,7 +293,7 @@ jobs:
       - name: Train tiny checkpoint
         run: |
           python - <<'PY'
-          from model_engine import AuraLiteEngine
+          from auralite import AuraLiteEngine
           text = "openai server smoke corpus for auralite pipeline. " * 60
           e = AuraLiteEngine()
           e.train(text, {"tokenizer": "char", "d_model": 32, "n_heads": 4,
@@ -289,7 +306,7 @@ jobs:
       - name: Start server and probe endpoints
         run: |
           set -e
-          AURALITE_MODEL=smoke.pt nohup python -m uvicorn server.openai_server:app \
+          AURALITE_MODEL=smoke.pt nohup python -m uvicorn auralite.server.openai_server:app \
             --host 127.0.0.1 --port 8123 > server.log 2>&1 &
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8123/health; then break; fi
@@ -360,7 +377,7 @@ jobs:
           test "$uid" != "0"
           docker volume create auralite-data
           docker run --rm -v auralite-data:/data "$image" python -c "
-          from model_engine import AuraLiteEngine
+          from auralite import AuraLiteEngine
           e = AuraLiteEngine()
           e.train('docker smoke corpus for auralite. ' * 40, {'tokenizer': 'char',
                   'd_model': 32, 'n_heads': 4, 'n_layers': 2, 'd_ff': 64,

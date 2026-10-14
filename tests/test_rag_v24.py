@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from web_tools import (
+from auralite.web_tools import (
     SimpleVectorStore, semantic_chunks, hyde_query, build_rag_context,
 )
 
@@ -105,7 +105,7 @@ class TestSimpleVectorStore:
 
 class TestBuildRagContext:
     def test_citations_present(self, tmp_path, monkeypatch):
-        import web_tools
+        import auralite.web_tools as web_tools
         monkeypatch.setattr(web_tools, "build_web_context", lambda *a, **k: "")
         docs = [("notes.txt", "RoPE rotates pairs of embedding dimensions. " * 10)]
         ctx = build_rag_context("what is RoPE?", local_docs=docs,
@@ -114,7 +114,7 @@ class TestBuildRagContext:
         assert "[source: notes.txt]" in ctx
 
     def test_web_snippets_appended(self, tmp_path, monkeypatch):
-        import web_tools
+        import auralite.web_tools as web_tools
         monkeypatch.setattr(web_tools, "build_web_context",
                             lambda *a, **k: "[1] Web: some snippet")
         docs = [("local.md", "local content about transformers " * 8)]
@@ -123,7 +123,7 @@ class TestBuildRagContext:
         assert "Web: some snippet" in ctx
 
     def test_web_failure_is_tolerated(self, tmp_path, monkeypatch):
-        import web_tools
+        import auralite.web_tools as web_tools
 
         def boom(*a, **k):
             raise RuntimeError("offline")

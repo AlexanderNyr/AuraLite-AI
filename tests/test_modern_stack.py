@@ -6,7 +6,7 @@ import math
 import pytest
 import torch
 
-from model_engine import (
+from auralite.engine import (
     AuraLiteEngine,
     Attention,
     HeadwiseRMSNorm,
@@ -16,7 +16,7 @@ from model_engine import (
     validate_params,
     split_parameters_for_muon,
 )
-from model_engine._legacy import _muon_adjust_lr, _newton_schulz_ortho
+from auralite.engine._legacy import _muon_adjust_lr, _newton_schulz_ortho
 
 
 # --------------------------------------------------------------------- #

@@ -6,7 +6,7 @@ import time
 import pytest
 
 torch = pytest.importorskip("torch")
-from model_engine import ModernTransformer
+from auralite.engine import ModernTransformer
 
 
 def tokens_per_sec_decode(device="cuda" if torch.cuda.is_available() else "cpu"):

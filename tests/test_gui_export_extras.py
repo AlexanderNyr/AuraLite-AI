@@ -46,8 +46,8 @@ def _apply_patches(stack):
 
 with ExitStack() as _s:
     _apply_patches(_s)
-    from gui_app import AIApp
-    from export import ModelExporter
+    from auralite.gui.app import AIApp
+    from auralite.export import ModelExporter
 
 
 class DummyModel(torch.nn.Module):
@@ -64,31 +64,47 @@ class DummyModel(torch.nn.Module):
 def fake_app():
     with ExitStack() as stack:
         _apply_patches(stack)
-        # v2.6.5: the tabs live in gui/tabs/* and read runtime flags from
-        # gui.common, so that is where the patch has to go (gui_app keeps
-        # the legacy names for backwards compatibility).
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
+        # The tabs live in auralite/gui/tabs/* and read runtime flags from
+        # auralite.gui.common, so that is where the patch has to go.
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", False))
         app = AIApp(DummyTk())
         app.exp_log_text = MagicMock()
         app.exp_status = MagicMock()
         yield app
 
 
+def _wait_for_status(app, text, timeout=5.0):
+    """The export runs on a worker thread; wait for its final status line."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if app.exp_status.config.call_args == ((), {"text": text}):
+            return
+        time.sleep(0.01)
+    app.exp_status.config.assert_called_with(text=text)
+
+
+def _logged(app) -> str:
+    return "\n".join(str(call.args[1]) for call in app.exp_log_text.insert.call_args_list)
+
+
 def test_build_export_tab_runs_successfully(fake_app):
+    assert hasattr(fake_app, "exp_pt2_btn")      # 2.7.0: the recommended format
+    assert fake_app.exp_pt2_dyn_var.get() is True
+    assert fake_app.exp_onnx_opset_var.get() == "18"
     assert hasattr(fake_app, "exp_ts_btn")
     assert hasattr(fake_app, "exp_onnx_btn")
     assert hasattr(fake_app, "exp_all_btn")
 
 def test_check_can_export_no_model(fake_app):
     fake_app.engine.model = None
-    with patch("gui_app.messagebox.showwarning") as mw:
+    with patch("auralite.gui.common.messagebox.showwarning") as mw:
         assert fake_app._check_can_export() is False
         mw.assert_called_once()
 
 def test_check_can_export_gguf_model(fake_app):
     fake_app.engine.model = DummyModel()
     fake_app.engine.backend = "gguf"
-    with patch("gui_app.messagebox.showwarning") as mw:
+    with patch("auralite.gui.common.messagebox.showwarning") as mw:
         assert fake_app._check_can_export() is False
         mw.assert_called_once()
 
@@ -103,7 +119,7 @@ def test_export_torchscript_success(fake_app, tmp_path):
     fake_app.engine.tokenizer = MagicMock()
     fake_app.engine.device = torch.device("cpu")
     out_file = tmp_path / "model_ts.pt"
-    with patch("gui_app.filedialog.asksaveasfilename", return_value=str(out_file)):
+    with patch("auralite.gui.common.filedialog.asksaveasfilename", return_value=str(out_file)):
         with patch.object(ModelExporter, "export_torchscript", return_value=str(out_file)):
             fake_app._export_torchscript()
             time.sleep(0.1)
@@ -115,11 +131,59 @@ def test_export_onnx_success(fake_app, tmp_path):
     fake_app.engine.tokenizer = MagicMock()
     fake_app.engine.device = torch.device("cpu")
     out_file = tmp_path / "model.onnx"
-    with patch("gui_app.filedialog.asksaveasfilename", return_value=str(out_file)):
+    with patch("auralite.gui.common.filedialog.asksaveasfilename", return_value=str(out_file)):
         with patch.object(ModelExporter, "export_onnx", return_value=str(out_file)):
             fake_app._export_onnx()
             time.sleep(0.1)
             fake_app.exp_status.config.assert_called_with(text="Status: ONNX export complete ✅")
+
+def test_export_pt2_success(fake_app, tmp_path):
+    fake_app.engine.model = DummyModel()
+    fake_app.engine.backend = "torch"
+    fake_app.engine.tokenizer = MagicMock()
+    fake_app.engine.device = torch.device("cpu")
+    out_file = tmp_path / "model.pt2"
+    with patch("auralite.gui.common.filedialog.asksaveasfilename", return_value=str(out_file)):
+        with patch.object(ModelExporter, "export_pt2", return_value=str(out_file)) as export:
+            fake_app._export_pt2()
+            _wait_for_status(fake_app, "Status: .pt2 export complete ✅")
+    export.assert_called_once_with(str(out_file), dynamic=True)
+    assert f"[.pt2] Successfully saved to {out_file}" in _logged(fake_app)
+
+
+def test_export_pt2_failure_is_reported(fake_app, tmp_path):
+    fake_app.engine.model = DummyModel()
+    fake_app.engine.backend = "torch"
+    fake_app.engine.device = torch.device("cpu")
+    with patch("auralite.gui.common.filedialog.asksaveasfilename",
+               return_value=str(tmp_path / "x.pt2")), \
+            patch("auralite.gui.common.messagebox.showerror") as shown, \
+            patch.object(ModelExporter, "export_pt2", side_effect=RuntimeError("no torch.export")):
+        fake_app._export_pt2()
+        _wait_for_status(fake_app, "Status: Export failed ✗")
+    shown.assert_called_once()
+    assert "no torch.export" in shown.call_args.args[1]
+
+
+def test_export_onnx_logs_which_exporter_ran(fake_app, tmp_path):
+    fake_app.engine.model = DummyModel()
+    fake_app.engine.backend = "torch"
+    fake_app.engine.tokenizer = MagicMock()
+    fake_app.engine.device = torch.device("cpu")
+    out_file = tmp_path / "model.onnx"
+
+    def fake_export(self, path, opset_version=None, dynamic_axes=True):
+        self.last_onnx_exporter = "dynamo"
+        return path
+
+    with patch("auralite.gui.common.filedialog.asksaveasfilename", return_value=str(out_file)):
+        with patch.object(ModelExporter, "export_onnx", autospec=True,
+                          side_effect=fake_export) as export:
+            fake_app._export_onnx()
+            _wait_for_status(fake_app, "Status: ONNX export complete ✅")
+    assert export.call_args.kwargs == {"opset_version": 18, "dynamic_axes": True}
+    assert "(dynamo exporter)" in _logged(fake_app)
+
 
 def test_export_all_success(fake_app, tmp_path):
     fake_app.engine.model = DummyModel()
@@ -127,10 +191,10 @@ def test_export_all_success(fake_app, tmp_path):
     fake_app.engine.tokenizer = MagicMock()
     fake_app.engine.device = torch.device("cpu")
     out_dir = tmp_path / "exports"
-    ts_path = str(out_dir / "ts.pt")
+    pt2_path = str(out_dir / "model.pt2")
     onnx_path = str(out_dir / "model.onnx")
-    with patch("gui_app.filedialog.askdirectory", return_value=str(out_dir)):
-        with patch.object(ModelExporter, "export_all", return_value=(ts_path, onnx_path)):
+    with patch("auralite.gui.common.filedialog.askdirectory", return_value=str(out_dir)):
+        with patch.object(ModelExporter, "export_all", return_value=(pt2_path, onnx_path)):
             fake_app._export_all()
-            time.sleep(0.1)
-            fake_app.exp_status.config.assert_called_with(text="Status: Export all complete ✅")
+            _wait_for_status(fake_app, "Status: Export all complete ✅")
+    assert f"[Export All] Saved .pt2: {pt2_path}" in _logged(fake_app)

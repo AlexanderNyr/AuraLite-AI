@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import (
+from auralite.engine import (
     AuraLiteEngine, GGUFNotAvailableError, GGUFModelProxy,
     estimate_n_params, ParamValidationError,
 )
@@ -233,7 +233,7 @@ class TestFallbacks:
 # ----------------------------------------------------------------------
 class TestEstimateParams:
     def test_estimate_close_to_count(self):
-        from model_engine import ModernTransformer
+        from auralite.engine import ModernTransformer
         cfg = dict(vocab_size=96, d_model=48, n_heads=4, n_kv_heads=2,
                    n_layers=3, d_ff=96, max_seq_len=16)
         model = ModernTransformer(**cfg)
@@ -360,7 +360,7 @@ class TestCheckpointInternals:
 
     def test_load_legacy_chars_checkpoint(self, small_text, tmp_path):
         """Old char-level checkpoints (pre-tokenizer era) must still load."""
-        from model_engine import ModernTransformer
+        from auralite.engine import ModernTransformer
         model = ModernTransformer(vocab_size=8, d_model=16, n_heads=2,
                                   n_layers=1, d_ff=32, max_seq_len=8)
         path = str(tmp_path / "legacy.pt")

@@ -15,10 +15,10 @@ import re
 
 import pytest
 
-import model_engine
+import auralite.engine as model_engine
 
 MODULE_DIR = pathlib.Path(model_engine.__file__).parent
-REPO_ROOT = MODULE_DIR.parent
+PACKAGE_DIR = MODULE_DIR.parent            # auralite/
 LEGACY = MODULE_DIR / "_legacy.py"
 
 #: module → public names that must be *defined* there (not re-exported).
@@ -77,11 +77,11 @@ def test_decomposed_modules_are_real_implementations(module_name):
     assert _imports_legacy(source) == [], f"{module_name}.py imports from _legacy.py"
     assert "from . import" not in source, f"{module_name}.py imports from the package root"
 
-    module = importlib.import_module(f"model_engine.{module_name}")
+    module = importlib.import_module(f"auralite.engine.{module_name}")
     for name in DECOMPOSED[module_name]:
         obj = getattr(module, name, None)
         assert obj is not None, f"{module_name}.{name} is missing"
-        assert getattr(obj, "__module__", None) == f"model_engine.{module_name}", (
+        assert getattr(obj, "__module__", None) == f"auralite.engine.{module_name}", (
             f"{module_name}.{name} is actually defined in "
             f"{getattr(obj, '__module__', '?')} — {module_name} only re-exports it")
 
@@ -89,7 +89,7 @@ def test_decomposed_modules_are_real_implementations(module_name):
 @pytest.mark.parametrize("name", UPSTREAM_PUBLIC_SURFACE)
 def test_upstream_public_names_survive_the_split(name):
     """`model_engine.X` and `model_engine._legacy.X` keep working for every old name."""
-    legacy = importlib.import_module("model_engine._legacy")
+    legacy = importlib.import_module("auralite.engine._legacy")
     assert hasattr(legacy, name), f"model_engine._legacy.{name} disappeared"
     assert hasattr(model_engine, name), f"model_engine.{name} disappeared"
     assert getattr(legacy, name) is getattr(model_engine, name), name
@@ -97,9 +97,9 @@ def test_upstream_public_names_survive_the_split(name):
 
 def test_legacy_reexports_stay_identical_objects():
     """`model_engine._legacy.X is model_engine.<module>.X` for every moved name."""
-    legacy = importlib.import_module("model_engine._legacy")
+    legacy = importlib.import_module("auralite.engine._legacy")
     for module_name, names in DECOMPOSED.items():
-        module = importlib.import_module(f"model_engine.{module_name}")
+        module = importlib.import_module(f"auralite.engine.{module_name}")
         for name in names:
             # Names that the pre-split `_legacy` already had must be re-exported
             # as the *same object*; brand-new ones (PagedDataset, …) only need to
@@ -112,11 +112,11 @@ def test_legacy_reexports_stay_identical_objects():
 
 def test_engine_itself_stays_in_legacy():
     """The engine class is *not* part of the split; it keeps its historical path."""
-    from model_engine import AuraLiteEngine as root_engine
-    from model_engine._legacy import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine as root_engine
+    from auralite.engine._legacy import AuraLiteEngine
 
     assert AuraLiteEngine is root_engine
-    assert AuraLiteEngine.__module__ == "model_engine._legacy"
+    assert AuraLiteEngine.__module__ == "auralite.engine._legacy"
 
 
 def test_no_module_imports_legacy_backwards():
@@ -133,8 +133,8 @@ def test_no_module_imports_legacy_backwards():
 def test_gui_and_server_use_public_import_paths():
     """Consumers import `model_engine` / submodules, never the private module."""
     checked = []
-    for path in sorted((REPO_ROOT / "gui").rglob("*.py")) + \
-            sorted((REPO_ROOT / "server").rglob("*.py")) + [REPO_ROOT / "auralite_cli.py"]:
+    for path in sorted((PACKAGE_DIR / "gui").rglob("*.py")) + \
+            sorted((PACKAGE_DIR / "server").rglob("*.py")) + [PACKAGE_DIR / "cli.py"]:
         source = path.read_text(encoding="utf-8")
         assert "_legacy" not in source, f"{path} imports the private module"
         checked.append(path)
@@ -158,7 +158,7 @@ def test_dataset_module_keeps_the_mmap_api():
     """`dataset.py` owns the mmap training path (roadmap P0.3 acceptance)."""
     import inspect
 
-    from model_engine.dataset import PagedDataset, write_tokens_memmap
+    from auralite.engine.dataset import PagedDataset, write_tokens_memmap
 
     assert inspect.isclass(PagedDataset)
     assert callable(write_tokens_memmap)
@@ -168,18 +168,18 @@ def test_dataset_module_keeps_the_mmap_api():
 
 def test_engine_uses_the_moved_classes():
     """The engine consumes the extracted modules instead of private copies."""
-    from model_engine import model as model_module
-    from model_engine._legacy import AuraLiteEngine
+    from auralite.engine import model as model_module
+    from auralite.engine._legacy import AuraLiteEngine
     import inspect
 
     source = inspect.getsource(AuraLiteEngine)
     assert "ModernTransformer" in source
-    assert model_module.ModernTransformer.__module__ == "model_engine.model"
+    assert model_module.ModernTransformer.__module__ == "auralite.engine.model"
 
 
 def test_cli_and_gui_smoke_on_top_of_the_new_layout():
     """A CLI `--help` and the GUI import path must survive the reshuffle."""
-    cli = importlib.import_module("auralite_cli")
+    cli = importlib.import_module("auralite.cli")
     assert cli.build_parser() is not None
-    app = importlib.import_module("gui.app")
+    app = importlib.import_module("auralite.gui.app")
     assert hasattr(app, "AIApp")

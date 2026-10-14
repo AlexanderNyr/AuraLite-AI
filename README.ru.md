@@ -1,9 +1,9 @@
 # 🌟 AuraLite AI
 
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.6.6-orange)
+![Version](https://img.shields.io/badge/version-2.7.0-orange)
 
 **English version: [README.md](README.md)** · Быстрый старт: [docs/quickstart.md](docs/quickstart.md)
 
@@ -58,7 +58,9 @@ engine.train(text, {
   очередь запросов вместо потока 503.
 - **🛡️ Безопасные чекпоинты**: `.pt` загружается с `weights_only=True` (старые файлы —
   через ограниченный allowlist), поддержка `.safetensors`.
-- **Экспорт и обмен**: ONNX / TorchScript / Hugging Face (extras), загрузка на HF Hub,
+- **Экспорт и обмен**: `.pt2` (`torch.export`, по умолчанию: `auralite export --model m.pt`;
+  запускается чистым PyTorch, токенизатор внутри), ONNX (через `torch.export`, extra
+  `export`), TorchScript (устарел вслед за `torch.jit`), Hugging Face, загрузка на HF Hub,
   LoRA-адаптеры.
 
 ## ✅ Статус функций (честно)
@@ -69,11 +71,11 @@ engine.train(text, {
 | FlexAttention | реализовано, opt-in | настоящий `torch.nn.attention.flex_attention` для префилла; автооткат к SDPA |
 | GGUF perplexity | реализовано | оценка в окнах `n_ctx−1`; кэш результатов (`$AURALITE_HOME/gguf_ppl_cache.json`) |
 | `llama-server` как бэкенд | реализовано | общая загрузка модели, свой KV-cache; perplexity на сервере недоступна — и это сказано явно |
-| Квантизация | реализовано | torch.ao (по умолчанию) или torchao (opt-in) для dynamic INT8 |
+| Квантизация | реализовано | dynamic INT8: `auto` (по умолчанию) — torch.ao, пока он есть в PyTorch (самые быстрые CPU-ядра), затем автоматически torchao (`pip install 'auralite-ai[torchao]'`); оба пути проверяются в CI |
 | OpenAI-сервер | реализовано, один воркер | сознательно: движок, KV-cache и лимитер живут в памяти процесса; очередь + `AURALITE_QUEUE_TIMEOUT` |
 | Батч-генерация | реализовано | группировка по длине + дедупликация одинаковых промптов |
 | Ускорение инференса | измерено | `torch.compile` даёт ×1.1–1.7 на префилле и **медленнее** на декоде одного токена — поэтому декод остаётся eager |
-| Сессии и локализация GUI | реализовано | `gui/config.py`, `gui/session.py`, `gui/i18n.py` |
+| Сессии и локализация GUI | реализовано | `auralite/gui/config.py`, `auralite/gui/session.py`, `auralite/gui/i18n.py` |
 | Логирование библиотеки | реализовано | ни один модуль библиотеки не печатает в stdout: всё через логгер `auralite`, `$AURALITE_LOG_LEVEL` |
 
 ## 📦 Установка
@@ -87,9 +89,9 @@ pip install -e '.[qlora]'     # + загрузка в 4/8 бит для QLoRA (b
 pip install -e '.[test]'      # + набор тестов
 ```
 
-`pip install -r requirements.txt` ставит те же зависимости ядра без установки пакета — этого хватает для `python gui_app.py` из клона.
+`pip install -r requirements.txt` ставит те же зависимости ядра без установки пакета — этого хватает для `python gui_app.py` из клона. Установленный AuraLite даёт две команды: `auralite` (CLI, она же `python -m auralite`) и `auralite-gui` (приложение, оно же `python -m auralite.gui`). С 2.7.0 весь код — в одном пакете `auralite` (`from auralite import AuraLiteEngine`); старые имена 2.6 (`model_engine`, `server`, …) работают в клоне репозитория до 2.8 с предупреждением `DeprecationWarning`.
 
-Требуется Python 3.10–3.14. Поддержка Python 3.10 закончилась 01.10.2026: линейка 2.6.x — последняя, которая его поддерживает, 2.7 потребует 3.11+. GPU не обязателен; CUDA Toolkit не нужен, достаточно драйвера NVIDIA.
+Требуется Python 3.11–3.14. Поддержка Python 3.10 закончилась 01.10.2026; линейка 2.6.x была последней, которая его поддерживала. GPU не обязателен; CUDA Toolkit не нужен, достаточно драйвера NVIDIA.
 
 ### Модели `.gguf` (llama.cpp)
 
@@ -130,11 +132,11 @@ auralite generate --model model.pt --prompt "Жили-были" --length 200
 auralite chat --model model.pt --template chatml --system "Ты — кот-поэт"
 
 # 3. графический интерфейс
-python gui_app.py
+auralite-gui              # из клона: python gui_app.py
 
 # 4. OpenAI-совместимый сервер
 AURALITE_MODEL=model.pt AURALITE_API_KEY=sk-local \
-  uvicorn server.openai_server:app --host 0.0.0.0 --port 8000
+  uvicorn auralite.server.openai_server:app --host 0.0.0.0 --port 8000
 
 # 5. диагностика и бенчмарки
 auralite info --model model.pt --bench 128 --bench-modes --bench-compile

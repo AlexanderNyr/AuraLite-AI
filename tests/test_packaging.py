@@ -4,14 +4,18 @@ Every CI job installs the project in editable mode, which puts the whole checkou
 on ``sys.path``. A module that ``pyproject.toml`` forgets to ship is therefore
 invisible to the test suite — that is exactly how ``auralite_cli`` (the target of
 the ``auralite`` console script) and ``image_engine`` (the GUI's Image tab) went
-missing from the wheel. These tests close the gap from three sides:
+missing from the 2.6.4 wheel. Since 2.7.0 everything lives in the one
+``auralite`` package and the flat names are checkout-only aliases. These tests
+close the gap from three sides:
 
-* statically, in both directions: every top-level module/package in the checkout
-  is declared, and every declared one exists;
-* by building a real wheel (no network, no isolation) and reading its file list;
+* statically: the package is discovered (no hand-kept module list), every
+  directory in it is a regular package, and the repository root holds nothing
+  but the deprecated aliases — a new top-level module would not be shipped;
+* by building a real wheel (no network, no isolation) and reading its file list:
+  ``auralite/`` and nothing else at the top level, every module included;
 * by checking that the test suite's own imports are declared in the ``test``
-  extra, so a clean CI runner can collect it (PyYAML and, on Python 3.10,
-  ``tomli`` used to arrive only by accident).
+  extra, so a clean CI runner can collect it (PyYAML used to arrive only by
+  accident).
 """
 from __future__ import annotations
 
@@ -29,16 +33,18 @@ import zipfile
 
 import pytest
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    tomllib = pytest.importorskip("tomli")
+import tomllib
+
+from auralite import _compat
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+PACKAGE = REPO_ROOT / "auralite"
 PYPROJECT = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 SETUPTOOLS = PYPROJECT["tool"]["setuptools"]
 
-#: Top-level files/directories that are not part of the runtime distribution.
+#: Repository-root modules that are deprecated aliases (checkout only, never shipped).
+ROOT_ALIASES = set(_compat.RENAMED)
+#: Other top-level entries that are not part of the runtime distribution.
 NOT_SHIPPED_MODULES = {"setup", "conftest"}
 NOT_SHIPPED_DIRS = {"tests", "benchmarks", "scripts", "docs", "build", "dist"}
 
@@ -47,51 +53,68 @@ def _canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _checkout_modules() -> set[str]:
-    return {p.stem for p in REPO_ROOT.glob("*.py")} - NOT_SHIPPED_MODULES
+def _package_modules() -> set[str]:
+    """Every ``.py`` file of the package, as a wheel path (``auralite/x/y.py``)."""
+    return {path.relative_to(REPO_ROOT).as_posix() for path in PACKAGE.rglob("*.py")
+            if "__pycache__" not in path.parts}
 
 
-def _checkout_packages() -> set[str]:
-    packages = set()
-    for init in REPO_ROOT.rglob("__init__.py"):
-        rel = init.parent.relative_to(REPO_ROOT)
-        if not rel.parts or rel.parts[0] in NOT_SHIPPED_DIRS:
+def _package_dirs() -> set[pathlib.Path]:
+    return {path.parent for path in PACKAGE.rglob("*.py") if "__pycache__" not in path.parts}
+
+
+def _root_packages() -> set[str]:
+    """Top-level directories of the checkout that are Python packages."""
+    names = set()
+    for init in REPO_ROOT.glob("*/__init__.py"):
+        name = init.parent.name
+        if name in NOT_SHIPPED_DIRS or name.startswith("."):
             continue
-        if (REPO_ROOT / rel.parts[0] / "pyvenv.cfg").exists():
+        if (init.parent / "pyvenv.cfg").exists():
             continue  # a virtualenv inside the checkout (venv/, env/, ...)
-        if any(part in {"__pycache__", "site-packages", "node_modules"} or part.startswith(".")
-               for part in rel.parts):
-            continue
-        packages.add(".".join(rel.parts))
-    return packages
+        names.add(name)
+    return names
 
 
 # ----------------------------------------------------------------------
 #  Static contract (milliseconds)
 # ----------------------------------------------------------------------
-def test_every_top_level_module_is_shipped():
-    declared = set(SETUPTOOLS["py-modules"])
-    on_disk = _checkout_modules()
-    assert on_disk - declared == set(), (
-        "top-level modules missing from [tool.setuptools] py-modules — a wheel "
-        f"install would not contain them: {sorted(on_disk - declared)}")
-    assert declared - on_disk == set(), f"declared but absent: {sorted(declared - on_disk)}"
+def test_one_package_is_discovered():
+    assert "py-modules" not in SETUPTOOLS, "2.7.0 ships no top-level modules"
+    find = SETUPTOOLS["packages"]["find"]
+    assert find["include"] == ["auralite", "auralite.*"]
+    # Namespace discovery would silently ship (or drop) half-made packages.
+    assert find["namespaces"] is False
 
 
-def test_every_package_is_shipped():
-    declared = set(SETUPTOOLS["packages"])
-    on_disk = _checkout_packages()
-    assert on_disk - declared == set(), f"packages missing: {sorted(on_disk - declared)}"
-    assert declared - on_disk == set(), f"declared but absent: {sorted(declared - on_disk)}"
+def test_every_package_directory_is_a_regular_package():
+    """With `namespaces = false` a directory without __init__.py is not shipped."""
+    missing = sorted(str(d.relative_to(REPO_ROOT)) for d in _package_dirs()
+                     if not (d / "__init__.py").exists())
+    assert not missing, f"directories that would be left out of the wheel: {missing}"
 
 
-def test_console_scripts_target_shipped_modules():
+def test_repository_root_holds_only_the_deprecated_aliases():
+    """A new top-level module or package would be invisible to the wheel."""
+    root_modules = {p.stem for p in REPO_ROOT.glob("*.py")} - NOT_SHIPPED_MODULES
+    assert root_modules == ROOT_ALIASES, (
+        "top-level modules must be the deprecated aliases from auralite/_compat.py — "
+        "new code belongs in the auralite package: "
+        f"unexpected {sorted(root_modules - ROOT_ALIASES)}, "
+        f"missing {sorted(ROOT_ALIASES - root_modules)}")
+    assert _root_packages() == {"auralite"}, _root_packages()
+    assert "kernels" not in ROOT_ALIASES     # Hugging Face's name: no alias at all
+
+
+def test_entry_points_target_the_package():
     scripts = PYPROJECT["project"]["scripts"]
-    assert "auralite" in scripts
-    shipped = set(SETUPTOOLS["py-modules"]) | {p.split(".")[0] for p in SETUPTOOLS["packages"]}
-    for name, target in scripts.items():
+    gui_scripts = PYPROJECT["project"]["gui-scripts"]
+    assert scripts == {"auralite": "auralite.cli:main"}
+    assert gui_scripts == {"auralite-gui": "auralite.gui.app:main"}
+    for target in (*scripts.values(), *gui_scripts.values()):
         module_name, _, attr = target.partition(":")
-        assert module_name.split(".")[0] in shipped, f"{name} -> {target} is not shipped"
+        if module_name.startswith("auralite.gui"):
+            pytest.importorskip("tkinter")
         assert callable(getattr(importlib.import_module(module_name), attr)), target
 
 
@@ -105,9 +128,11 @@ def test_license_metadata_uses_spdx():
 
 
 def test_cli_reports_its_version(capsys):
-    import auralite_cli
-    from model_engine import __version__
+    import auralite
+    import auralite.cli as auralite_cli
+    from auralite.engine import __version__
 
+    assert __version__ == auralite.__version__ == PYPROJECT["project"]["version"]
     with pytest.raises(SystemExit) as exc:
         auralite_cli.main(["--version"])
     assert exc.value.code == 0
@@ -187,8 +212,8 @@ def _import_name_providers() -> dict[str, set[str]]:
 
 
 def test_test_suite_imports_are_declared():
-    first_party = (_checkout_modules() | {p.split(".")[0] for p in _checkout_packages()}
-                   | {"tests"} | {p.stem for p in (REPO_ROOT / "tests").glob("*.py")})
+    first_party = ({"auralite", "tests"} | ROOT_ALIASES
+                   | {p.stem for p in (REPO_ROOT / "tests").glob("*.py")})
     stdlib = set(sys.stdlib_module_names)
     providers = _import_name_providers()
     declared = _declared_closure()
@@ -212,11 +237,12 @@ def _copy_project(dest: pathlib.Path) -> pathlib.Path:
     project.mkdir()
     for name in ("pyproject.toml", "README.md", *PYPROJECT["project"]["license-files"]):
         shutil.copy2(REPO_ROOT / name, project / name)
-    for module in SETUPTOOLS["py-modules"]:
-        shutil.copy2(REPO_ROOT / f"{module}.py", project / f"{module}.py")
-    for top in sorted({p.split(".")[0] for p in SETUPTOOLS["packages"]}):
-        shutil.copytree(REPO_ROOT / top, project / top,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(PACKAGE, project / "auralite",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # The aliases sit next to the package in a checkout; copy them too, so the
+    # wheel is built from the same layout and has to leave them out on its own.
+    for alias in sorted(ROOT_ALIASES):
+        shutil.copy2(REPO_ROOT / f"{alias}.py", project / f"{alias}.py")
     return project
 
 
@@ -240,21 +266,29 @@ def built_wheel(tmp_path_factory) -> zipfile.ZipFile:
         yield zf
 
 
-def test_wheel_contains_every_runtime_module(built_wheel):
+def test_wheel_top_level_is_only_auralite(built_wheel):
+    """The PyPI contract: no generic top-level names (`server`, `kernels`, …)."""
+    top = {name.split("/")[0] for name in built_wheel.namelist()}
+    dist_info = {name for name in top if name.endswith(".dist-info")}
+    assert len(dist_info) == 1
+    assert top - dist_info == {"auralite"}, sorted(top)
+
+
+def test_wheel_contains_every_module(built_wheel):
     names = set(built_wheel.namelist())
-    for module in sorted(_checkout_modules()):
-        assert f"{module}.py" in names, f"{module}.py is not in the wheel"
-    for package in sorted(_checkout_packages()):
-        init = "/".join(package.split(".")) + "/__init__.py"
-        assert init in names, f"package {package} is not in the wheel"
-    assert "model_engine/py.typed" in names
+    missing = sorted(_package_modules() - names)
+    assert not missing, f"not in the wheel: {missing}"
+    assert "auralite/py.typed" in names
+    assert "auralite/_compat.py" in names       # the alias machinery itself ships
 
 
 def test_wheel_metadata_entry_points_and_license(built_wheel):
     names = built_wheel.namelist()
     dist_info = next(n.split("/")[0] for n in names if n.split("/")[0].endswith(".dist-info"))
     entry_points = built_wheel.read(f"{dist_info}/entry_points.txt").decode()
-    assert "auralite = auralite_cli:main" in entry_points
+    assert "auralite = auralite.cli:main" in entry_points
+    assert "[gui_scripts]" in entry_points
+    assert "auralite-gui = auralite.gui.app:main" in entry_points
     meta = built_wheel.read(f"{dist_info}/METADATA").decode()
     assert "License-Expression: Apache-2.0" in meta
     assert f"{dist_info}/licenses/LICENSE" in names
@@ -298,10 +332,10 @@ def test_smoke_script_refuses_a_checkout():
 class _FakeEntryPoint:
     group = "console_scripts"
     name = "auralite"
-    value = "auralite_cli:main"
+    value = "auralite.cli:main"
 
     def load(self):
-        raise ModuleNotFoundError("No module named 'auralite_cli'", name="auralite_cli")
+        raise ModuleNotFoundError("No module named 'auralite.cli'", name="auralite.cli")
 
 
 class _FakeDist:
@@ -313,7 +347,7 @@ def test_smoke_script_reports_a_dead_console_script():
     smoke = _load_smoke()
     problems, notes = [], []
     smoke._check_console_scripts(_FakeDist(), problems, notes)
-    assert problems and "auralite_cli" in problems[0] and "does not load" in problems[0]
+    assert problems and "auralite.cli" in problems[0] and "does not load" in problems[0]
 
 
 # ----------------------------------------------------------------------
@@ -382,3 +416,38 @@ def test_print_requirements_works_where_the_dockerfile_puts_it(tmp_path):
     assert "fastapi>=0.111" in out.stdout.split()
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert dockerfile.count("print_requirements.py --pyproject pyproject.toml") == 2
+
+
+# ----------------------------------------------------------------------
+#  2.7.0: import strings handed to other tools must name the package
+# ----------------------------------------------------------------------
+def test_serve_command_runs_the_packaged_app(monkeypatch, tmp_path):
+    """`auralite serve` used to start uvicorn with "server.openai_server:app",
+    which only resolves in a checkout (via the deprecated alias)."""
+    pytest.importorskip("fastapi")
+    uvicorn = pytest.importorskip("uvicorn")
+    import auralite.cli as cli
+
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append((app, kw)))
+    monkeypatch.setenv("AURALITE_MODEL", "")
+    assert cli.main(["serve", "--model", str(tmp_path / "m.pt"), "--quiet"]) == 0
+    (app_ref, kwargs), = calls
+    assert app_ref == cli.SERVER_APP == "auralite.server.openai_server:app"
+    assert kwargs["workers"] == 1
+    module_name, _, attr = app_ref.partition(":")
+    assert getattr(importlib.import_module(module_name), attr) is not None
+
+
+def test_deployment_files_use_the_package_paths():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert dockerfile.count('"auralite.server.openai_server:app"') == 2
+    assert "server.openai_server:app\"" not in dockerfile.replace(
+        "auralite.server.openai_server:app\"", "")
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "from model_engine import" not in ci
+    assert " server.openai_server:app" not in ci
+    build = (REPO_ROOT / "build_exe.bat").read_text(encoding="utf-8")
+    assert "--collect-submodules auralite" in build
+    for old in ("model_engine", "kernels", "--collect-submodules gui", "--collect-submodules server"):
+        assert old not in build, old

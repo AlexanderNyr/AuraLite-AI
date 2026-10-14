@@ -16,7 +16,7 @@ within 30 days for confirmed issues.
 
 AuraLite is an educational framework; the following are **documented, not bugs**:
 
-- `agent/sandbox.py` is a subprocess sandbox with sanitized environment, resource
+- `auralite/agent/sandbox.py` is a subprocess sandbox with sanitized environment, resource
   limits and tree-kill — it is **not** an OS-level isolation boundary. A
   determined payload can still open sockets unless the process is containerized.
 - Checkpoints: `.pt` files are loaded with `weights_only=True`. The escape hatch

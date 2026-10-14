@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings("ignore")
 
 import torch  # noqa: E402
-from model_engine import AuraLiteEngine  # noqa: E402
+from auralite.engine import AuraLiteEngine  # noqa: E402
 
 SMALL = dict(model="/tmp/auralite_bench_small.pt",
              params=dict(tokenizer="bpe", bpe_vocab_size=512, d_model=128,

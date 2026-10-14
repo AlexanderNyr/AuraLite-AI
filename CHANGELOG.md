@@ -1,3 +1,179 @@
+# 📦 v2.7.0 — one `auralite` package, torch.export, torchao, ready for PyPI
+
+2.6.6 ran into PyTorch's deprecations (TorchScript, `torch.ao.quantization`)
+and the flat module layout kept AuraLite off PyPI. This release moves all code
+into one package, exports through `torch.export`, makes the torchao path work,
+drops Python 3.10 and prepares the first PyPI upload.
+
+**Breaking: everything lives in the `auralite` package**
+
+Until 2.6 every module sat at the top of the repository, and the wheel
+installed 16 top-level names into site-packages (`model_engine`, `server`,
+`agent`, `gui`, `export`, `eval`, `quantization`, `kernels`, …). Names this
+generic collide with other distributions — Hugging Face ships `kernels` — and
+pip silently overwrites the other package's files.
+
+| 2.6 | 2.7 |
+|---|---|
+| `from model_engine import AuraLiteEngine` | `from auralite import AuraLiteEngine` (or `auralite.engine`) |
+| `model_engine.layers`, `model_engine.model`, … | `auralite.engine.layers`, `auralite.engine.model`, … |
+| `uvicorn server.openai_server:app` | `uvicorn auralite.server.openai_server:app` (or `auralite serve`) |
+| `gui`, `gui.tabs.*`, `from gui_app import AIApp` | `auralite.gui`, `auralite.gui.tabs.*`, `auralite.gui.app.AIApp` |
+| `quantization`, `quantization_backends`, `export`, `eval`, `evaluation`, `image_engine`, `hf_integration`, `chat_interface`, `web_tools`, `agent` | `auralite.<same name>` |
+| `auralite_cli` | `auralite.cli` (`python -m auralite`) |
+| `kernels` | `auralite.kernels` — **no alias** (Hugging Face's name) |
+| `python gui_app.py` | `auralite-gui` or `python -m auralite.gui` |
+
+- In a **source checkout** the old names keep working until 2.8: small shim
+  files in the repository root warn once (`DeprecationWarning` that names the
+  replacement and points at your import line) and register the *real* module
+  under the old name, plus a meta-path finder for submodules. So
+  `model_engine is auralite.engine`, `model_engine.layers is
+  auralite.engine.layers`, and `mock.patch("model_engine._legacy.…")` still
+  patches the code that runs. A package of your own called `server` or `gui` is
+  left alone. `python gui_app.py`, `python auralite_cli.py …` and
+  `python eval.py …` work from a checkout without warnings.
+- An **installed** AuraLite (wheel, PyPI, the Docker image, and an editable
+  install imported from outside the checkout) provides only `auralite`.
+- Checkpoints are unaffected: `.pt`/`.safetensors` files store weights and JSON
+  metadata, no pickled class paths.
+- New entry points: `python -m auralite` (the CLI) and the `auralite-gui`
+  GUI script (no console window on Windows). `import auralite` is cheap (no
+  torch) and lazily exposes `AuraLiteEngine`, `ModernTransformer`,
+  `ImageGenEngine`, `QuantizationEngine`, `QuantConfig`, `ModelExporter`.
+  `auralite --version` no longer imports torch.
+- Fixed on the way: `auralite serve` started uvicorn with
+  `"server.openai_server:app"`, a string that only resolves inside a checkout
+  — the installed command would have failed (no test ran `cmd_serve`; one does
+  now). The agent's `web_search` tool inserted the parent directory into
+  `sys.path` on every call. Eight dead `gui/tabs/*_tab.py` placeholders are
+  gone.
+
+**Export: `.pt2` and the torch.export-based ONNX exporter**
+
+PyTorch 2.14 made the TorchScript deprecation loud (`FutureWarning` from
+`torch.jit.trace/script/freeze/load`, "not supported on Python 3.14+"), and
+its TorchScript-based ONNX exporter warns that the `torch.export` one has been
+the default since 2.9.
+
+- `ModelExporter.export_pt2()` — new and recommended: a `torch.export` program
+  with dynamic `batch` and `seq_len` (up to `max_seq_len`). It runs with plain
+  PyTorch (`torch.export.load("model.pt2").module()(input_ids)`), carries the
+  tokenizer and the model shape inside (`auralite.export.load_pt2()` returns
+  `(module, metadata)`), and needs nothing beyond torch. Bit-exact against
+  eager for GQA, MHA, ALiBi, sliding-window, MoE and tied/QK-norm models. The
+  example input is tiled to ≥ 2 in both dimensions: `torch.export`
+  specialises size-1 dimensions, so a `(1, T)` example would have produced a
+  batch-1-only program.
+- `export_onnx()` uses `torch.onnx.export(dynamo=True)` when `onnxscript` is
+  installed (now part of the `export` extra) and the opset is ≥ 18; the
+  TorchScript exporter is the fallback (no onnxscript, `opset_version < 18`,
+  or a failure of the new exporter). `exporter=` forces one;
+  `last_onnx_exporter` reports which ran. The default opset is now the
+  exporter's own (18). One self-contained file unless the weights exceed
+  1.8 GB.
+- `export_torchscript()` still works and warns (`FutureWarning`, pointing to
+  `export_pt2()`).
+- `export_all()` writes `model.pt2` + `model.onnx` (was TorchScript + ONNX).
+- `auralite export --model m.pt [--format pt2|onnx|torchscript] [--out PATH]
+  [--static] [--opset N] [--onnx-exporter …]` — new subcommand.
+- GUI Export tab: a ".pt2 — recommended" section and button, TorchScript marked
+  deprecated, ONNX opset 18 by default; the log names the ONNX exporter used.
+- Model: the MoE layer computes its load-balancing loss in training mode only
+  (`torch.export` warned about a tensor attribute assigned during export);
+  RoPE reads `rope_cos.shape[0]` instead of `len()`.
+
+**Quantization: torch.ao → torchao, measured**
+
+- The torchao path was broken: it called `int8_weight_only()`, which current
+  torchao releases no longer have, so `AURALITE_QUANT_BACKEND=torchao` failed
+  on every recent install — no test had ever run it. It now uses
+  `Int8WeightOnlyConfig` (old function as a fallback), gives clear errors for
+  an unknown API or a broken install, and keeps torchao's import noise on
+  CPU-only torch off the console.
+- `auto` is the default and means **torch.ao while PyTorch ships it, torchao
+  after that** (or when the torch.ao kernels fail at run time). 2.6's `auto`
+  preferred torchao whenever it was installed — which made quantized models
+  slower. Measured with torch 2.14 on a 2-vCPU x86 runner (eager, batch 1),
+  tokens/s against fp32:
+
+  | Model | torch.ao decode | torch.ao prefill | torchao (weight-only) decode | torchao prefill |
+  |---|---|---|---|---|
+  | d_model 256, 4 layers | 0.82× | 1.89× | 0.73× | 1.30× |
+  | d_model 512, 6 layers | 1.83× | 1.94× | 0.68× | 0.88× |
+
+- Reported sizes were wrong. Packed torch.ao INT8 weights are neither
+  parameters nor buffers and were not counted, so dynamic INT8 claimed ~20×
+  compression on the test model (INT8 against FP32 cannot exceed 4×); torchao's
+  tensor-subclass weights reported FP32 sizes (1.0×). Both are counted now
+  (3.5× and 3.3× on that model). docs/quantization.md and FAQ §5 replace the
+  claims that torchao is the faster path and that INT8 "is not faster on CPU"
+  with the measured table.
+- New `torchao` extra. Static INT8 and QAT still need `torch.ao`; they fail with
+  an explanation if it is gone.
+
+**Python 3.11+**
+- Python 3.10 (end-of-life 2026-10-01) is no longer supported:
+  `requires-python >= 3.11`, CI tests 3.11–3.14 plus Windows/3.11 and
+  ubuntu-26.04/3.14. The `tomli` fallbacks are gone; ruff and pyright target
+  3.11.
+
+**Ready for PyPI**
+- The wheel contains `auralite/` and nothing else. Three checks enforce it:
+  `tests/test_packaging.py` (statically, and by building a wheel offline from a
+  tree that includes the shims), and `scripts/smoke_installed_wheel.py` in the
+  CI `package` job (imports every module of the installed package; optional
+  extras become notes; no deprecated name may be shipped; the GUI script must
+  resolve).
+- Project URLs and keywords in `pyproject.toml`. `README.md` is the PyPI page:
+  it starts with a quickstart (its commands are parsed by a test) and links with
+  absolute URLs (relative ones 404 on pypi.org; a test checks that each target
+  exists).
+- Releases: signed SLSA build-provenance attestations for the attached files
+  (`actions/attest@v4`; verify with `gh attestation verify <file> -R
+  AlexanderNyr/AuraLite-AI`). The release notes print `pip install
+  auralite-ai[serve]==<version>` once PyPI publishing is enabled.
+- **Publishing needs the maintainer, once** — docs/releasing.md: a pending
+  Trusted Publisher on pypi.org for `auralite-ai`, the `pypi` environment, the
+  repository variable `PYPI_PUBLISH=true`; then push the tag `v2.7.0`.
+
+**CI**
+- pyright ratchet: `pyright || true` became a blocking check that the error
+  count only goes down (`scripts/pyright_ratchet.py`, baseline in
+  `.github/pyright-baseline.json`, pyright pinned to 1.1.414): 318 errors,
+  down from 362 at 2.6.6 with the same pyright. The lint job installs the CPU
+  torch wheel.
+- Coverage: one `--cov=auralite` (kernels and the new modules included), 86 %;
+  the gate moved from 60 % to 80 %.
+- `optional-deps` installs `[export,torchao]` and runs, with
+  `AURALITE_REQUIRE_INTEGRATIONS=1`, the real torchao tests and the `.pt2` /
+  torch.export-based ONNX checks — a missing package fails the job instead of
+  skipping. `.pt2` round trips run in every test leg.
+
+**Repository**
+- `.gitignore` covers generated output: torch profiler traces
+  (`benchmarks/profiles/`, written by `auralite.engine.profiling`), `build/`,
+  `dist/`, PyInstaller's `.spec`, and the `coverage.json`/`pyright.json` reports.
+  Ignored files are also safe from `git clean -fd`.
+
+**Docker**
+- The images serve `auralite.server.openai_server:app`;
+  `PIP_ROOT_USER_ACTION=ignore` removes pip's root warning from the build; the
+  unpinned `libgomp1` is a documented hadolint exception.
+
+**Numbers**: Python 3.13 — 1159 passed, 4 skipped (CUDA, transformers,
+llama.cpp); Python 3.11.17 with Tk 9.0 — 1157 passed, 6 skipped (torchao not
+installed there). Warnings 50 → 12; the remaining ones are PyTorch's own
+TorchScript/torch.ao deprecations in the tests of those deprecated paths, a
+hostile-pickle test and a TypedStorage notice from `torch.save`.
+
+**Not in this release**
+- Static INT8 and QAT on torchao (pt2e).
+- Removing the 2.6 aliases (2.8).
+- From the plan: `docs/learn/` with doctested snippets, a demo checkpoint,
+  server `logprobs`/`n`/JSON mode, `auralite quantize|eval`, splitting
+  `_legacy.py`, one-shot `ruff format`, CodeQL/pip-audit.
+
 # 🔧 v2.6.6 — real integrations, honest server, install without compiling
 
 Everything in this release came out of running the code paths that CI only

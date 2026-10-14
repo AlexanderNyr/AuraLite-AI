@@ -9,7 +9,9 @@ name: Release
 #   * `build`   — sdist + wheel, `twine check`, then the wheel is installed into a
 #                 clean venv and `scripts/smoke_installed_wheel.py` checks that
 #                 every module imports from site-packages and `auralite` runs;
-#   * `release` — GitHub Release with the artifacts attached and auto notes;
+#   * `release` — GitHub Release with the artifacts attached and auto notes,
+#                 plus signed SLSA build-provenance attestations for them
+#                 (`gh attestation verify <file> -R <owner>/<repo>`);
 #   * `image`   — ghcr.io/<owner>/auralite-ai:<version> and :latest (CPU runtime);
 #   * `pypi`    — PyPI via Trusted Publishing (OIDC, no API token stored
 #                 anywhere). Off by default; see docs/releasing.md to enable it:
@@ -137,6 +139,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write         # create the Release and its tag
+      id-token: write         # Sigstore certificate for the attestations
+      attestations: write     # store them with the repository
     steps:
       - uses: actions/checkout@v7
         with:
@@ -146,6 +150,12 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Attest build provenance (2.7.0)
+        # Signed SLSA provenance for the exact files attached below. (The PyPI
+        # upload gets its own PEP 740 attestations from pypa/gh-action-pypi-publish.)
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -157,11 +167,11 @@ jobs:
             Built and tested by CI on this commit.
 
             Artifacts: `auralite_ai-${{ needs.verify.outputs.version }}-py3-none-any.whl`
-            and the source distribution. Install the wheel attached to this
-            release (AuraLite is not on PyPI yet):
+            and the source distribution, with signed build provenance
+            (`gh attestation verify <file> -R ${{ github.repository }}`). Install:
 
             ```bash
-            pip install "auralite-ai[serve] @ https://github.com/${{ github.repository }}/releases/download/v${{ needs.verify.outputs.version }}/auralite_ai-${{ needs.verify.outputs.version }}-py3-none-any.whl"
+            ${{ vars.PYPI_PUBLISH == 'true' && format('pip install "auralite-ai[serve]=={0}"', needs.verify.outputs.version) || format('pip install "auralite-ai[serve] @ https://github.com/{0}/releases/download/v{1}/auralite_ai-{1}-py3-none-any.whl"', github.repository, needs.verify.outputs.version) }}
             ```
 
             Docker: `docker pull ghcr.io/${{ github.repository }}:${{ needs.verify.outputs.version }}`

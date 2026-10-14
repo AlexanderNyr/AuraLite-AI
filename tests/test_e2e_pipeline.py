@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import AuraLiteEngine
+from auralite.engine import AuraLiteEngine
 
 
 TEXT = (
@@ -71,7 +71,7 @@ class TestEndToEndPipeline:
         assert a == b
 
     def test_perplexity_finite_after_training(self, trained_engine):
-        from eval import compute_perplexity, compute_bpt
+        from auralite.eval import compute_perplexity, compute_bpt
         ppl = compute_perplexity(trained_engine, TEXT[:400])
         assert 1.0 < ppl < 1e6
         bpt = compute_bpt(trained_engine, TEXT[:400])

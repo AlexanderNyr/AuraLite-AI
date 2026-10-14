@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 
 from hypothesis import given, settings, strategies as st, HealthCheck
 
-from model_engine import BPETokenizer, CharTokenizer, Attention
+from auralite.engine import BPETokenizer, CharTokenizer, Attention
 
 
 ALPHA = st.characters(whitelist_categories=("Ll", "Lu", "Nd", "Zs"),
@@ -87,7 +87,7 @@ class TestAttentionProperties:
     def test_rotate_half_involution_pairing(self, dim):
         # rotate_half twice = swap back with negation pattern: r(r(x)) == [-x1, -x2] rotated...
         x = torch.randn(3, dim)
-        from model_engine import Attention as A
+        from auralite.engine import Attention as A
         r = A._rotate_half
         # known identity: r(r(r(r(x)))) == x
         assert torch.equal(r(r(r(r(x)))), x)
@@ -99,7 +99,7 @@ class TestQuantizationProperties:
     @settings(max_examples=10, deadline=None,
               suppress_health_check=list(HealthCheck))
     def test_packed_linear_int8_low_error(self, rows, cols):
-        from quantization import PackedLinear
+        from auralite.quantization import PackedLinear
         torch.manual_seed(rows * cols)
         w = torch.randn(rows, cols)
         layer = PackedLinear(cols, rows, bits=8, group_size=max(1, min(16, cols)))
@@ -116,7 +116,7 @@ class TestQuantizationProperties:
     @settings(max_examples=20, deadline=None,
               suppress_health_check=list(HealthCheck))
     def test_fake_quantize_within_scale(self, val):
-        from quantization import FakeQuantize
+        from auralite.quantization import FakeQuantize
         fq = FakeQuantize(bits=8, symmetric=True)
         x = torch.tensor([val, 1.0, -1.0])
         out = fq(x)

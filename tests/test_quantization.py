@@ -9,10 +9,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 torch = pytest.importorskip("torch")
-from model_engine import (
+from auralite.engine import (
     ModernTransformer, AuraLiteEngine, CharTokenizer, BPETokenizer,
 )
-from quantization import (
+from auralite.quantization import (
     QuantizationEngine, QuantConfig, QuantResult,
     QuantMethod, BitWidth,
     METHOD_SUPPORTED_BITS,

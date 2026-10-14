@@ -34,13 +34,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import ModernTransformer, CharTokenizer  # noqa: E402
-from export import ModelExporter  # noqa: E402
-from quantization import (  # noqa: E402
+from auralite.engine import ModernTransformer, CharTokenizer  # noqa: E402
+from auralite.export import ModelExporter  # noqa: E402
+from auralite.quantization import (  # noqa: E402
     QuantizationEngine, QuantConfig, QuantMethod, BitWidth,
 )
-from evaluation import AuraLiteLM  # noqa: E402
-from agent.sandbox import Sandbox  # noqa: E402
+from auralite.evaluation import AuraLiteLM  # noqa: E402
+from auralite.agent.sandbox import Sandbox  # noqa: E402
+from tests._integration import require  # noqa: E402
 
 VOCAB = 37
 CALIB_TEXT = "aura lite is a small educational language model written in pytorch " * 8
@@ -79,17 +80,59 @@ class TestExportWithRealTransformer:
         assert int(example.max()) < VOCAB
 
     def test_torchscript_export_roundtrip(self, tmp_path):
+        """Deprecated (2.7.0) but still working while PyTorch ships torch.jit."""
         model = _tiny_model()
         exporter = ModelExporter(model)
-        path = exporter.export_torchscript(str(tmp_path / "model_ts.pt"))
+        with pytest.warns(FutureWarning, match="export_pt2"):
+            path = exporter.export_torchscript(str(tmp_path / "model_ts.pt"))
 
         loaded = torch.jit.load(path)
         with torch.no_grad():
             out = loaded(torch.tensor([[1, 2, 3]]))
         assert out.shape == (1, 3, VOCAB)
 
+    # -- .pt2 (torch.export): needs nothing beyond torch, so every CI leg runs it --
+    @pytest.mark.parametrize("variant", [
+        {}, {"n_kv_heads": None}, {"use_alibi": True}, {"sliding_window": 4},
+        {"use_moe": True, "num_experts": 2}, {"tie_word_embeddings": True, "use_qk_norm": True},
+    ], ids=["gqa", "mha", "alibi", "sliding-window", "moe", "tied-qknorm"])
+    def test_pt2_export_roundtrip_with_dynamic_shapes(self, tmp_path, variant):
+        from auralite.export import load_pt2
+
+        model = _tiny_model(**variant)
+        tokenizer = _char_tokenizer()
+        with __import__("warnings").catch_warnings():
+            __import__("warnings").simplefilter("error")   # no export-time warnings
+            path = ModelExporter(model, tokenizer=tokenizer).export_pt2(str(tmp_path / "m.pt2"))
+        module, meta = load_pt2(path)
+        # one program for every batch size and length up to max_seq_len (16)
+        for shape in [(1, 1), (3, 5), (2, 16)]:
+            ids = torch.randint(0, VOCAB, shape)
+            with torch.no_grad():
+                expected = model(ids)
+                got = module(ids)
+            assert got.shape == (*shape, VOCAB)
+            assert torch.allclose(got, expected, atol=1e-5), (shape, variant)
+        assert meta["vocab_size"] == VOCAB and meta["max_seq_len"] == 16
+        assert meta["tokenizer"] == tokenizer.to_dict()
+        # plain torch can run it too — no AuraLite import needed
+        plain = torch.export.load(path).module()
+        with torch.no_grad():
+            assert plain(torch.tensor([[1, 2, 3]])).shape == (1, 3, VOCAB)
+
+    def test_pt2_static_export_fixes_the_example_shape(self, tmp_path):
+        model = _tiny_model()
+        path = ModelExporter(model).export_pt2(str(tmp_path / "static.pt2"),
+                                               example_input=torch.ones(1, 4, dtype=torch.long),
+                                               dynamic=False)
+        module = torch.export.load(path).module()
+        with torch.no_grad():
+            assert module(torch.ones(1, 4, dtype=torch.long)).shape == (1, 4, VOCAB)
+        with pytest.raises(Exception):  # noqa: B017 - torch raises a guard/assert error
+            module(torch.ones(2, 4, dtype=torch.long))
+
     def test_onnx_export_roundtrip(self, tmp_path):
-        onnx = pytest.importorskip("onnx")
+        onnx = require("onnx")
         model = _tiny_model()
         exporter = ModelExporter(model)
         path = exporter.export_onnx(str(tmp_path / "model.onnx"))
@@ -102,20 +145,36 @@ class TestExportWithRealTransformer:
         flags = [m._sdpa_enable_gqa for m in model.modules() if hasattr(m, "_sdpa_enable_gqa")]
         assert flags and all(flags)
 
-    def test_onnx_numeric_parity(self, tmp_path):
-        pytest.importorskip("onnxruntime")
+    @pytest.mark.parametrize("onnx_exporter", ["auto", "torchscript"])
+    def test_onnx_numeric_parity(self, tmp_path, onnx_exporter):
+        require("onnxruntime")
         import numpy as np
         model = _tiny_model()
         exporter = ModelExporter(model)
-        path = exporter.export_onnx(str(tmp_path / "model_parity.onnx"))
+        path = exporter.export_onnx(str(tmp_path / f"model_parity_{onnx_exporter}.onnx"),
+                                    exporter=onnx_exporter)
 
         import onnxruntime as ort
-        sess = ort.InferenceSession(path)
-        ids = np.array([[1, 2, 3, 4]], dtype=np.int64)
-        got = sess.run(None, {"input_ids": ids})[0]
-        with torch.no_grad():
-            ref = model(torch.tensor(ids)).numpy()
-        assert np.abs(got - ref).max() < 1e-4
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        # dynamic batch and length, not only the example's shape
+        for shape in [(1, 4), (3, 7), (2, 16)]:
+            ids = np.random.randint(0, VOCAB, size=shape).astype(np.int64)
+            got = sess.run(None, {"input_ids": ids})[0]
+            with torch.no_grad():
+                ref = model(torch.tensor(ids)).numpy()
+            assert np.abs(got - ref).max() < 1e-4, shape
+
+    def test_onnx_uses_the_torch_export_based_exporter(self, tmp_path):
+        """2.7.0: with onnxscript installed (the `export` extra) ONNX goes
+        through torch.export — the TorchScript exporter is deprecated."""
+        require("onnx")
+        require("onnxscript")
+        exporter = ModelExporter(_tiny_model())
+        exporter.export_onnx(str(tmp_path / "dynamo.onnx"))
+        assert exporter.last_onnx_exporter == "dynamo"
+        assert not (tmp_path / "dynamo.onnx.data").exists()   # one self-contained file
+        exporter.export_onnx(str(tmp_path / "legacy.onnx"), opset_version=17)
+        assert exporter.last_onnx_exporter == "torchscript"
 
 
 # ----------------------------------------------------------------------

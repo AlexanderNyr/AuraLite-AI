@@ -52,7 +52,7 @@ def tiny_llama_dir(tmp_path_factory):
 
 @pytest.fixture()
 def engine(tiny_llama_dir):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.load_hf_model(tiny_llama_dir, device_map="cpu", local_files_only=True,
@@ -63,14 +63,15 @@ def engine(tiny_llama_dir):
 def test_the_integration_does_not_need_bitsandbytes():
     """`sys.modules[name] = None` makes `import bitsandbytes` fail like a missing package."""
     code = ("import sys; sys.modules['bitsandbytes'] = None; "
-            "import hf_integration as h; print(h.HAS_HF_SUPPORT, h.bitsandbytes_available())")
+            "import auralite.hf_integration as h; "
+            "print(h.HAS_HF_SUPPORT, h.bitsandbytes_available())")
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True,
                          text=True, encoding="utf-8", timeout=180, check=True).stdout.split()
     assert out[0] == "True", "HF support must not depend on bitsandbytes"
 
 
 def test_load_uses_the_current_dtype_argument(tiny_llama_dir, capfd):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.load_hf_model(tiny_llama_dir, device_map="cpu", local_files_only=True, verbose=False)
@@ -129,7 +130,7 @@ def test_manual_loop_saves_where_asked(engine, tmp_path, monkeypatch):
 def test_reloading_an_adapter_restores_exactly_the_saved_weights(tiny_llama_dir, tmp_path):
     from safetensors.torch import load_file
 
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     first = AuraLiteEngine()
     first.load_hf_model(tiny_llama_dir, device_map="cpu", local_files_only=True,

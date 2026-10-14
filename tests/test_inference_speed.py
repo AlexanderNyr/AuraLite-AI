@@ -17,7 +17,7 @@ import os
 import pytest
 import torch
 
-from model_engine import AuraLiteEngine
+from auralite.engine import AuraLiteEngine
 
 TINY = ("AuraLite learns small models on CPU. " * 40)
 
@@ -145,7 +145,7 @@ def test_checkpoint_survives_compilation(engine, monkeypatch, tmp_path):
     path = tmp_path / "compiled.pt"
     engine.save_model(str(path))
 
-    from model_engine.safe_io import safe_torch_load
+    from auralite.engine.safe_io import safe_torch_load
 
     state = safe_torch_load(path, map_location="cpu")["model_state"]
     assert not any(key.startswith("_orig_mod.") for key in state), "compiled keys leaked"
@@ -206,7 +206,7 @@ def checkpoint(tmp_path_factory):
 
 
 def test_cli_bench_modes_prints_a_table(checkpoint, capsys, monkeypatch):
-    from auralite_cli import main
+    from auralite.cli import main
 
     monkeypatch.setattr(torch, "compile", lambda model, **kw: FakeCompiled(model))
     assert main(["info", "--model", checkpoint, "--bench", "6",
@@ -220,7 +220,7 @@ def test_cli_bench_modes_prints_a_table(checkpoint, capsys, monkeypatch):
 
 def test_cli_bench_on_gguf_like_backend_degrades_gracefully(checkpoint, capsys, monkeypatch):
     """External backends cannot be rebuilt with another KV dtype — report, don't crash."""
-    from auralite_cli import main
+    from auralite.cli import main
 
     monkeypatch.setattr(AuraLiteEngine, "_native_model", lambda self: None)
     assert main(["info", "--model", checkpoint, "--bench", "4",
@@ -229,7 +229,7 @@ def test_cli_bench_on_gguf_like_backend_degrades_gracefully(checkpoint, capsys, 
 
 
 def test_cli_generate_compile_flag(checkpoint, capsys, monkeypatch):
-    from auralite_cli import main
+    from auralite.cli import main
 
     monkeypatch.setattr(torch, "compile", lambda model, **kw: FakeCompiled(model))
     assert main(["generate", "--model", checkpoint, "--prompt", "AuraLite",

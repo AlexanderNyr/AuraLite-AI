@@ -9,7 +9,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("PIL")
 from PIL import Image
 
-from image_engine import (
+from auralite.image_engine import (
     ImageGenEngine, TinyUNet, DDPM, EMA, ImageFolderDataset,
     validate_image_params, tensor_to_uint8, IMAGE_PRESETS,
     PREDICTION_TYPES, NOISE_SCHEDULES, LR_SCHEDULES,
@@ -47,7 +47,7 @@ def test_unet_channels(channels):
 
 
 def test_attention_block_runs():
-    from image_engine import AttnBlock
+    from auralite.image_engine import AttnBlock
     a = AttnBlock(16, num_heads=4)
     x = torch.randn(2, 16, 8, 8)
     assert a(x).shape == x.shape

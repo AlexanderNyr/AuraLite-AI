@@ -21,10 +21,7 @@ import pathlib
 import re
 import sys
 
-try:  # Python 3.11+
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+import tomllib  # Python >= 3.11, like AuraLite itself
 
 HERE = pathlib.Path(__file__).resolve().parent
 # Next to the script (how the Dockerfile copies the two files), else the repo root.

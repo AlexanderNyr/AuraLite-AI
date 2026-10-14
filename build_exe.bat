@@ -1,8 +1,8 @@
 @echo off
 cd /d "%~dp0"
-title AuraLite AI v2.6 Builder
+title AuraLite AI v2.7 Builder
 echo ====================================================
-echo    Building AuraLite AI v2.6
+echo    Building AuraLite AI v2.7
 echo ====================================================
 echo.
 
@@ -15,7 +15,7 @@ if not defined PYTHON_EXE (
     if %errorlevel% equ 0 set "PYTHON_EXE=py -3"
 )
 if not defined PYTHON_EXE (
-    echo [!] Error: Python is not in PATH. Install Python 3.10-3.13 from python.org
+    echo [!] Error: Python is not in PATH. Install Python 3.11-3.14 from python.org
     echo     and check "Add Python to PATH" during installation.
     pause
     exit /b 1
@@ -58,12 +58,7 @@ echo [+] Starting compilation (--onedir) ...
     --windowed ^
     --name "AuraLite_AI_v2" ^
     --noconfirm ^
-    --hidden-import model_engine._legacy ^
-    --collect-submodules model_engine ^
-    --collect-submodules gui ^
-    --collect-submodules kernels ^
-    --collect-submodules server ^
-    --collect-submodules agent ^
+    --collect-submodules auralite ^
     --collect-data matplotlib ^
     --exclude-module scipy ^
     --exclude-module pandas ^

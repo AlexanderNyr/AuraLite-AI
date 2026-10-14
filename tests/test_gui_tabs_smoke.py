@@ -70,15 +70,15 @@ def app(tmp_path, monkeypatch):
             module_name, _, attr = target.rpartition(".")
             module = {"tkinter": _tk, "tkinter.ttk": _ttk}[module_name]
             stack.enter_context(patch.object(module, attr, value))
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", False))
         for target, value in _DIALOG_PATCHES.items():
             module_name, _, attr = target.rpartition(".")
             module = {"messagebox": sys.modules["tkinter.messagebox"],
                       "filedialog": sys.modules["tkinter.filedialog"]}[module_name]
             stack.enter_context(patch.object(module, attr, value))
 
-        from gui.app import AIApp
-        from gui import session as gui_session
+        from auralite.gui.app import AIApp
+        from auralite.gui import session as gui_session
 
         # `SESSION_PATH`/`DEFAULT_CONFIG_PATH` are computed at import time, so
         # point the modules at the temp dir explicitly.
@@ -101,7 +101,7 @@ def test_all_nine_tabs_are_built(app):
 
 
 def test_tab_titles_come_from_the_catalogue(app):
-    from gui.i18n import tr
+    from auralite.gui.i18n import tr
 
     titles = [call.kwargs.get("text") for call in app.notebook.add.call_args_list]
     assert titles == [tr(f"tab.{name}") for name in app._tab_names]
@@ -129,7 +129,7 @@ def test_console_redirect_is_installed_and_restored(tmp_path, monkeypatch):
     import tkinter as _tk
     from tkinter import ttk as _ttk
 
-    from gui.common import ConsoleRedirector
+    from auralite.gui.common import ConsoleRedirector
 
     monkeypatch.setenv("AURALITE_GUI_CONFIG", str(tmp_path / "cfg.json"))
     monkeypatch.setenv("AURALITE_GUI_SESSION", str(tmp_path / "sess.json"))
@@ -138,8 +138,8 @@ def test_console_redirect_is_installed_and_restored(tmp_path, monkeypatch):
             module_name, _, attr = target.rpartition(".")
             module = {"tkinter": _tk, "tkinter.ttk": _ttk}[module_name]
             stack.enter_context(patch.object(module, attr, value))
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
-        from gui.app import AIApp
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", False))
+        from auralite.gui.app import AIApp
 
         original_out, original_err = sys.stdout, sys.stderr
         instance = AIApp(DummyTk())
@@ -204,7 +204,7 @@ def test_chat_insights_hint_when_matplotlib_is_missing(app):
 
 
 def test_language_switch_relabels_tabs(app):
-    from gui.i18n import tr
+    from auralite.gui.i18n import tr
 
     app.notebook.tab.reset_mock()
     app._on_language_change("Русский")
@@ -229,8 +229,8 @@ def test_session_is_saved_and_restored(app, tmp_path):
     import tkinter as _tk
     from tkinter import ttk as _ttk
 
-    from gui.app import AIApp
-    from gui import session as gui_session
+    from auralite.gui.app import AIApp
+    from auralite.gui import session as gui_session
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text(TINY_TEXT, encoding="utf-8")
@@ -247,7 +247,7 @@ def test_session_is_saved_and_restored(app, tmp_path):
             module_name, _, attr = target.rpartition(".")
             module = {"tkinter": _tk, "tkinter.ttk": _ttk}[module_name]
             stack.enter_context(patch.object(module, attr, value))
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", False))
         stack.enter_context(patch.object(gui_session, "SESSION_PATH",
                                          tmp_path / "gui_session.json"))
         second = AIApp(DummyTk())
@@ -258,8 +258,8 @@ def test_restore_is_skipped_when_disabled(app, tmp_path):
     import tkinter as _tk
     from tkinter import ttk as _ttk
 
-    from gui.app import AIApp
-    from gui import session as gui_session
+    from auralite.gui.app import AIApp
+    from auralite.gui import session as gui_session
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("x", encoding="utf-8")
@@ -271,19 +271,19 @@ def test_restore_is_skipped_when_disabled(app, tmp_path):
             module_name, _, attr = target.rpartition(".")
             module = {"tkinter": _tk, "tkinter.ttk": _ttk}[module_name]
             stack.enter_context(patch.object(module, attr, value))
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", False))
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", False))
         stack.enter_context(patch.object(gui_session, "SESSION_PATH",
                                          tmp_path / "gui_session.json"))
-        from gui.config import GuiConfig
+        from auralite.gui.config import GuiConfig
 
-        stack.enter_context(patch("gui.app.load_config",
+        stack.enter_context(patch("auralite.gui.app.load_config",
                                   lambda *a, **k: GuiConfig(restore_session=False)))
         instance = AIApp(DummyTk())
     assert instance.selected_file_path is None
 
 
 def test_restore_ignores_missing_files(app):
-    import gui.session as gui_session
+    import auralite.gui.session as gui_session
 
     assert gui_session.restore_to_app(app, {"selected_file_path": "/nope/missing.txt"}) == []
 

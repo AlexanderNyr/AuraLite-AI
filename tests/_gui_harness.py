@@ -247,16 +247,16 @@ def build_gui_app(tmp_path, monkeypatch, prepare=None, config=None,
             module_name, _, attr = target.rpartition(".")
             module = {"tkinter": _tk, "tkinter.ttk": _ttk}[module_name]
             stack.enter_context(patch.object(module, attr, value))
-        stack.enter_context(patch("gui.common.HAS_MATPLOTLIB", bool(matplotlib)))
+        stack.enter_context(patch("auralite.gui.common.HAS_MATPLOTLIB", bool(matplotlib)))
         for target, value in _DIALOG_PATCHES.items():
             module_name, _, attr = target.rpartition(".")
             module = {"messagebox": sys.modules["tkinter.messagebox"],
                       "filedialog": sys.modules["tkinter.filedialog"]}[module_name]
             stack.enter_context(patch.object(module, attr, value))
 
-        from gui.app import AIApp
-        from gui import config as gui_config_module
-        from gui import session as gui_session
+        from auralite.gui.app import AIApp
+        from auralite.gui import config as gui_config_module
+        from auralite.gui import session as gui_session
 
         # `SESSION_PATH`/`DEFAULT_CONFIG_PATH` are computed at import time, so
         # point the modules at the temp dir explicitly.
@@ -266,7 +266,7 @@ def build_gui_app(tmp_path, monkeypatch, prepare=None, config=None,
                                          tmp_path / "gui_config.json"))
 
         if config is not None or not restore_session or language:
-            from gui.config import GuiConfig
+            from auralite.gui.config import GuiConfig
 
             base = config if config is not None else GuiConfig()
             base.restore_session = bool(restore_session and base.restore_session)

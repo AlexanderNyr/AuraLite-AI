@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from gui import visualizations
+from auralite.gui import visualizations
 
 
 class FakeAxis:
@@ -120,7 +120,7 @@ TINY_CORPUS = ("AuraLite learns small models on CPU. " * 12)
 
 @pytest.fixture()
 def trained_engine():
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.train(TINY_CORPUS, {
@@ -160,7 +160,7 @@ def test_attention_maps_validate_arguments(trained_engine):
 
 
 def test_attention_maps_need_a_native_model():
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     with pytest.raises(RuntimeError):

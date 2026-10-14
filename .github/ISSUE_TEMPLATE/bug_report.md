@@ -14,7 +14,7 @@ labels: bug
 ```
 
 **Environment**
-- AuraLite version (`auralite info --model ...` or `python -c "import model_engine; print(model_engine.__version__)"`):
+- AuraLite version (`auralite --version` or `python -c "import auralite; print(auralite.__version__)"`):
 - Python / PyTorch:
 - OS / device (CPU or CUDA):
 

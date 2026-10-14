@@ -3,7 +3,7 @@
 AuraLite implements quantization **itself** (no `auto-gptq`/`optimum`/`bitsandbytes`
 import): `quantization.py` contains the packing, the Hessian-based rounding and
 the activation-aware scaling, and the GUI Quantization tab / engine API drive it.
-The one external runtime it can delegate to is `torchao` (opt-in, see below).
+The one external runtime it can delegate to is `torchao` (see *Backends*).
 
 Everything here applies to **native AuraLite `.pt` models**. `.gguf` files are
 already quantized by llama.cpp and are inference-only; Hugging Face models should
@@ -21,17 +21,29 @@ be quantized with their own tooling.
 | HQQ | `hqq` | `int2`…`int8` | no | Half-Quadratic Quantization — calibration-free low-bit path. |
 | Half precision | `half` | `fp16`, `bf16` | no | Not really quantization: just halves the dtype of every parameter. |
 
-Backends: `auralite info --model model.pt --backends` reports what is available.
+### Backends (dynamic INT8)
 
-- `AURALITE_QUANT_BACKEND=torch.ao` (default) uses the deprecated-but-working
-  `torch.ao.quantization` for the dynamic/static INT8 paths.
-- `=torchao` routes dynamic INT8 through `torchao.quantization.quantize_`.
-- `=auto` prefers `torchao` when it is installed.
+`auralite info --model model.pt --backends` reports what is available.
+PyTorch deprecated `torch.ao.quantization` in favour of
+[torchao](https://github.com/pytorch/ao); torch 2.14 still ships it.
+
+- `AURALITE_QUANT_BACKEND=auto` (default since 2.7.0) uses `torch.ao` while
+  PyTorch ships it — its eager CPU kernels are the fastest option (numbers
+  below) — and **torchao automatically** once it does not (or when the torch.ao
+  kernels fail). `pip install 'auralite-ai[torchao]'` keeps dynamic INT8 working
+  on a future PyTorch.
+- `=torch.ao` forces `torch.ao.quantization.quantize_dynamic` (INT8 weights,
+  activations quantized on the fly).
+- `=torchao` forces torchao: INT8 **weight-only** (`Int8WeightOnlyConfig`,
+  activations stay float). Tested in CI against torchao 0.18.
+
+Static INT8 and QAT still need `torch.ao` (a torchao/pt2e port is planned);
+without it they fail with an explanation instead of a bare `ImportError`.
 
 ## Using it
 
 ```python
-from model_engine import AuraLiteEngine
+from auralite import AuraLiteEngine
 
 engine = AuraLiteEngine()
 engine.load_model("model.pt")
@@ -42,7 +54,7 @@ quantized, result = engine.quantize_model(
 )
 print(result.summary())        # size, compression, measured speed, perplexity
 
-from quantization import compare_quantizations, format_comparison_table
+from auralite.quantization import compare_quantizations, format_comparison_table
 results = compare_quantizations(engine.model, engine.tokenizer, calibration_text)
 print(format_comparison_table(results))
 ```
@@ -53,15 +65,26 @@ table (size, compression ratio, tokens/s, perplexity) side by side.
 
 ## What to actually expect
 
-**Memory: yes. Speed: usually not — and never silently.** This repo's honest
+**Memory: yes. Speed: only on some paths — measure, never assume.** This repo's honest
 position, measured on CPU with the engine's own benchmarks:
 
 - A 4× smaller file loads 4× faster and needs ~4× less RAM while idle. That is
   real and is the main reason to quantize for CPU inference.
-- Dynamic int8 on CPU is frequently **slower** than fp32 in the deprecated
-  `torch.ao` path, because the dequantize→matmul→requantize sandwich runs on
-  generic kernels. `AURALITE_QUANT_BACKEND=torchao` (fused kernels) is the one to
-  try when speed is the goal; check it rather than assuming.
+- Dynamic INT8 speed depends on the matrix sizes. Measured with torch 2.14 on a
+  2-vCPU x86 runner (eager, batch 1; decode = one token with the KV cache,
+  prefill = 128-token prompt), tokens/s relative to fp32:
+
+  | Model | `torch.ao` decode | `torch.ao` prefill | torchao (weight-only) decode | torchao prefill |
+  |---|---|---|---|---|
+  | d_model 256, 4 layers | 0.82× | 1.89× | 0.73× | 1.30× |
+  | d_model 512, 6 layers | 1.83× | 1.94× | 0.68× | 0.88× |
+
+  Tiny matrices are overhead-bound; from a few hundred dimensions on, `torch.ao`
+  pays off. torchao's INT8 kernels are built for `torch.compile` and GPUs — in
+  eager CPU mode weight-only INT8 dequantizes on the fly and is *slower* than
+  fp32 (its dynamic-activation config even more so). Before 2.7.0 `auto`
+  preferred torchao whenever it was installed, which made quantized models slower;
+  measure on your machine (`auralite info --bench`) rather than assuming.
 - `half` (fp16/bf16) on CPU: usually slower, sometimes much slower, unless the
   machine has native bf16/fp16 vector paths.
 - Quality: at int8, perplexity moves by a few percent; at int4 with GPTQ/AWQ it is

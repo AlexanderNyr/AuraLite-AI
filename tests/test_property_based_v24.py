@@ -2,7 +2,7 @@ import pytest
 
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import given, strategies as st
-from model_engine import CharTokenizer, BPETokenizer
+from auralite.engine import CharTokenizer, BPETokenizer
 
 
 @given(st.text(min_size=1, max_size=200))

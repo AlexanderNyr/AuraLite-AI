@@ -2,7 +2,7 @@
 import pytest
 
 torch = pytest.importorskip("torch")
-from model_engine import ModernTransformer, validate_params
+from auralite.engine import ModernTransformer, validate_params
 
 
 def test_gradient_checkpointing_flag():

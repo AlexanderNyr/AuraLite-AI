@@ -40,7 +40,7 @@ def text(tiny_text):
 
 
 def test_anonymous_memmap_is_used_then_removed(text, private_tmp):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     seen_during_training, epoch_losses = [], []
 
@@ -61,8 +61,8 @@ def test_anonymous_memmap_is_used_then_removed(text, private_tmp):
 
 def test_anonymous_memmap_is_removed_when_training_fails(text, private_tmp,
                                                          monkeypatch):
-    import model_engine.dataset as dataset_mod
-    from model_engine import AuraLiteEngine
+    import auralite.engine.dataset as dataset_mod
+    from auralite.engine import AuraLiteEngine
 
     def broken_dataset(*args, **kwargs):
         raise RuntimeError("simulated failure after the corpus was tokenised")
@@ -74,7 +74,7 @@ def test_anonymous_memmap_is_removed_when_training_fails(text, private_tmp,
 
 
 def test_explicit_corpus_cache_path_is_kept(text, private_tmp, tmp_path):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     cache = tmp_path / "keep" / "corpus.uint32.bin"
     cache.parent.mkdir()
@@ -91,8 +91,8 @@ def test_memmap_still_mapped_is_removed_at_exit(text, private_tmp, monkeypatch):
     import atexit
     import os
 
-    import model_engine._legacy as legacy
-    from model_engine import AuraLiteEngine
+    import auralite.engine._legacy as legacy
+    from auralite.engine import AuraLiteEngine
 
     real_remove = os.remove
     registered = []

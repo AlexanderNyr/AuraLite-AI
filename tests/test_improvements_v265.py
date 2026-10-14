@@ -45,7 +45,7 @@ class _Hostile:
 
 
 def test_safe_torch_load_roundtrip_of_plain_weights(tmp_path):
-    from model_engine.safe_io import numpy_rng_state_to_builtins, safe_torch_load
+    from auralite.engine.safe_io import numpy_rng_state_to_builtins, safe_torch_load
 
     path = tmp_path / "plain.pt"
     torch.save({
@@ -62,7 +62,7 @@ def test_safe_torch_load_roundtrip_of_plain_weights(tmp_path):
 
 
 def test_safe_torch_load_rejects_hostile_pickle(tmp_path, monkeypatch):
-    from model_engine.safe_io import safe_torch_load
+    from auralite.engine.safe_io import safe_torch_load
 
     marker = tmp_path / "pwned"
     path = tmp_path / "evil.pt"
@@ -93,7 +93,7 @@ def test_safe_torch_load_rejects_hostile_pickle(tmp_path, monkeypatch):
 
 def test_safe_torch_load_reads_legacy_numpy_rng_state(tmp_path):
     """Pre-2.6.5 checkpoints stored `np.random.get_state()` verbatim."""
-    from model_engine.safe_io import (
+    from auralite.engine.safe_io import (
         numpy_rng_state_from_builtins, safe_torch_load,
     )
 
@@ -111,7 +111,7 @@ def test_safe_torch_load_reads_legacy_numpy_rng_state(tmp_path):
 
 
 def test_numpy_rng_state_builtins_are_json_serializable():
-    from model_engine.safe_io import (
+    from auralite.engine.safe_io import (
         numpy_rng_state_from_builtins, numpy_rng_state_to_builtins,
     )
 
@@ -125,7 +125,7 @@ def test_numpy_rng_state_builtins_are_json_serializable():
 
 def test_safetensors_checkpoint_roundtrip(tmp_path):
     safetensors = pytest.importorskip("safetensors")
-    from model_engine.safe_io import (
+    from auralite.engine.safe_io import (
         load_safetensors_checkpoint, save_safetensors_checkpoint,
     )
     assert safetensors is not None
@@ -151,7 +151,7 @@ def test_safetensors_engine_roundtrip_preserves_generation(tmp_path, trained_tin
     engine.save_model(str(path))          # .safetensors → pickle-free container
     assert path.exists()
 
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
     reloaded = AuraLiteEngine()
     reloaded.load_model(str(path))
 
@@ -172,13 +172,13 @@ def test_safetensors_engine_roundtrip_preserves_generation(tmp_path, trained_tin
     ("abs(-4) + 1", 5),
 ])
 def test_safe_calculate_valid(expr, expected):
-    from agent.tools import safe_calculate
+    from auralite.agent.tools import safe_calculate
     assert safe_calculate(expr) == expected
 
 
 def test_safe_calculate_math_functions_and_constants():
     import math
-    from agent.tools import safe_calculate
+    from auralite.agent.tools import safe_calculate
     assert safe_calculate("sqrt(16) + pi") == pytest.approx(4 + math.pi)
     assert safe_calculate("sin(pi/2)") == pytest.approx(1.0)
     assert safe_calculate("log(e)") == pytest.approx(1.0)
@@ -196,7 +196,7 @@ def test_safe_calculate_math_functions_and_constants():
     "print(1)",
 ])
 def test_safe_calculate_blocks_attacks(expr):
-    from agent.tools import safe_calculate
+    from auralite.agent.tools import safe_calculate
     with pytest.raises((ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError)):
         safe_calculate(expr)
 
@@ -205,7 +205,7 @@ def test_safe_calculate_blocks_attacks(expr):
 #  3. Hardened agent sandbox
 # ======================================================================
 def test_sandbox_strips_secret_env_and_redirects_home(tmp_path, monkeypatch):
-    from agent.sandbox import Sandbox
+    from auralite.agent.sandbox import Sandbox
 
     monkeypatch.setenv("MY_TEST_API_KEY", "super-secret")
     with Sandbox(workdir=str(tmp_path)) as box:
@@ -220,7 +220,7 @@ def test_sandbox_strips_secret_env_and_redirects_home(tmp_path, monkeypatch):
 
 
 def test_sandbox_network_denied_drops_network_commands():
-    from agent.sandbox import Sandbox
+    from auralite.agent.sandbox import Sandbox
     box = Sandbox(allow_network=False)
     try:
         assert "curl" not in box.shell_whitelist
@@ -233,7 +233,7 @@ def test_sandbox_network_denied_drops_network_commands():
 #  4. Agent configuration via environment
 # ======================================================================
 def test_agent_env_knobs(monkeypatch):
-    from agent.agent import AuraLiteAgent
+    from auralite.agent.agent import AuraLiteAgent
 
     monkeypatch.setenv("AURALITE_AGENT_MAX_ITERATIONS", "12")
     monkeypatch.setenv("AURALITE_AGENT_TOOL_TIMEOUT", "30")
@@ -246,7 +246,7 @@ def test_agent_env_knobs(monkeypatch):
 
 
 def test_agent_env_knobs_fall_back_on_garbage(monkeypatch):
-    from agent.agent import AuraLiteAgent
+    from auralite.agent.agent import AuraLiteAgent
 
     monkeypatch.setenv("AURALITE_AGENT_MAX_ITERATIONS", "many")
     monkeypatch.setenv("AURALITE_AGENT_TOOL_TIMEOUT", "")
@@ -266,7 +266,7 @@ def server_app(monkeypatch):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     monkeypatch.delenv("AURALITE_MODEL_PATH", raising=False)
-    from server import openai_server
+    from auralite.server import openai_server
     return openai_server
 
 
@@ -357,8 +357,8 @@ def test_speculative_sampling_smoke(trained_engine):
 def test_flex_attention_matches_sdpa():
     # The flex-attention helpers (and their caches) live in model_engine.layers
     # since the v2.6.5 decomposition; _legacy re-exports them.
-    from model_engine import ModernTransformer
-    from model_engine import layers as layers_mod
+    from auralite.engine import ModernTransformer
+    from auralite.engine import layers as layers_mod
 
     if layers_mod._get_flex_attention() is False:
         pytest.skip("FlexAttention is not available in this runtime")
@@ -417,7 +417,7 @@ class _FakeTokenizer:
 
 
 def test_gguf_rolling_loglikelihood_window_math():
-    from model_engine._legacy import _gguf_rolling_loglikelihood
+    from auralite.engine._legacy import _gguf_rolling_loglikelihood
 
     llama, tokenizer = _FakeLlama(), _FakeTokenizer()
     total, scored = _gguf_rolling_loglikelihood(llama, "x" * 30, 8, tokenizer,
@@ -428,7 +428,7 @@ def test_gguf_rolling_loglikelihood_window_math():
 
 
 def test_gguf_proxy_perplexity_and_counts():
-    from model_engine._legacy import GGUFModelProxy
+    from auralite.engine._legacy import GGUFModelProxy
 
     proxy = object.__new__(GGUFModelProxy)
     proxy.llama = _FakeLlama()
@@ -489,7 +489,7 @@ def test_generate_batch_deduplicates_identical_prompts(trained_engine, monkeypat
 #  11. "Model built" size report
 # ======================================================================
 def test_train_reports_actual_model_size(capsys, tiny_text):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.train(tiny_text, {
@@ -512,10 +512,12 @@ def test_train_reports_actual_model_size(capsys, tiny_text):
 #  12. GUI split (gui_app.py → gui/ package)
 # ======================================================================
 def test_gui_entrypoint_is_a_shim_over_the_package():
-    import gui_app
-    from gui.app import AIApp, main
+    with pytest.warns(DeprecationWarning, match="auralite.gui.app"):
+        sys.modules.pop("gui_app", None)
+        import gui_app
+    from auralite.gui.app import AIApp, main
 
-    assert gui_app.AIApp is AIApp           # old import path keeps working
+    assert gui_app.AIApp is AIApp           # old import path keeps working (2.7.x)
     assert gui_app.main is main
     assert callable(main)
 
@@ -524,9 +526,9 @@ def test_gui_tabs_are_single_source_mixins():
     import ast
     import pathlib
 
-    from gui.app import AIApp
+    from auralite.gui.app import AIApp
 
-    core = pathlib.Path(REPO_ROOT) / "gui"
+    core = pathlib.Path(REPO_ROOT) / "auralite" / "gui"
     mixin_files = sorted((core / "tabs").glob("*.py"))
     assert len(mixin_files) >= 10, "expected one module per tab"
 
@@ -552,7 +554,8 @@ def test_gui_tabs_are_single_source_mixins():
 
 
 def test_gui_main_guards_multiprocessing():
-    gui_main = open(os.path.join(REPO_ROOT, "gui", "app.py"), encoding="utf-8").read()
+    gui_main = open(os.path.join(REPO_ROOT, "auralite", "gui", "app.py"),
+                    encoding="utf-8").read()
     assert "freeze_support()" in gui_main
     assert "__main__" in gui_main
     assert "class AIApp" in gui_main
@@ -564,10 +567,7 @@ def test_gui_main_guards_multiprocessing():
 #  13. Packaging hygiene
 # ======================================================================
 def _pyproject() -> dict:
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # Python 3.10: `tomli` comes with the test extra
-        tomllib = pytest.importorskip("tomli")
+    import tomllib
     with open(os.path.join(REPO_ROOT, "pyproject.toml"), "rb") as fh:
         return tomllib.load(fh)
 
@@ -591,21 +591,23 @@ def test_pytest_configuration():
 
 
 def test_packaging_targets_exist_on_disk():
-    """Every py-module/package declared in pyproject must exist (typo guard)."""
+    """2.7.0: one package, discovered — no hand-kept module lists to forget."""
+    import pathlib
+
     cfg = _pyproject()["tool"]["setuptools"]
-    for mod in cfg["py-modules"]:
-        assert os.path.exists(os.path.join(REPO_ROOT, f"{mod}.py")), mod
-    for pkg in cfg["packages"]:
-        path = os.path.join(REPO_ROOT, *pkg.split("."))
-        assert os.path.isdir(path), pkg
-        assert os.path.exists(os.path.join(path, "__init__.py")), pkg
-    assert "quantization_backends" in cfg["py-modules"]
+    assert "py-modules" not in cfg
+    find = cfg["packages"]["find"]
+    assert find["include"] == ["auralite", "auralite.*"]
+    assert find["namespaces"] is False
+    root = pathlib.Path(REPO_ROOT) / "auralite"
+    for init_dir in [p for p in root.rglob("*") if p.is_dir() and p.name != "__pycache__"]:
+        assert (init_dir / "__init__.py").exists(), f"{init_dir} would not be packaged"
 
 
 def test_pep561_marker_is_packaged():
     data = _pyproject()["tool"]["setuptools"]["package-data"]
-    assert "py.typed" in data["model_engine"]
-    assert os.path.exists(os.path.join(REPO_ROOT, "model_engine", "py.typed"))
+    assert "py.typed" in data["auralite"]
+    assert os.path.exists(os.path.join(REPO_ROOT, "auralite", "py.typed"))
 
 
 def test_ci_runs_the_extended_hygiene_gate():
@@ -617,43 +619,58 @@ def test_ci_runs_the_extended_hygiene_gate():
 
 
 # ======================================================================
-#  14. Quantization backends (torch.ao default, torchao opt-in)
+#  14. Quantization backends (2.7.0: auto = torch.ao while it exists, else torchao)
 # ======================================================================
-def test_quant_backend_default_is_torch_ao(monkeypatch):
-    from quantization_backends import describe_backends, resolve_backend
+def test_quant_backend_default_is_auto_and_resolves_to_torch_ao(monkeypatch):
+    from auralite.quantization_backends import describe_backends, resolve_backend
 
     monkeypatch.delenv("AURALITE_QUANT_BACKEND", raising=False)
-    assert resolve_backend() == "torch.ao"
+    assert resolve_backend() == "torch.ao"          # torch 2.14 still ships it
     info = describe_backends()
-    assert info["default_backend"] == "torch.ao"
+    assert info["default_backend"].startswith("auto")
+    assert info["selected_backend"] == "torch.ao"
     assert info["pytorch"]
     assert info["torch.ao.quantization"] == "available"
 
 
-def test_quant_backend_auto_prefers_torchao_when_present():
-    from quantization_backends import resolve_backend, torchao_available
-    expected = "torchao" if torchao_available() else "torch.ao"
-    assert resolve_backend("auto") == expected
+@pytest.mark.parametrize("torch_ao, torchao, expected", [
+    (True, True, "torch.ao"),        # faster eager CPU kernels: torchao is not preferred
+    (True, False, "torch.ao"),
+    (False, True, "torchao"),        # a PyTorch without torch.ao.quantization
+    (False, False, RuntimeError),
+])
+def test_quant_backend_auto_resolution(monkeypatch, torch_ao, torchao, expected):
+    import auralite.quantization_backends as qb
+
+    monkeypatch.setattr(qb, "torch_ao_available", lambda: torch_ao)
+    monkeypatch.setattr(qb, "torchao_available", lambda: torchao)
+    if expected is RuntimeError:
+        with pytest.raises(RuntimeError, match="pip install torchao"):
+            qb.resolve_backend("auto")
+    else:
+        assert qb.resolve_backend("auto") == expected
+        assert qb.resolve_backend("") == expected     # unset env var = auto
 
 
 def test_quant_backend_unknown_value_is_rejected():
-    from quantization_backends import resolve_backend
+    from auralite.quantization_backends import resolve_backend
     with pytest.raises(ValueError, match="Unknown quantization backend"):
         resolve_backend("nonsense")
 
 
 def test_quant_backend_torchao_missing_raises_clear_error(monkeypatch):
-    from quantization_backends import resolve_backend, torchao_available
-    if torchao_available():
-        pytest.skip("torchao is installed here — the guard cannot be triggered")
+    import auralite.quantization_backends as qb
+
+    monkeypatch.setitem(sys.modules, "torchao", None)     # behaves like "not installed"
+    assert qb.torchao_available() is False and qb.torchao_version() is None
     monkeypatch.delenv("AURALITE_QUANT_BACKEND", raising=False)
     with pytest.raises(RuntimeError, match="pip install torchao"):
-        resolve_backend("torchao")
+        qb.resolve_backend("torchao")
 
 
 def test_quant_backend_torchao_stub_is_used(monkeypatch):
-    """The torchao path goes through `quantize_(model, int8_weight_only())`."""
-    import quantization_backends as qb
+    """Old torchao releases: `quantize_(model, int8_weight_only())`."""
+    import auralite.quantization_backends as qb
 
     calls: list = []
     fake_quant = types.ModuleType("torchao.quantization")
@@ -677,7 +694,7 @@ def test_quant_backend_torchao_stub_is_used(monkeypatch):
 
 def test_quant_backend_guard_when_torch_ao_is_gone(monkeypatch):
     """Future PyTorch without torch.ao.quantization → descriptive RuntimeError."""
-    import quantization_backends as qb
+    import auralite.quantization_backends as qb
 
     monkeypatch.setitem(sys.modules, "torch.ao.quantization", None)
     monkeypatch.setitem(sys.modules, "torch.quantization", None)
@@ -687,12 +704,10 @@ def test_quant_backend_guard_when_torch_ao_is_gone(monkeypatch):
 
 def test_dynamic_int8_real_path_produces_quantized_layers():
     pytest.importorskip("torch")
-    from quantization_backends import dynamic_int8, torchao_available
+    from auralite.quantization_backends import dynamic_int8
 
     model = torch.nn.Sequential(torch.nn.Linear(8, 4))
-    quantized = dynamic_int8(model)                      # default torch.ao path
-    if torchao_available():
-        pytest.skip("torchao present: default resolution may differ")
+    quantized = dynamic_int8(model)      # default: auto → torch.ao (also with torchao installed)
     weight_dtypes = set()
     for module in quantized.modules():
         weight = getattr(module, "weight", None)
@@ -713,7 +728,7 @@ def test_dynamic_int8_real_path_produces_quantized_layers():
 #  15. CLI: --quiet / --log-level / safe info / --bench / --backends
 # ======================================================================
 def test_cli_global_and_subcommand_flags_parse():
-    from auralite_cli import build_parser
+    from auralite.cli import build_parser
 
     parser = build_parser()
     sub = parser.parse_args(["info", "--model", "x.pt", "--quiet", "--bench", "5"])
@@ -728,7 +743,7 @@ def test_cli_global_and_subcommand_flags_parse():
 def test_cli_logging_configuration(monkeypatch):
     import logging
 
-    from auralite_cli import _configure_logging, build_parser
+    from auralite.cli import _configure_logging, build_parser
 
     args = build_parser().parse_args(["info", "--model", "x.pt", "--log-level", "DEBUG"])
     _configure_logging(args)
@@ -743,7 +758,7 @@ def test_cli_logging_configuration(monkeypatch):
 
 
 def test_cli_info_uses_safe_load_and_reports_backends(trained_ckpt_path, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     assert main(["info", "--model", trained_ckpt_path, "--backends", "--quiet"]) == 0
     out = capsys.readouterr().out
@@ -753,7 +768,7 @@ def test_cli_info_uses_safe_load_and_reports_backends(trained_ckpt_path, capsys)
 
 
 def test_cli_info_fails_cleanly_on_junk(tmp_path, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     junk = tmp_path / "junk.pt"
     junk.write_text("definitely not a checkpoint", encoding="utf-8")
@@ -765,7 +780,7 @@ def test_cli_info_fails_cleanly_on_junk(tmp_path, capsys):
 
 
 def test_cli_bench_reports_tokens_per_second(trained_ckpt_path, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     assert main(["info", "--model", trained_ckpt_path, "--bench", "4", "--quiet"]) == 0
     out = capsys.readouterr().out
@@ -785,8 +800,9 @@ def test_readme_documents_feature_status():
 
 def test_architecture_map_exists():
     arch = open(os.path.join(REPO_ROOT, "ARCHITECTURE.md"), encoding="utf-8").read()
-    for topic in ("model_engine", "gui/", "tabs/", "safe_io",
-                  "server/openai_server.py", "quantization_backends.py"):
+    for topic in ("auralite/engine/", "auralite/gui/", "tabs/", "safe_io",
+                  "auralite/server/openai_server.py", "quantization_backends.py",
+                  "_compat.py"):
         assert topic in arch, topic
 
 
@@ -807,16 +823,21 @@ def test_server_restart_clears_shutdown_flag(server_app):
 
 
 def test_gui_shim_exposes_the_legacy_namespace():
-    """`gui_app.<name>` keeps working for scripts/tests that monkeypatch it."""
-    import gui_app
-    from gui import common
+    """`gui_app.<name>` keeps working (deprecated) for scripts that monkeypatch it."""
+    import warnings
+
+    from auralite.gui import common
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import gui_app
 
     for name in ("messagebox", "filedialog", "tk", "ttk", "ConsoleRedirector"):
         assert getattr(gui_app, name) is getattr(common, name), name
     assert callable(gui_app._fmt_duration)
     if hasattr(common, "HAS_MATPLOTLIB"):
         assert gui_app.HAS_MATPLOTLIB == common.HAS_MATPLOTLIB
-    assert gui_app.AIApp is __import__("gui.app", fromlist=["AIApp"]).AIApp
+    assert gui_app.AIApp is __import__("auralite.gui.app", fromlist=["AIApp"]).AIApp
 
 
 # ======================================================================
@@ -828,7 +849,7 @@ def test_seeded_server_requests_are_reproducible(trained_engine, monkeypatch):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
-    import server.openai_server as srv
+    import auralite.server.openai_server as srv
 
     monkeypatch.setattr(srv, "_engine", trained_engine)
     body = {"prompt": "AuraLite", "max_tokens": 6, "temperature": 1.5, "seed": 99}
@@ -844,7 +865,7 @@ def test_seeded_server_requests_are_reproducible(trained_engine, monkeypatch):
 # ======================================================================
 def test_token_chunks_are_exact_for_char_tokenizer(tiny_tokenizer, tiny_text):
     """Chunked tokenization must reproduce whole-text encoding exactly."""
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.tokenizer = tiny_tokenizer
@@ -855,7 +876,7 @@ def test_token_chunks_are_exact_for_char_tokenizer(tiny_tokenizer, tiny_text):
 
 
 def test_write_tokens_memmap_and_paged_view(tmp_path):
-    from model_engine.dataset import PagedDataset, write_tokens_memmap
+    from auralite.engine.dataset import PagedDataset, write_tokens_memmap
 
     path = tmp_path / "tokens.bin"
     total = write_tokens_memmap(path, [list(range(100)), list(range(100, 160))],
@@ -877,7 +898,7 @@ def test_write_tokens_memmap_and_paged_view(tmp_path):
 
 def test_train_with_mmap_corpus_matches_ram(tiny_text, tmp_path):
     """Same seed, same tokens → identical weights, loss history and output."""
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     params = {
         "tokenizer": "char", "d_model": 32, "d_ff": 64, "n_heads": 4, "n_layers": 2,
@@ -905,7 +926,7 @@ def test_train_with_mmap_corpus_matches_ram(tiny_text, tmp_path):
 
 
 def test_train_mmap_reports_memmap_and_honours_env(tiny_text, tmp_path, monkeypatch, capsys):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     monkeypatch.setenv("AURALITE_CORPUS_CACHE", "mmap")   # env switch, no params key
     cache = tmp_path / "env_corpus.bin"
@@ -920,7 +941,7 @@ def test_train_mmap_reports_memmap_and_honours_env(tiny_text, tmp_path, monkeypa
 
 
 def test_cli_train_mmap_flag(tiny_text, tmp_path, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     text_file = tmp_path / "corpus.txt"
     text_file.write_text(tiny_text, encoding="utf-8")
@@ -939,7 +960,7 @@ def test_cli_train_mmap_flag(tiny_text, tmp_path, capsys):
 
 
 def test_cli_rejects_unknown_training_parameter(tiny_text, tmp_path, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     text_file = tmp_path / "corpus.txt"
     text_file.write_text(tiny_text, encoding="utf-8")

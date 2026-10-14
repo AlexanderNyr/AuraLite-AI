@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import web_tools
-from web_tools import (
+import auralite.web_tools as web_tools
+from auralite.web_tools import (
     _DDGResultParser,
     _clean_ddg_url,
     build_web_context,

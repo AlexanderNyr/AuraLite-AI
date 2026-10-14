@@ -46,7 +46,7 @@ thousands tok/s because the weights are read once for 64 positions.
 
 ## 3. `--compile` made things *slower*
 
-By design — see `model_engine/_legacy.py::_infer`. `torch.compile` is a win for
+By design — see `auralite/engine/_legacy.py::_infer`. `torch.compile` is a win for
 **prefill** (many positions share one weight read, so the compiled kernels pay
 off) and a loss for **decode** (batch 1, one token per step, and every new KV
 length re-checks Dynamo's guards).
@@ -87,12 +87,15 @@ it.
 
 ## 5. Quantization: int8 should be ~2× faster, isn't it?
 
-Not on CPU, and not with dynamic int8 in PyTorch. Weight-only int8 shrinks the
-**memory** footprint and the load time; the arithmetic still happens in fp32
-unless you hit a kernel that is actually vectorised for int8 (which the deprecated
-`torch.ao.quantization` path usually is not). Read
-[quantization.md](quantization.md) for the measured picture and for how to check
-with perplexity instead of vibes.
+Sometimes — it depends on the path and the matrix sizes. Dynamic INT8 through
+`torch.ao` (the default backend) runs on int8 CPU kernels: in our measurements
+~1.9× faster prompt processing and, from d_model ≈ 512, ~1.8× faster decoding,
+but *slower* decoding for tiny models where overhead dominates. Weight-only INT8
+(torchao in eager mode, and the native GPTQ/AWQ/HQQ `PackedLinear` layers, which
+dequantize to float before the matmul) shrinks the **memory** footprint and load
+time but computes in fp32 — expect no speed-up there. Read
+[quantization.md](quantization.md) for the measured table and for how to check
+quality with perplexity instead of vibes.
 
 ## 6. It's using only 1 core / it's using all cores and my laptop throttles
 

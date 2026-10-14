@@ -9,6 +9,7 @@ by the people downloading a broken release.
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import re
 
@@ -52,10 +53,10 @@ def test_version_check_accepts_its_own_tag(version_check):
 
 
 def test_server_has_no_hardcoded_version():
-    source = (REPO_ROOT / "server" / "openai_server.py").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "auralite" / "server" / "openai_server.py").read_text(encoding="utf-8")
     assert not re.search(r'^_AURALITE_VERSION\s*=\s*"', source, re.M)
-    from server.openai_server import _AURALITE_VERSION
-    from model_engine import __version__
+    from auralite.server.openai_server import _AURALITE_VERSION
+    from auralite.engine import __version__
 
     assert _AURALITE_VERSION == __version__
 
@@ -88,6 +89,22 @@ def test_release_workflow_jobs_and_permissions():
     # Nothing publishes before verify/build succeed.
     assert set(jobs["release"]["needs"]) == {"verify", "build"}
     assert jobs["image"]["needs"] == ["verify", "build"]
+
+
+def test_release_artifacts_get_signed_provenance():
+    """2.7.0: SLSA build provenance for the files attached to the Release."""
+    release = WORKFLOWS["release.yml"]["jobs"]["release"]
+    assert release["permissions"] == {"contents": "write", "id-token": "write",
+                                      "attestations": "write"}
+    names = [step.get("uses", "").split("@")[0] for step in release["steps"]]
+    attest = names.index("actions/attest")
+    assert attest < names.index("softprops/action-gh-release")   # attest, then publish
+    assert release["steps"][attest]["with"]["subject-path"] == "dist/*"
+    body = next(step for step in release["steps"]
+                if step.get("uses", "").startswith("softprops/"))["with"]["body"]
+    assert "gh attestation verify" in body
+    assert "vars.PYPI_PUBLISH == 'true'" in body        # PyPI install line once enabled
+    assert "not on PyPI yet" not in body
 
 
 def test_release_workflow_verifies_version_and_gates_on_lint():
@@ -153,7 +170,7 @@ NODE24_MAJORS = {
     "actions/upload-artifact": 6, "actions/download-artifact": 7,
     "docker/setup-buildx-action": 4, "docker/login-action": 4,
     "docker/metadata-action": 6, "docker/build-push-action": 7,
-    "softprops/action-gh-release": 3, "actions/cache": 5,
+    "softprops/action-gh-release": 3, "actions/cache": 5, "actions/attest": 4,
 }
 
 
@@ -176,20 +193,21 @@ def test_gui_coverage_report_reads_json_paths(tmp_path, capsys):
     stores paths relative to each --cov package, so "gui/" never matched."""
     report = _load_script("coverage_report")
     files = {
-        "gui/app.py": {"summary": {"num_statements": 10, "covered_lines": 7}},
-        "gui\\tabs\\model.py": {"summary": {"num_statements": 20, "covered_lines": 5}},
-        "gui/widgets.py": {"summary": {"num_statements": 0, "covered_lines": 0}},
-        "model_engine/model.py": {"summary": {"num_statements": 50, "covered_lines": 1}},
+        "auralite/gui/app.py": {"summary": {"num_statements": 10, "covered_lines": 7}},
+        "auralite\\gui\\tabs\\model.py": {"summary": {"num_statements": 20,
+                                                          "covered_lines": 5}},
+        "auralite/gui/widgets.py": {"summary": {"num_statements": 0, "covered_lines": 0}},
+        "auralite/engine/model.py": {"summary": {"num_statements": 50, "covered_lines": 1}},
     }
-    rows = report.least_covered(files, "gui/", 12)
-    assert [row[0] for row in rows] == ["gui/tabs/model.py", "gui/app.py"]
+    rows = report.least_covered(files, "auralite/gui/", 12)
+    assert [row[0] for row in rows] == ["auralite/gui/tabs/model.py", "auralite/gui/app.py"]
     assert rows[0][3] == pytest.approx(25.0)
 
     path = tmp_path / "coverage.json"
     path.write_text(__import__("json").dumps({"files": files}), encoding="utf-8")
-    assert report.main([str(path), "--prefix", "gui/", "--limit", "1"]) == 0
+    assert report.main([str(path), "--prefix", "auralite/gui/", "--limit", "1"]) == 0
     out = capsys.readouterr().out
-    assert "gui/tabs/model.py" in out and "gui/app.py" not in out
+    assert "auralite/gui/tabs/model.py" in out and "auralite/gui/app.py" not in out
     assert report.main([str(path), "--prefix", "nothing/"]) == 1
 
     step = next(step for step in WORKFLOWS["ci.yml"]["jobs"]["coverage"]["steps"]
@@ -256,9 +274,11 @@ def test_docker_targets_used_by_ci_exist():
 def test_ci_coverage_job_measures_the_user_facing_surface():
     coverage = WORKFLOWS["ci.yml"]["jobs"]["coverage"]
     joined = "\n".join(str(step) for step in coverage["steps"])
-    for package in ("--cov=gui", "--cov=image_engine", "--cov=auralite_cli"):
-        assert package in joined
-    assert "--cov-fail-under=" in joined
+    # 2.7.0: one package, one --cov — the GUI, image engine and CLI included.
+    assert "--cov=auralite " in joined or "--cov=auralite\\" in joined
+    assert "--cov=gui" not in joined and "--cov=model_engine" not in joined
+    gate = re.search(r"--cov-fail-under=(\d+)", joined)
+    assert gate is not None and int(gate.group(1)) >= 80     # 2.7.0 ratchet (was 60)
     assert "import tkinter" in joined      # GUI tests must not silently skip
 
 
@@ -276,13 +296,31 @@ def test_markdown_relative_links_resolve(path):
     assert missing == [], f"{path.name} links to missing files: {missing}"
 
 
+GITHUB_BLOB = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/"
+
+
+def test_pypi_readme_has_only_absolute_links():
+    """README.md is the PyPI project page (2.7.0), where relative links 404.
+
+    Links into this repository use absolute GitHub URLs instead — and each must
+    still point at a file that exists in the checkout.
+    """
+    text = README.read_text(encoding="utf-8")
+    relative = re.findall(r"\]\((?!https?://|#|mailto:)([^)\s]+)\)", text)
+    assert relative == [], f"relative links break on pypi.org: {relative}"
+    targets = re.findall(re.escape(GITHUB_BLOB) + r"([^)#\s]+)", text)
+    assert len(targets) >= 8
+    missing = [t for t in targets if not (REPO_ROOT / t).exists()]
+    assert missing == [], f"README links to missing files: {missing}"
+
+
 def test_readme_advertises_the_documentation_set():
     readme = README.read_text(encoding="utf-8")
     for target in ("docs/quickstart.md", "docs/faq.md", "docs/quantization.md",
                    "README.ru.md"):
         assert target in readme, target
     # The badges must not promise a version the code does not have.
-    from model_engine import __version__
+    from auralite.engine import __version__
 
     assert f"version-{__version__}-orange" in readme
 
@@ -293,7 +331,9 @@ def test_docs_keep_the_honest_claims():
     assert "slower" in faq.lower()
     assert "931" in faq and "798" in faq          # eager vs compiled decode
     quant = (REPO_ROOT / "docs" / "quantization.md").read_text(encoding="utf-8")
-    assert "memory" in quant.lower() and "usually not" in quant.lower()
+    assert "memory" in quant.lower() and "never assume" in quant.lower()
+    # 2.7.0: the measured table keeps the cases where INT8 is slower than fp32
+    assert "0.82×" in quant and "0.68×" in quant and "slower" in quant.lower()
 
 
 def test_scripts_are_executable_and_documented():
@@ -352,10 +392,7 @@ def _matrix_pythons():
 
 
 def test_python_classifiers_match_the_ci_matrix():
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # Python 3.10
-        tomllib = pytest.importorskip("tomli")
+    import tomllib
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     classifiers = project["classifiers"]
     classified = {c.rsplit(" :: ", 1)[1] for c in classifiers
@@ -422,3 +459,86 @@ def test_dockerfile_runtime_images_are_non_root_and_not_editable():
         assert stage.index("print_requirements.py") < stage.index("COPY . "), name
     assert "|| true" not in dockerfile
     assert "llama-cpp-python" not in dockerfile.split("FROM base AS runtime-cuda")[1].split("RUN")[1]
+
+
+# ----------------------------------------------------------------------
+#  2.7.0: PyPI readiness
+# ----------------------------------------------------------------------
+def _readme_quickstart_blocks() -> tuple[str, str]:
+    text = README.read_text(encoding="utf-8")
+    section = text[text.index("## ⚡ Quickstart"):]
+    section = section[:section.index("\n## ", 5)]
+    bash = re.search(r"```bash\n(.*?)```", section, re.S)
+    python = re.search(r"```python\n(.*?)```", section, re.S)
+    assert bash is not None and python is not None, "the quickstart lost a code block"
+    return bash.group(1), python.group(1)
+
+
+def test_readme_quickstart_commands_parse():
+    """Every `auralite …` line of the quickstart is a valid command line."""
+    import shlex
+
+    from auralite.cli import build_parser
+
+    bash, python = _readme_quickstart_blocks()
+    commands = [shlex.split(line.split("#", 1)[0]) for line in bash.splitlines()
+                if line.startswith("auralite ")]
+    assert {argv[1] for argv in commands} >= {"train", "generate", "serve", "export"}
+    parser = build_parser()
+    for argv in commands:
+        parser.parse_args(argv[1:])
+    assert "auralite-gui" in bash and "pip install 'auralite-ai[serve]'" in bash
+    assert "from auralite import AuraLiteEngine" in python
+
+
+def test_project_metadata_is_ready_for_pypi():
+    import tomllib
+
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    urls = project["urls"]
+    assert {"Homepage", "Repository", "Issues", "Changelog", "Documentation"} <= set(urls)
+    for url in urls.values():
+        assert url.startswith("https://github.com/AlexanderNyr/AuraLite-AI"), url
+    for url in (urls["Changelog"], urls["Documentation"]):
+        assert (REPO_ROOT / url.split("/blob/main/", 1)[1]).exists(), url
+    assert project["readme"] == "README.md" and len(project["keywords"]) >= 5
+    assert project["requires-python"] == ">=3.11"
+
+
+# ----------------------------------------------------------------------
+#  2.7.0: the pyright ratchet
+# ----------------------------------------------------------------------
+def _pyright_report(errors: int, version: str = "1.1.414", path: str = "auralite/x.py") -> dict:
+    diags = [{"file": str(REPO_ROOT / path), "severity": "error", "message": "m"}] * errors
+    return {"version": version, "summary": {"errorCount": errors}, "generalDiagnostics": diags}
+
+
+def test_pyright_ratchet_only_goes_down(tmp_path, capsys):
+    ratchet = _load_script("pyright_ratchet")
+    baseline = {"errors": 10, "pyright": "1.1.414"}
+    assert ratchet.check(_pyright_report(10), baseline)[0] == 0
+    code, message = ratchet.check(_pyright_report(9), baseline)
+    assert code == 0 and "--update" in message
+    code, message = ratchet.check(_pyright_report(12), baseline)
+    assert code == 1 and "+2" in message and "auralite/x.py (12)" in message
+    code, message = ratchet.check(_pyright_report(5, version="1.1.999"), baseline)
+    assert code == 1 and "1.1.414" in message          # counts differ between releases
+
+    report = tmp_path / "pyright.json"
+    report.write_text(json.dumps(_pyright_report(7)), encoding="utf-8")
+    base = tmp_path / "baseline.json"
+    assert ratchet.main([str(report), "--baseline", str(base), "--update"]) == 0
+    assert json.loads(base.read_text(encoding="utf-8")) == {"errors": 7, "pyright": "1.1.414"}
+    assert ratchet.main([str(report), "--baseline", str(base)]) == 0
+    capsys.readouterr()
+
+
+def test_ci_runs_the_pinned_pyright_ratchet():
+    lint = WORKFLOWS["ci.yml"]["jobs"]["lint"]
+    runs = "\n".join(step.get("run", "") for step in lint["steps"])
+    assert "pyright || true" not in runs
+    assert "python scripts/pyright_ratchet.py pyright.json" in runs
+    baseline = json.loads((REPO_ROOT / ".github" / "pyright-baseline.json").read_text(
+        encoding="utf-8"))
+    assert f"'pyright=={baseline['pyright']}'" in runs      # CI pins the measured release
+    assert 0 < baseline["errors"] < 362     # 7a60507 had 362 with this pyright: only down

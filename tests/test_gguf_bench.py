@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from model_engine.gguf_proxy import (
+from auralite.engine.gguf_proxy import (
     GGUFNotAvailableError,
     LlamaServerProxy,
     LlamaServerTokenizer,
@@ -191,7 +191,7 @@ def test_proxy_refuses_perplexity_with_an_explanation(proxy):
 
 def test_engine_loads_a_server_url(monkeypatch, server):
     """`load_gguf_model("http://…")` routes generation to the server backend."""
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.load_gguf_model("http://127.0.0.1:8080")
@@ -204,7 +204,7 @@ def test_engine_loads_a_server_url(monkeypatch, server):
 
 
 def test_engine_uses_raw_completion_without_a_template(monkeypatch, server):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     monkeypatch.setattr(FakeServer, "__call__", _no_template_server(FakeServer.__call__))
     engine = AuraLiteEngine()
@@ -228,7 +228,7 @@ def _no_template_server(inner):
 
 
 def test_engine_honours_the_server_env_var(monkeypatch, server):
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     monkeypatch.setenv("AURALITE_LLAMA_SERVER_URL", "http://127.0.0.1:8080")
     engine = AuraLiteEngine()
@@ -328,7 +328,7 @@ def _install_fake_llama(monkeypatch, logprob_per_token: float = -1.0):
         scored = max(1, tokens - 1)
         return logprob_per_token * scored, scored
 
-    monkeypatch.setattr("model_engine.gguf_proxy._gguf_rolling_loglikelihood", fake_rolling)
+    monkeypatch.setattr("auralite.engine.gguf_proxy._gguf_rolling_loglikelihood", fake_rolling)
     return fake_module
 
 
@@ -363,7 +363,7 @@ def test_bench_gguf_perplexity_respects_no_cache(tmp_path, monkeypatch):
 
 
 def test_cli_perplexity_prints_and_uses_the_cache(tmp_path, monkeypatch, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     model = tmp_path / "tiny.gguf"
     model.write_bytes(b"weights")
@@ -385,7 +385,7 @@ def test_cli_perplexity_prints_and_uses_the_cache(tmp_path, monkeypatch, capsys)
 
 
 def test_cli_perplexity_reports_missing_text(tmp_path, monkeypatch, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     monkeypatch.setenv("AURALITE_HOME", str(tmp_path / "home"))
     model = tmp_path / "tiny.gguf"
@@ -396,7 +396,7 @@ def test_cli_perplexity_reports_missing_text(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_perplexity_clears_the_cache(tmp_path, monkeypatch, capsys):
-    from auralite_cli import main
+    from auralite.cli import main
 
     model = tmp_path / "tiny.gguf"
     model.write_bytes(b"weights")
@@ -419,7 +419,7 @@ def test_missing_llama_cpp_points_at_the_prebuilt_wheels(monkeypatch, tmp_path):
     """v2.6.6: a bare `pip install llama-cpp-python` compiles llama.cpp from source."""
     import sys
 
-    from model_engine.gguf_proxy import GGUFModelProxy, GGUFNotAvailableError
+    from auralite.engine.gguf_proxy import GGUFModelProxy, GGUFNotAvailableError
 
     monkeypatch.setitem(sys.modules, "llama_cpp", None)      # import fails like a missing package
     with pytest.raises(GGUFNotAvailableError) as exc:

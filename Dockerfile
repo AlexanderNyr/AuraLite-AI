@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# AuraLite serving images (v2.6.6).
+# AuraLite serving images (2.7.0: the server is `auralite.server.openai_server`).
 #
 #   docker build --target runtime-cpu  -t auralite-ai:cpu  .   # default in CI/releases
 #   docker build --target runtime-cuda -t auralite-ai:cuda .   # docker run --gpus all …
@@ -18,8 +18,13 @@
 ARG PYTHON_VERSION=3.12
 
 FROM python:${PYTHON_VERSION}-slim AS base
+# PIP_ROOT_USER_ACTION: the build stage installs as root on purpose (the runtime
+# user cannot write site-packages); without it every pip call warns about root.
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    AURALITE_HOME=/data
+    PIP_ROOT_USER_ACTION=ignore AURALITE_HOME=/data
+# DL3008: libgomp1 (OpenMP for torch) follows the base image's Debian suite; a
+# pinned version would break the build at the next Debian security update.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 auralite \
@@ -40,7 +45,7 @@ USER auralite
 WORKDIR /data
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" || exit 1
-CMD ["uvicorn", "server.openai_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "auralite.server.openai_server:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # ---------------------------------------------------------------------------
 # CUDA runtime: the default PyPI torch wheel bundles the CUDA libraries
@@ -59,4 +64,4 @@ USER auralite
 WORKDIR /data
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" || exit 1
-CMD ["uvicorn", "server.openai_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "auralite.server.openai_server:app", "--host", "0.0.0.0", "--port", "8000"]

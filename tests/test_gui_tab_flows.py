@@ -303,7 +303,7 @@ class TestTrainingProgress:
 
 class TestTrainingHelpers:
     def test_apply_every_preset(self, app):
-        from gui.common import CONFIG_PRESETS
+        from auralite.gui.common import CONFIG_PRESETS
 
         for name in CONFIG_PRESETS:
             app.preset_var.set(name)
@@ -346,7 +346,7 @@ class TestTrainingHelpers:
 
     def test_loss_plot_uses_matplotlib_when_available(self, tmp_path, monkeypatch):
         """With matplotlib present the tab plots instead of appending text lines."""
-        import gui.tabs.training as training_module
+        import auralite.gui.tabs.training as training_module
         from tests._gui_harness import FakeFigure, make_mock
 
         def prepare():
@@ -405,7 +405,7 @@ class TestGenerationFlow:
         assert gen_app.web_query_row.pack_forget.called
 
     def test_fetch_web_context_uses_the_query_or_the_seed(self, gen_app, monkeypatch):
-        import gui.tabs.generation as generation_module
+        import auralite.gui.tabs.generation as generation_module
 
         calls = []
 
@@ -421,7 +421,7 @@ class TestGenerationFlow:
         assert calls[-1][0] == "typed query"
 
     def test_fetch_web_context_survives_a_search_failure(self, gen_app, monkeypatch):
-        import gui.tabs.generation as generation_module
+        import auralite.gui.tabs.generation as generation_module
 
         def boom(*a, **k):
             raise RuntimeError("offline")
@@ -485,7 +485,7 @@ class TestGenerationFlow:
         assert "✅ ANSWER" in gen_app.result_text.content
 
     def test_thinking_mode_combines_web_context_and_draft(self, gen_app, monkeypatch):
-        import gui.tabs.generation as generation_module
+        import auralite.gui.tabs.generation as generation_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(generation_module, "build_web_context",
@@ -502,7 +502,7 @@ class TestGenerationFlow:
         assert "🧠 THINKING (draft pass)" in content
 
     def test_web_search_only_path_prepends_context(self, gen_app, monkeypatch):
-        import gui.tabs.generation as generation_module
+        import auralite.gui.tabs.generation as generation_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(generation_module, "build_web_context",
@@ -573,7 +573,7 @@ class TestGenerationFlow:
 @pytest.fixture()
 def eval_app(tmp_path, monkeypatch):
     """An app built with `lm-eval` reported available, plus a trained engine."""
-    import evaluation
+    import auralite.evaluation as evaluation
 
     with build_gui_app(tmp_path, monkeypatch,
                        prepare=lambda: monkeypatch.setattr(evaluation, "HAS_LM_EVAL", True)) as app:
@@ -906,7 +906,7 @@ class TestModelTab:
         assert app.engine.model is None
 
     def test_load_model_reports_missing_gguf_support(self, app, tmp_path, monkeypatch):
-        from model_engine import GGUFNotAvailableError
+        from auralite.engine import GGUFNotAvailableError
 
         fake = tmp_path / "model.gguf"
         fake.write_bytes(b"GGUF")
@@ -1018,7 +1018,7 @@ class TestModelTab:
     ])
     def test_hf_load_errors_are_reported(self, app, monkeypatch, error, expected):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        from model_engine import HFNotAvailableError
+        from auralite.engine import HFNotAvailableError
 
         def boom(*a, **k):
             if error == "HFNotAvailableError":
@@ -1261,7 +1261,7 @@ class TestQuantizationTab:
         assert quant_app.q_desc_label.config.call_args.kwargs["text"] == ""
 
     def test_build_quant_config_reads_every_field(self, quant_app):
-        from quantization import QuantMethod
+        from auralite.quantization import QuantMethod
 
         quant_app.q_method_var.set("gptq")
         quant_app.q_bits_var.set("int4")
@@ -1331,7 +1331,7 @@ class TestQuantizationTab:
         assert quant_app.q_save_btn.config.call_args.kwargs["state"] == "disabled"
         assert quant_app.q_revert_btn.config.call_args.kwargs["state"] == "disabled"
 
-        from quantization import QuantResult
+        from auralite.quantization import QuantResult
 
         quant_app._q_original_model = object()
         quant_app._q_last_result = QuantResult(method=None, bits=None)
@@ -1387,7 +1387,7 @@ class TestQuantizationTab:
 
     def test_quantization_failure_is_shown(self, quant_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        import gui.tabs.quantization as quant_module
+        import auralite.gui.tabs.quantization as quant_module
 
         class Exploding:
             def quantize(self, *a, **k):
@@ -1406,8 +1406,8 @@ class TestQuantizationTab:
 
     def test_quantization_errors_inside_the_result_are_listed(self, quant_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        import gui.tabs.quantization as quant_module
-        from quantization import QuantResult
+        import auralite.gui.tabs.quantization as quant_module
+        from auralite.quantization import QuantResult
 
         failed = QuantResult(method=None, bits=None, errors=["layer 3 refused"])
 
@@ -1474,8 +1474,8 @@ class TestQuantizationTab:
 
     def test_benchmark_quantized_uses_the_engine_result(self, quant_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        import gui.tabs.quantization as quant_module
-        from quantization import QuantResult
+        import auralite.gui.tabs.quantization as quant_module
+        from auralite.quantization import QuantResult
 
         result = QuantResult(method=None, bits=None, original_perplexity=30.0,
                              quantized_perplexity=31.25, perplexity_delta=1.25,
@@ -1504,7 +1504,7 @@ class TestQuantizationTab:
 
     def test_compare_all_methods_renders_the_table(self, quant_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        import gui.tabs.quantization as quant_module
+        import auralite.gui.tabs.quantization as quant_module
 
         monkeypatch.setattr(quant_module, "compare_quantizations",
                             lambda *a, **k: ["result-a", "result-b"])
@@ -1526,7 +1526,7 @@ class TestQuantizationTab:
 
     def test_compare_errors_are_reported(self, quant_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
-        import gui.tabs.quantization as quant_module
+        import auralite.gui.tabs.quantization as quant_module
 
         def boom(*a, **k):
             raise RuntimeError("comparison exploded")
@@ -1592,7 +1592,7 @@ class TestImageTab:
         app.img_vars["seed"].set("0")
 
     def test_every_preset_can_be_applied(self, app):
-        from image_engine import IMAGE_PRESETS
+        from auralite.image_engine import IMAGE_PRESETS
 
         assert IMAGE_PRESETS, "no presets to test"
         for name in IMAGE_PRESETS:
@@ -1614,12 +1614,12 @@ class TestImageTab:
         (None, None),
     ])
     def test_int_list_parsing(self, value, expected):
-        from gui.tabs.image import ImageTabMixin
+        from auralite.gui.tabs.image import ImageTabMixin
 
         assert ImageTabMixin._parse_int_list(value) == expected
 
     def test_int_list_rejects_junk(self):
-        from gui.tabs.image import ImageTabMixin
+        from auralite.gui.tabs.image import ImageTabMixin
 
         with pytest.raises(ValueError):
             ImageTabMixin._parse_int_list("junk")
@@ -1710,7 +1710,7 @@ class TestImageTab:
         assert app.image_loss_history == []        # throttled, nothing applied
 
     def test_image_progress_plot_with_matplotlib(self, tmp_path, monkeypatch):
-        import gui.tabs.image as image_module
+        import auralite.gui.tabs.image as image_module
         from tests._gui_harness import FakeFigure, make_mock
 
         def prepare():
@@ -1803,7 +1803,9 @@ class TestImageTab:
         assert target.exists()
         assert "model saved" in app.img_status_label.config.call_args.kwargs["text"]
 
-        app.image_engine = __import__("image_engine").ImageGenEngine()
+        from auralite.image_engine import ImageGenEngine
+
+        app.image_engine = ImageGenEngine()
         app.image_is_trained = False
         with dialog_double("filedialog.askopenfilename", str(target)):
             app.load_image_model()
@@ -1999,7 +2001,7 @@ class TestChatTab:
         chat_app.chat_plot_ax = plot_ax
 
     def test_token_distribution_plot_uses_the_last_reply(self, chat_app, monkeypatch):
-        import gui.visualizations as vis
+        import auralite.gui.visualizations as vis
 
         calls = {}
         monkeypatch.setattr(vis, "plot_token_distribution",
@@ -2024,7 +2026,7 @@ class TestChatTab:
         assert info.called
 
     def test_attention_map_plot_round_trip(self, chat_app, monkeypatch):
-        import gui.visualizations as vis
+        import auralite.gui.visualizations as vis
 
         calls = {}
         monkeypatch.setattr(vis, "plot_attention_heatmap",
@@ -2059,7 +2061,7 @@ class TestChatTab:
         assert warning.called
 
     def test_agent_mode_toggle_without_the_agent_package(self, chat_app, monkeypatch):
-        import gui.tabs.chat as chat_module
+        import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", False)
         warning = sys.modules["tkinter.messagebox"].showwarning
@@ -2072,7 +2074,7 @@ class TestChatTab:
         assert chat_app.agent_mode_var.get() is False
 
     def test_agent_mode_toggle_on_and_off(self, chat_app, monkeypatch):
-        import gui.tabs.chat as chat_module
+        import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
         chat_app.agent_mode_var.set(True)
@@ -2087,7 +2089,7 @@ class TestChatTab:
         assert chat_app._agent is None
 
     def test_agent_message_streams_into_the_chat(self, chat_app, monkeypatch):
-        import gui.tabs.chat as chat_module
+        import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
@@ -2104,7 +2106,7 @@ class TestChatTab:
         assert chat_app.agent_stop_btn.config.call_args.kwargs["state"] == "disabled"
 
     def test_agent_tool_calls_are_logged(self, chat_app, monkeypatch):
-        import gui.tabs.chat as chat_module
+        import auralite.gui.tabs.chat as chat_module
 
         class NoisyAgent(_FakeAgent):
             def __init__(self, engine, **kwargs):
@@ -2124,7 +2126,7 @@ class TestChatTab:
         assert "= 4" in log
 
     def test_agent_errors_are_shown_in_the_chat(self, chat_app, monkeypatch):
-        import gui.tabs.chat as chat_module
+        import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)

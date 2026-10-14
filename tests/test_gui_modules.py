@@ -17,10 +17,10 @@ import time
 
 import pytest
 
-from gui import config as gui_config
-from gui import i18n
-from gui import session as gui_session
-from gui.async_ops import TkAsyncBridge
+from auralite.gui import config as gui_config
+from auralite.gui import i18n
+from auralite.gui import session as gui_session
+from auralite.gui.async_ops import TkAsyncBridge
 
 
 # ----------------------------------------------------------------------
@@ -199,7 +199,7 @@ def test_catalogues_are_in_sync():
 
 
 def test_tab_keys_match_the_app_tab_names():
-    from gui.app import AIApp
+    from auralite.gui.app import AIApp
 
     for name in AIApp._TAB_NAMES:
         assert f"tab.{name}" in i18n.MESSAGES["en"], f"tab.{name} has no label"

@@ -24,7 +24,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from model_engine import AuraLiteEngine  # noqa: E402
+from auralite.engine import AuraLiteEngine  # noqa: E402
 
 DATA = Path(__file__).parent / "data"
 CORPUS = ("the quick brown fox jumps over the lazy dog. "

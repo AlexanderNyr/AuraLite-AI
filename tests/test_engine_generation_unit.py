@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import AuraLiteEngine  # noqa: E402
+from auralite.engine import AuraLiteEngine  # noqa: E402
 
 
 class TinyAlphabetTokenizer:

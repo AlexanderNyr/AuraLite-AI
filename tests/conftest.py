@@ -80,7 +80,7 @@ def _canonical_engine_logging(monkeypatch):
     for every test that happens to run afterwards, which made the suite
     order-dependent.
     """
-    from model_engine.logging_utils import reset_engine_logging
+    from auralite.engine.logging_utils import reset_engine_logging
 
     monkeypatch.delenv("AURALITE_LOG_LEVEL", raising=False)
     reset_engine_logging()
@@ -105,7 +105,7 @@ def tiny_text() -> str:
 @pytest.fixture()
 def tiny_tokenizer(tiny_text):
     """A real char tokenizer trained on tiny_text."""
-    from model_engine import CharTokenizer
+    from auralite.engine import CharTokenizer
     tok = CharTokenizer()
     tok.train(tiny_text)
     return tok
@@ -115,7 +115,7 @@ def tiny_tokenizer(tiny_text):
 def tiny_model():
     """A real ModernTransformer (vocab 48, 2 layers, GQA) in eval mode."""
     import torch
-    from model_engine import ModernTransformer
+    from auralite.engine import ModernTransformer
     model = ModernTransformer(
         vocab_size=48, d_model=32, n_heads=4, n_kv_heads=2,
         n_layers=2, d_ff=64, max_seq_len=32,
@@ -138,7 +138,7 @@ def trained_tiny_engine(tmp_path_factory):
     need a usable engine (generation, chat, quantization, export, …).
     """
     import torch
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
 
     engine = AuraLiteEngine()
     engine.train(TINY_TEXT, {
@@ -167,7 +167,7 @@ def trained_ckpt_path(trained_tiny_engine) -> str:
 @pytest.fixture()
 def fresh_trained_engine(trained_ckpt_path):
     """A separate engine that loads the trained checkpoint from disk."""
-    from model_engine import AuraLiteEngine
+    from auralite.engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(trained_ckpt_path)
     return engine

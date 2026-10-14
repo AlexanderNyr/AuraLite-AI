@@ -1,14 +1,38 @@
 # 🌟 AuraLite AI
 
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.6.6-orange)
-![Coverage](https://img.shields.io/badge/coverage-84%25-green)
+![Version](https://img.shields.io/badge/version-2.7.0-orange)
+![Coverage](https://img.shields.io/badge/coverage-86%25-green)
 
-**English** · [Русская версия](README.ru.md) · [Quickstart](docs/quickstart.md) · [FAQ](docs/faq.md) · [Quantization](docs/quantization.md)
+**English** · [Русская версия](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/README.ru.md) · [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
 
 **AuraLite AI** is a lightweight, educational Large Language Model (LLM) implemented using **PyTorch**. It is designed to demonstrate the inner workings of the Transformer architecture (the foundation of models like GPT-4) in a way that is accessible and runnable on consumer hardware.
+
+## ⚡ Quickstart
+
+```bash
+pip install 'auralite-ai[serve]'     # Python 3.11–3.14 (PyPI from 2.7.0; in a clone: pip install -e '.[serve]')
+auralite train --text corpus.txt --model model.pt
+auralite generate --model model.pt --prompt "Once upon a time" --length 80
+auralite serve --model model.pt      # OpenAI-compatible API on http://127.0.0.1:8000
+auralite export --model model.pt     # model.pt2 — runs with plain PyTorch (torch.export)
+auralite-gui                         # desktop app: train, chat, quantize, evaluate, export
+```
+
+```python
+from auralite import AuraLiteEngine
+
+engine = AuraLiteEngine()
+engine.train(open("corpus.txt", encoding="utf-8").read(), {"epochs": 3})
+print(engine.generate("Once upon a time", length=80))
+```
+
+Everything lives in one package, `auralite` (`auralite.engine`, `auralite.server`,
+`auralite.quantization`, `auralite.export`, …). Extras: `[serve]` server, `[hf]`
+Hugging Face + LoRA, `[export]` ONNX, `[torchao]` future-proof INT8, `[gguf]`
+llama.cpp — see *Installation* below.
 
 
 ## ⚡ v2.6 Modern Training Stack
@@ -55,15 +79,15 @@ graph TD
 - **Hardened GQA KV-cache**: per-layer caches keep unrepeated KV heads, support sliding-window eviction, and optional FP8/INT8 cache storage.
 - **Research architecture flags**: `sliding_window`, `use_moe`, `num_experts`, `use_flex_attention`, `kv_cache_dtype`, `tie_word_embeddings`.
 - **Untied input/output embeddings (default)**: the token embedding (read/context) and the LM head (write/classification) are two mathematically distinct layers, kept as **independent parameters by default**. Sharing one matrix forces it to both cluster synonyms (input) and separate them (output); the opposing gradients partially cancel and slow convergence. Legacy weight tying remains an explicit opt-in via `tie_word_embeddings=True`, `model.tie_weights()` / `model.untie_weights()`.
-- **Refactored imports**: use `model_engine.layers`, `model_engine.model`, `model_engine.dataset`, `model_engine.backends`, etc.; legacy `from model_engine import AuraLiteEngine` still works.
-- **Serving**: `server/openai_server.py` exposes `/v1/completions`, `/v1/chat/completions`, and `/health`.
+- **One package** (2.7.0): everything is importable from `auralite` — `from auralite import AuraLiteEngine`, `auralite.engine.layers`, `auralite.engine.model`, `auralite.server`, … The flat names of 2.6 (`model_engine`, `server`, …) still work inside a source checkout until 2.8, with a `DeprecationWarning`.
+- **Serving**: `auralite/server/openai_server.py` exposes `/v1/completions`, `/v1/chat/completions`, and `/health`.
 - **RAG upgrade**: optional persistent vector store, semantic chunking, HyDE query expansion, and citation-style `[source: ...]` context.
 - **Quantization upgrade**: HQQ, optional FP8, AWQ alpha/clip grid search, Cholesky-stabilized GPTQ.
 
 ### Example: train with modern options
 
 ```python
-from model_engine import AuraLiteEngine
+from auralite import AuraLiteEngine
 
 engine = AuraLiteEngine()
 engine.train(text, {
@@ -86,7 +110,8 @@ engine.save_model("auralite-v24.pt")
 ### Example: serve OpenAI-compatible API
 
 ```bash
-AURALITE_MODEL=auralite-v24.pt uvicorn server.openai_server:app --host 0.0.0.0 --port 8000
+AURALITE_MODEL=auralite-v24.pt uvicorn auralite.server.openai_server:app --host 0.0.0.0 --port 8000
+# or: auralite serve --model auralite-v24.pt
 ```
 
 ## 🚀 Key Features
@@ -141,19 +166,19 @@ Honest status of the features that are easy to over-promise. Everything marked
 | GGUF evaluation | **implemented** | `.gguf` models are scored directly through llama.cpp: perplexity / rolling log-likelihood in `n_ctx-1` windows (`engine.gguf_perplexity`, `gguf_loglikelihood_rolling`). Needs `llama-cpp-python` with `logits_all` support; `evaluation.py` also tries the `lm_eval` llama.cpp backend first. |
 | Checkpoint safety | **implemented** | `.pt` files load with `weights_only=True`; pre-2.6.5 checkpoints work through a scoped numpy allowlist. `.safetensors` (weights + JSON metadata, no pickle) is supported for text and image models. `AURALITE_UNSAFE_LOAD=1` / `allow_unsafe=True` is an explicit opt-in for trusted old files. |
 | Agent tools (`calculate`, sandbox) | **implemented, limited** | `calculate` is an AST whitelist (no `eval`), the sandbox runs in a subprocess with a sanitized environment, resource limits and tree-kill. OS-level isolation is **not** provided — a determined payload can still open sockets (documented limitation). |
-| Quantization backends | **torch.ao (verified) + torchao (opt-in)** | `AURALITE_QUANT_BACKEND=torch.ao` (default) uses the deprecated-but-working `torch.ao.quantization`; `=torchao` routes dynamic INT8 through `torchao.quantization.quantize_`; `=auto` prefers torchao when installed. See `quantization_backends.py`, `auralite info --backends`. |
-| ONNX / TorchScript / Hugging Face export | **opt-in extras** | Requires `onnx`, `onnxruntime`, `transformers`, `peft`. The `optional-deps` CI job installs them and runs the real-model export tests, so these paths are covered. |
+| Quantization backends | **torch.ao + torchao, both tested** | `AURALITE_QUANT_BACKEND=auto` (default, 2.7.0) uses PyTorch's deprecated `torch.ao.quantization` while it exists — its eager CPU INT8 kernels are the fastest (≈1.9× prefill vs fp32; torchao's weight-only INT8 is slower than fp32 without `torch.compile`) — and switches to torchao automatically once it is gone (`pip install 'auralite-ai[torchao]'`). `=torchao` forces INT8 weight-only through `torchao.quantize_` (CI runs it against torchao 0.18). Reported sizes now count the packed INT8 weights: dynamic INT8 used to claim ~20× compression. See `auralite/quantization_backends.py`, `auralite info --backends`, [docs/quantization.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md). |
+| Export: `.pt2` / ONNX / TorchScript / Hugging Face | **implemented** (2.7.0: `torch.export`) | `auralite export --model m.pt` writes a `.pt2` `torch.export` program (dynamic batch and length, tokenizer inside, runs with plain PyTorch). ONNX goes through PyTorch's `torch.export`-based exporter (`pip install -e '.[export]'` brings `onnx`, `onnxruntime`, `onnxscript`); the TorchScript exporter is the fallback for opset < 18. TorchScript export still works but is deprecated, as PyTorch deprecated `torch.jit`. Hugging Face export needs `transformers`/`peft`. The `optional-deps` CI job runs the real ONNX/HF paths with `AURALITE_REQUIRE_INTEGRATIONS=1`, so they cannot pass by skipping; `.pt2` round trips run in every test job. |
 | OpenAI-compatible server | **implemented, single worker** | API-key auth (`AURALITE_API_KEY`, comma-separated keys, constant-time compare), SSE streaming with graceful shutdown, `/metrics` (Prometheus text format). Single worker is deliberate: engine, KV-cache and rate-limiter live in process memory. |
 | Streaming chat text | **implemented** | `generate_chat_streaming()` and `generate_chat()` now produce the same text (leading whitespace of the first piece is trimmed). |
 | Batch generation | **implemented** | Mixed-length prompts are grouped by length, identical prompts are deduplicated (a repeated question costs one forward pass). |
 | Inference speed | **measured** | `auralite info --bench N --bench-modes --bench-compile` reports decode tokens/s, KV-cache bytes/token for fp32/fp16/int8 (same weights, rebuilt model) and eager vs `torch.compile` prefill. CPU measurement (d512/4L/256): decode 1748 tok/s; `torch.compile` ×1.1–1.7 on prefill (B=4 T=64: 40k→58k tok/s), 0.0× on single-token decode — hence decode stays eager, and `--compile` only speeds up prompts. Kernel cache lives in `$AURALITE_HOME/torch_inductor`. |
 | GGUF backends | **implemented** | Two runtimes behind one API: in-process `llama-cpp-python` (tokenisation, generation, perplexity) and a shared `llama-server` (`AURALITE_LLAMA_SERVER_URL` / `load_gguf_model("http://…")`) that keeps one model load per machine. Perplexity is refused on the server backend instead of being approximated, and in-process scores are cached in `$AURALITE_HOME/gguf_ppl_cache.json` (keyed by file identity + n_ctx + corpus hash) — `auralite info --model m.gguf --perplexity --text F`. |
 | Server concurrency | **implemented** | No 503 storm under burst: requests queue for `AURALITE_QUEUE_TIMEOUT` seconds (default 10) on top of the generation-slot semaphore (`AURALITE_MAX_CONCURRENT`, default 4) and only then get `503` + `Retry-After`; `/metrics` exposes the in-flight gauge. |
-| Module layout | **implemented** | `model_engine/_legacy.py` is down to the engine itself; layers/model/dataset/tokenizers/optimizers/scheduler/gguf_proxy/safe_io/logging_utils own their code, `model_engine.X` still resolves every historical name — and `tests/test_module_layout.py` fails if a module turns back into a re-export shim. |
-| GUI code layout | **implemented** | `gui_app.py` is a thin entry point; `gui/app.py` holds the app core and `gui/tabs/*.py` one module per tab (mixins). `python gui_app.py` and `from gui_app import AIApp` keep working. |
-| GUI session & i18n | **implemented** | `gui/config.py` persists settings (`$AURALITE_HOME/gui_config.json`), `gui/session.py` keeps a crash-safe snapshot (atomic write, last corpus/tab/language restored on start, saved on close). UI language: English/Русский (`gui/i18n.py`, switched from the toolbar or `$AURALITE_GUI_LANG`). |
-| GUI insights | **implemented** | Chat tab plots the last reply's token frequencies and this layer's attention map (`engine.token_frequencies()`, `engine.attention_maps()` → `gui/visualizations.py`); visible when matplotlib is installed, hidden with an explanatory label otherwise. |
-| GUI background work | **implemented** | `gui/async_ops.TkAsyncBridge` runs blocking functions/coroutines off the Tk thread and delivers results (or errors) back through `root.after`, and is shut down when the window closes. |
+| Module layout | **implemented** | One import package, `auralite` (2.7.0): the wheel installs nothing else, so no generic top-level names (`server`, `kernels`, …) land in site-packages. `auralite/engine/_legacy.py` is down to the engine itself; layers/model/dataset/tokenizers/optimizers/scheduler/gguf_proxy/safe_io/logging_utils own their code, `auralite.engine.X` resolves every historical name — and `tests/test_module_layout.py` fails if a module turns back into a re-export shim. In a checkout the 2.6 names are deprecated aliases of the same module objects until 2.8 (`auralite/_compat.py`). |
+| GUI code layout | **implemented** | `auralite/gui/app.py` holds the app core and `auralite/gui/tabs/*.py` one module per tab (mixins). Start it with `auralite-gui` (installed) or `python gui_app.py` (checkout); `from gui_app import AIApp` still works until 2.8, with a `DeprecationWarning`. |
+| GUI session & i18n | **implemented** | `auralite/gui/config.py` persists settings (`$AURALITE_HOME/gui_config.json`), `auralite/gui/session.py` keeps a crash-safe snapshot (atomic write, last corpus/tab/language restored on start, saved on close). UI language: English/Русский (`auralite/gui/i18n.py`, switched from the toolbar or `$AURALITE_GUI_LANG`). |
+| GUI insights | **implemented** | Chat tab plots the last reply's token frequencies and this layer's attention map (`engine.token_frequencies()`, `engine.attention_maps()` → `auralite/gui/visualizations.py`); visible when matplotlib is installed, hidden with an explanatory label otherwise. |
+| GUI background work | **implemented** | `auralite/gui/async_ops.TkAsyncBridge` runs blocking functions/coroutines off the Tk thread and delivers results (or errors) back through `root.after`, and is shut down when the window closes. |
 | Library logging | **implemented** | No library module prints any more: the engine logs through the `auralite` logger (sub-loggers `auralite.hf`, `auralite.image`, `auralite.export`, `auralite.webtools`), "[AuraLite] …" wording unchanged, INFO visible by default, `$AURALITE_LOG_LEVEL` respected. The CLI keeps the historical UX by pointing that logger at stdout (`--quiet` → CRITICAL, `--log-level` honoured); the GUI console tab shows the same lines because the handler re-resolves `sys.stderr` on every record. The CLI/eval reports and the benchmarks still print — that is their output. |
 
 ### Diagnostics
@@ -164,20 +189,20 @@ auralite info --model model.pt --bench 128       # tokens/s, weight memory, KV-c
 auralite info --model model.pt --quiet           # no progress/library noise
 auralite train --text corpus.txt --params p.json  # engine logs go to stdout
 AURALITE_LOG_LEVEL=WARNING auralite generate ...  # or silence INFO library lines
-AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 python gui_app.py
+AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 auralite-gui
 ```
 
 ## 📚 Documentation
 
 | File | Contents |
 |---|---|
-| [docs/quickstart.md](docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
-| [docs/faq.md](docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
-| [docs/quantization.md](docs/quantization.md) | every method (dynamic/static INT8, QAT, GPTQ, AWQ, HQQ, half), what it actually buys, GGUF paths |
-| [docs/releasing.md](docs/releasing.md) | for maintainers: tag → verified GitHub Release, GHCR image and (opt-in, tokenless) PyPI upload |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | module map and engine data flow |
-| [CHANGELOG.md](CHANGELOG.md) | what changed in v2.6.5 and why |
-| [README.ru.md](README.ru.md) | то же самое по-русски |
+| [docs/quickstart.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
+| [docs/faq.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
+| [docs/quantization.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md) | every method (dynamic/static INT8, QAT, GPTQ, AWQ, HQQ, half), what it actually buys, GGUF paths |
+| [docs/releasing.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/releasing.md) | for maintainers: tag → verified GitHub Release, GHCR image and (opt-in, tokenless) PyPI upload |
+| [ARCHITECTURE.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/ARCHITECTURE.md) | module map and engine data flow |
+| [CHANGELOG.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/CHANGELOG.md) | what changed in v2.6.5 and why |
+| [README.ru.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/README.ru.md) | то же самое по-русски |
 
 ## 🛠 Technical Specifications
 - **Framework**: PyTorch (Tensors, Autograd, AMP on CUDA, optional `torch.compile`).
@@ -189,7 +214,7 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 python gui_app.p
 ## 📦 Installation & Setup
 
 ### Prerequisites
-- **Python 3.10 – 3.14.** Python 3.10 reached end-of-life on 2026-10-01; AuraLite 2.6.x is the last series that supports it (2.7 will need 3.11+).
+- **Python 3.11 – 3.14.** Python 3.10 reached end-of-life on 2026-10-01; AuraLite 2.6.x was the last series that supported it.
 - **NVIDIA GPU** (optional). No CUDA Toolkit is needed — only the driver: on Linux the default `torch` wheel from PyPI already contains CUDA; on Windows pick the CUDA build on [pytorch.org](https://pytorch.org/get-started/locally/).
 
 ### Install
@@ -201,7 +226,7 @@ pip install -e '.[hf]'        # + Hugging Face models and LoRA fine-tuning (tran
 pip install -e '.[qlora]'     # + 4-/8-bit QLoRA loading (bitsandbytes; not on macOS)
 pip install -e '.[test]'      # + the test suite
 ```
-`pip install -r requirements.txt` installs the same core dependencies without installing the package (enough for `python gui_app.py` from the checkout).
+`pip install -r requirements.txt` installs the same core dependencies without installing the package (enough for `python gui_app.py` from the checkout). An installed AuraLite adds two commands: `auralite` (CLI, also `python -m auralite`) and `auralite-gui` (desktop app, also `python -m auralite.gui`).
 
 ### `.gguf` models (llama.cpp)
 PyPI only has the *source* of `llama-cpp-python`, so a plain `pip install` compiles llama.cpp — minutes of waiting, and an error on Windows without Visual C++ build tools. Use the prebuilt wheels instead:
@@ -227,7 +252,8 @@ The image serves the OpenAI-compatible API on port 8000. It runs as an unprivile
 ## 📖 How to Use
 1. **Launch the App**:
    ```bash
-   python gui_app.py
+   auralite-gui          # installed (pip install -e . or a wheel)
+   python gui_app.py     # straight from a source checkout
    ```
 2. **Use an existing `.gguf` model (optional)**:
    - Open the **💾 Model** tab.

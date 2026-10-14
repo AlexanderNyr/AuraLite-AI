@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-import eval as eval_cli  # noqa: E402
+import auralite.eval as eval_cli  # noqa: E402
 
 
 class SimpleTokenizer:

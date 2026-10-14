@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-import hf_integration  # noqa: E402
-from hf_integration import HFDataset, HFNotAvailableError, HuggingFaceProxy, _check_hf_support  # noqa: E402
+import auralite.hf_integration as hf_integration  # noqa: E402
+from auralite.hf_integration import HFDataset, HFNotAvailableError, HuggingFaceProxy, _check_hf_support  # noqa: E402
 
 
 class Batch(dict):

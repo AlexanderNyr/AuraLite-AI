@@ -8,5 +8,17 @@ coverage.xml
 htmlcov/
 *.egg-info/
 
-# Benchmark output (generated)
+# Benchmark / profiling output (generated). Ignored files also survive
+# `git clean -fd`: benchmarks/profiles/ holds the traces written by
+# auralite.engine.profiling.torch_profile().
 benchmarks/latest_generation.json
+benchmarks/profiles/
+
+# Build output: `python -m build`, build_exe.bat (PyInstaller and its .spec)
+build/
+dist/
+*.spec
+
+# Reports the CI steps write when run locally
+coverage.json
+pyright.json

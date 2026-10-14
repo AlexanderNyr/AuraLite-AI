@@ -6,13 +6,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.6.6"
+version = "2.7.0"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "AuraLite AI contributors"}]
+keywords = ["llm", "transformer", "pytorch", "education", "training", "quantization",
+            "torch-export", "onnx", "openai-api", "gguf"]
 # Keep the Python list in sync with the CI test matrix (tests/test_release.py
 # checks it). No "License ::" classifier: with an SPDX `license` string (PEP 639)
 # setuptools rejects license classifiers.
@@ -24,7 +26,6 @@ classifiers = [
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -38,8 +39,19 @@ dependencies = [
   "matplotlib>=3.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/AlexanderNyr/AuraLite-AI"
+Documentation = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md"
+Repository = "https://github.com/AlexanderNyr/AuraLite-AI"
+Issues = "https://github.com/AlexanderNyr/AuraLite-AI/issues"
+Changelog = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/CHANGELOG.md"
+
 [project.scripts]
-auralite = "auralite_cli:main"
+auralite = "auralite.cli:main"
+
+[project.gui-scripts]
+# Windows: starts without a console window. Same as `python -m auralite.gui`.
+auralite-gui = "auralite.gui.app:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
@@ -48,10 +60,9 @@ test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
         # (StarletteDeprecationWarning in every CI job) and uses httpx2 when it is
         # installed; httpx stays for older Starlette and the importorskip guards.
         "httpx2>=2",
-        # The release/packaging tests parse the workflows and pyproject.toml.
-        # Both used to arrive only by accident (a dev machine with PyYAML;
-        # Python >= 3.11 for tomllib), which broke CI on clean runners.
-        "pyyaml>=6", "tomli>=1.1; python_version < '3.11'",
+        # The release/packaging tests parse the workflows; PyYAML used to arrive
+        # only by accident (a dev machine), which broke CI on clean runners.
+        "pyyaml>=6",
         # tests/test_packaging.py builds a real wheel offline (no isolation).
         "setuptools>=77"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
@@ -67,33 +78,39 @@ gguf = ["llama-cpp-python>=0.3"]
 # quantization.py and the RAG stack uses the built-in hashed embeddings. The
 # unused extras were removed to keep installs honest and small.
 serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30"]
+# Dynamic INT8 once PyTorch drops the deprecated torch.ao.quantization (the `auto`
+# backend switches over by itself); explicit with AURALITE_QUANT_BACKEND=torchao.
+# torchao releases track recent PyTorch versions — see torchao's compatibility table.
+torchao = ["torchao>=0.10"]
 vllm = ["vllm>=0.5; platform_system == 'Linux'"]
 rag = ["sentence-transformers>=3", "faiss-cpu>=1.8"]
 safetensors = ["safetensors>=0.4"]
-export = ["onnx>=1.15", "onnxruntime>=1.17"]
+# onnxscript: torch.onnx.export(dynamo=True), the primary ONNX exporter since 2.7.0
+# (without it AuraLite falls back to the deprecated TorchScript exporter).
+# `.pt2` export (torch.export) needs nothing beyond torch.
+export = ["onnx>=1.15", "onnxruntime>=1.17", "onnxscript>=0.5"]
 # Lower bounds = the oldest stack CI tests for real (integrations job, "minimum").
 hf = ["transformers>=4.46", "peft>=0.13", "accelerate>=1.1"]
 # 4-/8-bit QLoRA loading — the only feature that needs bitsandbytes (2.6.6).
 qlora = ["auralite-ai[hf]", "bitsandbytes>=0.43; platform_system != 'Darwin'"]
 dev = ["auralite-ai[test,lint,full,serve,rag]"]
 
-[tool.setuptools]
-# Flat layout: every top-level runtime module must be listed here explicitly.
-# `auralite_cli` (the `auralite` console script) and `image_engine` (the Image tab)
-# were missing until v2.6.5, so a wheel/sdist install had a dead `auralite`
-# command — invisible in CI because CI uses editable installs. Guarded by
-# tests/test_packaging.py (both directions + a real wheel build).
-py-modules = ["quantization", "quantization_backends", "web_tools", "hf_integration", "chat_interface", "evaluation", "eval", "export", "gui_app",
-              "auralite_cli", "image_engine"]
-packages = ["model_engine", "gui", "gui.tabs", "kernels", "server", "agent"]
+[tool.setuptools.packages.find]
+# 2.7.0: one import package. The flat layout installed 16 top-level names
+# (`model_engine`, `server`, `export`, `kernels`, …) into site-packages, where
+# generic names collide with other distributions — Hugging Face ships `kernels`.
+# The deprecated aliases in the repository root are deliberately not packaged
+# (tests/test_packaging.py builds a wheel and checks its top level is `auralite`).
+include = ["auralite", "auralite.*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-# PEP 561 marker: model_engine ships inline type hints (v2.6.5).
-model_engine = ["py.typed"]
+# PEP 561 marker for the whole package (was model_engine/py.typed until 2.6).
+auralite = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 exclude = [".git", "build", "dist", ".venv"]
 
 [tool.ruff.lint]
@@ -108,11 +125,10 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["."]
-omit = ["tests/*", "setup.py"]
+source = ["auralite"]
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportUnknownMemberType = false

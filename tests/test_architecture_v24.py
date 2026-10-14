@@ -1,7 +1,7 @@
 import pytest
 
 torch = pytest.importorskip("torch")
-from model_engine import Attention, ModernTransformer
+from auralite.engine import Attention, ModernTransformer
 
 
 def test_weight_tying_and_untying_gradient_flow():

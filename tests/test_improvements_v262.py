@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 torch = pytest.importorskip("torch")
 
-from model_engine import AuraLiteEngine
-from model_engine._legacy import BPETokenizer, UNK_TOKEN
+from auralite.engine import AuraLiteEngine
+from auralite.engine._legacy import BPETokenizer, UNK_TOKEN
 
 
 TINY_PARAMS = {
@@ -41,6 +41,20 @@ class TestRepoHygiene:
             content = f.read()
         assert "__pycache__/" in content
         assert "*.py[cod]" in content
+
+    def test_gitignore_covers_generated_output(self):
+        """Generated output must be ignored: it never gets committed by
+        accident, and `git clean -fd` (no -x) leaves ignored files alone."""
+        import inspect
+
+        from auralite.engine.profiling import torch_profile
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            entries = {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+        profiles = inspect.signature(torch_profile).parameters["output_dir"].default
+        assert f"{profiles}/" in entries
+        assert {"build/", "dist/"} <= entries
 
     def test_no_pyc_files_tracked_in_git(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,7 +98,7 @@ class TestSeed:
         assert e1.last_val_loss == pytest.approx(e2.last_val_loss)
 
     def test_negative_seed_rejected(self):
-        from model_engine._legacy import ParamValidationError
+        from auralite.engine._legacy import ParamValidationError
         e = AuraLiteEngine()
         with pytest.raises(ParamValidationError, match="seed"):
             e.train(TEXT, {**TINY_PARAMS, "seed": -1})
@@ -111,7 +125,7 @@ class TestAmpDtype:
         assert e.model is not None
 
     def test_invalid_amp_dtype_rejected(self):
-        from model_engine._legacy import ParamValidationError
+        from auralite.engine._legacy import ParamValidationError
         e = AuraLiteEngine()
         with pytest.raises(ParamValidationError, match="amp_dtype"):
             e.train(TEXT, {**TINY_PARAMS, "amp_dtype": "fp8"})
@@ -308,7 +322,7 @@ class _FakeEngine:
 def client(monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    import server.openai_server as srv
+    import auralite.server.openai_server as srv
     monkeypatch.setattr(srv, "_engine", _FakeEngine())
     monkeypatch.setattr(srv, "_rate_bucket", {})
     return TestClient(srv.app, raise_server_exceptions=False)
@@ -379,7 +393,7 @@ class TestServerV262:
         # Only the 503 is under test, not the default 10-second queue wait.
         monkeypatch.setenv("AURALITE_QUEUE_TIMEOUT", "0.2")
         from fastapi.testclient import TestClient
-        import server.openai_server as srv
+        import auralite.server.openai_server as srv
         srv._engine = _FakeEngine()
         srv._rate_bucket = {}
         old = srv._gen_semaphore
@@ -396,7 +410,7 @@ class TestServerV262:
             srv._rate_bucket = {}
 
     def test_embeddings_endpoint_matches_hash_embedding(self, client):
-        from web_tools import hash_embedding
+        from auralite.web_tools import hash_embedding
         r = client.post("/v1/embeddings", json={"input": "hello world"})
         assert r.status_code == 200
         body = r.json()
@@ -424,7 +438,7 @@ class TestCLI:
         params_file = tmp_path / "params.json"
         params_file.write_text(json.dumps(params), encoding="utf-8")
         out = str(tmp_path / "cli.pt")
-        from auralite_cli import main
+        from auralite.cli import main
         rc = main(["train", "--text", str(text_file),
                    "--params", str(params_file), "--model", out])
         assert rc == 0 and os.path.exists(out)
@@ -436,7 +450,7 @@ class TestCLI:
         assert ck["chat_template"] == "chatml"
 
     def test_generate_via_cli(self, trained_model, capsys):
-        from auralite_cli import main
+        from auralite.cli import main
         # --log-level WARNING: since v2.6.5 the engine logs its progress at INFO
         # and the CLI prints that to stdout (as the old print()s did), which
         # would otherwise end up in the captured output below.
@@ -451,14 +465,14 @@ class TestCLI:
         assert len(out) == len("improvements") + 3
 
     def test_chat_one_shot_via_cli(self, trained_model, capsys):
-        from auralite_cli import main
+        from auralite.cli import main
         rc = main(["chat", "--model", trained_model, "--prompt", "hi",
                    "--length", "2", "--system", "be terse"])
         assert rc == 0
         assert "assistant:" in capsys.readouterr().out
 
     def test_info_via_cli(self, trained_model, capsys):
-        from auralite_cli import main
+        from auralite.cli import main
         rc = main(["info", "--model", trained_model])
         assert rc == 0
         out = capsys.readouterr().out
@@ -466,7 +480,7 @@ class TestCLI:
         assert "tokenizer: char" in out
 
     def test_train_missing_file_fails_cleanly(self, tmp_path):
-        from auralite_cli import main
+        from auralite.cli import main
         rc = main(["train", "--text", str(tmp_path / "nope.txt"),
                    "--model", str(tmp_path / "x.pt")])
         assert rc == 2
@@ -476,7 +490,7 @@ class TestCLI:
         with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as f:
             content = f.read()
         assert "[project.scripts]" in content
-        assert 'auralite = "auralite_cli:main"' in content
-        from auralite_cli import build_parser
+        assert 'auralite = "auralite.cli:main"' in content
+        from auralite.cli import build_parser
         # every subcommand parses
         build_parser().parse_args(["info", "--model", "x.pt"])

@@ -26,7 +26,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         import torch
-        from model_engine import ModernTransformer
+        from auralite.engine import ModernTransformer
     except Exception as e:
         Path(args.out).write_text(json.dumps({"error": str(e)}, indent=2), encoding="utf-8")
         print(f"benchmark skipped: {e}")

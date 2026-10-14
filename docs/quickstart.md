@@ -76,7 +76,8 @@ the engine API. Chat: `auralite chat --model model.pt --system "…" --template 
 
 ```bash
 AURALITE_MODEL=model.pt AURALITE_API_KEY=sk-local \
-  uvicorn server.openai_server:app --host 0.0.0.0 --port 8000
+  uvicorn auralite.server.openai_server:app --host 0.0.0.0 --port 8000
+# the same, through the CLI:  auralite serve --model model.pt --host 0.0.0.0
 ```
 
 ```bash
@@ -102,7 +103,7 @@ and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or
 ## 5. GUI
 
 ```bash
-python gui_app.py
+auralite-gui          # installed; from a source checkout: python gui_app.py
 ```
 
 The GUI covers training (text *and* image diffusion), generation, chat with
@@ -132,6 +133,23 @@ not what the marketing usually claims.
 | `.safetensors` | save/load | yes | Weights + JSON metadata, no pickle. Text and image models. |
 | `.gguf` | no | yes | Inference-only (llama.cpp). Perplexity/cross-entropy scoring supported in-process; `llama-server` mode trades that for shared memory. |
 | Hugging Face | export | via `transformers` | `auralite` export commands / GUI Export tab; needs `.[full]`. |
+
+## Export for deployment
+
+```bash
+auralite export --model model.pt                      # model.pt2 (torch.export), the default
+auralite export --model model.pt --format onnx        # model.onnx (pip install -e '.[export]')
+```
+
+| Format | Runs with | Notes |
+|---|---|---|
+| `.pt2` | plain PyTorch: `torch.export.load("model.pt2").module()(input_ids)` | Recommended. Dynamic batch and length (up to the model's context); the tokenizer travels inside — `auralite.export.load_pt2()` returns `(module, metadata)`. Needs nothing beyond torch. |
+| ONNX | onnxruntime, any ONNX runtime | Exported through `torch.export` (`onnxscript`, in the `export` extra) at opset 18; `--opset 17` or a missing `onnxscript` use the legacy TorchScript exporter. `--onnx-exporter` forces one. |
+| TorchScript | `torch.jit.load` | **Deprecated** — PyTorch deprecated `torch.jit` (warnings since 2.14, unsupported on Python 3.14+). Still available as `--format torchscript`. |
+
+All three export the same function: `input_ids (batch, seq_len) → logits (batch,
+seq_len, vocab)` — the full forward pass without a KV cache. The GUI Export tab
+offers the same formats.
 
 ## Where to look next
 
