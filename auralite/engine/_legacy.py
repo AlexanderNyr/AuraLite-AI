@@ -102,10 +102,13 @@ from auralite.engine.model import (  # noqa: E402,F401
     LoRALayer, ModernTransformer, estimate_n_params,
 )
 from auralite.engine.dataset import CharDataset  # noqa: E402,F401
+from auralite.engine import sampling as _sampling  # noqa: E402
+from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
 from auralite.engine.optimizers import (  # noqa: E402,F401
     Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
     split_parameters_for_muon,
+    adamw_param_groups,
 )
 from auralite.engine.gguf_proxy import (  # noqa: E402,F401
     is_gguf_like,
@@ -225,6 +228,12 @@ def validate_params(params: dict) -> list[str]:
         errors.append(f"val_split must be in [0, 1), got {val_split}")
     if accumulation_steps < 1:
         errors.append(f"accumulation_steps must be >= 1, got {accumulation_steps}")
+    max_steps = params.get("max_steps", 0)
+    try:
+        if max_steps is not None and int(max_steps) < 0:
+            errors.append(f"max_steps must be >= 0 (0 = no limit), got {max_steps}")
+    except (TypeError, ValueError):
+        errors.append(f"max_steps must be an integer, got {max_steps!r}")
 
     # Gradient checkpointing validation
     if use_gradient_checkpointing and not isinstance(use_gradient_checkpointing, bool):
@@ -505,6 +514,76 @@ _SDPA_GQA_SUPPORTED: bool | None = None
 #  Engine
 # ===================================================================
 
+class _DraftSession:
+    """A draft model with a persistent KV cache, for speculative decoding (2.8).
+
+    Each round it rolls its cache back to the longest prefix it shares with the
+    target's tokens, feeds only the new tokens, and proposes `k` greedy tokens.
+    The 2.7 loop re-ran the draft over the whole context for every proposal.
+    """
+
+    def __init__(self, engine, capacity: int):
+        self.engine = engine
+        self.model = engine.model
+        self.model.eval()
+        self.cached: list[int] = []
+        self.supported = callable(getattr(self.model, "truncate_cache", None))
+        try:
+            self.model.reset_cache(capacity=capacity)
+        except TypeError:
+            self.model.reset_cache()
+
+    def _step(self, tokens: list[int], start: int) -> torch.Tensor:
+        t = torch.tensor([tokens], dtype=torch.long, device=self.engine.device)
+        logits = self.engine._infer(t, start_pos=start, use_cache=True, logits_to_keep=1)
+        return logits[0, -1]
+
+    def propose(self, ids: list[int], k: int) -> list[int]:
+        if k <= 0 or not ids:
+            return []
+        if not self.supported:          # foreign draft model: stateless, as in 2.7
+            try:
+                out = self.engine._generate_ids(ids, k, temperature=0.0, top_k=1)
+                return list(out[len(ids):len(ids) + k])
+            except Exception:
+                return []
+        try:
+            common = 0
+            limit = min(len(self.cached), len(ids))
+            while common < limit and self.cached[common] == ids[common]:
+                common += 1
+            if common == len(ids):      # nothing new to feed: re-feed the last token
+                common -= 1
+            if common < len(self.cached):
+                self.model.truncate_cache(common)
+                self.cached = self.cached[:common]
+            logits = self._step(ids[common:], common)
+            self.cached = list(ids)
+            proposals: list[int] = []
+            for i in range(k):
+                tok = int(torch.argmax(logits).item())
+                proposals.append(tok)
+                if i == k - 1:
+                    break
+                logits = self._step([tok], len(self.cached))
+                self.cached.append(tok)
+            return proposals
+        except Exception:               # a draft failure must never break decoding
+            self.cached = []
+            try:
+                self.model.reset_cache()
+            except Exception:
+                pass
+            return []
+
+    def close(self) -> None:
+        try:
+            self.model.reset_cache()
+        except Exception:
+            pass
+        self.cached = []
+
+
 class AuraLiteEngine:
     """Modern training & inference engine for AuraLite AI v2.1.
 
@@ -641,6 +720,9 @@ class AuraLiteEngine:
         chat_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stop_tokens: Optional[List[str]] = None,
+        *,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
     ) -> str:
         """
         Generate a response in chat/instruction mode.
@@ -687,7 +769,7 @@ class AuraLiteEngine:
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    repeat_penalty=repetition_penalty,
+                    repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty),
                     min_p=min_p,
                     stream=False,
                     stop=stop_strs,
@@ -703,6 +785,7 @@ class AuraLiteEngine:
                 full = self._gguf_generate_text(
                     prompt, max_new_tokens, temperature, top_k, top_p,
                     repetition_penalty, min_p, stop=stop_strs,
+                    presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                 )
                 return self._truncate_at_stop(full[len(prompt):], stop_strs).strip()
 
@@ -728,6 +811,8 @@ class AuraLiteEngine:
                 ids, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p=min_p,
                 stop_token_ids=self._stop_token_ids(stop_strs),
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
             )
             # Return only the newly generated part (token-based slice),
             # cut at the first stop marker (incl. multi-token ones).
@@ -747,6 +832,9 @@ class AuraLiteEngine:
         chat_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stop_tokens: Optional[List[str]] = None,
+        *,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
     ) -> Iterator[str]:
         """
         Streaming version of generate_chat — yields text pieces one by one.
@@ -766,7 +854,8 @@ class AuraLiteEngine:
         for piece in self._generate_chat_streaming_raw(
                 messages, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p, chat_template, system_prompt,
-                stop_tokens):
+                stop_tokens, presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty):
             if not piece:
                 continue
             if not started:
@@ -793,6 +882,9 @@ class AuraLiteEngine:
         chat_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stop_tokens: Optional[List[str]] = None,
+        *,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
     ) -> Iterator[str]:
         """Unprocessed streaming implementation (see generate_chat_streaming)."""
         if not HAS_CHAT_SUPPORT:
@@ -849,7 +941,7 @@ class AuraLiteEngine:
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    repeat_penalty=repetition_penalty,
+                    repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty),
                     min_p=min_p,
                     stream=True,
                     stop=stop_strs,
@@ -903,52 +995,27 @@ class AuraLiteEngine:
                 yield self._truncate_at_stop(text, stop_strs)
             return
 
-        # Native AuraLite streaming
+        # Native AuraLite streaming (the shared decode loop, 2.8)
         ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
         stop_ids = self._stop_token_ids(stop_strs)
-        self.model.eval()
-        self.model.reset_cache()
-
-        result_ids = list(ids)
         if max_new_tokens <= 0:
             return
-
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
         hit_stop = False
-        with torch.inference_mode():
-            # Process prompt
-            t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self._infer(t, start_pos=0, use_cache=True)
-            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids, min_p=min_p)
-            result_ids.append(nxt)
-            if nxt in stop_ids:
-                hit_stop = True
-            else:
-                out, hit_stop = _consume(self.decode([nxt]))
-                if out:
-                    yield out
-
-            hard_cap = max(self.model.max_seq_len + max_new_tokens, self.model.max_seq_len * 4, 8192)
-
-            for _ in range(max_new_tokens - 1):
-                if hit_stop:
-                    break
-                pos = len(result_ids) - 1
-                if pos + 1 >= hard_cap:
-                    break
-                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self._infer(t, start_pos=pos, use_cache=True)
-                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids, min_p=min_p)
-                result_ids.append(nxt)
+        tokens = self._iter_token_ids(ids, max_new_tokens, sp)
+        try:
+            for nxt in tokens:
                 if nxt in stop_ids:
                     hit_stop = True
                     break
                 out, hit_stop = _consume(self.decode([nxt]))
                 if out:
                     yield out
-
-        self.model.reset_cache()
+                if hit_stop:
+                    break
+        finally:
+            tokens.close()      # frees the KV cache now, not at garbage collection
         if not hit_stop and text_buffer:
             yield text_buffer
 
@@ -1325,12 +1392,23 @@ class AuraLiteEngine:
             raise ValueError("gguf_loglikelihood_rolling() requires a loaded .gguf model.")
         return self.model.loglikelihood_rolling(text)
 
+    @staticmethod
+    def _gguf_penalty_kwargs(presence_penalty: float = 0.0,
+                             frequency_penalty: float = 0.0) -> dict:
+        """llama.cpp's presence/frequency penalties, only when requested."""
+        if not (presence_penalty or frequency_penalty):
+            return {}
+        return {"presence_penalty": float(presence_penalty),
+                "frequency_penalty": float(frequency_penalty)}
+
     def _gguf_generate_text(self, prompt: str, length: int = 50,
                             temperature: float = 0.8,
                             top_k: int = 50, top_p: float = 0.9,
                             repetition_penalty: float = 1.0,
                             min_p: float = 0.0,
-                            stop: list[str] | None = None) -> str:
+                            stop: list[str] | None = None, *,
+                            presence_penalty: float = 0.0,
+                            frequency_penalty: float = 0.0) -> str:
         if not is_gguf_like(self.model):
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
@@ -1338,7 +1416,7 @@ class AuraLiteEngine:
                 self._gguf_prompt_messages(prompt),
                 max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
-                repeat_penalty=repetition_penalty, stream=False,
+                repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=False,
                 stop=stop,
             )
             try:
@@ -1349,7 +1427,7 @@ class AuraLiteEngine:
             out = self.model.create_completion(
                 prompt, max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
-                repeat_penalty=repetition_penalty, stream=False,
+                repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=False,
                 stop=stop,
             )
             try:
@@ -1385,9 +1463,42 @@ class AuraLiteEngine:
         """
         compiled = self._compiled_inference_model
         x = args[0] if args else kwargs.get("x")
+        keep = kwargs.pop("logits_to_keep", None)
+        if keep is not None and self._accepts_logits_to_keep():
+            kwargs["logits_to_keep"] = keep
+            keep = None
         if compiled is not None and getattr(x, "ndim", 0) >= 2 and x.shape[1] > 1:
-            return compiled(*args, **kwargs)
-        return self.model(*args, **kwargs)
+            out = compiled(*args, **kwargs)
+        else:
+            out = self.model(*args, **kwargs)
+        if keep is not None and out.ndim == 3 and out.shape[1] > keep:
+            out = out[:, -int(keep):]           # model without the 2.8 argument
+        return out
+
+    def _accepts_logits_to_keep(self) -> bool:
+        """Does the loaded model's forward take `logits_to_keep` (2.8)?"""
+        model = getattr(self.model, "_orig_mod", self.model)
+        cached = getattr(self, "_ltk_support", None)
+        if cached is not None and cached[0] is model:
+            return cached[1]
+        try:
+            import inspect
+            ok = "logits_to_keep" in inspect.signature(model.forward).parameters
+        except (TypeError, ValueError, AttributeError):
+            ok = False
+        self._ltk_support = (model, ok)
+        return ok
+
+    def _reset_model_cache(self, model=None, capacity: int | None = None) -> None:
+        """reset_cache(capacity=…) when the model supports preallocation."""
+        model = self.model if model is None else model
+        if capacity:
+            try:
+                model.reset_cache(capacity=capacity)
+                return
+            except TypeError:          # a model without the 2.8 signature
+                pass
+        model.reset_cache()
 
     def enable_inference_compile(self, mode: str = "default",
                                  warmup_tokens: int = 2) -> float:
@@ -1535,7 +1646,16 @@ class AuraLiteEngine:
         arch = self._model_arch_kwargs(model)
         head_dim = arch["d_model"] // arch["n_heads"]
         kv_heads = arch["n_kv_heads"] or arch["n_heads"]
-        bytes_per_element = {"fp32": 4, "fp16": 2, "bf16": 2, "int8": 1}
+
+        def kv_bytes_per_token(spec: str | None) -> int:
+            # Measured on the real storage (2.8): int8/fp8 include their
+            # per-(token, head) scales, fp16/bf16 really are 2 bytes.
+            from auralite.engine.kv_cache import KVCache
+            probe = torch.zeros(1, kv_heads, 1, head_dim)
+            cache = KVCache(spec)
+            cache.append(probe, probe, start_pos=0)
+            return cache.bytes_per_token() * arch["n_layers"]
+
         state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         original = self.model
         results: list[dict] = []
@@ -1558,8 +1678,8 @@ class AuraLiteEngine:
                     "mode": f"kv={mode_key}",
                     "tokens_per_sec": max(speeds) if repeats > 1 else speeds[0],
                     "seconds": tokens / (max(speeds) if repeats > 1 else speeds[0]),
-                    "kv_bytes_per_token": (bytes_per_element.get(mode_key, 4)
-                                           * 2 * arch["n_layers"] * kv_heads * head_dim),
+                    "kv_bytes_per_token": kv_bytes_per_token(
+                        None if mode_key == "fp32" else mode_key),
                     "notes": "",
                 })
             if include_compile:
@@ -1577,7 +1697,7 @@ class AuraLiteEngine:
                     "mode": "kv=fp32+compile",
                     "tokens_per_sec": best,
                     "seconds": tokens / best,
-                    "kv_bytes_per_token": bytes_per_element["fp32"] * 2 * arch["n_layers"] * kv_heads * head_dim,
+                    "kv_bytes_per_token": kv_bytes_per_token(None),
                     "notes": f"compile={compile_seconds:.1f}s (cached for later runs)",
                 })
         finally:
@@ -1711,56 +1831,99 @@ class AuraLiteEngine:
             ids = ids[-max_prompt_tokens:]
         return ids
 
+    @staticmethod
+    def _sampling_params(temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9,
+                         repetition_penalty: float = 1.0, min_p: float = 0.0,
+                         presence_penalty: float = 0.0,
+                         frequency_penalty: float = 0.0) -> SamplingParams:
+        return SamplingParams(
+            temperature=float(temperature), top_k=int(top_k or 0), top_p=float(top_p),
+            repetition_penalty=float(repetition_penalty or 1.0), min_p=float(min_p or 0.0),
+            presence_penalty=float(presence_penalty or 0.0),
+            frequency_penalty=float(frequency_penalty or 0.0))
+
+    def _hard_cap(self, length: int) -> int:
+        # Safety cap on total sequence length (bounds KV-cache growth). The
+        # trained max_seq_len is NOT a hard stop — RoPE extends its buffers.
+        return max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
+
+    def _claim_cache(self) -> object:
+        """Mark the model's KV cache as owned by a new generation (2.8).
+
+        A suspended stream that is closed later may only free the cache if no
+        other generation has claimed it in the meantime.
+        """
+        token = object()
+        self._decode_owner = token
+        return token
+
+    def _release_cache(self, token: object, model=None) -> None:
+        if getattr(self, "_decode_owner", None) is token:
+            (self.model if model is None else model).reset_cache()
+            self._decode_owner = None
+
+    def _iter_token_ids(self, ids: list[int], length: int, sp: SamplingParams,
+                        stop_token_ids: set[int] | None = None) -> Iterator[int]:
+        """The decode loop every native generation path shares (2.8).
+
+        Yields each newly sampled id (a stop token is yielded, then the loop
+        ends). One prefill over the prompt computes logits for the last
+        position only, the KV cache is preallocated for prompt + `length`, and
+        each further step feeds one token. 2.7 had four copies of this loop.
+
+        Inference mode is entered per step, not across `yield`: a suspended
+        generator must not leave the caller's thread in inference mode.
+        """
+        if self.model is None:
+            raise ValueError("Train or load a model first!")
+        if length <= 0:
+            return
+        model = self.model
+        model.eval()
+        hard_cap = self._hard_cap(length)
+        stop = stop_token_ids or set()
+        history = list(ids)
+        owner = self._claim_cache()
+        self._reset_model_cache(model, capacity=min(len(ids) + length, hard_cap))
+        try:
+            with torch.inference_mode():
+                t = torch.tensor([ids], dtype=torch.long, device=self.device)
+                logits = self._infer(t, start_pos=0, use_cache=True, logits_to_keep=1)
+                nxt = self._sample_with(logits[0, -1], sp, history)
+            history.append(nxt)
+            yield nxt
+            if nxt in stop:
+                return
+            for _ in range(length - 1):
+                pos = len(history) - 1
+                if pos + 1 >= hard_cap:
+                    break
+                with torch.inference_mode():
+                    t = torch.tensor([[nxt]], dtype=torch.long, device=self.device)
+                    logits = self._infer(t, start_pos=pos, use_cache=True)
+                    nxt = self._sample_with(logits[0, -1], sp, history)
+                history.append(nxt)
+                yield nxt
+                if nxt in stop:
+                    return
+        finally:
+            # Only the generation that owns the cache may drop it: a stream the
+            # client abandoned can be closed after a newer generation started.
+            self._release_cache(owner, model)
+
     def _generate_ids(self, ids: list[int], length: int = 50,
                       temperature: float = 0.8,
                       top_k: int = 50, top_p: float = 0.9,
                       repetition_penalty: float = 1.0,
                       min_p: float = 0.0,
-                      stop_token_ids: set[int] | None = None) -> list[int]:
+                      stop_token_ids: set[int] | None = None,
+                      *, presence_penalty: float = 0.0,
+                      frequency_penalty: float = 0.0) -> list[int]:
         if self.model is None:
             raise ValueError("Train or load a model first!")
-
-        self.model.eval()
-        self.model.reset_cache()
-
-        result_ids: list[int] = list(ids)
-        if length <= 0:
-            return result_ids
-
-        # Hard safety cap on total sequence length to prevent unbounded
-        # KV-cache growth. Trained max_seq_len is NOT a hard stop — RoPE
-        # auto-extends its rotary buffers and extrapolates.
-        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
-        stop_token_ids = stop_token_ids or set()
-
-        with torch.inference_mode():
-            # --- Process full seed in one pass --------------------------
-            t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self._infer(t, start_pos=0, use_cache=True)
-            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids, min_p=min_p)
-            result_ids.append(nxt)
-            if nxt in stop_token_ids:
-                self.model.reset_cache()
-                return result_ids
-
-            # --- Generate remaining tokens one-by-one (KV-cache) --------
-            for _ in range(length - 1):
-                pos = len(result_ids) - 1
-                # Safety cap instead of hard stop at training window — RoPE
-                # auto-extends its buffers and extrapolates beyond max_seq_len.
-                if pos + 1 >= hard_cap:
-                    break
-                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self._infer(t, start_pos=pos, use_cache=True)
-                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids, min_p=min_p)
-                result_ids.append(nxt)
-                if nxt in stop_token_ids:
-                    break
-
-        self.model.reset_cache()
-        return result_ids
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        return list(ids) + list(self._iter_token_ids(list(ids), length, sp, stop_token_ids))
 
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
@@ -1875,6 +2038,8 @@ class AuraLiteEngine:
           autosave_path    : where to autosave (default "aura_autosave.pt")
           continue_training: keep existing model/tokenizer and fine-tune (default False)
           accumulation_steps: gradient accumulation (default 1, no accumulation)
+          max_steps        : stop after N optimizer steps (default 0 = no limit);
+                             the LR schedule is sized to the budget (2.8)
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
@@ -1965,7 +2130,11 @@ class AuraLiteEngine:
         autosave_every_steps = params.get("autosave_every_steps", 0)
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
-        accumulation_steps = params.get("accumulation_steps", 1)
+        accumulation_steps = max(1, int(params.get("accumulation_steps", 1) or 1))
+        # 2.8: a budget in optimizer steps (0 = no limit). With sliding-window
+        # samples an "epoch" is (tokens - seq_length) windows, so a fixed step
+        # budget is the practical way to bound a run.
+        max_steps = max(0, int(params.get("max_steps", 0) or 0))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
         resume_training_state = params.get("resume_training_state", True)
@@ -2090,7 +2259,9 @@ class AuraLiteEngine:
                     "on large corpora this may take a few minutes",
                     0.08,
                 )
-                self.tokenizer = BPETokenizer()
+                # 2.8: GPT-style pre-tokenization by default; "ws" = 2.7 behaviour
+                self.tokenizer = BPETokenizer(
+                    pretokenizer=str(params.get("bpe_pretokenizer", "gpt")))
                 # IMPROVED: stratified sampling instead of prefix
                 self.tokenizer.train(training_text, vocab_size=bpe_vocab)
             else:
@@ -2188,10 +2359,23 @@ class AuraLiteEngine:
                             f"AdamW ({len(adam_decay_params) + len(adam_no_decay_params)} params, lr={lr})")
 
         if optimizer_name != "muon":
-            self.optimizer = optim.AdamW(
-                self.model.parameters(), lr=lr,
-                weight_decay=weight_decay, betas=(0.9, 0.95),
-            )
+            single_group_state = (
+                isinstance(optimizer_state_to_restore, dict)
+                and len(optimizer_state_to_restore.get("param_groups", [])) == 1)
+            if single_group_state:
+                # Resuming a 2.7 optimizer state (one group): keep its layout so
+                # the Adam moments carry over exactly.
+                self.optimizer = optim.AdamW(
+                    self.model.parameters(), lr=lr,
+                    weight_decay=weight_decay, betas=(0.9, 0.95),
+                )
+            else:
+                # 2.8: weight decay on the weight matrices only (no norm gains,
+                # embeddings or biases), as the Muon path already did.
+                self.optimizer = optim.AdamW(
+                    adamw_param_groups(self.model, weight_decay), lr=lr,
+                    betas=(0.9, 0.95),
+                )
         self.optimizer_name = optimizer_name
         if optimizer_state_to_restore is not None:
             try:
@@ -2365,7 +2549,13 @@ class AuraLiteEngine:
                                f"(val slice has {total_tokens - split_at} tokens, need > "
                                f"{seq_length}). Validation DISABLED.")
 
-        total_steps  = epochs * len(loader)
+        # Scheduler steps = optimizer steps. 2.7 counted *batches*, so with
+        # accumulation_steps=N the schedule only reached 1/N of its length:
+        # WSD never decayed and cosine stopped at a high LR.
+        opt_steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
+        total_steps  = epochs * opt_steps_per_epoch
+        if max_steps:
+            total_steps = min(total_steps, max_steps)
         warmup_steps = min(200, total_steps // 10)
         # v2.6: WSD (Warmup-Stable-Decay) is the default schedule — it matches
         # or beats cosine convergence and supports branching decay runs from
@@ -2473,6 +2663,8 @@ class AuraLiteEngine:
 
         last_report_t = 0.0
         completed_batches_total = 0
+        run_opt_steps = 0           # optimizer steps taken in this run (max_steps)
+        budget_done = False
 
         for epoch in range(epochs):
             if train_sampler is not None:
@@ -2520,6 +2712,7 @@ class AuraLiteEngine:
                     self._scaler_step_optimizer()
                     self.scaler.update()
                     self.scheduler.step()
+                    run_opt_steps += 1
                     if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
                         try:
                             self.save_model(autosave_path)
@@ -2529,6 +2722,8 @@ class AuraLiteEngine:
                 running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
                 completed_batches_total += 1
+                if max_steps and run_opt_steps >= max_steps:
+                    budget_done = True
 
                 # ---- Live batch progress (between epochs) ----------------
                 if report_rank_ok and progress_callback is not None:
@@ -2580,6 +2775,9 @@ class AuraLiteEngine:
                             },
                         )
 
+                if budget_done:
+                    break
+
             if stopped_mid:
                 # Final status for interrupted epoch
                 if report_rank_ok and seen_batches > 0:
@@ -2602,12 +2800,13 @@ class AuraLiteEngine:
                 break
 
             # Handle remaining accumulated gradients
-            if seen_batches > 0 and (batch_idx + 1) % accumulation_steps != 0:
+            if seen_batches > 0 and not budget_done and (batch_idx + 1) % accumulation_steps != 0:
                 self._scaler_unscale_optimizer()
                 nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 self._scaler_step_optimizer()
                 self.scaler.update()
                 self.scheduler.step()
+                run_opt_steps += 1
                 if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
                     try:
                         self.save_model(autosave_path)
@@ -2671,6 +2870,11 @@ class AuraLiteEngine:
                         "epoch_seconds": epoch_dur,
                     },
                 )
+
+            if budget_done:
+                logger.info(f"[AuraLite] max_steps={max_steps} reached "
+                            f"(epoch {epoch + 1}/{epochs}); training stops.")
+                break
 
     def compile_for_inference(self, mode: str = "reduce-overhead") -> bool:
         """Compile the native torch model for low-latency inference.
@@ -2753,7 +2957,12 @@ class AuraLiteEngine:
 
     def _propose_draft_model(self, draft_engine, ids: list[int],
                              max_proposals: int) -> list[int]:
-        """Greedy proposal from a small draft model with the same vocabulary."""
+        """Greedy proposal from a small draft model with the same vocabulary.
+
+        Stateless variant (one full draft pass); the speculative loop itself
+        uses :class:`_DraftSession`, which keeps the draft's KV cache between
+        rounds.
+        """
         try:
             out = draft_engine._generate_ids(ids, max_proposals, temperature=0.0, top_k=1)
             return list(out[len(ids):len(ids) + max_proposals])
@@ -2782,7 +2991,9 @@ class AuraLiteEngine:
                                   repetition_penalty: float, min_p: float,
                                   draft_engine=None, draft_tokens: int = 4,
                                   stop_token_ids: set[int] | None = None,
-                                  stats: dict | None = None) -> list[int]:
+                                  stats: dict | None = None, *,
+                                  presence_penalty: float = 0.0,
+                                  frequency_penalty: float = 0.0) -> list[int]:
         """Exact speculative decoding loop (shared by both draft sources).
 
         Verification is exact for *any* temperature: each proposal is treated as
@@ -2790,93 +3001,115 @@ class AuraLiteEngine:
         and replaced by a draw from the residual distribution on rejection — so
         the sampled sequence follows the same law as normal generation, while
         accepted tokens cost one batch forward instead of one forward each.
+
+        2.8: a rejected draft token rolls the KV cache back
+        (``truncate_cache``) instead of re-running the model over the whole
+        prefix, and a draft model keeps its own cache across rounds instead of
+        re-reading the full context for every proposal. ``stats`` reports
+        ``rollbacks``; ``cache_resets`` (full re-prefills) stays 0 unless the
+        model cannot truncate its cache.
         """
         model = self.model
         model.eval()
-        model.reset_cache()
         result_ids = list(ids)
         if length <= 0:
             return result_ids
 
-        hard_cap = max(model.max_seq_len + length, model.max_seq_len * 4, 8192)
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        hard_cap = self._hard_cap(length)
         stop = set(stop_token_ids or ())
-        n_drafted = n_accepted = n_resets = 0
+        can_truncate = callable(getattr(model, "truncate_cache", None))
+        n_drafted = n_accepted = n_resets = n_rollbacks = 0
+        draft = (_DraftSession(draft_engine, len(ids) + length + draft_tokens + 1)
+                 if draft_engine is not None else None)
 
-        def _finish():
+        def _forward(tokens: list[int], start: int, keep: int | None = None) -> torch.Tensor:
+            t = torch.tensor([tokens], dtype=torch.long, device=self.device)
+            return self._infer(t, start_pos=start, use_cache=True, logits_to_keep=keep)
+
+        def _rollback(end: int) -> None:
+            """Cache must hold exactly result_ids[:end] afterwards."""
+            nonlocal n_resets, n_rollbacks
+            if can_truncate:
+                try:
+                    model.truncate_cache(end)
+                    n_rollbacks += 1
+                    return
+                except ValueError:
+                    # A sliding-window cache already dropped the history this
+                    # rollback needs (drafts longer than its slack): re-prefill.
+                    pass
+            n_resets += 1                       # 2.7 path (foreign models)
             model.reset_cache()
+            if end:
+                _forward(result_ids[:end], 0, keep=1)
+
+        owner = self._claim_cache()
+        self._reset_model_cache(model, capacity=min(len(ids) + length + draft_tokens + 1,
+                                                    hard_cap + draft_tokens))
+        try:
+            with torch.inference_mode():
+                pending = _forward(result_ids, 0, keep=1)[0, -1]
+                while len(result_ids) - len(ids) < length:
+                    if len(result_ids) + 1 >= hard_cap:
+                        break
+                    # Never draft more than the remaining budget: a fully accepted
+                    # batch must not overshoot `length` by an extra token.
+                    remaining = length - (len(result_ids) - len(ids))
+                    if draft is not None:
+                        proposals = draft.propose(result_ids, draft_tokens)
+                    else:
+                        proposals = self._propose_prompt_lookup(result_ids, draft_tokens)
+                    proposals = [int(t) for t in proposals if 0 <= int(t) < self.vocab_size
+                                 and int(t) not in stop][:max(0, min(draft_tokens, remaining))]
+
+                    if not proposals:
+                        # No draft available → ordinary single-token step.
+                        nxt = self._sample_with(pending, sp, result_ids)
+                        result_ids.append(nxt)
+                        if nxt in stop:
+                            break
+                        pending = _forward([nxt], len(result_ids) - 1)[0, -1]
+                        continue
+
+                    n_drafted += len(proposals)
+                    base = len(result_ids)
+                    verif = _forward(proposals, base)   # cache: result_ids + proposals
+                    rejected_at = None
+                    for i, tok in enumerate(proposals):
+                        step_logits = pending if i == 0 else verif[0, i - 1]
+                        filtered = self._filter_with(step_logits, sp, result_ids)
+                        probs = torch.softmax(filtered, dim=-1)
+                        p_tok = float(probs[tok].item()) if torch.isfinite(probs[tok]) else 0.0
+                        if torch.rand(1).item() < p_tok:
+                            result_ids.append(tok)
+                            n_accepted += 1
+                        else:
+                            result_ids.append(self._sample_corrected_token(filtered, tok))
+                            rejected_at = i
+                            break
+
+                    if rejected_at is None:
+                        pending = verif[0, len(proposals) - 1]
+                        continue
+                    corrected = result_ids[-1]
+                    if corrected in stop:
+                        break
+                    # Keep the accepted drafts, forget the rejected tail, then
+                    # feed the corrected token like a normal decode step.
+                    _rollback(base + rejected_at)
+                    pending = _forward([corrected], base + rejected_at)[0, -1]
+        finally:
+            self._release_cache(owner, model)
+            if draft is not None:
+                draft.close()
             if stats is not None:
                 stats.update({"drafted": n_drafted, "accepted": n_accepted,
                               "acceptance_rate": (n_accepted / n_drafted) if n_drafted else 0.0,
-                              "cache_resets": n_resets,
+                              "cache_resets": n_resets, "rollbacks": n_rollbacks,
                               "tokens": len(result_ids) - len(ids)})
-            return result_ids
-
-        def _refresh_cache():
-            nonlocal n_resets
-            n_resets += 1
-            model.reset_cache()
-            t = torch.tensor([result_ids], dtype=torch.long).to(self.device)
-            logits = model(t, start_pos=0, use_cache=True)
-            return logits[0, -1]
-
-        with torch.inference_mode():
-            full = torch.tensor([ids], dtype=torch.long).to(self.device)
-            pending = model(full, start_pos=0, use_cache=True)[0, -1]
-
-            while len(result_ids) - len(ids) < length:
-                if len(result_ids) + 1 >= hard_cap:
-                    break
-                # Never draft more than the remaining budget: a fully accepted
-                # batch must not overshoot `length` by an extra token.
-                remaining = length - (len(result_ids) - len(ids))
-
-                if draft_engine is not None:
-                    proposals = self._propose_draft_model(draft_engine, result_ids, draft_tokens)
-                else:
-                    proposals = self._propose_prompt_lookup(result_ids, draft_tokens)
-                proposals = [int(t) for t in proposals if 0 <= int(t) < self.vocab_size
-                             and int(t) not in stop][:max(0, min(draft_tokens, remaining))]
-
-                if not proposals:
-                    # No draft available → ordinary single-token step.
-                    nxt = self._sample_token(pending, temperature, top_k, top_p,
-                                             repetition_penalty, result_ids, min_p=min_p)
-                    result_ids.append(nxt)
-                    if nxt in stop:
-                        return _finish()
-                    pos = len(result_ids) - 1
-                    tok = torch.tensor([[nxt]], dtype=torch.long).to(self.device)
-                    pending = model(tok, start_pos=pos, use_cache=True)[0, -1]
-                    continue
-
-                n_drafted += len(proposals)
-                pt = torch.tensor([proposals], dtype=torch.long).to(self.device)
-                verif = model(pt, start_pos=len(result_ids), use_cache=True)
-
-                rejected = False
-                for i, tok in enumerate(proposals):
-                    step_logits = pending if i == 0 else verif[0, i - 1]
-                    filtered = self._filtered_logits(
-                        step_logits, temperature, top_k, top_p,
-                        repetition_penalty, result_ids, min_p)
-                    probs = torch.softmax(filtered, dim=-1)
-                    p_tok = float(probs[tok].item()) if torch.isfinite(probs[tok]) else 0.0
-                    if torch.rand(1).item() < p_tok:
-                        result_ids.append(tok)
-                        n_accepted += 1
-                        if tok in stop:
-                            return _finish()
-                    else:
-                        result_ids.append(self._sample_corrected_token(filtered, tok))
-                        rejected = True
-                        break
-
-                if rejected:
-                    pending = _refresh_cache()
-                else:
-                    pending = verif[0, len(proposals) - 1]
-
-        return _finish()
+        return result_ids
 
     def generate_speculative(self, start_str: str, length: int = 50,
                              draft_engine: "AuraLiteEngine | None" = None,
@@ -2885,7 +3118,9 @@ class AuraLiteEngine:
                              top_k: int = 50, top_p: float = 0.9,
                              repetition_penalty: float = 1.0,
                              min_p: float = 0.0,
-                             stats: dict | None = None) -> str:
+                             stats: dict | None = None, *,
+                             presence_penalty: float = 0.0,
+                             frequency_penalty: float = 0.0) -> str:
         """Speculative decoding with prompt-lookup drafting (v2.6.5 — real).
 
         Two ways to obtain draft tokens:
@@ -2923,7 +3158,8 @@ class AuraLiteEngine:
         used_prompt = self.decode(ids)
         result_ids = self._speculative_generate_ids(
             ids, length, temperature, top_k, top_p, repetition_penalty, min_p,
-            draft_engine=draft_engine, draft_tokens=draft_tokens, stats=stats)
+            draft_engine=draft_engine, draft_tokens=draft_tokens, stats=stats,
+            presence_penalty=presence_penalty, frequency_penalty=frequency_penalty)
         generated_full = self.decode(result_ids)
         return start_str + generated_full[len(used_prompt):]
 
@@ -2932,12 +3168,21 @@ class AuraLiteEngine:
                  temperature: float = 0.8,
                  top_k: int = 50, top_p: float = 0.9,
                  repetition_penalty: float = 1.0,
-                 min_p: float = 0.0) -> str:
+                 min_p: float = 0.0, *,
+                 presence_penalty: float = 0.0,
+                 frequency_penalty: float = 0.0) -> str:
+        """Continue `start_str` by up to `length` tokens.
 
+        `presence_penalty` / `frequency_penalty` (2.8, OpenAI semantics) lower
+        the logits of tokens among the last 64 by ``presence + frequency *
+        count``; the native engine and GGUF honour them, Hugging Face models
+        (which have no equivalent) ignore them.
+        """
         if self.is_gguf_model():
             return self._gguf_generate_text(
                 start_str, length, temperature, top_k, top_p,
                 repetition_penalty=repetition_penalty, min_p=min_p,
+                presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
             )
 
         if self.is_hf_model():
@@ -2954,12 +3199,11 @@ class AuraLiteEngine:
             return self.hf_proxy.generate(start_str, **kwargs)
 
         ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
-        used_prompt = self.decode(ids)
         result_ids = self._generate_ids(
             ids, length, temperature, top_k, top_p,
-            repetition_penalty=repetition_penalty, min_p=min_p)
-        generated_full = self.decode(result_ids)
-        return start_str + generated_full[len(used_prompt):]
+            repetition_penalty=repetition_penalty, min_p=min_p,
+            presence_penalty=presence_penalty, frequency_penalty=frequency_penalty)
+        return start_str + self.decode(result_ids[len(ids):])
 
     # ---- Thinking Mode (two-pass generation) ---------------------------
     def generate_with_thinking(self, start_str: str, length: int = 50,
@@ -3094,7 +3338,9 @@ class AuraLiteEngine:
                            temperature: float = 0.8,
                            top_k: int = 50, top_p: float = 0.9,
                            repetition_penalty: float = 1.0,
-                           min_p: float = 0.0) -> Iterator[str]:
+                           min_p: float = 0.0, *,
+                           presence_penalty: float = 0.0,
+                           frequency_penalty: float = 0.0) -> Iterator[str]:
         """Generate text token-by-token, yielding each new token as it's produced.
 
         Yields individual decoded tokens so the GUI can update in real-time.
@@ -3110,7 +3356,7 @@ class AuraLiteEngine:
                     self._gguf_prompt_messages(start_str),
                     max_tokens=length, temperature=temperature,
                     top_k=top_k, top_p=top_p, min_p=min_p,
-                    repeat_penalty=repetition_penalty, stream=True,
+                    repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=True,
                 )
                 for chunk in stream:
                     try:
@@ -3123,7 +3369,7 @@ class AuraLiteEngine:
                 stream = self.model.create_completion(
                     start_str, max_tokens=length, temperature=temperature,
                     top_k=top_k, top_p=top_p, min_p=min_p,
-                    repeat_penalty=repetition_penalty, stream=True,
+                    repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=True,
                 )
                 for chunk in stream:
                     try:
@@ -3153,87 +3399,57 @@ class AuraLiteEngine:
             return
 
         ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
-
-        self.model.eval()
-        self.model.reset_cache()
-
-        result_ids: list[int] = list(ids)
-        if length <= 0:
-            return
-
-        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
-
-        with torch.inference_mode():
-            # Process seed
-            t = torch.tensor([ids], dtype=torch.long).to(self.device)
-            logits = self._infer(t, start_pos=0, use_cache=True)
-            nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                     repetition_penalty, result_ids, min_p=min_p)
-            result_ids.append(nxt)
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        for nxt in self._iter_token_ids(ids, length, sp):
             yield self.decode([nxt])
-
-            # Generate remaining tokens
-            for _ in range(length - 1):
-                pos = len(result_ids) - 1
-                if pos + 1 >= hard_cap:
-                    break
-                t = torch.tensor([[result_ids[-1]]], dtype=torch.long).to(self.device)
-                logits = self._infer(t, start_pos=pos, use_cache=True)
-                nxt = self._sample_token(logits[0, -1], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids, min_p=min_p)
-                result_ids.append(nxt)
-                yield self.decode([nxt])
-
-        self.model.reset_cache()
 
     def _generate_batch_group(self, batch_ids: list[list[int]], length: int = 50,
                               temperature: float = 0.8,
                               top_k: int = 50, top_p: float = 0.9,
                               repetition_penalty: float = 1.0,
-                              min_p: float = 0.0) -> list[list[int]]:
+                              min_p: float = 0.0, *,
+                              presence_penalty: float = 0.0,
+                              frequency_penalty: float = 0.0) -> list[list[int]]:
         """Generate in parallel for prompts that already have the same length."""
         if self.model is None:
             raise ValueError("Train or load a model first!")
         if not batch_ids:
             return []
 
-        self.model.reset_cache()
         result_ids = [list(ids) for ids in batch_ids]
-        batch = torch.tensor(batch_ids, dtype=torch.long).to(self.device)
-        B = len(batch_ids)
-
         if length <= 0:
             return result_ids
-
-        hard_cap = max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
-
-        with torch.inference_mode():
-            logits = self._infer(batch, start_pos=0, use_cache=True)
-            last_logits = logits[:, -1, :]
-
-            next_tokens = []
-            for b in range(B):
-                nxt = self._sample_token(last_logits[b], temperature, top_k, top_p,
-                                         repetition_penalty, result_ids[b], min_p=min_p)
-                result_ids[b].append(nxt)
-                next_tokens.append(nxt)
-
-            for _ in range(length - 1):
-                pos = len(result_ids[0]) - 1
-                if pos + 1 >= hard_cap:
-                    break
-
-                next_input = torch.tensor(next_tokens, dtype=torch.long).unsqueeze(1).to(self.device)
-                logits = self._infer(next_input, start_pos=pos, use_cache=True)
-
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        hard_cap = self._hard_cap(length)
+        B = len(batch_ids)
+        owner = self._claim_cache()
+        self._reset_model_cache(capacity=min(len(batch_ids[0]) + length, hard_cap))
+        try:
+            with torch.inference_mode():
+                batch = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
+                logits = self._infer(batch, start_pos=0, use_cache=True, logits_to_keep=1)
                 next_tokens = []
                 for b in range(B):
-                    nxt = self._sample_token(logits[b, 0], temperature, top_k, top_p,
-                                             repetition_penalty, result_ids[b], min_p=min_p)
+                    nxt = self._sample_with(logits[b, -1], sp, result_ids[b])
                     result_ids[b].append(nxt)
                     next_tokens.append(nxt)
 
-        self.model.reset_cache()
+                for _ in range(length - 1):
+                    pos = len(result_ids[0]) - 1
+                    if pos + 1 >= hard_cap:
+                        break
+                    next_input = torch.tensor(next_tokens, dtype=torch.long,
+                                              device=self.device).unsqueeze(1)
+                    logits = self._infer(next_input, start_pos=pos, use_cache=True)
+                    next_tokens = []
+                    for b in range(B):
+                        nxt = self._sample_with(logits[b, -1], sp, result_ids[b])
+                        result_ids[b].append(nxt)
+                        next_tokens.append(nxt)
+        finally:
+            self._release_cache(owner)
         return result_ids
 
     # ---- Batch Generation (NEW) ---------------------------------------
@@ -3241,7 +3457,9 @@ class AuraLiteEngine:
                        temperature: float = 0.8,
                        top_k: int = 50, top_p: float = 0.9,
                        repetition_penalty: float = 1.0,
-                       min_p: float = 0.0) -> list[str]:
+                       min_p: float = 0.0, *,
+                       presence_penalty: float = 0.0,
+                       frequency_penalty: float = 0.0) -> list[str]:
         """Generate text for multiple prompts in parallel.
 
         Prompts are first truncated to the model context limit and then grouped
@@ -3260,7 +3478,9 @@ class AuraLiteEngine:
 
         if self.is_gguf_model() or self.is_hf_model():
             return [self.generate(p, length, temperature, top_k, top_p,
-                                  repetition_penalty=repetition_penalty, min_p=min_p)
+                                  repetition_penalty=repetition_penalty, min_p=min_p,
+                                  presence_penalty=presence_penalty,
+                                  frequency_penalty=frequency_penalty)
                     for p in prompts]
 
         # --- Deduplicate identical prompts -----------------------------
@@ -3284,7 +3504,8 @@ class AuraLiteEngine:
             batch_ids = [ids for _, ids in batch_group]
             generated_ids = self._generate_batch_group(
                 batch_ids, length, temperature, top_k, top_p,
-                repetition_penalty=repetition_penalty, min_p=min_p)
+                repetition_penalty=repetition_penalty, min_p=min_p,
+                presence_penalty=presence_penalty, frequency_penalty=frequency_penalty)
             for (orig_idx, used_ids), out_ids in zip(batch_group, generated_ids, strict=True):
                 used_prompt = self.decode(used_ids)
                 out_text = self.decode(out_ids)
@@ -3294,87 +3515,52 @@ class AuraLiteEngine:
         unique_final = [r if r is not None else "" for r in results]
         return [unique_final[first_index[p]] for p in prompts]
 
+    def _sample_with(self, logits: torch.Tensor, sp: SamplingParams,
+                     history: list[int] | None) -> int:
+        """Every decode loop samples through `_sample_token`, which stays the
+        one hook to override (tests script it, subclasses may replace it)."""
+        return self._sample_token(logits, sp.temperature, sp.top_k, sp.top_p,
+                                  sp.repetition_penalty, history, sp.min_p,
+                                  presence_penalty=sp.presence_penalty,
+                                  frequency_penalty=sp.frequency_penalty)
+
+    def _filter_with(self, logits: torch.Tensor, sp: SamplingParams,
+                     history: list[int] | None) -> torch.Tensor:
+        return self._filtered_logits(logits, sp.temperature, sp.top_k, sp.top_p,
+                                     sp.repetition_penalty, history, sp.min_p,
+                                     presence_penalty=sp.presence_penalty,
+                                     frequency_penalty=sp.frequency_penalty)
+
     def _filtered_logits(self, logits: torch.Tensor,
                          temperature: float, top_k: int, top_p: float,
                          repetition_penalty: float = 1.0,
                          recent_ids: list[int] | None = None,
-                         min_p: float = 0.0) -> torch.Tensor:
-        """Apply the sampling filters (repetition / temperature / top-k / min-p /
-        top-p) and return the masked logits.
+                         min_p: float = 0.0, *,
+                         presence_penalty: float = 0.0,
+                         frequency_penalty: float = 0.0) -> torch.Tensor:
+        """Full-vocabulary logits after every sampling filter (``-inf`` = removed).
 
-        Split out of `_sample_token` (v2.6.5) so speculative decoding can build
-        the *exact same* distribution the normal sampler would use and verify
-        draft tokens against it.
+        Speculative decoding verifies draft tokens against exactly this
+        distribution. Implementation: :mod:`auralite.engine.sampling` (2.8).
         """
-        logits = logits.float().clone()
-
-        # Repetition penalty (CTRL-style): discourage recently used tokens
-        if repetition_penalty and repetition_penalty != 1.0 and recent_ids:
-            for tid in set(recent_ids[-64:]):
-                if logits[tid] > 0:
-                    logits[tid] /= repetition_penalty
-                else:
-                    logits[tid] *= repetition_penalty
-
-        logits = logits / max(temperature, 1e-8)
-
-        # Top-k filtering
-        if 0 < top_k < self.vocab_size:
-            kth_val = torch.topk(logits, min(top_k, self.vocab_size))[0][-1]
-            logits = logits.masked_fill(logits < kth_val, float("-inf"))
-
-        # Min-P filtering (applied before Top-P)
-        if min_p and 0.0 < min_p < 1.0:
-            probs = torch.softmax(logits, dim=-1)
-            max_prob = torch.max(probs).item()
-            limit = min_p * max_prob
-            logits = logits.masked_fill(probs < limit, float("-inf"))
-
-        # Top-p (nucleus) filtering
-        if 0.0 < top_p < 1.0:
-            # v2.6.3: after top-k masking only `top_k` entries can ever be
-            # sampled; sorting those K candidates instead of the full vocab is
-            # exactly equivalent and much cheaper on CPU (V >> K).
-            if 0 < top_k < self.vocab_size:
-                cand = min(top_k, self.vocab_size)
-                work, cand_idx = torch.topk(logits, cand)
-            else:
-                work = logits
-                cand_idx = None
-            # torch.sort (stable, like the previous full-vocab implementation)
-            sorted_logits, order = torch.sort(work, descending=True)
-            cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            remove = cum_probs > top_p
-            remove[1:] = remove[:-1].clone()
-            remove[0] = False
-            removed_sorted_idx = order[remove]
-            if cand_idx is None:
-                logits = logits.scatter(0, removed_sorted_idx, float("-inf"))
-            else:
-                logits = logits.scatter(0, cand_idx[removed_sorted_idx], float("-inf"))
-
-        return logits
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        return _sampling.filtered_logits(logits, sp, recent_ids)
 
     def _sample_token(self, logits: torch.Tensor,
                       temperature: float, top_k: int, top_p: float,
                       repetition_penalty: float = 1.0,
                       recent_ids: list[int] | None = None,
-                      min_p: float = 0.0) -> int:
-        """Sample a single token id with temperature, repetition penalty,
-        top-k, and top-p (nucleus) filtering.
+                      min_p: float = 0.0, *,
+                      presence_penalty: float = 0.0,
+                      frequency_penalty: float = 0.0) -> int:
+        """Sample one token id (penalties, temperature, top-k, min-p, top-p).
 
-        IMPROVED (v2.1+):
-        - Fallback to uniform sampling if all logits become -inf
+        Falls back to a uniform draw if every token was filtered out.
         """
-        logits = self._filtered_logits(
-            logits, temperature, top_k, top_p, repetition_penalty, recent_ids, min_p)
-
-        # IMPROVED: fallback if all logits are -inf (prevents NaN crash)
-        if torch.all(logits == float("-inf")):
-            return torch.randint(0, self.vocab_size, (1,)).item()
-
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).item()
+        sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
+                                   presence_penalty, frequency_penalty)
+        return _sampling.sample(logits, sp, recent_ids)
 
     # ---- Save / Load --------------------------------------------------
     def save_model(self, path: str, include_optimizer: bool = True):

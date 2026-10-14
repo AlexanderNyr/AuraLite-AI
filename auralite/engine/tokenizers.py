@@ -14,6 +14,22 @@ logger = logging.getLogger("auralite")
 
 UNK_TOKEN = "\ufffd"  # Unicode replacement character
 
+# GPT-2/GPT-4-style pre-tokenizer (2.8), written for the stdlib `re` module:
+# a word keeps its leading space (" world"), letters/digits/punctuation form
+# separate pieces, digits are grouped in threes, newlines get their own
+# pieces. `[^\W\d_]` = Unicode letters, so Cyrillic works like Latin.
+# The final alternative catches anything else, so the split is lossless.
+_GPT_SPLIT = re.compile(
+    r"""'(?:[sdmtSDMT]|ll|ve|re|LL|VE|RE)"""
+    r"""| ?[^\W\d_]+"""
+    r"""| ?\d{1,3}"""
+    r"""| ?(?:[^\s\w]|_)+[\r\n]*"""
+    r"""|\s*[\r\n]+"""
+    r"""|\s+(?!\S)"""
+    r"""|\s+"""
+    r"""|[\s\S]""")
+_WS_SPLIT = re.compile(r"(\s+)")
+
 class CharTokenizer:
     """Simple character-level tokenizer (original AuraLite behaviour)."""
 
@@ -66,7 +82,21 @@ class BPETokenizer:
     kind = "bpe"
     unk_token = UNK_TOKEN  # Unicode replacement character
 
-    def __init__(self):
+    def __init__(self, pretokenizer: str = "gpt"):
+        """`pretokenizer` decides where merges may happen (2.8):
+
+        * ``"gpt"`` (default for new tokenizers): GPT-style pieces — a word
+          keeps its leading space, punctuation and digits are split off. On
+          tinyshakespeare at 2,048 tokens this encodes the text in about 25 %
+          fewer tokens than ``"ws"``, so the same context window holds more
+          text and every epoch costs fewer steps.
+        * ``"ws"`` (2.7 and earlier, kept for their checkpoints): split on
+          whitespace only, so every space is a token of its own and
+          ``word,`` / ``word.`` / ``word`` become unrelated tokens.
+        """
+        if pretokenizer not in ("gpt", "ws"):
+            raise ValueError(f"unknown pretokenizer {pretokenizer!r} (use 'gpt' or 'ws')")
+        self.pretokenizer = pretokenizer
         self.vocab: list[str] = []
         self.token_to_id: dict[str, int] = {}
         # ordered merge rules: (id_a, id_b) -> new_id, rank = list index
@@ -80,10 +110,11 @@ class BPETokenizer:
         return len(self.vocab)
 
     # ---- helpers -----------------------------------------------------
-    @staticmethod
-    def _split_pieces(text: str) -> list[str]:
-        # keep whitespace runs as separate pieces so nothing is lost
-        return [p for p in re.split(r"(\s+)", text) if p]
+    def _split_pieces(self, text: str) -> list[str]:
+        if self.pretokenizer == "gpt":
+            return _GPT_SPLIT.findall(text)
+        # 2.7: keep whitespace runs as separate pieces so nothing is lost
+        return [p for p in _WS_SPLIT.split(text) if p]
 
     def _build_ranks(self):
         self._ranks = {(a, b): (r, nid) for r, (a, b, nid) in enumerate(self.merges)}
@@ -283,12 +314,19 @@ class BPETokenizer:
 
     # ---- (de)serialization ---------------------------------------------
     def to_dict(self) -> dict:
-        return {"kind": self.kind, "vocab": self.vocab, "merges": self.merges,
-                "unk_token": self.unk_token}
+        d = {"kind": self.kind, "vocab": self.vocab, "merges": self.merges,
+             "unk_token": self.unk_token}
+        if self.pretokenizer != "ws":
+            # 2.8+: older AuraLite versions ignore unknown keys and would split
+            # on whitespace — still a valid (if less compact) tokenization.
+            d["version"] = 2
+            d["pretokenizer"] = self.pretokenizer
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "BPETokenizer":
-        tok = cls()
+        # Dicts written before 2.8 carry no "pretokenizer": whitespace split.
+        tok = cls(pretokenizer=str(d.get("pretokenizer", "ws")))
         tok.vocab = list(d["vocab"])
         tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
         tok.merges = [tuple(m) for m in d.get("merges", [])]

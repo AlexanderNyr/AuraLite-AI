@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.eval` — removed in AuraLite 2.8.
+"""Deprecated alias of :mod:`auralite.eval` — removed in AuraLite 2.9.
 
 ``python eval.py --model ckpt.pt --test test.txt`` keeps working in a source
 checkout; an installed AuraLite runs it as ``python -m auralite.eval``.

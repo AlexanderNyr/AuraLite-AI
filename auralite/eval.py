@@ -4,7 +4,7 @@
 Usage:
     python -m auralite.eval --model checkpoint.pt --test test.txt --device cuda
 
-(``python eval.py …`` from a source checkout still works until 2.8.)
+(``python eval.py …`` from a source checkout still works until 2.9.)
 """
 
 import argparse

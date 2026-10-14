@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 import logging
 
+from .kv_cache import KVCache
+
 logger = logging.getLogger("auralite")
 
 
@@ -156,7 +158,6 @@ class Attention(nn.Module):
         self.kv_cache_dtype = kv_cache_dtype
         self.use_flex_attention = bool(use_flex_attention)
         self.use_qk_norm = bool(use_qk_norm)
-        self.kv_cache_start_pos = 0
 
         self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
@@ -180,7 +181,10 @@ class Attention(nn.Module):
         if use_alibi:
             self.register_buffer("alibi_slopes", self._get_alibi_slopes(), persistent=True)
 
-        self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        # 2.8: a preallocated, truncatable cache object (see kv_cache.py)
+        # instead of a (k, v) tuple rebuilt with torch.cat on every step.
+        self._cache: KVCache | None = None
+        self._cache_reserve = 0
 
     def _yarn_find_correction_dim(self, num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
         """YaRN helper from the public formula: dimension where a frequency
@@ -323,41 +327,53 @@ class Attention(nn.Module):
         bias = bias.masked_fill(blocked.unsqueeze(0), float("-inf"))
         return bias
 
-    # ---- KV cache helpers -------------------------------------------
-    def _pack_cache_tensor(self, t: torch.Tensor):
-        """Optionally store KV-cache in a lower precision format.
+    # ---- KV cache ----------------------------------------------------
+    @property
+    def kv_cache(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The cached ``(keys, values)`` a next query can attend to, or None.
 
-        INT8 uses a per-tensor scale (simple and educational); FP8 uses native
-        torch float8 dtypes when available. Dequantization happens immediately
-        before attention, so correctness is preserved with graceful fallback.
+        Read-only view kept for diagnostics and 2.7 callers: unquantized
+        storage is returned without a copy, int8/fp8 storage is dequantized
+        into fresh tensors. With a sliding window only the last `window`
+        positions are shown (the storage keeps a little more for rollback).
         """
-        dtype = (self.kv_cache_dtype or "").lower()
-        if dtype in {"", "none", "fp16", "bf16"}:
-            return t
-        if dtype in {"fp8", "fp8_e4m3"} and hasattr(torch, "float8_e4m3fn"):
-            return t.to(torch.float8_e4m3fn)
-        if dtype == "fp8_e5m2" and hasattr(torch, "float8_e5m2"):
-            return t.to(torch.float8_e5m2)
-        if dtype in {"int8", "i8"}:
-            scale = t.detach().abs().amax().clamp_min(1e-8) / 127.0
-            return (torch.clamp(torch.round(t / scale), -128, 127).to(torch.int8), scale)
-        return t
+        cache = self._cache
+        if cache is None or cache.length == 0:
+            return None
+        dtype = self.W_k.weight.dtype
+        return cache.read(dtype, last=self.sliding_window)
 
-    def _unpack_cache_tensor(self, packed, dtype: torch.dtype) -> torch.Tensor:
-        if isinstance(packed, tuple) and len(packed) == 2 and getattr(packed[0], "dtype", None) is torch.int8:
-            return (packed[0].to(dtype=torch.float32) * packed[1]).to(dtype)
-        if isinstance(packed, torch.Tensor) and str(packed.dtype).startswith("torch.float8"):
-            return packed.to(dtype)
-        return packed
+    @property
+    def kv_cache_start_pos(self) -> int:
+        """Absolute position of the first entry of :attr:`kv_cache`."""
+        cache = self._cache
+        if cache is None or cache.length == 0:
+            return 0
+        if self.sliding_window is not None and cache.length > self.sliding_window:
+            return cache.end - self.sliding_window
+        return cache.start
+
+    @property
+    def cache_length(self) -> int:
+        """Absolute position after the last cached token (0 when empty)."""
+        cache = self._cache
+        return 0 if cache is None or cache.length == 0 else cache.end
 
     def _get_cached_kv(self, dtype: torch.dtype):
-        if self.kv_cache is None:
+        """2.7 helper: the visible cache as `dtype`, or None."""
+        cache = self._cache
+        if cache is None or cache.length == 0:
             return None
-        cached_k, cached_v = self.kv_cache
-        return self._unpack_cache_tensor(cached_k, dtype), self._unpack_cache_tensor(cached_v, dtype)
+        return cache.read(dtype, last=self.sliding_window)
 
-    def _set_cached_kv(self, k: torch.Tensor, v: torch.Tensor):
-        self.kv_cache = (self._pack_cache_tensor(k.detach()), self._pack_cache_tensor(v.detach()))
+    def kv_cache_bytes(self) -> int:
+        """Memory held by this layer's cache storage, in bytes."""
+        return 0 if self._cache is None else self._cache.memory_bytes()
+
+    def truncate_cache(self, end: int) -> None:
+        """Forget cached positions ``>= end`` (speculative-decoding rollback)."""
+        if self._cache is not None:
+            self._cache.truncate(end)
 
     # ---- Forward -----------------------------------------------------
     def forward(self, x: torch.Tensor,
@@ -393,22 +409,21 @@ class Attention(nn.Module):
 
         key_start_pos = 0
         if use_cache:
-            cached = self._get_cached_kv(k.dtype)
-            if cached is not None:
-                cached_k, cached_v = cached
-                key_start_pos = self.kv_cache_start_pos
-                k = torch.cat([cached_k, k], dim=2)
-                v = torch.cat([cached_v, v], dim=2)
-            # Sliding-window eviction: drop oldest tokens from the KV cache.
-            # key_start_pos tracks the absolute sequence position of cache[0].
-            if self.sliding_window is not None and self.sliding_window > 0 and k.shape[2] > self.sliding_window:
-                overflow = k.shape[2] - self.sliding_window
-                k = k[:, :, overflow:, :]
-                v = v[:, :, overflow:, :]
-                key_start_pos = key_start_pos + overflow  # absolute position of new cache[0]
-            # Always update stored start position *before* writing cache
-            self.kv_cache_start_pos = key_start_pos
-            self._set_cached_kv(k, v)
+            if self._cache is None:
+                self._cache = KVCache(self.kv_cache_dtype, self.sliding_window,
+                                      reserve=self._cache_reserve)
+            # In-place write into preallocated storage; returns every cached
+            # key/value (views when unquantized) and the position of the first.
+            k, v, key_start_pos = self._cache.append(k, v, start_pos)
+            if self.sliding_window is not None and self.sliding_window > 0:
+                # Attend to exactly what the chunk's windows need: keys from
+                # (first query - window + 1) on. The 2.7 cache evicted *before*
+                # attending, so a chunk longer than the window lost keys.
+                first = max(key_start_pos, start_pos - self.sliding_window + 1)
+                if first > key_start_pos:
+                    k = k[:, :, first - key_start_pos:]
+                    v = v[:, :, first - key_start_pos:]
+                    key_start_pos = first
 
         # Repeat KV *after* concatenating/evicting the cache. This preserves
         # GQA memory savings in the cache and exactly matches LLaMA grouping.
@@ -452,7 +467,11 @@ class Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, **sdpa_gqa_kw)
         elif T == S and start_pos == 0 and self.sliding_window is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **sdpa_gqa_kw)
-        elif T == 1 and self.sliding_window is None:
+        elif T == 1 and (self.sliding_window is None or (
+                use_cache and key_start_pos + S - 1 == start_pos
+                and S <= self.sliding_window)):
+            # One query at the newest position: every cached key is allowed
+            # (for a window, the slice above already kept exactly the window).
             out = F.scaled_dot_product_attention(q, k, v, **sdpa_gqa_kw)
         else:
             keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
@@ -461,9 +480,12 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.W_o(out)
 
-    def reset_cache(self):
-        self.kv_cache = None
-        self.kv_cache_start_pos = 0
+    def reset_cache(self, capacity: int | None = None):
+        """Drop the cache. `capacity` (optional) preallocates that many
+        positions on the next write — generation passes prompt + max tokens,
+        so the storage never has to grow."""
+        self._cache = None
+        self._cache_reserve = int(capacity) if capacity else 0
 
 class FeedForward(nn.Module):
     """SwiGLU Feed-Forward Network — standard in LLaMA / Qwen / Mistral.
@@ -491,14 +513,34 @@ class FeedForward(nn.Module):
         h = F.silu(g) * u
         return self.down(h) + self.lora["down"](h)
 
-class Top2MoE(nn.Module):
-    """Educational top-2 Mixture-of-Experts feed-forward layer.
+def _graph_capture_active() -> bool:
+    """True while torch.jit tracing, torch.compile/torch.export or the ONNX
+    exporter is capturing a graph (data-dependent shapes are unwelcome there)."""
+    if torch.jit.is_tracing():
+        return True
+    compiler = getattr(torch, "compiler", None)
+    for name in ("is_compiling", "is_exporting"):
+        fn = getattr(compiler, name, None)
+        if fn is not None and fn():
+            return True
+    onnx_export = getattr(getattr(torch, "onnx", None), "is_in_onnx_export", None)
+    return bool(onnx_export is not None and onnx_export())
 
-    Each token is routed to its two highest-scoring SwiGLU experts. The layer
-    exposes `last_load_balance_loss` so the trainer can add a small auxiliary
-    penalty and avoid expert collapse. It is intentionally simple (dense expert
-    evaluation) for clarity and CPU fallback; production kernels can replace it
-    later without changing the public API.
+
+class Top2MoE(nn.Module):
+    """Top-k Mixture-of-Experts feed-forward layer (SwiGLU experts).
+
+    Each token is routed to its `top_k` highest-scoring experts and gets their
+    outputs mixed with the renormalized router probabilities. The layer
+    exposes `last_load_balance_loss` (training mode) so the trainer can add a
+    small auxiliary penalty and avoid expert collapse.
+
+    2.8: sparse dispatch — every expert runs only on the tokens routed to it,
+    so a layer with E experts costs about `top_k` dense FFNs instead of `E`
+    (2.7 evaluated every expert on every token and masked the result). The
+    dense form is kept for graph capture (torch.compile, torch.export, ONNX,
+    TorchScript), where data-dependent shapes would break the export; both
+    give the same output.
     """
 
     def __init__(self, d_model: int, d_ff: int, num_experts: int = 4,
@@ -510,16 +552,11 @@ class Top2MoE(nn.Module):
         self.router = nn.Linear(d_model, self.num_experts, bias=False)
         self.experts = nn.ModuleList([FeedForward(d_model, d_ff) for _ in range(self.num_experts)])
         self.last_load_balance_loss: torch.Tensor | None = None
+        #: "auto" (sparse in eager mode, dense under graph capture), "sparse" or "dense"
+        self.dispatch = "auto"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        router_logits = self.router(x)
-        router_probs = torch.softmax(router_logits.float(), dim=-1)
-        top_prob, top_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
-        top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-
-        # Dense expert evaluation keeps the implementation readable and robust;
-        # top-k masks ensure only selected experts contribute to each token.
+    def _dense(self, x: torch.Tensor, top_prob: torch.Tensor, top_idx: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
         out = torch.zeros_like(x)
         for expert_id, expert in enumerate(self.experts):
             expert_out = expert(x)
@@ -527,6 +564,33 @@ class Top2MoE(nn.Module):
             for slot in range(self.top_k):
                 weights = weights + torch.where(top_idx[..., slot] == expert_id, top_prob[..., slot].to(expert_out.dtype), torch.zeros_like(weights))
             out = out + expert_out * weights.unsqueeze(-1)
+        return out
+
+    def _sparse(self, x: torch.Tensor, top_prob: torch.Tensor, top_idx: torch.Tensor) -> torch.Tensor:
+        D = x.shape[-1]
+        flat = x.reshape(-1, D)
+        flat_idx = top_idx.reshape(-1, self.top_k)
+        flat_prob = top_prob.reshape(-1, self.top_k)
+        out = torch.zeros_like(flat)
+        for expert_id, expert in enumerate(self.experts):
+            token_idx, slot = torch.where(flat_idx == expert_id)
+            if token_idx.numel() == 0:
+                continue
+            expert_out = expert(flat.index_select(0, token_idx))
+            weights = flat_prob[token_idx, slot].to(expert_out.dtype).unsqueeze(-1)
+            out = out.index_add(0, token_idx, expert_out * weights)
+        return out.view_as(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        router_logits = self.router(x)
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        top_prob, top_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
+        top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        mode = self.dispatch
+        if mode == "auto":
+            mode = "dense" if _graph_capture_active() else "sparse"
+        out = self._dense(x, top_prob, top_idx) if mode == "dense" else self._sparse(x, top_prob, top_idx)
 
         if self.training:
             # A training loss only (2.7.0): in eval mode the attribute is left

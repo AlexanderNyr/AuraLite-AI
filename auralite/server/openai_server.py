@@ -234,6 +234,10 @@ class _SamplingOptions(BaseModel):
     top_k: int = Field(default=50, ge=0, le=1000)
     min_p: float = Field(default=0.0, ge=0.0, le=1.0)
     repetition_penalty: float = Field(default=1.0, gt=0.0, le=4.0)
+    # 2.8: OpenAI's presence/frequency penalties (same ranges). Before 2.8
+    # pydantic dropped them, so non-zero values were silently ignored.
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     seed: int | None = Field(default=None, ge=0)
     stop: str | list[str] | None = None
     stream_options: dict[str, Any] | None = None
@@ -550,8 +554,15 @@ def seeded_rng(seed: int | None) -> Iterator[None]:
 
 
 def _sampling_kwargs(req: _SamplingOptions) -> dict[str, Any]:
-    return {"top_k": req.top_k, "top_p": req.top_p,
-            "repetition_penalty": req.repetition_penalty, "min_p": req.min_p}
+    kwargs: dict[str, Any] = {"top_k": req.top_k, "top_p": req.top_p,
+                              "repetition_penalty": req.repetition_penalty,
+                              "min_p": req.min_p}
+    # Only when requested: backends from before 2.8 do not take these kwargs.
+    if req.presence_penalty:
+        kwargs["presence_penalty"] = req.presence_penalty
+    if req.frequency_penalty:
+        kwargs["frequency_penalty"] = req.frequency_penalty
+    return kwargs
 
 
 def _usage_chunk(object_name: str, model: str, usage: dict[str, int],
@@ -801,7 +812,8 @@ def _ollama_options(options: dict[str, Any] | None) -> dict[str, Any]:
         out["max_tokens"] = max(0, int(options["num_predict"]))
     for src, dst in (("temperature", "temperature"), ("top_k", "top_k"),
                      ("top_p", "top_p"), ("repeat_penalty", "repetition_penalty"),
-                     ("min_p", "min_p")):
+                     ("min_p", "min_p"), ("presence_penalty", "presence_penalty"),
+                     ("frequency_penalty", "frequency_penalty")):
         if src in options:
             try:
                 out[dst] = float(options[src]) if dst != "top_k" else int(options[src])
@@ -828,7 +840,9 @@ def ollama_generate(req: OllamaGenerateRequest, request: Request):
     max_tokens = int(opts.pop("max_tokens", 128))
     temperature = float(opts.pop("temperature", 0.8))
     sampling = {k: v for k, v in opts.items() if k in ("top_k", "top_p",
-                                                       "repetition_penalty", "min_p")}
+                                                       "repetition_penalty", "min_p",
+                                                       "presence_penalty", "frequency_penalty")
+                and (v or k not in ("presence_penalty", "frequency_penalty"))}
     stops = opts.get("stop") or []
     seed = opts.get("seed")
     prompt = sanitize_prompt(req.prompt)
@@ -890,7 +904,9 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
     max_tokens = int(opts.pop("max_tokens", 128))
     temperature = float(opts.pop("temperature", 0.7))
     sampling = {k: v for k, v in opts.items() if k in ("top_k", "top_p",
-                                                       "repetition_penalty", "min_p")}
+                                                       "repetition_penalty", "min_p",
+                                                       "presence_penalty", "frequency_penalty")
+                and (v or k not in ("presence_penalty", "frequency_penalty"))}
     chat_kwargs = {**sampling, "max_new_tokens": max_tokens,
                    "temperature": temperature, "stop_tokens": opts.get("stop") or None}
 

@@ -3,7 +3,7 @@
 2.7.0 moved every module into the ``auralite`` package. The repository-root
 shims (``model_engine.py``, ``server.py``, …) and ``auralite/_compat.py`` keep old
 scripts, notebooks and ``mock.patch("model_engine._legacy.…")`` targets working
-until 2.8. What matters is *identity*: a second copy of a module would give two
+until 2.9. What matters is *identity*: a second copy of a module would give two
 ``AuraLiteEngine`` classes, broken ``isinstance`` checks and patches that silently
 miss. Each check runs in a fresh interpreter, because an alias is process-wide
 state (and a warning is only raised by the first import).
@@ -57,7 +57,7 @@ def test_every_alias_is_the_new_module_and_warns_once():
                         if issubclass(w.category, DeprecationWarning)]
             out[old] = {"same": module is importlib.import_module(new) and again is module,
                         "warnings": len(messages),
-                        "names_new": all(new in m and "2.8" in m for m in messages)}
+                        "names_new": all(new in m and _compat.REMOVED_IN in m for m in messages)}
         print(json.dumps(out))
     """))
     expected = set(_compat.RENAMED) - {"gui_app"}

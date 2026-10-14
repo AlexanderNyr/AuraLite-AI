@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.quantization_backends` — removed in AuraLite 2.8.
+"""Deprecated alias of :mod:`auralite.quantization_backends` — removed in AuraLite 2.9.
 
 AuraLite 2.7 moved every module into the ``auralite`` package. This file only
 keeps ``import quantization_backends`` working inside a source checkout (it is not installed);

@@ -3,7 +3,7 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.7.0-orange)
+![Version](https://img.shields.io/badge/version-2.8.0-orange)
 
 **English version: [README.md](README.md)** · Быстрый старт: [docs/quickstart.md](docs/quickstart.md)
 
@@ -89,7 +89,7 @@ pip install -e '.[qlora]'     # + загрузка в 4/8 бит для QLoRA (b
 pip install -e '.[test]'      # + набор тестов
 ```
 
-`pip install -r requirements.txt` ставит те же зависимости ядра без установки пакета — этого хватает для `python gui_app.py` из клона. Установленный AuraLite даёт две команды: `auralite` (CLI, она же `python -m auralite`) и `auralite-gui` (приложение, оно же `python -m auralite.gui`). С 2.7.0 весь код — в одном пакете `auralite` (`from auralite import AuraLiteEngine`); старые имена 2.6 (`model_engine`, `server`, …) работают в клоне репозитория до 2.8 с предупреждением `DeprecationWarning`.
+`pip install -r requirements.txt` ставит те же зависимости ядра без установки пакета — этого хватает для `python gui_app.py` из клона. Установленный AuraLite даёт две команды: `auralite` (CLI, она же `python -m auralite`) и `auralite-gui` (приложение, оно же `python -m auralite.gui`). С 2.7.0 весь код — в одном пакете `auralite` (`from auralite import AuraLiteEngine`); старые имена 2.6 (`model_engine`, `server`, …) работают в клоне репозитория до 2.9 с предупреждением `DeprecationWarning`.
 
 Требуется Python 3.11–3.14. Поддержка Python 3.10 закончилась 01.10.2026; линейка 2.6.x была последней, которая его поддерживала. GPU не обязателен; CUDA Toolkit не нужен, достаточно драйвера NVIDIA.
 
@@ -163,6 +163,7 @@ auralite info --model model.gguf --perplexity --text corpus.txt
 |---|---|
 | [docs/quickstart.md](docs/quickstart.md) | установка, обучение, генерация, сервер, GUI, чекпоинты |
 | [docs/faq.md](docs/faq.md) | «почему не ускоряется»: измерение, `torch.compile`, KV-cache, квантизация, корпус |
+| [docs/engine.md](docs/engine.md) | как устроен движок: цикл генерации, KV-cache, сэмплинг, спекулятивное декодирование, MoE, BPE — с замерами 2.7 → 2.8 (English) |
 | [docs/quantization.md](docs/quantization.md) | все методы квантизации, что реально экономится, GGUF |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | карта модулей и поток данных движка |
 | [CHANGELOG.md](CHANGELOG.md) | что и почему изменилось в 2.6.5 |

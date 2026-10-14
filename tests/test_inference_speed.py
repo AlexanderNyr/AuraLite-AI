@@ -167,7 +167,11 @@ def test_generation_modes_report_speed_and_kv_memory(engine):
     assert [row["mode"] for row in rows] == ["kv=fp32", "kv=fp16", "kv=int8"]
     assert all(row["tokens_per_sec"] > 0 for row in rows)
     fp32, fp16, int8 = (row["kv_bytes_per_token"] for row in rows)
-    assert fp32 == fp16 * 2 == int8 * 4                 # 4 / 2 / 1 bytes per element
+    # Measured on the real cache storage (2.8): fp16 is 2 bytes per element,
+    # int8 is 1 byte per element plus one fp32 scale per (token, head).
+    head_dim = engine.model.d_model // engine.model.n_heads
+    assert fp32 == fp16 * 2
+    assert int8 * 4 * head_dim == fp32 * (head_dim + 4)
 
     # the engine is restored: same object, same weights, no compiled module
     assert engine.model is original_model

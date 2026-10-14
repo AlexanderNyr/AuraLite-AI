@@ -25,14 +25,14 @@ Subpackages and modules:
 =============================  ==============================================
 
 The flat module names of AuraLite <= 2.6 (``model_engine``, ``server``, …)
-still work inside a source checkout until 2.8, with a ``DeprecationWarning``
+still work inside a source checkout until 2.9, with a ``DeprecationWarning``
 — see :mod:`auralite._compat`.
 """
 from __future__ import annotations
 
 import importlib
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 #: Public name → module that defines it (resolved on first attribute access).
 _LAZY = {

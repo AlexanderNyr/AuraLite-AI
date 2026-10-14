@@ -11,6 +11,21 @@ import logging
 logger = logging.getLogger("auralite")
 
 
+def _check_group_count(state: dict, optimizer) -> None:
+    """Refuse a state saved for a different number of parameter groups.
+
+    Raises *before* anything is assigned, so a failed restore leaves the fresh
+    scheduler intact (2.8: AdamW gained a separate no-decay group, and a
+    half-applied 2.7 state crashed the next `step()`).
+    """
+    n = len(optimizer.param_groups)
+    for key in ("base_lrs", "current_lrs"):
+        values = state.get(key)
+        if values is not None and len(values) != n:
+            raise ValueError(f"scheduler state has {len(values)} {key} for an "
+                             f"optimizer with {n} parameter groups")
+
+
 class CosineWarmupScheduler:
     """Cosine decay with linear warmup — standard in modern LLM training."""
 
@@ -51,6 +66,7 @@ class CosineWarmupScheduler:
         }
 
     def load_state_dict(self, state: dict):
+        _check_group_count(state, self.optimizer)
         self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
         self.max_steps = state.get("max_steps", self.max_steps)
         self.min_lr = state.get("min_lr", self.min_lr)
@@ -135,6 +151,7 @@ class WSDScheduler:
         }
 
     def load_state_dict(self, state: dict):
+        _check_group_count(state, self.optimizer)
         self.warmup_steps = state.get("warmup_steps", self.warmup_steps)
         self.max_steps = state.get("max_steps", self.max_steps)
         self.stable_ratio = float(state.get("stable_ratio", self.stable_ratio))

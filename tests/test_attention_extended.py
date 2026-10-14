@@ -250,16 +250,41 @@ class TestRopeScaling:
 
 
 class TestKVCacheDtype:
-    def test_int8_cache_roundtrip_small_error(self):
-        attn = Attention(32, 4, max_seq_len=16, kv_cache_dtype="int8")
-        x = torch.randn(1, 4, 32)
-        ref = attn._pack_cache_tensor(x)
-        back = attn._unpack_cache_tensor(ref, torch.float32)
-        assert back.shape == x.shape
-        assert (back - x).abs().max() < 0.05  # per-tensor int8 scale
+    """2.8: quantized storage keeps one scale per (token, head), written once."""
 
-    def test_fp16_dtype_is_noop(self):
-        attn = Attention(32, 4, max_seq_len=16, kv_cache_dtype="fp16")
+    @staticmethod
+    def _filled(spec, x):
+        from auralite.engine.kv_cache import KVCache
+        cache = KVCache(spec)
+        k, _, _ = cache.append(x, x, start_pos=0)
+        return cache, k
+
+    def test_int8_cache_roundtrip_small_error(self):
+        x = torch.randn(1, 4, 3, 8)
+        cache, back = self._filled("int8", x)
+        assert cache.k is not None and cache.k.dtype is torch.int8
+        assert back.shape == x.shape
+        # per-(token, head) absmax scale: error <= half a quantization step
+        step = x.abs().amax(dim=-1, keepdim=True) / 127.0
+        assert ((back - x).abs() <= step / 2 + 1e-6).all()
+
+    def test_fp16_dtype_really_stores_half_precision(self):
+        """2.7 accepted kv_cache_dtype="fp16" and silently kept fp32."""
         x = torch.randn(2, 4, 3, 8)
-        packed = attn._pack_cache_tensor(x)
-        assert packed is x
+        cache, back = self._filled("fp16", x)
+        assert cache.k is not None and cache.k.dtype is torch.float16
+        assert back.dtype is torch.float32          # read back in compute dtype
+        assert torch.allclose(back, x, atol=1e-2, rtol=1e-3)
+        fp32, _ = self._filled(None, x)
+        assert cache.memory_bytes() * 2 == fp32.memory_bytes()
+
+    def test_old_entries_are_never_requantized(self):
+        """Appending tokens with a larger range must not change stored history."""
+        from auralite.engine.kv_cache import KVCache
+        cache = KVCache("int8")
+        first = torch.randn(1, 2, 5, 8)
+        k1, _, _ = cache.append(first, first, start_pos=0)
+        k1 = k1.clone()
+        big = 100 * torch.randn(1, 2, 1, 8)
+        k2, _, _ = cache.append(big, big, start_pos=5)
+        assert torch.equal(k2[:, :, :5], k1)

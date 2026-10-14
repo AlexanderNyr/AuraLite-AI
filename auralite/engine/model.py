@@ -8,8 +8,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import logging
+from typing import cast
 
-from .layers import RMSNorm, TransformerBlock
+from .layers import Attention, RMSNorm, TransformerBlock
 
 logger = logging.getLogger("auralite")
 
@@ -177,11 +178,15 @@ class ModernTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False,
-                capture: dict | None = None) -> torch.Tensor:
-        """Returns logits for ALL positions: (B, T, vocab_size).
+                capture: dict | None = None,
+                logits_to_keep: int | None = None) -> torch.Tensor:
+        """Returns logits (B, T, vocab_size) — for all positions by default.
 
-        Training uses every position (dense next-token loss, nanoGPT-style);
-        generation simply takes the last position: logits[:, -1, :].
+        Training uses every position (dense next-token loss, nanoGPT-style).
+        Generation only needs the newest position: ``logits_to_keep=1`` (2.8)
+        runs the final norm and the LM head on the last position only, which
+        skips a (T x d_model x vocab) matmul per prompt. Speculative decoding
+        keeps as many positions as it verifies.
 
         ``capture`` is a diagnostic-only side channel: pass a dict and every
         layer stores its (detached) RoPE-rotated q/k under its index, which is
@@ -192,6 +197,8 @@ class ModernTransformer(nn.Module):
         for index, layer in enumerate(self.layers):
             layer_capture = capture.setdefault(index, {}) if capture is not None else None
             h = layer(h, start_pos, use_cache, layer_capture)
+        if logits_to_keep is not None and 0 < int(logits_to_keep) < h.shape[1]:
+            h = h[:, -int(logits_to_keep):]
         h = self.final_norm(h)
         return self.head(h)
 
@@ -206,9 +213,37 @@ class ModernTransformer(nn.Module):
             return None
         return torch.stack([l.to(losses[0].device) for l in losses]).sum()
 
-    def reset_cache(self):
-        for layer in self.layers:
-            layer.attn.reset_cache()
+    def reset_cache(self, capacity: int | None = None):
+        """Drop every layer's KV cache.
+
+        `capacity` (2.8, optional) preallocates storage for that many
+        positions on the next write, so a generation of known length never
+        reallocates (the cache grows geometrically otherwise).
+        """
+        for attn in self._attention_layers():
+            attn.reset_cache(capacity)
+
+    def _attention_layers(self) -> list[Attention]:
+        return [cast(TransformerBlock, layer).attn for layer in self.layers]
+
+    def truncate_cache(self, end: int) -> None:
+        """Roll every layer's cache back to positions ``< end`` (2.8).
+
+        Speculative decoding calls this after a rejected draft token instead
+        of re-running the model over the whole prefix.
+        """
+        for attn in self._attention_layers():
+            attn.truncate_cache(end)
+
+    @property
+    def cache_length(self) -> int:
+        """Positions currently cached (the next token's position)."""
+        layers = self._attention_layers()
+        return layers[0].cache_length if layers else 0
+
+    def kv_cache_bytes(self) -> int:
+        """Memory held by the KV caches of all layers, in bytes."""
+        return sum(attn.kv_cache_bytes() for attn in self._attention_layers())
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

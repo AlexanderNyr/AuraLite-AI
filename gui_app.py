@@ -4,7 +4,7 @@ An installed AuraLite provides the ``auralite-gui`` command (``python -m
 auralite.gui``); the implementation lives in ``auralite/gui/``.
 
 Importing this module (``from gui_app import AIApp``) is deprecated since 2.7
-and stops working in 2.8 — import ``auralite.gui.app`` instead. Until then it
+and stops working in 2.9 — import ``auralite.gui.app`` instead. Until then it
 still mirrors every module-level name of ``auralite.gui.common`` (flags,
 presets, ``messagebox``…), as it has since the GUI was split up in 2.6.5.
 """

@@ -1,8 +1,8 @@
 @echo off
 cd /d "%~dp0"
-title AuraLite AI v2.7 Builder
+title AuraLite AI v2.8 Builder
 echo ====================================================
-echo    Building AuraLite AI v2.7
+echo    Building AuraLite AI v2.8
 echo ====================================================
 echo.
 

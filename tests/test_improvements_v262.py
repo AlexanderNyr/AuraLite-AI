@@ -219,7 +219,7 @@ class TestCheckpointsV262:
 #  Fast incremental BPE trainer — bit-identical to the naive reference
 # ---------------------------------------------------------------------------
 
-def _reference_naive_bpe(text: str, vocab_size: int):
+def _reference_naive_bpe(text: str, vocab_size: int, pretokenizer: str = "gpt"):
     """Faithful copy of the pre-v2.6.2 naive trainer (full rescans per merge)."""
     from collections import Counter
     sample = BPETokenizer._stratified_sample(text, max_chars=2_000_000, n_chunks=100)
@@ -232,7 +232,7 @@ def _reference_naive_bpe(text: str, vocab_size: int):
     unk_id = token_to_id.get(UNK_TOKEN, 0)
     merges = []
     if vocab_size > len(vocab):
-        piece_counts = Counter(BPETokenizer._split_pieces(sample))
+        piece_counts = Counter(BPETokenizer(pretokenizer)._split_pieces(sample))
         corpus = [([token_to_id.get(c, unk_id) for c in piece], cnt)
                   for piece, cnt in piece_counts.items()]
         while len(vocab) < vocab_size:
@@ -272,10 +272,11 @@ class TestBPETrainerIdentity:
         ("tiny", "tiny", 64),
     ]
 
+    @pytest.mark.parametrize("pretokenizer", ["gpt", "ws"])
     @pytest.mark.parametrize("name,text,vocab_size", CASES)
-    def test_vocab_and_merges_match_naive(self, name, text, vocab_size):
-        ref_vocab, ref_merges = _reference_naive_bpe(text, vocab_size)
-        tok = BPETokenizer()
+    def test_vocab_and_merges_match_naive(self, name, text, vocab_size, pretokenizer):
+        ref_vocab, ref_merges = _reference_naive_bpe(text, vocab_size, pretokenizer)
+        tok = BPETokenizer(pretokenizer)
         tok.train(text, vocab_size=vocab_size)
         assert tok.vocab == ref_vocab, name
         assert tok.merges == ref_merges, name

@@ -1,3 +1,122 @@
+# 📦 v2.8.0 — the engine core: KV cache, sampling, speculative decoding, MoE, BPE
+
+This release changes the native engine, not the packaging. Each change is
+measured against 2.7.0 with the same script (`benchmarks/core_bench.py`, CPU),
+and each speed-up is tested for equivalence with the code it replaces. Tables:
+[docs/engine.md](docs/engine.md).
+
+**Fixed**
+
+- **Sliding-window models gave wrong results for prompts longer than the
+  window.** The 2.7 cache was trimmed to the window *before* attending, so the
+  first positions of a long prompt lost keys they needed. The wrong hidden
+  states were then cached and affected every later token (max |diff| 0.07 in
+  the logits on the test model). Speculative-decoding verification chunks
+  were affected the same way. The cache now attends with every key the
+  chunk's windows need and trims afterwards.
+- **KV-cache dtypes did not do what they said.**
+  - `kv_cache_dtype="fp16"`/`"bf16"` was accepted and silently kept fp32,
+    while `bench_generation_modes()` reported 2 bytes per element.
+  - `"int8"` used one scale for the whole cache and re-quantized the entire
+    history on every token: O(n) work per step, plus another rounding pass
+    over old entries each time.
+
+  Now fp16/bf16 store half precision, and int8/fp8 keep one scale per
+  (token, head), written once. The reported bytes are measured on the real
+  storage: int8 is 0.28× of fp32 including its scales.
+- **The LR schedule ignored gradient accumulation.** It was sized in batches.
+  With `accumulation_steps=4` a run therefore ended at a quarter of its
+  schedule, so WSD never reached its decay phase and cosine stopped at a high
+  LR. It is now sized in optimizer steps. Measured: 2.032 vs 2.056 nats/char
+  after 150 steps with accumulation 4.
+- **AdamW decayed RMSNorm/QK-norm gains and the token embedding.** Weight
+  decay now applies to the weight matrices only, as the Muon path already
+  did. Resuming a 2.7 optimizer state keeps its single parameter group, so
+  the Adam moments carry over.
+- **Restoring a scheduler state saved for a different number of parameter
+  groups could crash the next step.** It used to be half-applied before
+  failing. It is now refused before anything is assigned.
+
+**Faster** (2-vCPU CPU, 4 layers, `d_model` 256; 2.7.0 → 2.8.0)
+
+- **KV cache** (`auralite/engine/kv_cache.py`): preallocated, in-place
+  writes, sized once by generation for prompt + max tokens. Before, every
+  token ran a `torch.cat` of the whole history in every layer. Decode at
+  1k+ tokens of context: fp32 2.26 → 2.18 ms per token, int8
+  3.05 → 2.58 ms.
+- **Prefill** computes logits for the last position only
+  (`forward(..., logits_to_keep=1)`). First token after a 512-token prompt
+  with a 32k vocabulary: 67.5 → 24.9 ms.
+- **Sampling** (`auralite/engine/sampling.py`): min-p, top-p and the draw run
+  on the top-k candidates, and the repetition penalty is vectorized. The
+  sampling step is ×1.8–7.4 faster, e.g. 834 → 158 µs with
+  `repetition_penalty=1.1`. End to end with that penalty: 460 → 615 tok/s.
+  The kept tokens and probabilities are exactly 2.7's; a test compares the two
+  implementations, ties included.
+- **Speculative decoding**:
+  - a rejected draft rolls the cache back instead of re-reading the whole
+    context;
+  - a draft model keeps its own cache instead of re-reading the context for
+    every proposal.
+
+  Prompt lookup at 89 % acceptance: 296 → 647 tok/s. That is ×1.5 faster than
+  plain decoding, where 2.7 was *slower* than plain decoding. All drafts
+  rejected: 21 → 138 tok/s.
+- **MoE**: every expert runs only on the tokens routed to it, instead of every
+  token followed by masking. The dense form is kept for torch.compile, export
+  and tracing. Forward pass ×1.6 (4 experts) and ×2.5 (8 experts); training
+  step ×1.5 and ×3.0. Outputs and gradients are equal.
+- One shared decode loop for `generate`, streaming, chat and thinking mode
+  (2.7 had four copies). It enters inference mode per step, so a paused
+  stream no longer leaves the caller's thread in inference mode. A stream the
+  client abandoned can no longer free a newer generation's cache.
+
+**New**
+
+- **BPE pre-tokenizer `"gpt"`**, the default for new BPE tokenizers. A word
+  keeps its leading space, and punctuation and digits are split off. It
+  gives 16–34 % fewer tokens for the same text (tinyshakespeare and «Война и
+  мир», 512–8 192 tokens). At an equal step budget it measured
+  2.142 vs 2.245 bits per character on held-out Shakespeare. 2.7 checkpoints
+  keep the whitespace split; `bpe_pretokenizer="ws"` trains the old style.
+- **Presence / frequency penalties** (OpenAI semantics, over the last 64
+  tokens) in every native generation method. The server accepts
+  `presence_penalty`/`frequency_penalty` on both OpenAI endpoints and in
+  Ollama `options`; before 2.8 pydantic dropped them silently. GGUF models
+  pass them to llama.cpp. Hugging Face models have no equivalent and ignore
+  them.
+- **`max_steps`** training parameter: a budget in optimizer steps, with the
+  schedule sized to it.
+- Model API: `reset_cache(capacity=)`, `truncate_cache(end)`, `cache_length`,
+  `kv_cache_bytes()`, `forward(..., logits_to_keep=)`.
+- `docs/engine.md` (how generation works, measured) and
+  `benchmarks/core_bench.py` (the script behind the numbers; it also runs
+  against older trees).
+
+**Tried and rejected**: GPT-2's scaled init of the residual projections. It
+was worse in the same runs: 1.662 vs 1.640 nats/char over 3 seeds.
+
+**Compatibility**
+
+- The checkpoint format is unchanged. 2.7 checkpoints load and generate the
+  same greedy text, except sliding-window models (now correct) and
+  `kv_cache_dtype="fp16"`/`"bf16"` (now really half precision).
+- Sampling draws the same distribution with fewer random numbers. A fixed
+  seed therefore yields different samples than 2.7.
+- BPE tokenizer dicts gain `version`/`pretokenizer`. AuraLite 2.7 loads them
+  with its whitespace split: valid, but less compact.
+- `Attention.kv_cache` is now a read-only view of the new cache object.
+  The private `_pack_cache_tensor`/`_unpack_cache_tensor`/`_set_cached_kv`
+  helpers are gone.
+- The 2.6 module aliases stay one more release: their removal moves to 2.9, so
+  that this release changes the engine only.
+
+**Numbers**: Python 3.13 — 1216 passed, 4 skipped (50 new tests in
+`tests/test_engine_core_v28.py`); Python 3.11.17 — 1214 passed, 6 skipped.
+ruff gates are clean. The pyright ratchet baseline drops from 318 to 309: the
+shared decode loop removed ten errors in `_legacy.py` and added none
+elsewhere.
+
 # 📦 v2.7.0 — one `auralite` package, torch.export, torchao, ready for PyPI
 
 2.6.6 ran into PyTorch's deprecations (TorchScript, `torch.ao.quantization`)

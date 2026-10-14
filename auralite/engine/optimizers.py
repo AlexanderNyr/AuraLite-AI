@@ -138,13 +138,39 @@ def split_parameters_for_muon(model: nn.Module):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "norm" in name or "embedding" in name or param.ndim < 2:
+        if _no_weight_decay(name, param):
             adam_no_decay.append(param)
         elif param.ndim == 2 and "layers." in name:
             muon_params.append(param)
         else:
             adam_decay.append(param)
     return muon_params, adam_decay, adam_no_decay
+
+def _no_weight_decay(name: str, param: torch.Tensor) -> bool:
+    """Norm gains, embeddings, biases and other <2-D tensors are not decayed."""
+    return "norm" in name or "embedding" in name or param.ndim < 2
+
+
+def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """AdamW parameter groups: decay the weight matrices only (2.8).
+
+    2.7 passed ``model.parameters()`` with one weight decay, which also pulled
+    every RMSNorm/QK-norm gain and the token embedding towards zero. The Muon
+    path already excluded them (:func:`split_parameters_for_muon`); AdamW now
+    follows the same rule, which is the usual practice (GPT-2/nanoGPT, LLaMA).
+    """
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        (no_decay if _no_weight_decay(name, param) else decay).append(param)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
 
 class _ChainedOptimizers:
     """Thin wrapper that steps several optimizers as one (Muon + AdamW).

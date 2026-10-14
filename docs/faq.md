@@ -71,19 +71,24 @@ it never breaks generation.
 
 ## 4. int8/fp8 KV cache saved memory but not time — why?
 
-Because the cache is not the bottleneck at these sizes. The `--bench-modes` table
-reports both halves honestly:
+Because the cache is not the bottleneck at these sizes. Measured with
+`benchmarks/core_bench.py` (2.8, 4 layers, `d_model` 256, 2 KV heads, CPU):
 
-| KV mode | tokens/s | bytes/token (d=64, 4 layers) |
-|---|---|---|
-| fp32 | 1 139 | 2 048 |
-| fp16 | 1 148 | 1 024 |
-| int8 | 954 | 512 |
+| KV mode | bytes / token | decode at 0–255 tokens of context | at 1 024–1 279 |
+|---|---|---|---|
+| fp32 | 2 048 | 1.24 ms | 2.18 ms |
+| fp16 | 1 024 | — | — |
+| int8 (incl. scales) | 576 | 1.54 ms | 2.58 ms |
 
-4:2:1 bytes is exactly what you would expect, and the CPU speed is flat-ish (int8
-costs extra conversion work). Use a smaller KV dtype when **memory** is the limit
-(long context, big batch, many concurrent sessions); do not expect tokens/s from
-it.
+int8 keeps one scale per (token, head), so it costs 0.28× of fp32 rather than
+0.25×. The time difference is the dequantization work. Use a smaller KV dtype
+when **memory** is the limit (long context, big batch, many concurrent
+sessions); do not expect tokens/s from it.
+
+Before 2.8 this table looked better than reality. `kv_cache_dtype="fp16"` was
+silently stored as fp32 but reported as 2 bytes. The int8 cache re-quantized
+its whole history on every token, which made it slower the longer the
+context grew. [engine.md](engine.md) has the details.
 
 ## 5. Quantization: int8 should be ~2× faster, isn't it?
 
