@@ -208,6 +208,25 @@ class TestTrainingFlow:
         app.start_training()                     # the error is reported, not raised
         assert app.train_btn.config.call_args.kwargs["state"] == "normal"
 
+    def test_early_stopping_field_and_status(self, app, tmp_path, monkeypatch):
+        corpus = write_corpus(tmp_path)
+        tiny_train_params(app, corpus)
+        app.early_stop_var.set("3")
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        seen = {}
+
+        def fake_train(text, params, **kwargs):
+            seen.update(params)
+            return {"stop_reason": "early_stopping", "epochs_completed": 7,
+                    "restored_best": True, "best_val_loss": 1.25, "best_epoch": 4}
+
+        monkeypatch.setattr(app.engine, "train", fake_train)
+        app.start_training()
+        assert seen["early_stopping_patience"] == 3
+        status = app.status_label.config.call_args.kwargs["text"]
+        assert "Stopped early after epoch 7" in status and "restored" in status
+        assert "1.2500 at epoch 4" in status
+
     def test_autosave_path_is_derived_from_the_corpus(self, app, tmp_path, monkeypatch):
         corpus = write_corpus(tmp_path)
         tiny_train_params(app, corpus)

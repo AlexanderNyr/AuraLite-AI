@@ -1,3 +1,132 @@
+# 📦 v2.9.0 — training: one-pass epochs, honest validation, early stopping, faster steps
+
+This release changes how the native engine trains, not how it generates. The
+quality numbers are validation losses on the entire held-out 10 % of
+tinyshakespeare, as the mean of two seeds. The speed numbers come from
+`benchmarks/train_bench.py` (CPU, 2 threads). Details and tables are in
+[docs/training.md](docs/training.md).
+
+**Changed: an epoch is one pass over the text**
+
+- Up to 2.8 the training set held a window at every token position, so one
+  "epoch" was `seq_length` passes over the text. `recommend_epochs`, the GUI
+  *Auto* button and the presets all count passes. With the *Small* preset on
+  tinyshakespeare an epoch was 31,367 optimizer steps; it is now 491. The
+  preset's 100 epochs drop from about 56 hours to about 53 minutes.
+- Windows start every `sample_stride` tokens (default `seq_length`), from a
+  random offset drawn per epoch. At an equal step budget both kinds of epoch
+  train equally well: 1.6305 with stride 1 against 1.6355 with stride 64,
+  with the two seeds of each setting 0.008 apart.
+- `sample_stride=1` restores the 2.8 epoch. Scripts that chose an epoch count
+  for 2.8 now run 1/`seq_length` of the steps: multiply the epochs or set
+  `max_steps`.
+
+**Fixed**
+
+- **Validation looked at one passage.** 2.8 read the first 50 batches of
+  stride-1 windows, which is the first ~1,700 tokens of the held-out split,
+  each read up to 64 times. It was 0.14–0.19 nats (8–12 %) too optimistic and
+  could rank runs the wrong way: it put lr 1e-3 ahead of 2e-3, while the
+  entire split puts them the other way round. Validation now reads
+  non-overlapping windows spread over the whole split, within the same budget
+  (`val_max_tokens`, default 50 batches' worth). It matched the entire split
+  to within 0.001 in every run. Batches are weighted by their token count.
+- **Misspelt training parameters were silently ignored.** The quickstart's own
+  example used `"seq_len"`, so those runs trained with a context of 64
+  instead of 128. Unknown keys are now logged, with a suggestion
+  (`'seq_len' (did you mean 'seq_length'?)`). Names from other trainers are
+  recognised (`learning_rate`, `block_size`, `n_embd`, …). `auralite train`
+  rejects a near-miss with exit code 2. The quickstart is fixed.
+- **The `torch.compile` trial step compiled the wrong graph.** It ran one
+  sequence under `no_grad`, an inference graph that training never used, so a
+  failing backward only surfaced inside the loop. It is now a real training
+  step (the loader's batch shape, forward and backward), so a failure falls
+  back to eager before training starts. The compile time is logged. The
+  compiled loop drops the short last batch of an epoch, which would otherwise
+  compile a second graph.
+
+**Faster**
+
+- **Training step −8 to −14 % on CPU.** The step was timed with the 2.8 and
+  2.9 layers in one process on the same weights, char-level and 6 M BPE
+  models (dropout 0.1, with and without QK-norm). Two layers changed:
+  - RMSNorm and QK-norm have a closed-form backward (`_RMSNormFunction`)
+    instead of six autograd-recorded ops. Forward + backward on 32×128×128:
+    2.52 → 0.92 ms. Gradients match to float32 rounding, and a float64
+    gradcheck passes.
+  - Residual dropout (`ResidualDropout`) draws a uniform mask instead of
+    Bernoulli samples and keeps the scaled mask for a one-multiply backward.
+    On 4096×128: 3.69 → 2.49 ms, with the same distribution.
+
+  Both fall back to the plain code for inference, export and torch.compile.
+- **No `DataLoader` worker processes.** A batch is one gather from the token
+  tensor (`WindowBatches`, 0.03 ms). 2.8 started up to 4 workers on machines
+  with 4+ threads. With spawn (Windows, macOS) that cost 1.2 s before the
+  first batch and a pickled copy of the corpus per worker, plus 0.9 ms of IPC
+  per batch.
+- **Validation of a small split is up to `seq_length` × cheaper**: it is read
+  once instead of in overlapping windows. 60 steps plus one validation on a
+  200,000-character corpus: 12.1 → 8.1 s.
+- **The *Medium* and *GQA* presets no longer turn on gradient
+  checkpointing.** At that shape it made a step 36 % slower (0.43 vs 0.31 s
+  at batch 16) to save about 0.9 GB at the preset's batch of 64. *Large*
+  keeps it.
+
+**New**
+
+- `early_stopping_patience` (epochs without a better validation loss) and
+  `restore_best_weights`, which is on by default with early stopping. An
+  example: 40 epochs on 100,000 characters without dropout ended at
+  val 2.4381. With patience 3 the run stopped after epoch 16 and restored
+  epoch 13 at 1.5613, in 41 s instead of 110 s.
+- `train()` returns a summary, also kept as `engine.last_train_summary`:
+  epochs, optimizer steps, tokens, train/val/best loss, best epoch,
+  `stop_reason`, seconds. A final log line states the same.
+- GUI: an *Early stop* field next to *Val Split*. The status line reports an
+  early stop and the restored epoch.
+- `sample_stride` and `val_max_tokens` parameters.
+- `docs/training.md` and `benchmarks/train_bench.py`. The script also runs on
+  an older checkout for a before/after.
+
+**Defaults**
+
+- **Learning rate 3e-4 → 1e-3**: the engine default, the GUI field and the
+  *Small* preset. 1,500 steps of the *Small* model gave 1.7016 at 3e-4 and
+  1.6355 at 1e-3. 2e-3 (1.6310) and 3e-3 (1.6328) were within noise of 1e-3,
+  which is safer for larger models. The *Tiny*, *Medium*, *Large* and *GQA*
+  presets keep their values.
+- **Dropout stays at 0.1.** For about three passes over a corpus, no dropout
+  is better: 1.5840 against 1.6355. For 40 passes over 100,000 characters,
+  the final val loss was 2.4087 without dropout, 1.6934 at 0.1 and 1.5581 at
+  0.2.
+
+**Tried and rejected**
+
+- Random window starts (with replacement) instead of the shifted grid: 1.6380
+  against 1.6355.
+- `wsd_min_lr_ratio=0` instead of 0.2: 1.6384 against 1.6355.
+- A custom-op dropout under torch.compile: 160 against 164 ms, within run-to-run
+  noise.
+- `DataLoader` workers for in-memory windows: the IPC per batch costs 30×
+  the in-process gather.
+
+**Compatibility**
+
+- **Epoch semantics** (above). `sample_stride=1` restores the 2.8 epoch.
+- `train()` returns a dict instead of `None`.
+- A fixed `seed` draws a different batch order than 2.8.
+- The checkpoint format is unchanged. `ResidualDropout` subclasses
+  `nn.Dropout` and has no state.
+- The 2.6 module aliases (`import model_engine`, `from gui_app import AIApp`,
+  …) stay until 3.0 instead of being removed in 2.9. `python gui_app.py`
+  keeps working after that.
+
+**Numbers**: Python 3.13 — 1256 passed, 4 skipped (39 new tests in
+`tests/test_training_v29.py`, one more in the GUI flows); Python 3.11.17 — 1254
+passed, 6 skipped. The suite runs in about 2 minutes instead of about 5,
+because its training tests no longer run `seq_length`-pass epochs. The ruff
+gates are clean. The pyright ratchet baseline drops from 309 to 305.
+
 # 📦 v2.8.0 — the engine core: KV cache, sampling, speculative decoding, MoE, BPE
 
 This release changes the native engine, not the packaging. Each change is
@@ -75,8 +204,8 @@ and each speed-up is tested for equivalence with the code it replaces. Tables:
 
 - **BPE pre-tokenizer `"gpt"`**, the default for new BPE tokenizers. A word
   keeps its leading space, and punctuation and digits are split off. It
-  gives 16–34 % fewer tokens for the same text (tinyshakespeare and «Война и
-  мир», 512–8 192 tokens). At an equal step budget it measured
+  gives 23–34 % fewer tokens for the same text (tinyshakespeare, 512–8 192
+  tokens). At an equal step budget it measured
   2.142 vs 2.245 bits per character on held-out Shakespeare. 2.7 checkpoints
   keep the whitespace split; `bpe_pretokenizer="ws"` trains the old style.
 - **Presence / frequency penalties** (OpenAI semantics, over the last 64
@@ -480,7 +609,7 @@ Release of the improvement roadmap (P0 + P1 + actionable P2 items) on top of the
   silently did nothing; and the training progress strip formatted `val_loss` with
   `:.4f`, which raised `ValueError` as soon as the engine reported a string.
 - Session restore + `GuiConfig` persistence (atomic writes, tolerant of
-  corrupt/missing files), English/Русский UI with a live language switch,
+  corrupt/missing files), English/Russian UI with a live language switch,
   `TkAsyncBridge` for background work with proper shutdown, and Chat-tab
   insights: token-frequency bars and this layer's attention map
   (`engine.attention_maps()` / `token_frequencies()`).

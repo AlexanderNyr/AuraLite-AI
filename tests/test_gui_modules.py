@@ -28,12 +28,12 @@ from auralite.gui.async_ops import TkAsyncBridge
 # ----------------------------------------------------------------------
 def test_config_roundtrip(tmp_path):
     path = tmp_path / "cfg.json"
-    cfg = gui_config.GuiConfig(language="ru", theme="dark", geometry="1200x800",
+    cfg = gui_config.GuiConfig(language="fr", theme="dark", geometry="1200x800",
                                last_corpus="/data/corpus.txt", attention_layer=2)
     cfg.save(path)
     loaded = gui_config.load_config(path)
     assert loaded == cfg
-    assert loaded.as_dict()["language"] == "ru"
+    assert loaded.as_dict()["language"] == "fr"
 
 
 def test_config_missing_or_corrupt_file_yields_defaults(tmp_path):
@@ -52,10 +52,10 @@ def test_config_missing_or_corrupt_file_yields_defaults(tmp_path):
 
 def test_config_ignores_unknown_keys(tmp_path):
     path = tmp_path / "cfg.json"
-    path.write_text(json.dumps({"language": "ru", "format": "now", "unknown": 42}),
+    path.write_text(json.dumps({"language": "fr", "format": "now", "unknown": 42}),
                     encoding="utf-8")
     loaded = gui_config.load_config(path)
-    assert loaded.language == "ru"
+    assert loaded.language == "fr"
     assert not hasattr(loaded, "unknown")
     assert loaded.update(unknown=1, geometry="900x700").geometry == "900x700"
 
@@ -81,8 +81,8 @@ def test_config_path_env_override(monkeypatch, tmp_path):
 
 
 def test_config_language_defaults_to_env(monkeypatch):
-    monkeypatch.setenv("AURALITE_GUI_LANG", "ru")
-    assert gui_config.GuiConfig().language == "ru"
+    monkeypatch.setenv("AURALITE_GUI_LANG", "fr")
+    assert gui_config.GuiConfig().language == "fr"
 
 
 # ----------------------------------------------------------------------
@@ -122,12 +122,12 @@ def test_snapshot_from_app_skips_missing_paths(tmp_path):
     class FakeApp:
         selected_file_path = "/definitely/not/here.txt"
         last_prompt = "hello"
-        language = "ru"
+        language = "fr"
         gui_config = gui_config.GuiConfig(geometry="1000x700")
 
     state = gui_session.snapshot_from_app(FakeApp())
     assert "selected_file_path" not in state
-    assert state["last_prompt"] == "hello" and state["language"] == "ru"
+    assert state["last_prompt"] == "hello" and state["language"] == "fr"
     assert state["geometry"] == "1000x700"
 
 
@@ -193,9 +193,11 @@ def test_restore_tolerates_a_broken_widget(tmp_path):
 #  gui/i18n.py
 # ----------------------------------------------------------------------
 def test_catalogues_are_in_sync():
-    en, ru = i18n.MESSAGES["en"], i18n.MESSAGES["ru"]
-    assert set(en) == set(ru), f"missing translations: {set(en) ^ set(ru)}"
-    assert all(en[key].strip() and ru[key].strip() for key in en)
+    en = i18n.MESSAGES["en"]
+    assert set(i18n.MESSAGES) == set(i18n.LANGUAGES)
+    for code, catalogue in i18n.MESSAGES.items():
+        assert set(catalogue) == set(en), f"{code}: missing {set(en) ^ set(catalogue)}"
+        assert all(text.strip() for text in catalogue.values())
 
 
 def test_tab_keys_match_the_app_tab_names():
@@ -206,11 +208,10 @@ def test_tab_keys_match_the_app_tab_names():
 
 
 def test_translation_lookup_and_fallbacks():
-    assert i18n.tr("tab.train", lang="ru") == " Обучение "
     assert i18n.tr("tab.train", lang="en") == " Train "
+    assert i18n.tr("tab.train", lang="xx") == " Train "        # unknown → English
     assert i18n.tr("does.not.exist") == "does.not.exist"
     assert i18n.tr("msg.attention_title", layer=3) == "Attention (layer 3)"
-    assert i18n.tr("msg.attention_title", layer=3, lang="ru") == "Внимание (слой 3)"
     # a missing placeholder must not blow up
     assert "{layer}" in i18n.tr("msg.attention_title")
 
@@ -218,12 +219,12 @@ def test_translation_lookup_and_fallbacks():
 def test_set_language_switches_and_rejects_unknown():
     original = i18n.get_language()
     try:
-        assert i18n.set_language("ru") == "ru"
-        assert i18n.get_language() == "ru"
-        assert i18n.tr("btn.save") == "Сохранить"
+        assert i18n.set_language("en") == "en"
+        assert i18n.get_language() == "en"
+        assert i18n.tr("btn.save") == "Save"
         assert i18n.set_language("klingon") == "en"
         assert i18n.language_name() == "English"
-        assert set(i18n.available_languages()) == {"en", "ru"}
+        assert set(i18n.available_languages()) == {"en"}
     finally:
         i18n.set_language(original)
 

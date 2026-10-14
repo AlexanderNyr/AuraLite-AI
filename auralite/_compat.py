@@ -56,7 +56,7 @@ RENAMED: dict[str, str] = {
 }
 
 #: The release that deletes the shims.
-REMOVED_IN = "2.9"
+REMOVED_IN = "3.0"
 
 _finder_lock = threading.Lock()
 

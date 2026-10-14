@@ -1,4 +1,4 @@
-# Contributing / Как контрибьютить
+# Contributing
 
 ## Quick start
 
@@ -31,7 +31,7 @@ python benchmarks/benchmark_generation.py --quick              # sanity benchmar
   the package name (`from auralite.engine import …`), not the deprecated 2.6
   aliases.
 - Keep the public API of `auralite/__init__.py` and `auralite/engine/__init__.py`
-  intact. Until 2.9 the repository-root aliases (`model_engine.py`, `gui_app.py`,
+  intact. Until 3.0 the repository-root aliases (`model_engine.py`, `gui_app.py`,
   …) must keep resolving to the same module objects (`tests/test_compat_aliases.py`).
 
 ## Commit style

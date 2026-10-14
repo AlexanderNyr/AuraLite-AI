@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.gui` — removed in AuraLite 2.9.
+"""Deprecated alias of :mod:`auralite.gui` — removed in AuraLite 3.0.
 
 AuraLite 2.7 moved every module into the ``auralite`` package. This file only
 keeps ``import gui`` working inside a source checkout (it is not installed);

@@ -41,12 +41,11 @@ import math
 from collections import Counter, defaultdict
 from uuid import uuid4
 from pathlib import Path
-from typing import Callable, Iterator, Any, List, Dict, Optional
+from typing import Callable, Iterator, Any, List, Dict, Optional, cast
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 
 from auralite.engine.logging_utils import canonical_level, engine_logging
@@ -101,7 +100,7 @@ from auralite.engine.layers import (  # noqa: E402,F401
 from auralite.engine.model import (  # noqa: E402,F401
     LoRALayer, ModernTransformer, estimate_n_params,
 )
-from auralite.engine.dataset import CharDataset  # noqa: E402,F401
+from auralite.engine.dataset import CharDataset, WindowBatches, spread_indices  # noqa: E402,F401
 from auralite.engine import sampling as _sampling  # noqa: E402
 from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
@@ -174,6 +173,58 @@ class ParamValidationError(Exception):
     pass
 
 
+#: Every key `AuraLiteEngine.train` reads from its `params` dict (2.9). Anything
+#: else is ignored — `unknown_train_params` names those keys so a typo such as
+#: "seq_len" for "seq_length" no longer trains silently with the default.
+KNOWN_TRAIN_PARAMS = frozenset({
+    "accumulation_steps", "amp_dtype", "autosave_every", "autosave_every_steps",
+    "autosave_path", "batch_size", "bpe_pretokenizer", "bpe_vocab_size",
+    "chat_template", "continue_training", "corpus_cache", "corpus_cache_path",
+    "d_ff", "d_model", "dropout", "early_stopping_patience", "epochs", "grad_clip",
+    "kv_cache_dtype", "lora_rank", "lr", "lr_schedule", "max_steps",
+    "muon_adjust_lr", "muon_lr", "muon_momentum", "n_heads", "n_kv_heads",
+    "n_layers", "num_experts", "optimizer", "progress_every_batches",
+    "progress_every_seconds", "restore_best_weights", "resume_training_state",
+    "rope_scaling", "sample_stride", "seed", "seq_length", "sliding_window",
+    "tie_word_embeddings", "tokenizer", "use_alibi", "use_compile", "use_ddp",
+    "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
+    "val_max_tokens", "val_split", "weight_decay", "wsd_decay", "wsd_min_lr_ratio",
+    "wsd_stable_ratio",
+})
+
+
+#: Names other trainers use for AuraLite parameters (nanoGPT, Hugging Face, …).
+_TRAIN_PARAM_SYNONYMS = {
+    "learning_rate": "lr", "block_size": "seq_length", "context_length": "seq_length",
+    "max_seq_len": "seq_length", "seq_len": "seq_length", "n_embd": "d_model",
+    "hidden_size": "d_model", "n_layer": "n_layers", "num_layers": "n_layers",
+    "num_hidden_layers": "n_layers", "n_head": "n_heads", "num_heads": "n_heads",
+    "num_attention_heads": "n_heads", "intermediate_size": "d_ff",
+    "num_epochs": "epochs", "num_train_epochs": "epochs", "max_iters": "max_steps",
+    "gradient_accumulation_steps": "accumulation_steps", "vocab_size": "bpe_vocab_size",
+}
+
+
+def unknown_train_params(params: dict) -> list[tuple[str, str | None]]:
+    """``(key, closest known key or None)`` for every key `train()` would ignore."""
+    import difflib
+
+    unknown = []
+    for key in sorted(str(k) for k in params if k not in KNOWN_TRAIN_PARAMS):
+        hint = _TRAIN_PARAM_SYNONYMS.get(key)
+        if hint is None:
+            close = difflib.get_close_matches(key, KNOWN_TRAIN_PARAMS, n=1, cutoff=0.75)
+            hint = close[0] if close else None
+        unknown.append((key, hint))
+    return unknown
+
+
+def describe_unknown_params(unknown: list[tuple[str, str | None]]) -> str:
+    """``'seq_len' (did you mean 'seq_length'?), 'notes'`` — for warnings and errors."""
+    return ", ".join(f"{key!r}" + (f" (did you mean {hint!r}?)" if hint else "")
+                     for key, hint in unknown)
+
+
 def validate_params(params: dict) -> list[str]:
     """Validate training parameters. Returns list of error messages (empty = OK)."""
     errors = []
@@ -183,7 +234,7 @@ def validate_params(params: dict) -> list[str]:
     d_ff = params.get("d_ff", 256)
     seq_length = params.get("seq_length", 64)
     batch_size = params.get("batch_size", 32)
-    lr = params.get("lr", 3e-4)
+    lr = params.get("lr", 1e-3)
     epochs = params.get("epochs", 100)
     dropout = params.get("dropout", 0.1)
     grad_clip = params.get("grad_clip", 1.0)
@@ -234,6 +285,16 @@ def validate_params(params: dict) -> list[str]:
             errors.append(f"max_steps must be >= 0 (0 = no limit), got {max_steps}")
     except (TypeError, ValueError):
         errors.append(f"max_steps must be an integer, got {max_steps!r}")
+    # 2.9: epoch sampling, validation budget, early stopping
+    for key, low, none_ok in (("sample_stride", 1, True), ("val_max_tokens", 1, True),
+                              ("early_stopping_patience", 0, False)):
+        value = params.get(key)
+        if value is None and (none_ok or key not in params):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            errors.append(f"{key} must be an integer, got {value!r}")
+        elif value < low:
+            errors.append(f"{key} must be >= {low}, got {value}")
 
     # Gradient checkpointing validation
     if use_gradient_checkpointing and not isinstance(use_gradient_checkpointing, bool):
@@ -612,6 +673,8 @@ class AuraLiteEngine:
         self._compiled_inference_model = None  # torch.compile for generation (v2.6.5)
         self._compile_seconds = 0.0
         self.last_val_loss: float | None = None
+        #: what the last `train()` call did (2.9) — see `train` for the keys
+        self.last_train_summary: dict | None = None
         # v2.6.2: chat template persisted with the checkpoint; generate_chat()
         # uses it when the caller does not pass `chat_template` explicitly.
         self.default_chat_template: str = "chatml"
@@ -1927,25 +1990,29 @@ class AuraLiteEngine:
 
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
-    def _evaluate(self, loader, criterion, max_batches: int = 50) -> float | None:
-        """Returns mean cross-entropy on `loader`, or None if loader is empty."""
+    def _evaluate(self, loader, criterion, max_batches: int | None = None) -> float | None:
+        """Mean per-token cross-entropy on `loader`, or None if it is empty.
+
+        Batches are weighted by their token count (2.8 averaged batch means, so a
+        short last batch counted as much as a full one).
+        """
         self.model.eval()
-        total, n = 0.0, 0
+        total, count = 0.0, 0
         try:
             for i, (xb, yb) in enumerate(loader):
-                if i >= max_batches:
+                if max_batches is not None and i >= max_batches:
                     break
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
                 out = self.model(xb)
                 loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
-                total += loss.item()
-                n += 1
+                total += loss.item() * yb.numel()
+                count += yb.numel()
         finally:
             self.model.train()
-        if n == 0:
+        if count == 0:
             return None
-        return total / n
+        return total / count
 
     # ---- Training ----------------------------------------------------
     @staticmethod
@@ -2040,6 +2107,22 @@ class AuraLiteEngine:
           accumulation_steps: gradient accumulation (default 1, no accumulation)
           max_steps        : stop after N optimizer steps (default 0 = no limit);
                              the LR schedule is sized to the budget (2.8)
+          sample_stride    : distance between the starts of training windows
+                             (default seq_length: an epoch is one pass over the
+                             training tokens, with a fresh random window offset
+                             per epoch; 1 = every window, the 2.8 behaviour)
+          val_max_tokens   : validation budget in tokens (default
+                             50 * batch_size * seq_length), spread evenly over
+                             the validation split in non-overlapping windows
+          early_stopping_patience: stop after N epochs without a better
+                             validation loss (default 0 = off)
+          restore_best_weights: end with the weights of the best validation
+                             epoch (default: on when early stopping is on)
+
+        Returns a summary dict (also kept as ``engine.last_train_summary``):
+        epochs_completed, optimizer_steps, tokens, train_loss, val_loss,
+        best_val_loss, best_epoch, restored_best, stop_reason
+        (None | "max_steps" | "early_stopping" | "stopped"), seconds.
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
@@ -2104,6 +2187,10 @@ class AuraLiteEngine:
         errors = validate_params(params)
         if errors:
             raise ParamValidationError("\n".join(errors))
+        unknown = unknown_train_params(params)
+        if unknown:
+            logger.warning(f"[AuraLite] WARNING: unknown training parameter(s) ignored: "
+                           f"{describe_unknown_params(unknown)}")
 
         seq_length = params.get("seq_length", 64)
         d_model    = params.get("d_model", 128)
@@ -2115,7 +2202,9 @@ class AuraLiteEngine:
         # previously reached ModernTransformer where the %-modulo raised ZeroDivisionError.
         if n_kv_heads in (0, "0"):
             n_kv_heads = None
-        lr         = params.get("lr", 3e-4)
+        # 2.9: 1e-3 (was 3e-4) — measured best for the default model size,
+        # see docs/training.md § 5.
+        lr         = params.get("lr", 1e-3)
         epochs     = params.get("epochs", 100)
         batch_size = params.get("batch_size", 32)
         dropout    = params.get("dropout", 0.1)
@@ -2131,10 +2220,19 @@ class AuraLiteEngine:
         autosave_path  = params.get("autosave_path", "aura_autosave.pt")
         continue_training = params.get("continue_training", False)
         accumulation_steps = max(1, int(params.get("accumulation_steps", 1) or 1))
-        # 2.8: a budget in optimizer steps (0 = no limit). With sliding-window
-        # samples an "epoch" is (tokens - seq_length) windows, so a fixed step
-        # budget is the practical way to bound a run.
+        # 2.8: a budget in optimizer steps (0 = no limit); the LR schedule is
+        # sized to whichever ends first, the epochs or this budget.
         max_steps = max(0, int(params.get("max_steps", 0) or 0))
+        # 2.9: an epoch is one pass over the training tokens. Windows start every
+        # `sample_stride` tokens (default seq_length = no overlap) from a random
+        # offset drawn per epoch; sample_stride=1 restores the 2.8 epochs, which
+        # visited every window and were therefore seq_length passes long.
+        sample_stride = params.get("sample_stride")
+        sample_stride = max(1, int(sample_stride)) if sample_stride else int(seq_length)
+        val_max_tokens = params.get("val_max_tokens")
+        early_stopping_patience = max(0, int(params.get("early_stopping_patience", 0) or 0))
+        restore_best_weights = bool(params.get("restore_best_weights",
+                                               early_stopping_patience > 0))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
         resume_training_state = params.get("resume_training_state", True)
@@ -2446,7 +2544,7 @@ class AuraLiteEngine:
             encoded_bytes = encoded.numel() * encoded.element_size()
             logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
                         f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
-        token_count = total_tokens if use_mmap else len(encoded)
+        token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
         _setup_progress(
             f"Corpus tokenized: {token_count:,} tokens", 0.55,
         )
@@ -2488,62 +2586,68 @@ class AuraLiteEngine:
                     train_data = encoded[:split_at]
                     val_data   = encoded[split_at:]
 
-                n_val_samples = max(0, val_tokens - seq_length)
-                n_train_samples = max(0, n_train_tokens - seq_length)
-                logger.info(f"[AuraLite] Split: {n_train_tokens} train tokens "
-                            f"({n_train_samples} samples), {val_tokens} val tokens "
-                            f"({n_val_samples} samples), seq_length={seq_length}")
+                logger.info(f"[AuraLite] Split: {n_train_tokens} train tokens, "
+                            f"{val_tokens} val tokens, seq_length={seq_length}")
 
+        net = cast(nn.Module, self.model)      # the module being trained (typed)
         if use_mmap:
             from auralite.engine.dataset import PagedDataset
-            dataset = PagedDataset(corpus_file, seq_length, offset=0, limit=split_at)
+            assert corpus_file is not None
+            dataset = PagedDataset(corpus_file, seq_length, offset=0, limit=split_at,
+                                   stride=sample_stride)
         else:
-            dataset = CharDataset(train_data, seq_length)
+            assert train_data is not None
+            dataset = CharDataset(train_data, seq_length, stride=sample_stride)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
             )
 
-        # IMPROVED: better worker count heuristic
-        use_workers = (self.num_threads > 1) and (len(dataset) >= 5000)
-        num_workers = min(4, max(0, (self.num_threads // 2) - 1)) if use_workers else 0
-        train_sampler = None
-        if ddp_active:
-            train_sampler = DistributedSampler(
-                dataset, num_replicas=self.world_size,
-                rank=dist.get_rank(), shuffle=True, drop_last=False
-            )
-
-        loader_kwargs: dict = dict(
-            batch_size=batch_size,
-            shuffle=(train_sampler is None),
-            sampler=train_sampler,
-            num_workers=num_workers,
-            drop_last=False,
+        # 2.9: batches are gathered in-process (WindowBatches) instead of by
+        # DataLoader workers: a batch is one indexing op (~0.02 ms), while worker
+        # processes cost start-up time, IPC per batch and — with spawn on
+        # Windows — a pickled copy of the whole corpus per worker.
+        if seed is not None:
+            loader_seed = int(seed)
+        elif ddp_active:
+            loader_seed = 0                    # every rank must draw the same order
+        else:
+            loader_seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
+        loader = WindowBatches(
+            dataset, batch_size, shuffle=True, seed=loader_seed,
+            rank=dist.get_rank() if ddp_active else 0,
+            world_size=self.world_size if ddp_active else 1,
             pin_memory=(self.device.type == "cuda"),
+            drop_last=bool(use_compile),
         )
-        if num_workers > 0:
-            loader_kwargs["persistent_workers"] = True
-            loader_kwargs["prefetch_factor"] = 2
-
-        loader = DataLoader(dataset, **loader_kwargs)
+        logger.info(f"[AuraLite] Epoch: {len(dataset):,} windows of {seq_length} tokens "
+                    f"(stride {sample_stride}) = {len(loader):,} batches")
 
         val_loader = None
         if use_mmap:
+            assert corpus_file is not None
             val_ds = (PagedDataset(corpus_file, seq_length, offset=split_at,
-                                   limit=total_tokens - split_at)
+                                   limit=total_tokens - split_at, stride=seq_length)
                       if split_at < total_tokens else None)
         else:
-            val_ds = CharDataset(val_data, seq_length) if val_data is not None else None
+            val_ds = (CharDataset(val_data, seq_length, stride=seq_length)
+                      if val_data is not None else None)
         if val_ds is not None:
             if len(val_ds) > 0:
-                # Use a batch size that's guaranteed not to drop everything;
-                # never larger than the val set itself.
-                val_bs = max(1, min(batch_size, len(val_ds)))
-                val_loader = DataLoader(val_ds, batch_size=val_bs,
-                                        shuffle=False, drop_last=False)
-                logger.info(f"[AuraLite] Validation loader: {len(val_ds)} samples, "
-                            f"batch_size={val_bs}, {len(val_loader)} batches")
+                # 2.9: non-overlapping windows spread over the whole split. 2.8
+                # read the first 50 batches of stride-1 windows, i.e. only the
+                # first ~50*batch_size tokens of the split, ~seq_length times over.
+                from auralite.engine.dataset import _Subset
+                budget = int(val_max_tokens) if val_max_tokens else 50 * batch_size * seq_length
+                picked = spread_indices(len(val_ds), max(1, budget // seq_length))
+                val_bs = max(1, min(batch_size, len(picked)))
+                val_loader = WindowBatches(_Subset(val_ds, picked), val_bs,
+                                           shuffle=False, random_offsets=False)
+                spread = ("" if len(picked) == len(val_ds)
+                          else f", spread over {len(val_ds):,}")
+                logger.info(f"[AuraLite] Validation: {len(picked):,} windows "
+                            f"({len(picked) * seq_length:,} tokens{spread}), "
+                            f"batch_size={val_bs}")
             else:
                 logger.warning(f"[AuraLite] WARNING: val dataset is empty after windowing "
                                f"(val slice has {total_tokens - split_at} tokens, need > "
@@ -2597,20 +2701,30 @@ class AuraLiteEngine:
         if use_compile:
             compiled = None
             try:
+                compile_t0 = time.time()
                 compiled = torch.compile(self.model)
-                # Trial forward to force compilation now and catch backend errors
-                sample_len = min(seq_length, max(1, n_train_tokens - 1))
-                probe = torch.zeros((1, max(1, sample_len)),
-                                    dtype=torch.long, device=self.device)
-                with torch.no_grad():
-                    _ = compiled(probe)
                 if compiled is None:
                     raise RuntimeError("torch.compile returned None")
+                # 2.9: the trial step is a real training step — the batch shape
+                # of the loader, grad mode, forward *and* backward. 2.8 probed
+                # one sequence under no_grad, which compiled an inference graph
+                # that training never used and could not catch a backward
+                # failure; the training graph was then compiled inside the loop.
+                probe = torch.zeros((min(batch_size, len(dataset)), seq_length),
+                                    dtype=torch.long, device=self.device)
+                with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
+                    probe_out = compiled(probe)
+                probe_out.float().mean().backward()
+                net.zero_grad(set_to_none=True)
                 train_model = compiled
+                logger.info(f"[AuraLite] torch.compile: training graph ready in "
+                            f"{time.time() - compile_t0:.1f}s")
             except Exception as e:
                 # graceful fallback — training continues in plain eager mode
                 logger.warning(f"[AuraLite] torch.compile disabled (falling back to eager): {e}")
                 train_model = self.model
+                net.zero_grad(set_to_none=True)
+                loader.drop_last = False
                 try:
                     torch._dynamo.reset()
                 except Exception:
@@ -2666,11 +2780,20 @@ class AuraLiteEngine:
         run_opt_steps = 0           # optimizer steps taken in this run (max_steps)
         budget_done = False
 
+        best_val = None
+        best_epoch = None
+        best_state = None
+        epochs_without_gain = 0
+        epochs_completed = 0
+        tokens_seen = 0
+        last_train_loss = None
+        stop_reason = None
+
         for epoch in range(epochs):
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
             if stop_event and stop_event.is_set():
+                stop_reason = "stopped"
                 break
+            loader.set_epoch(epoch)
 
             running_loss   = 0.0
             seen_batches   = 0
@@ -2722,6 +2845,7 @@ class AuraLiteEngine:
                 running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
                 completed_batches_total += 1
+                tokens_seen += yb.numel()
                 if max_steps and run_opt_steps >= max_steps:
                     budget_done = True
 
@@ -2778,7 +2902,10 @@ class AuraLiteEngine:
                 if budget_done:
                     break
 
+            if seen_batches:
+                last_train_loss = running_loss / seen_batches
             if stopped_mid:
+                stop_reason = "stopped"
                 # Final status for interrupted epoch
                 if report_rank_ok and seen_batches > 0:
                     avg_loss = running_loss / seen_batches
@@ -2835,6 +2962,15 @@ class AuraLiteEngine:
                     )
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
+                if val_loss is not None:
+                    if best_val is None or val_loss < best_val:
+                        best_val, best_epoch, epochs_without_gain = val_loss, epoch + 1, 0
+                        if restore_best_weights:
+                            best_state = {k: v.detach().clone()
+                                          for k, v in net.state_dict().items()}
+                    else:
+                        epochs_without_gain += 1
+            epochs_completed = epoch + 1
 
             if autosave_every and (epoch + 1) % autosave_every == 0 and (not ddp_active or dist.get_rank() == 0):
                 try:
@@ -2872,9 +3008,48 @@ class AuraLiteEngine:
                 )
 
             if budget_done:
+                stop_reason = "max_steps"
                 logger.info(f"[AuraLite] max_steps={max_steps} reached "
                             f"(epoch {epoch + 1}/{epochs}); training stops.")
                 break
+            if early_stopping_patience and epochs_without_gain >= early_stopping_patience:
+                stop_reason = "early_stopping"
+                logger.info(f"[AuraLite] Early stopping: no better validation loss for "
+                            f"{epochs_without_gain} epochs (best {best_val:.4f} at epoch "
+                            f"{best_epoch}).")
+                break
+
+        restored = False
+        if (restore_best_weights and best_state is not None
+                and (best_epoch != epochs_completed or stop_reason == "stopped")):
+            net.load_state_dict(best_state)
+            self.last_val_loss = best_val
+            restored = True
+            logger.info(f"[AuraLite] Restored the weights of epoch {best_epoch} "
+                        f"(best validation loss {best_val:.4f}).")
+        elapsed = time.time() - train_t0
+        val_note = ""
+        if self.last_val_loss is not None:
+            val_note = f", val loss {self.last_val_loss:.4f}"
+            if best_epoch is not None and not restored and best_epoch != epochs_completed:
+                val_note += f" (best {best_val:.4f} at epoch {best_epoch})"
+        logger.info(f"[AuraLite] Training done: {epochs_completed} epochs, "
+                    f"{run_opt_steps:,} optimizer steps, {tokens_seen:,} tokens in "
+                    f"{elapsed:.1f}s ({tokens_seen / max(elapsed, 1e-9):,.0f} tokens/s)"
+                    f"{val_note}" + (f"; stopped: {stop_reason}" if stop_reason else ""))
+        self.last_train_summary = {
+            "epochs_completed": epochs_completed,
+            "optimizer_steps": run_opt_steps,
+            "tokens": tokens_seen,
+            "train_loss": last_train_loss,
+            "val_loss": self.last_val_loss,
+            "best_val_loss": best_val,
+            "best_epoch": best_epoch,
+            "restored_best": restored,
+            "stop_reason": stop_reason,
+            "seconds": elapsed,
+        }
+        return dict(self.last_train_summary)
 
     def compile_for_inference(self, mode: str = "reduce-overhead") -> bool:
         """Compile the native torch model for low-latency inference.
@@ -3468,7 +3643,7 @@ class AuraLiteEngine:
         sampled from the logits of a padding token.
 
         v2.6.5: identical prompts are deduplicated — a batch like
-        ["Что такое X?", "Что такое X?", "другое"] runs the duplicate once and
+        ["What is X?", "What is X?", "something else"] runs the duplicate once and
         reuses the result, which is the common GUI/API pattern.
         """
         if self.model is None:

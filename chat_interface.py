@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.chat_interface` — removed in AuraLite 2.9.
+"""Deprecated alias of :mod:`auralite.chat_interface` — removed in AuraLite 3.0.
 
 AuraLite 2.7 moved every module into the ``auralite`` package. This file only
 keeps ``import chat_interface`` working inside a source checkout (it is not installed);

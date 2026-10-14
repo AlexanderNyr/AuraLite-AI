@@ -2,7 +2,7 @@
 
 Until 2.6 this package was the top-level ``model_engine``; 2.7.0 moved it into
 the ``auralite`` package (``import model_engine`` still works in a source
-checkout until 2.8, see :mod:`auralite._compat`).
+checkout until 3.0, see :mod:`auralite._compat`).
 
 PyInstaller note
 ----------------

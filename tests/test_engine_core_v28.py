@@ -487,15 +487,15 @@ def test_resuming_a_single_group_optimizer_state_keeps_its_layout(tiny_text):
 # ----------------------------------------------------------------------
 #  BPE pre-tokenizer
 # ----------------------------------------------------------------------
-MIXED = ("Hello, world! It's 2026-10-14: 12345 items_total.\n\nПривет, мир — "
-         "«ёжик» 3.14\t  done.\r\nend")
+MIXED = ("Hello, world! It's 2026-10-14: 12345 items_total.\n\nΚαλημέρα, κόσμε — "
+         "«ψάρι» 3.14\t  done.\r\nend")
 
 
 def test_gpt_pretokenizer_is_lossless_and_keeps_leading_spaces():
     tok = BPETokenizer()
     pieces = tok._split_pieces(MIXED)
     assert "".join(pieces) == MIXED
-    assert " world" in pieces and " мир" in pieces and "Hello" in pieces
+    assert " world" in pieces and " κόσμε" in pieces and "Hello" in pieces
     assert " 123" in pieces and "45" in pieces       # digits in groups of three
     tok.train(MIXED * 20, vocab_size=120)
     assert tok.decode(tok.encode(MIXED)) == MIXED
@@ -503,7 +503,7 @@ def test_gpt_pretokenizer_is_lossless_and_keeps_leading_spaces():
 
 def test_gpt_pretokenizer_compresses_better_than_whitespace():
     text = ("The quick brown fox, the lazy dog; the end. " * 40
-            + "Быстрая лиса, ленивая собака; конец. " * 40)
+            + "Η γρήγορη αλεπού, ο τεμπέλης σκύλος· τέλος. " * 40)
     sizes = {}
     for mode in ("ws", "gpt"):
         tok = BPETokenizer(pretokenizer=mode)

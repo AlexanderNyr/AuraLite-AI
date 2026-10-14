@@ -4,10 +4,12 @@ Every other training test asserts `loss > 0` or `loss is not None`. A broken
 causal mask, a RoPE sign error or an optimizer that never steps would pass all
 of them. These tests pin down *behaviour* instead:
 
-* one epoch (~5 s on a CPU) on a small deterministic corpus must take the
-  validation loss from ~ln(vocab) ≈ 3.4 nats to far below 0.5 (measured: 0.037),
+* ~380 optimizer steps (~5 s on a CPU) on a small deterministic corpus must
+  take the validation loss from ~ln(vocab) ≈ 3.4 nats to far below 0.5,
   predict the next character correctly almost everywhere, and continue a
-  memorised sentence greedily;
+  memorised sentence greedily. Since 2.9 an epoch is one pass over the corpus
+  (6 batches here), so the budget is 64 epochs — the token count of one 2.8
+  epoch, which visited every window;
 * a checkpoint written by AuraLite 2.6.4 (before the `weights_only` loading,
   the decomposed engine and the 2.6.5 refactors) must load with identical
   tokenisation and logits. `tests/data/golden_v2_6_4.*` was produced by the
@@ -31,7 +33,7 @@ CORPUS = ("the quick brown fox jumps over the lazy dog. "
           "a journey of a thousand miles begins with a single step. "
           "to be or not to be, that is the question. ") * 40
 PARAMS = {"tokenizer": "char", "d_model": 64, "d_ff": 128, "n_heads": 4, "n_layers": 2,
-          "n_kv_heads": 2, "seq_length": 64, "batch_size": 16, "lr": 3e-3, "epochs": 1,
+          "n_kv_heads": 2, "seq_length": 64, "batch_size": 16, "lr": 3e-3, "epochs": 64,
           "val_split": 0.1, "seed": 0, "optimizer": "adamw"}
 
 
@@ -51,12 +53,15 @@ def learned():
     return engine
 
 
-def test_one_epoch_learns_the_corpus(learned):
+def test_short_training_learns_the_corpus(learned):
     uniform = math.log(learned.vocab_size)
     assert uniform > 3.0
     assert learned.last_val_loss is not None
     assert learned.last_val_loss < 0.5, (
-        f"val loss {learned.last_val_loss:.3f} after one epoch (uniform guess: {uniform:.2f})")
+        f"val loss {learned.last_val_loss:.3f} after training (uniform guess: {uniform:.2f})")
+    summary = learned.last_train_summary
+    assert summary["epochs_completed"] == 64 and summary["stop_reason"] is None
+    assert 300 <= summary["optimizer_steps"] <= 500
 
 
 def test_next_character_is_predicted_almost_everywhere(learned):

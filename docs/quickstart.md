@@ -34,7 +34,7 @@ engine has sensible defaults. A minimal parametrisation for a CPU laptop:
 ```json
 {
   "d_model": 128, "n_layers": 4, "n_heads": 4, "d_ff": 512,
-  "seq_len": 128, "batch_size": 32, "epochs": 20,
+  "seq_length": 128, "batch_size": 32, "epochs": 20,
   "tokenizer": "bpe", "bpe_vocab_size": 2048,
   "optimizer": "muon", "lr_schedule": "wsd"
 }
@@ -109,8 +109,7 @@ auralite-gui          # installed; from a source checkout: python gui_app.py
 The GUI covers training (text *and* image diffusion), generation, chat with
 attention/token-frequency plots, model management, quantization, evaluation and
 export. Settings live in `$AURALITE_HOME/gui_config.json`, the last session
-(corpus path, tab, language) is restored on start, and the UI speaks English and
-Russian (`$AURALITE_GUI_LANG=en|ru`, or the toolbar switch).
+(corpus path, tab) is restored on start.
 
 ## 6. Measure before you optimise
 
@@ -156,4 +155,3 @@ offers the same formats.
 - `auralite --help` — every command; `auralite info --help` for the diagnostics.
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — module map and the engine's data flow.
 - [CHANGELOG.md](../CHANGELOG.md) — what changed in v2.6.5 and why.
-- README.ru.md — то же самое по-русски.

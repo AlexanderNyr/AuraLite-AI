@@ -1,4 +1,4 @@
-# FAQ — «почему не ускоряется?» / "why isn't it faster?"
+# FAQ — "why isn't it faster?"
 
 Every number in this file was measured on this repository's own code; the
 commands to reproduce each one are included. Where a claim could not be verified
@@ -105,20 +105,26 @@ quality with perplexity instead of vibes.
 ## 6. It's using only 1 core / it's using all cores and my laptop throttles
 
 The engine calls `configure_cpu_threads()` at import (and can be re-run with an
-explicit number). Two independent thread pools exist: PyTorch's intra-op threads
-and the `DataLoader` workers. On a laptop, `torch_threads=4` can be *faster* than
+explicit number). Only PyTorch's intra-op threads do the work: since 2.9,
+training gathers batches in its own process and starts no `DataLoader`
+workers. On a laptop, `torch_threads=4` can be *faster* than
 `torch_threads=all` because sustained all-core AVX load drops the clock. Try both.
 
 ## 7. Training is slow / memory-hungry
 
 - Use `--mmap` for large corpora (§ quickstart): the RAM path allocates ~16 MiB
   per 1 MiB of text just to tokenise.
-- `gradient_checkpointing=True` trades ~30 % speed for a large activation-memory
-  cut.
-- `batch_size` × `seq_len` is the memory knob; `d_model` is the compute knob.
+- `use_gradient_checkpointing=True` trades speed for activation memory: a step
+  was 36 % slower for 230 MB less peak memory per 16 sequences at the *Medium*
+  preset's shape ([training.md](training.md) § 4).
+- `batch_size` × `seq_length` is the memory knob; `d_model` is the compute knob.
 - Watch **val loss**, not loss: if val stops improving while loss keeps falling,
-  more epochs will not help. `engine.recommend_epochs(corpus_size)` gives a
+  more epochs will not help — `early_stopping_patience=3` ends the run there and
+  keeps the best epoch's weights. `engine.recommend_epochs(corpus_size)` gives a
   starting point.
+- Coming from 2.8? An epoch is now one pass over the text, not `seq_length`
+  passes ([training.md](training.md) § 1); `sample_stride=1` restores the old
+  epoch.
 
 ## 8. The GUI generation is slower than the CLI with the same model
 

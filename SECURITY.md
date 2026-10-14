@@ -1,13 +1,10 @@
-# Security policy / Политика безопасности
+# Security policy
 
 ## Reporting a vulnerability
 
 Please **do not** open a public issue for security problems. Report privately via
 GitHub Security Advisories ("Report a vulnerability" in the *Security* tab) or by
 e-mail to the maintainer listed in `pyproject.toml`.
-
-Уязвимости не публикуйте в открытых issue — используйте GitHub Security
-Advisories или письмо мейнтейнеру.
 
 We aim to acknowledge within 3 business days and to ship a fix or mitigation
 within 30 days for confirmed issues.

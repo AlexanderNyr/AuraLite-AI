@@ -18,7 +18,7 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
-READMES = [README, REPO_ROOT / "README.ru.md"]
+READMES = [README]
 DOC_FILES = [p for p in (REPO_ROOT / "docs").glob("*.md")]
 WORKFLOWS = {p.name: yaml.safe_load(p.read_text(encoding="utf-8"))
              for p in (REPO_ROOT / ".github" / "workflows").glob("*.yml")}
@@ -317,7 +317,7 @@ def test_pypi_readme_has_only_absolute_links():
 def test_readme_advertises_the_documentation_set():
     readme = README.read_text(encoding="utf-8")
     for target in ("docs/quickstart.md", "docs/faq.md", "docs/quantization.md",
-                   "README.ru.md"):
+                   "docs/engine.md", "docs/training.md"):
         assert target in readme, target
     # The badges must not promise a version the code does not have.
     from auralite.engine import __version__

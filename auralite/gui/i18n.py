@@ -1,15 +1,14 @@
-"""gui/i18n.py — tiny translation layer for the AuraLite GUI (v2.6.5).
+"""gui/i18n.py — the string catalogue of the AuraLite GUI.
 
-The GUI shipped English-only labels; the project's audience (and its README) is
-Russian-speaking. This module is intentionally a *dictionary*, not a framework:
-two complete catalogues, a module-level "current language" that the GUI sets
-from `GuiConfig`/``$AURALITE_GUI_LANG``, and a fallback chain
-``requested language → English → the key itself`` so a missing string can never
-crash a tab.
+A *dictionary*, not a framework: one catalogue per language, a module-level
+"current language" that the GUI sets from `GuiConfig`/``$AURALITE_GUI_LANG``,
+and a fallback chain ``requested language → English → the key itself`` so a
+missing string can never crash a tab. The GUI shows a language selector only
+when more than one catalogue is present.
 
 Keys are grouped by area: ``tab.*`` for notebook titles (the suffix is the
 `AIApp._TAB_NAMES` entry: ``tab.train``, ``tab.gen``, ``tab.quant``, …), ``btn.*`` for buttons
-worth translating, ``msg.*`` for the few status strings the app produces itself.
+and labels, ``msg.*`` for the few status strings the app produces itself.
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ __all__ = ["LANGUAGES", "MESSAGES", "available_languages", "get_language",
 DEFAULT_LANGUAGE = "en"
 
 #: language code → human-readable name (shown in the GUI selector)
-LANGUAGES = {"en": "English", "ru": "Русский"}
+LANGUAGES = {"en": "English"}
 
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
@@ -55,38 +54,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "msg.tokens_title": "Token frequency",
         "msg.attention_title": "Attention (layer {layer})",
         "msg.plots_unavailable": "Install matplotlib to see plots: pip install matplotlib",
-    },
-    "ru": {
-        # вкладки
-        "tab.train": " Обучение ",
-        "tab.image": " Картинки ",
-        "tab.gen": " Генерация ",
-        "tab.chat": " Чат ",
-        "tab.model": " Модель ",
-        "tab.quant": " Квантование ",
-        "tab.eval": " Оценка ",
-        "tab.export": " Экспорт ",
-        "tab.console": " Консоль ",
-        # кнопки и подписи
-        "btn.language": "🌐 Язык",
-        "btn.dark": "🌙 Тёмная тема",
-        "btn.save": "Сохранить",
-        "btn.load": "Загрузить",
-        "btn.clear": "Очистить",
-        "btn.copy": "Копировать",
-        "btn.insights": "📊 Токены",
-        "btn.attention": "🔥 Карта внимания",
-        "lbl.tokens": "Токены",
-        "lbl.attention_layer": "Слой",
-        "lbl.status": "Статус",
-        # сообщения приложения
-        "msg.session_restored": "Сессия восстановлена: {what}",
-        "msg.session_saved": "Сессия сохранена в {path}",
-        "msg.no_model": "Сначала загрузите или обучите модель.",
-        "msg.empty_output": "Вывод пуст — нечего рисовать.",
-        "msg.tokens_title": "Частоты токенов",
-        "msg.attention_title": "Внимание (слой {layer})",
-        "msg.plots_unavailable": "Для графиков установите matplotlib: pip install matplotlib",
     },
 }
 

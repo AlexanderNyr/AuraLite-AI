@@ -17,7 +17,7 @@ UNK_TOKEN = "\ufffd"  # Unicode replacement character
 # GPT-2/GPT-4-style pre-tokenizer (2.8), written for the stdlib `re` module:
 # a word keeps its leading space (" world"), letters/digits/punctuation form
 # separate pieces, digits are grouped in threes, newlines get their own
-# pieces. `[^\W\d_]` = Unicode letters, so Cyrillic works like Latin.
+# pieces. `[^\W\d_]` = Unicode letters, so every alphabet works like Latin.
 # The final alternative catches anything else, so the split is lossless.
 _GPT_SPLIT = re.compile(
     r"""'(?:[sdmtSDMT]|ll|ve|re|LL|VE|RE)"""

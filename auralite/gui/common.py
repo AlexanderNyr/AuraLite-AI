@@ -96,7 +96,7 @@ CONFIG_PRESETS = {
     },
     "Small (default)": {
         "d_model": 128, "d_ff": 256, "n_heads": 4, "n_layers": 4,
-        "seq_length": 64, "batch_size": 32, "lr": 0.0003, "epochs": 100,
+        "seq_length": 64, "batch_size": 32, "lr": 0.001, "epochs": 100,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
@@ -105,7 +105,9 @@ CONFIG_PRESETS = {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
-        "use_gradient_checkpointing": True,
+        # 2.9: off — recomputing activations made each step ~36 % slower
+        # for ~0.9 GB less memory at this size (docs/training.md § 4).
+        "use_gradient_checkpointing": False,
         "rope_scaling": {"type": "yarn", "factor": 4.0},  # 4x context
     },
     "Large (powerful GPU)": {
@@ -119,7 +121,7 @@ CONFIG_PRESETS = {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 2,
-        "use_gradient_checkpointing": True,
+        "use_gradient_checkpointing": False,
         "rope_scaling": {"type": "ntk", "factor": 4.0},
     },
 }

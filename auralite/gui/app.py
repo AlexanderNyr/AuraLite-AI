@@ -166,17 +166,20 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._build_console_tab()
 
         # Language selector (v2.6.5): tabs are re-labelled in place, the choice
-        # is remembered in gui_config.json.
+        # is remembered in gui_config.json. Shown only when the catalogue has
+        # more than one language.
         try:
             self.language_var = tk.StringVar(value=language_name(self.language))
+            if len(available_languages()) < 2:
+                raise LookupError("single-language catalogue")
             lang_menu = ttk.OptionMenu(info_row, self.language_var,
                                        language_name(self.language),
                                        *[language_name(code) for code in available_languages()],
                                        command=self._on_language_change)
             lang_menu.pack(side=tk.RIGHT, padx=8)
             ttk.Label(info_row, text=tr("btn.language"), style="Sub.TLabel").pack(side=tk.RIGHT)
-        except Exception as exc:      # pragma: no cover - exotic Tk builds
-            gui_common.logger.debug("language selector unavailable: %s", exc)
+        except Exception as exc:      # one language, or an exotic Tk build
+            gui_common.logger.debug("language selector not shown: %s", exc)
 
         # Hook stdout/stderr into the console tab. Do it AFTER the widget
         # exists. Keep references so we can restore them on shutdown.

@@ -140,6 +140,14 @@ def cmd_train(args: argparse.Namespace) -> int:
     except Exception as err:
         print(f"error: invalid training parameters: {err}", file=sys.stderr)
         return 2
+    # 2.9: the typed config accepts extra keys, so a misspelt key used to train
+    # silently with the default. A near-miss of a known key is now an error.
+    from auralite.engine import describe_unknown_params, unknown_train_params
+    typos = [(key, hint) for key, hint in unknown_train_params(params) if hint]
+    if typos:
+        print(f"error: unknown training parameter(s): {describe_unknown_params(typos)}",
+              file=sys.stderr)
+        return 2
     engine = AuraLiteEngine()
     engine.train(text, params,
                  progress_callback=None if getattr(args, "quiet", False) else _progress)

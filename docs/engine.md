@@ -141,16 +141,16 @@ Both forms produce the same outputs and gradients, which a test checks.
   so with `accumulation_steps=4` a run ended at a quarter of its schedule.
   The WSD decay phase never started, and cosine stopped at a high LR.
 * **`max_steps`** sets a budget in optimizer steps, and the schedule is sized
-  to it. With sliding-window samples an "epoch" contains
-  `tokens - seq_length` windows, so a step budget is the practical way to
-  bound a run.
+  to it. (In 2.8 an "epoch" contained `tokens - seq_length` windows, so a
+  step budget was the practical way to bound a run. Since 2.9 an epoch is
+  one pass over the text — see [training.md](training.md).)
 
 ## 7. BPE pre-tokenizer
 
 The pre-tokenizer decides where merges may happen. New BPE tokenizers use
 GPT-style pieces: a word keeps its leading space (`" world"`), punctuation and
 digits are split off, and digits are grouped in threes. Letters are matched as
-Unicode letters, so Cyrillic text is handled like Latin. 2.7 split on
+Unicode letters, so every alphabet is handled like Latin. 2.7 split on
 whitespace only. Every space was a token of its own, and `word`, `word,` and
 `word.` were unrelated tokens.
 
@@ -240,9 +240,6 @@ The pre-tokenizer counts compression on held-out text:
 | tinyshakespeare | 512 | 1.70 | 2.22 | 23 % |
 | tinyshakespeare | 2 048 | 2.02 | 2.86 | 29 % |
 | tinyshakespeare | 8 192 | 2.36 | 3.58 | 34 % |
-| «Война и мир», том 1 | 512 | 1.72 | 2.05 | 16 % |
-| «Война и мир», том 1 | 2 048 | 2.19 | 2.96 | 26 % |
-| «Война и мир», том 1 | 8 192 | 2.58 | 3.83 | 33 % |
 
 Fewer tokens for the same text means a fixed `seq_length` holds more text,
 an epoch costs fewer steps and generation needs fewer steps per sentence.

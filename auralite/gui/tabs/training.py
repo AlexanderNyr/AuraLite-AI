@@ -32,7 +32,7 @@ class TrainTabMixin:
         grid.pack(fill=tk.X)
 
         self.params = {
-            "lr":         tk.StringVar(value="0.0003"),
+            "lr":         tk.StringVar(value="0.001"),
             "epochs":     tk.StringVar(value="100"),
             "d_model":    tk.StringVar(value="128"),
             "d_ff":       tk.StringVar(value="256"),
@@ -103,6 +103,15 @@ class TrainTabMixin:
         self.val_split_var = tk.StringVar(value="0.1")
         ttk.Entry(row1, textvariable=self.val_split_var,
                   width=6).pack(side=tk.LEFT, padx=4)
+
+        # 2.9: stop when val loss has not improved for N epochs and keep the
+        # best epoch's weights (needs a validation split).
+        ttk.Label(row1, text="Early stop:").pack(side=tk.LEFT, padx=(12, 4))
+        self.early_stop_var = tk.StringVar(value="0")
+        ttk.Entry(row1, textvariable=self.early_stop_var,
+                  width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="(epochs, 0=off)", style="Sub.TLabel").pack(
+            side=tk.LEFT, padx=2)
 
         # NEW: GQA, Accumulation, ALiBi, LoRA
         row1b = ttk.Frame(tok_frame)
@@ -612,6 +621,7 @@ class TrainTabMixin:
                 "tokenizer":       self.tok_var.get(),
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
                 "val_split":       float(self.val_split_var.get()),
+                "early_stopping_patience": int(self.early_stop_var.get() or 0),
                 # Live progress bar: ~1% of epoch + time-based ticks
                 "progress_every_seconds": 0.5,
                 "use_compile":     bool(self.compile_var.get()),
@@ -719,15 +729,24 @@ class TrainTabMixin:
 
         def run():
             try:
-                self.engine.train(
+                summary = self.engine.train(
                     text, params,
                     progress_callback=self.update_progress,
                     stop_event=self.stop_event,
                 )
+                summary = summary if isinstance(summary, dict) else {}
                 total_time = (time.time() - self.train_start_time
                               if self.train_start_time else 0.0)
                 total_str = _fmt_duration(total_time)
-                if self.stop_event.is_set():
+                if summary.get("stop_reason") == "early_stopping":
+                    kept = ("restored" if summary.get("restored_best")
+                            else "of the last epoch kept")
+                    msg = (f"Status: Stopped early after epoch "
+                           f"{summary.get('epochs_completed')} — weights {kept}, best "
+                           f"val loss {summary.get('best_val_loss', 0.0):.4f} at epoch "
+                           f"{summary.get('best_epoch')} ✅  |  Total: {total_str}")
+                    print(f"[AuraLite] Training stopped early after {total_str}.")
+                elif self.stop_event.is_set():
                     msg = (f"Status: Stopped. 🛑 Weights preserved — "
                            f"you can generate or save.  |  Total: {total_str}")
                     print(f"[AuraLite] Training stopped after {total_str}.")

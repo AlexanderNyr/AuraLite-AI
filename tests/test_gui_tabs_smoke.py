@@ -207,10 +207,10 @@ def test_language_switch_relabels_tabs(app):
     from auralite.gui.i18n import tr
 
     app.notebook.tab.reset_mock()
-    app._on_language_change("Русский")
-    assert app.language == "ru"
-    assert app.gui_config.language == "ru"
-    assert tr("tab.train") == " Обучение "
+    app._on_language_change("English")
+    assert app.language == "en"
+    assert app.gui_config.language == "en"
+    assert tr("tab.train") == " Train "
     assert app.notebook.tab.call_count == len(app._tab_names)
     for call in app.notebook.tab.call_args_list:
         assert call.kwargs["text"].startswith(" ")

@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.evaluation` — removed in AuraLite 2.9.
+"""Deprecated alias of :mod:`auralite.evaluation` — removed in AuraLite 3.0.
 
 AuraLite 2.7 moved every module into the ``auralite`` package. This file only
 keeps ``import evaluation`` working inside a source checkout (it is not installed);

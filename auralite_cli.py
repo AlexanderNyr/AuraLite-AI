@@ -1,4 +1,4 @@
-"""Deprecated alias of :mod:`auralite.cli` — removed in AuraLite 2.9.
+"""Deprecated alias of :mod:`auralite.cli` — removed in AuraLite 3.0.
 
 ``python auralite_cli.py …`` keeps working in a source checkout; an installed
 AuraLite provides the ``auralite`` command (``python -m auralite``). Importing
