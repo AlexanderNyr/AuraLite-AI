@@ -108,21 +108,23 @@ CONFIG_PRESETS = {
         # 2.9: off — recomputing activations made each step ~36 % slower
         # for ~0.9 GB less memory at this size (docs/training.md § 4).
         "use_gradient_checkpointing": False,
-        "rope_scaling": {"type": "yarn", "factor": 4.0},  # 4x context
+        # 2.11: no RoPE scaling — it did not extend the context in any
+        # measurement (docs/engine.md § 9); generation keeps the trained length.
+        "rope_scaling": None,
     },
     "Large (powerful GPU)": {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
         "seq_length": 256, "batch_size": 32, "lr": 0.0001, "epochs": 30,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": True,
-        "rope_scaling": {"type": "yarn", "factor": 8.0},
+        "rope_scaling": None,
     },
     "GQA-efficient (Medium)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 2,
         "use_gradient_checkpointing": False,
-        "rope_scaling": {"type": "ntk", "factor": 4.0},
+        "rope_scaling": None,
     },
 }
 

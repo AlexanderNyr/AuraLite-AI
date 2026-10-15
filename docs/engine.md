@@ -1,7 +1,8 @@
 # Inside the native engine
 
 How a native AuraLite model (`.pt` / `.safetensors`) turns a prompt into
-text, and what changed in 2.8. GGUF and Hugging Face models run in their own
+text, what changed in 2.8, and how much of the history a generated token
+attends to (2.11, section 9). GGUF and Hugging Face models run in their own
 runtimes and are not covered here.
 
 Speed numbers on this page come from `python benchmarks/core_bench.py`, run
@@ -17,10 +18,14 @@ All native generation paths share one decode loop, `AuraLiteEngine._iter_token_i
 four copies of it. Each call does this:
 
 1. **Reserve the KV cache.** It allocates room for `prompt + max_new_tokens`
-   positions once, so the storage never grows during generation.
+   positions once, so the storage never grows during generation. With the
+   2.11 context window the cache holds about two windows, however long the
+   generation runs (section 9).
 2. **Prefill.** One forward pass over the prompt with `logits_to_keep=1`: the
    final norm and the LM head run on the last position only. 2.7 computed
-   `T × vocab` logits and threw away all but the last row.
+   `T × vocab` logits and threw away all but the last row. Since 2.11 a prompt
+   longer than `max(256, 2 × window)` tokens goes in chunks of that size, with
+   the same result (section 9).
 3. **Sample, feed, repeat.** One token per step. Inference mode is entered per
    step, not across a `yield`, so a paused stream does not leave the caller's
    thread in inference mode.
@@ -248,3 +253,108 @@ an epoch costs fewer steps and generation needs fewer steps per sentence.
 projections (std `0.02/√(2L)` for `W_o` and `down`) made the same 600-step
 runs *worse*: 1.662 vs 1.640 nats/char, consistently over 3 seeds. It is not
 part of 2.8.
+
+## 9. Context length
+
+A native model is trained on windows of `seq_length` tokens and saved with
+`max_seq_len = seq_length`. Its attention has never scored two tokens that
+are `max_seq_len` or more positions apart. RoPE attention scores depend on
+that distance, so past the trained length the model is out of distribution.
+
+**What 2.10 did.** Generation attended to the whole history. Held-out loss
+per position of a char model trained with `seq_length` 64 (setup below):
+
+| positions | 0–63 | 64–127 | 128–255 | 256–511 |
+|---|---|---|---|---|
+| whole history (2.10) | 1.546 | 2.666 | 3.877 | 3.973 |
+| newest 64 tokens (2.11 default) | 1.546 | 1.571 | 1.519 | 1.481 |
+
+A uniform guess over the 65 characters scores 4.174, so past ~128 tokens the
+2.10 model was barely better than chance. In generation (prompt `ROMEO:`,
+temperature 0.8, KV cache) the text was coherent for about 70 characters and
+garbage after that; with the window it stays coherent for all 600.
+
+**2.11: the context window.** Every generated token attends to the newest
+`max_seq_len` tokens. All attention distances stay inside the trained range,
+so token 5 000 is predicted as well as token 50. Inside the trained length
+nothing changes (the same logits, bit for bit). The KV cache holds about two
+windows instead of the whole history, and the time per token stops growing
+with the context.
+
+| | how |
+|---|---|
+| Python | `engine.set_context_window("auto")` (default), `"full"` (the 2.10 behaviour), or a number of tokens; `engine.full_context = True`; `engine.context_window` reports the window in use |
+| CLI | `auralite generate/chat/serve --full-context` or `--context-window N` |
+| server | `AURALITE_CONTEXT_WINDOW=auto\|full\|N` |
+| GUI | Generation tab, *Full context (no window)*; it applies to the Chat tab too |
+
+Every generation path uses it: `generate`, `generate_streaming`, the chat
+methods, thinking mode, `generate_batch`, speculative decoding (the draft
+model uses its own window), the server and the GUI. `auralite info` prints the
+window of a checkpoint. A model trained with its own `sliding_window` keeps
+it. Training is not affected: the window applies outside `model.train()`
+only. The window is a property of generation, not of the checkpoint, and is
+not saved.
+
+**Speed and memory.** `benchmarks/context_bench.py speed` and the decode
+section of `core_bench.py` (the benchmark model of this page, trained length
+256), 2.10.0 against 2.11:
+
+| 1 000 tokens after a 32-token prompt | 2.10.0 | 2.11 window | 2.11 full context |
+|---|---|---|---|
+| tokens/s, median of 3 (two rounds) | 568 / 552 | **646 / 665** | 619 / 592 |
+| KV cache at the end | 4 096 KiB | **1 280 KiB** | 4 096 KiB |
+
+| decode step, context | fp32 2.10.0 | fp32 2.11 | int8 2.10.0 | int8 2.11 |
+|---|---|---|---|---|
+| 256–511 | 1.94 ms | 1.34 ms | 2.27 ms | 1.85 ms |
+| 512–767 | 2.06 ms | 1.35 ms | 2.36 ms | 1.90 ms |
+| 1 024–1 279 | 2.22 ms | 1.35 ms | 2.74 ms | 1.92 ms |
+
+Past the window the step time no longer grows. Inside it nothing changes: six
+interleaved runs over positions 32–255 gave 1.26 / 1.25 ms per token for
+2.10.0, 1.20 / 1.15 ms for 2.11 with the window and 1.19 / 1.15 ms without
+it. Full context is faster than 2.10.0 too: the RoPE tables used to be
+rebuilt for every new position past the trained length; they now grow
+geometrically.
+
+What the window cannot do: a model trained on 64 tokens still cannot use
+something said 200 tokens ago. It could not in 2.10 either; it produced noise
+instead. To read further, train on longer windows (below).
+
+**Long prompts.** A prompt longer than `max(256, 2 × window)` tokens is
+prefilled in chunks of that size. Each chunk attends to the cached window plus
+itself, which is what one forward pass over the whole prompt computes (the
+tests compare both), but the work grows linearly with the prompt and the
+cache never holds the whole prompt. 2.10 also had a bug here: a prompt cut to
+the 8 191-token cap left room for one generated token; it now gets all
+`max_new_tokens`.
+
+**ALiBi models** get the window too. ALiBi degrades far less than plain RoPE
+past the trained length, but the window still wins (same setup, `use_alibi`):
+
+| positions | 0–63 | 64–127 | 128–255 | 256–511 |
+|---|---|---|---|---|
+| ALiBi, whole history | 1.529 | 1.613 | 1.603 | 1.619 |
+| ALiBi, newest 64 tokens | 1.529 | 1.578 | 1.507 | 1.483 |
+
+**RoPE scaling is not a free extension.** The README used to promise
+"2k → 16k–32k" from `rope_scaling`. Applied at inference without training,
+NTK ×8 lowers the loss past the window (1.80 at 128–255 instead of 3.88) but
+hurts every position inside it (1.709 instead of 1.546 at 0–63), and YaRN ×8
+is near chance everywhere (3.10–4.00). Both lose to the plain window at every
+position. `dynamic_ntk` is an alias of `ntk`: the frequencies are computed once
+from `max_seq_len` and do not follow the sequence length.
+
+**Exported graphs** (`auralite export`, `.pt2` / ONNX) are traced for inputs of
+up to `max_seq_len` tokens, where the window changes nothing. They do not
+contain the window: feed them at most `max_seq_len` tokens.
+
+**Setup of the loss tables.** tinyshakespeare, the first 90 % for training;
+char tokenizer; 4 layers, `d_model` 128, 4 heads, `d_ff` 344; batch 32, AdamW at
+lr 3e-3, WSD; 4 epochs (about 190 s on 2 CPU threads). Loss per position on 48
+random held-out windows of 512 characters. Reproduce with
+`python benchmarks/context_bench.py loss --text tinyshakespeare.txt`;
+`tests/test_long_context_v211.py` checks the window on a smaller model
+(positions past 4 windows within 10 % of the first window, and full context
+clearly worse). Longer training windows: docs/training.md § 7.

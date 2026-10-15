@@ -101,6 +101,7 @@ from auralite.engine.model import (  # noqa: E402,F401
     LoRALayer, ModernTransformer, estimate_n_params,
 )
 from auralite.engine.dataset import CharDataset, WindowBatches, spread_indices  # noqa: E402,F401
+from auralite.engine.context import ContextWindowMixin  # noqa: E402
 from auralite.engine import sampling as _sampling  # noqa: E402
 from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
@@ -434,28 +435,32 @@ def recommend_gen_length(seed_str: str,
                          max_seq_len: int = 4096,
                          multiplier: float = 8.0,
                          hard_min: int = 30,
-                         hard_max: int = 800) -> int:
+                         hard_max: int = 800,
+                         *, full_context: bool = False) -> int:
     """Recommend a generation length (in tokens) for a given seed.
 
     Aims for `multiplier` times the seed length so short prompts still
-    produce meaningful output. Bounded below by hard_min and above by
-    max(hard_max, 2*max_seq_len, 1024) — since v2.6 the recommendation may
-    legitimately exceed the training window because RoPE extrapolates.
+    produce meaningful output, bounded below by `hard_min` and above by
+    max(hard_max, 2*max_seq_len, 1024). Outputs longer than the training
+    window are fine because generation attends to the newest `max_seq_len`
+    tokens (the 2.11 context window). With ``full_context=True`` (no window)
+    everything past `max_seq_len` degrades into noise, so the recommendation
+    stops at the room the prompt leaves inside it.
 
-    Examples (multiplier=8):
-        seed_tokens=1   → 30   (hard_min)
+    Examples (multiplier=8, max_seq_len=64):
+        seed_tokens=1   → 30    (hard_min)
         seed_tokens=5   → 40
         seed_tokens=10  → 80
-        seed_tokens=20  → 160
-        seed_tokens=50  → 400
-        seed_tokens=200 → 800  (hard_max)
+        seed_tokens=50  → 400   (full_context: 14)
+        seed_tokens=200 → 1024  (the ceiling)
 
     Args:
         seed_str:   the prompt the user typed
         tokenizer:  trained CharTokenizer/BPETokenizer (None = use chars)
-        max_seq_len: model.max_seq_len (a reference scale, not a hard cap)
+        max_seq_len: model.max_seq_len, the length the model was trained on
         multiplier: how much longer than the seed the output should be
         hard_min/hard_max: absolute clamps
+        full_context: generation runs without the context window
 
     Returns:
         recommended generation length (in tokens)
@@ -470,9 +475,10 @@ def recommend_gen_length(seed_str: str,
 
     seed_tokens = max(1, seed_tokens)
     raw = int(round(seed_tokens * multiplier))
-    # Allow long outputs past training window (RoPE extrapolates).
     effective_max = max(hard_max, max_seq_len * 2, 1024)
     raw = max(hard_min, min(effective_max, raw))
+    if full_context:
+        raw = min(raw, max(1, int(max_seq_len) - seed_tokens))
     return max(1, raw)
 
 
@@ -587,6 +593,9 @@ class _DraftSession:
         self.engine = engine
         self.model = engine.model
         self.model.eval()
+        sync = getattr(engine, "_sync_context_window", None)
+        if callable(sync):               # the draft engine's own window (2.11)
+            sync()
         self.cached: list[int] = []
         self.supported = callable(getattr(self.model, "truncate_cache", None))
         try:
@@ -596,6 +605,9 @@ class _DraftSession:
 
     def _step(self, tokens: list[int], start: int) -> torch.Tensor:
         t = torch.tensor([tokens], dtype=torch.long, device=self.engine.device)
+        prefill: Any = getattr(self.engine, "_prefill", None)
+        if start == 0 and len(tokens) > 1 and prefill is not None:
+            return prefill(t)[0, -1]         # chunked for long contexts (2.11)
         logits = self.engine._infer(t, start_pos=start, use_cache=True, logits_to_keep=1)
         return logits[0, -1]
 
@@ -645,7 +657,7 @@ class _DraftSession:
         self.cached = []
 
 
-class AuraLiteEngine:
+class AuraLiteEngine(ContextWindowMixin):
     """Modern training & inference engine for AuraLite AI v2.1.
 
     IMPROVED (v2.1+):
@@ -673,11 +685,17 @@ class AuraLiteEngine:
         self._compiled_inference_model = None  # torch.compile for generation (v2.6.5)
         self._compile_seconds = 0.0
         self.last_val_loss: float | None = None
+        #: validation loss in bits per UTF-8 byte (2.11): comparable across
+        #: tokenizers, unlike the loss per token
+        self.last_val_bpb: float | None = None
         #: what the last `train()` call did (2.9) — see `train` for the keys
         self.last_train_summary: dict | None = None
         # v2.6.2: chat template persisted with the checkpoint; generate_chat()
         # uses it when the caller does not pass `chat_template` explicitly.
         self.default_chat_template: str = "chatml"
+        # 2.11: "auto" (the trained length), 0 (no window) or a token count —
+        # see set_context_window().
+        self._context_window_setting: int | str = "auto"
         self._resume_optimizer_state = None
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
@@ -1886,7 +1904,8 @@ class AuraLiteEngine:
         if not ids:
             ids = [0]
 
-        # Safety cap allows RoPE extrapolation beyond training window.
+        # Safety cap on the prompt (bounds the prefill work and, without a
+        # context window, the KV cache); prompts may exceed max_seq_len.
         safety_cap = max(self.model.max_seq_len, (max_gen_tokens or 0) + self.model.max_seq_len, 8192)
         max_prompt_tokens = safety_cap - (1 if reserve_generation_slot else 0)
         max_prompt_tokens = max(1, max_prompt_tokens)
@@ -1905,10 +1924,14 @@ class AuraLiteEngine:
             presence_penalty=float(presence_penalty or 0.0),
             frequency_penalty=float(frequency_penalty or 0.0))
 
-    def _hard_cap(self, length: int) -> int:
-        # Safety cap on total sequence length (bounds KV-cache growth). The
-        # trained max_seq_len is NOT a hard stop — RoPE extends its buffers.
-        return max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192)
+    def _hard_cap(self, length: int, prompt_len: int = 0) -> int:
+        # Safety cap on the total sequence length. Generation may run past the
+        # trained max_seq_len: the context window (2.11) keeps attention inside
+        # the trained distances. The prompt itself is capped by
+        # `_prepare_prompt_ids`; 2.10 left a capped long prompt room for one
+        # generated token only.
+        return max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192,
+                   int(prompt_len) + length)
 
     def _claim_cache(self) -> object:
         """Mark the model's KV cache as owned by a new generation (2.8).
@@ -1943,7 +1966,8 @@ class AuraLiteEngine:
             return
         model = self.model
         model.eval()
-        hard_cap = self._hard_cap(length)
+        self._sync_context_window()
+        hard_cap = self._hard_cap(length, len(ids))
         stop = stop_token_ids or set()
         history = list(ids)
         owner = self._claim_cache()
@@ -1951,7 +1975,7 @@ class AuraLiteEngine:
         try:
             with torch.inference_mode():
                 t = torch.tensor([ids], dtype=torch.long, device=self.device)
-                logits = self._infer(t, start_pos=0, use_cache=True, logits_to_keep=1)
+                logits = self._prefill(t)
                 nxt = self._sample_with(logits[0, -1], sp, history)
             history.append(nxt)
             yield nxt
@@ -2121,7 +2145,8 @@ class AuraLiteEngine:
 
         Returns a summary dict (also kept as ``engine.last_train_summary``):
         epochs_completed, optimizer_steps, tokens, train_loss, val_loss,
-        best_val_loss, best_epoch, restored_best, stop_reason
+        best_val_loss, val_bpb, best_val_bpb (bits per UTF-8 byte, 2.11),
+        best_epoch, restored_best, stop_reason
         (None | "max_steps" | "early_stopping" | "stopped"), seconds.
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
@@ -2285,6 +2310,7 @@ class AuraLiteEngine:
             )
         ddp_active = bool(use_ddp and self.is_distributed)
 
+        previous_params = dict(self.params_used or {})
         self.params_used = dict(params)
 
         # ---- Reproducibility (v2.6.2) --------------------------------
@@ -2420,6 +2446,24 @@ class AuraLiteEngine:
                     and estimated != actual_params else "")
             logger.info(f"[AuraLite] Model built: {actual_params:,} params "
                         f"(vocab={self.vocab_size:,}{note})")
+        else:
+            # 2.11 "train short, extend long": continuing on longer windows
+            # raises the trained length, and with it the generation window.
+            native = getattr(self.model, "module", self.model)
+            extend = getattr(native, "extend_context", None)
+            old_len = int(getattr(native, "max_seq_len", 0) or 0)
+            if callable(extend) and extend(int(seq_length)):
+                logger.info(f"[AuraLite] Context extended: {old_len} → {seq_length} tokens "
+                            f"(continued training on longer windows; generation now "
+                            f"attends to the newest {seq_length} tokens)")
+                old_batch = previous_params.get("batch_size")
+                old_tokens = int(old_batch or 0) * old_len
+                new_tokens = int(batch_size) * int(seq_length)
+                if old_tokens and old_tokens < new_tokens:
+                    keep = max(1, old_tokens // int(seq_length))
+                    logger.info(f"[AuraLite] Tokens per optimizer step: {old_tokens:,} → "
+                                f"{new_tokens:,}. batch_size={keep} keeps them (and the "
+                                f"steps per epoch) as before; docs/training.md, section 7.")
 
         self._ddp_model = None
 
@@ -2652,6 +2696,7 @@ class AuraLiteEngine:
                 logger.warning(f"[AuraLite] WARNING: val dataset is empty after windowing "
                                f"(val slice has {total_tokens - split_at} tokens, need > "
                                f"{seq_length}). Validation DISABLED.")
+        val_bytes_per_token = self._bytes_per_token(val_loader) if val_loader is not None else None
 
         # Scheduler steps = optimizer steps. 2.7 counted *batches*, so with
         # accumulation_steps=N the schedule only reached 1/N of its length:
@@ -2742,6 +2787,12 @@ class AuraLiteEngine:
         train_model = self._ddp_model if self._ddp_model is not None else train_model
         train_model.train()
         self.last_val_loss = None
+        self.last_val_bpb = None
+
+        def _bpb(loss: float | None) -> float | None:
+            if loss is None or not val_bytes_per_token:
+                return None
+            return float(loss) / math.log(2.0) / val_bytes_per_token
 
         n_loader_batches = max(1, len(loader))
         if progress_every_batches <= 0:
@@ -2962,6 +3013,7 @@ class AuraLiteEngine:
                     )
                 val_loss = self._evaluate(val_loader, criterion)
                 self.last_val_loss = val_loss
+                self.last_val_bpb = _bpb(val_loss)
                 if val_loss is not None:
                     if best_val is None or val_loss < best_val:
                         best_val, best_epoch, epochs_without_gain = val_loss, epoch + 1, 0
@@ -3004,6 +3056,7 @@ class AuraLiteEngine:
                         "is_epoch_end": True,
                         "epoch_loss": avg_loss,
                         "epoch_seconds": epoch_dur,
+                        "val_bpb": _bpb(val_loss),
                     },
                 )
 
@@ -3024,6 +3077,7 @@ class AuraLiteEngine:
                 and (best_epoch != epochs_completed or stop_reason == "stopped")):
             net.load_state_dict(best_state)
             self.last_val_loss = best_val
+            self.last_val_bpb = _bpb(best_val)
             restored = True
             logger.info(f"[AuraLite] Restored the weights of epoch {best_epoch} "
                         f"(best validation loss {best_val:.4f}).")
@@ -3031,6 +3085,8 @@ class AuraLiteEngine:
         val_note = ""
         if self.last_val_loss is not None:
             val_note = f", val loss {self.last_val_loss:.4f}"
+            if self.last_val_bpb is not None:
+                val_note += f" ({self.last_val_bpb:.4f} bits/byte)"
             if best_epoch is not None and not restored and best_epoch != epochs_completed:
                 val_note += f" (best {best_val:.4f} at epoch {best_epoch})"
         logger.info(f"[AuraLite] Training done: {epochs_completed} epochs, "
@@ -3044,6 +3100,8 @@ class AuraLiteEngine:
             "train_loss": last_train_loss,
             "val_loss": self.last_val_loss,
             "best_val_loss": best_val,
+            "val_bpb": self.last_val_bpb,
+            "best_val_bpb": _bpb(best_val),
             "best_epoch": best_epoch,
             "restored_best": restored,
             "stop_reason": stop_reason,
@@ -3192,7 +3250,8 @@ class AuraLiteEngine:
 
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
-        hard_cap = self._hard_cap(length)
+        self._sync_context_window()
+        hard_cap = self._hard_cap(length, len(ids))
         stop = set(stop_token_ids or ())
         can_truncate = callable(getattr(model, "truncate_cache", None))
         n_drafted = n_accepted = n_resets = n_rollbacks = 0
@@ -3218,14 +3277,16 @@ class AuraLiteEngine:
             n_resets += 1                       # 2.7 path (foreign models)
             model.reset_cache()
             if end:
-                _forward(result_ids[:end], 0, keep=1)
+                self._prefill(torch.tensor([result_ids[:end]], dtype=torch.long,
+                                           device=self.device))
 
         owner = self._claim_cache()
         self._reset_model_cache(model, capacity=min(len(ids) + length + draft_tokens + 1,
                                                     hard_cap + draft_tokens))
         try:
             with torch.inference_mode():
-                pending = _forward(result_ids, 0, keep=1)[0, -1]
+                pending = self._prefill(torch.tensor([result_ids], dtype=torch.long,
+                                                     device=self.device))[0, -1]
                 while len(result_ids) - len(ids) < length:
                     if len(result_ids) + 1 >= hard_cap:
                         break
@@ -3597,14 +3658,15 @@ class AuraLiteEngine:
             return result_ids
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
-        hard_cap = self._hard_cap(length)
+        self._sync_context_window()
+        hard_cap = self._hard_cap(length, len(batch_ids[0]))
         B = len(batch_ids)
         owner = self._claim_cache()
         self._reset_model_cache(capacity=min(len(batch_ids[0]) + length, hard_cap))
         try:
             with torch.inference_mode():
                 batch = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
-                logits = self._infer(batch, start_pos=0, use_cache=True, logits_to_keep=1)
+                logits = self._prefill(batch)
                 next_tokens = []
                 for b in range(B):
                     nxt = self._sample_with(logits[b, -1], sp, result_ids[b])

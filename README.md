@@ -3,7 +3,7 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.10.0-orange)
+![Version](https://img.shields.io/badge/version-2.11.0-orange)
 ![Coverage](https://img.shields.io/badge/coverage-86%25-green)
 
 [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
@@ -151,7 +151,8 @@ AURALITE_MODEL=auralite-v24.pt uvicorn auralite.server.openai_server:app --host 
 - **Interruptible Training**: Ability to stop training at any point and preserve the learned weights for immediate testing.
 - **Gradient Checkpointing**: Trade compute for memory — enables training of larger models on consumer GPUs. Toggle in the Training tab.
 - **💬 Chat / Instruction Mode**: Dedicated chat tab with system/user/assistant roles, multiple templates (ChatML, Llama-2, Mistral, Gemma, Phi), conversation history, and **real-time token streaming**.
-- **🔄 YaRN / NTK RoPE Scaling**: Extend context beyond training length (2k → 16k–32k). Supports linear, NTK and YaRN methods.
+- **📏 Long generations stay coherent (2.11)**: generation attends to the newest `seq_length` tokens, the distances the model was trained on. Before 2.11 everything past the trained length turned into noise (held-out loss 3.97 against 1.48 at positions 256–511 of a model trained on 64). The KV cache stays bounded and long prompts are prefilled in chunks. `--full-context` / `engine.set_context_window("full")` restores the old behaviour — see [docs/engine.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/engine.md#9-context-length).
+- **🔄 RoPE scaling (linear / NTK / YaRN)**: for continued training on longer windows and for imported models. On its own it does not let a model read past the length it was trained on (measured in docs/engine.md § 9); `continue_training` with a longer `seq_length` extends a model (docs/training.md § 7).
 - **🌙 Dark Theme**: Toggle available in the header.
 - **☁️ Hugging Face Hub Integration**: Push/pull models and LoRA adapters to/from the Hub.
 - **📊 Model Evaluation**: Built-in evaluation using `lm-evaluation-harness` (ARC, MMLU, GSM8K, etc.).

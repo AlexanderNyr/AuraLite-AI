@@ -3,7 +3,7 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 7.
+to reproduce them are in § 8.
 
 ## 1. An epoch is one pass over the text
 
@@ -63,6 +63,16 @@ number was 0.14–0.19 nats too optimistic (8–12 %). Its error also
 changed from run to run, so it could rank runs the wrong way. It put lr 1e-3
 ahead of 2e-3 (1.4471 against 1.4607), while the entire split puts them the
 other way round (1.6355 against 1.6310).
+
+**Bits per byte (2.11).** A loss per token depends on the tokenizer: a BPE
+token covers 2–4 characters, a char token one, so the numbers of a char run
+and a BPE run cannot be compared. The validation loss is now also reported in
+bits per UTF-8 byte: `val_bpb` and `best_val_bpb` in the summary, `val_bpb` in
+the epoch-end progress `info`, the GUI status line, the last line of
+`auralite train`, and `python -m auralite.eval` (with perplexity and bits per
+token/character, now from one pass over the text instead of three). It is the
+loss divided by ln 2 and by the mean number of bytes per predicted token of
+the validation windows; those windows are fixed, so the ratio is computed once.
 
 ## 3. Early stopping and the best weights
 
@@ -227,11 +237,83 @@ near-miss instead of training with the default.
   falling, more epochs will not help — set `early_stopping_patience`.
 * **Dropout.** Use 0 for a large corpus that you read a few times. Keep 0.1 or
   more for a small corpus that you read dozens of times.
+* **Tokenizer (2.11, measured in bits per byte).** The GUI's *Small* preset
+  trained for the same wall-clock time with each tokenizer; the time per
+  optimizer step was measured first, then `max_steps` = budget / step time.
+  Validation bits per byte on the last 10 % of each text (lower is better):
+
+  | corpus, budget | char | BPE 512 (default) | BPE 2048 | BPE 4096 |
+  |---|---|---|---|---|
+  | tinyshakespeare (1.1 MB), 150 s | 2.349 | 2.121 | 2.042 | **2.021** |
+  | TinyStories (first 1.2 MB of the validation file), 150 s | 1.617 | 1.315 | **1.242** | 1.250 |
+  | first 100 KB of tinyshakespeare, 60 s, last epoch | **2.228** | 2.478 | 2.669 | |
+  | same, best epoch | 2.228 | 2.243 | **2.150** | |
+
+  On a megabyte of text, BPE 2048–4096 beats the 512 default by 4–6 %
+  (TinyStories' 2048 run got 20 % more time than its 512 run, the
+  tinyshakespeare runs within 8 % of each other). On 100 KB every BPE run
+  memorised the text within the minute: a BPE epoch has 2.5–3.5× fewer tokens,
+  so the same time means 33–39 epochs instead of 14. With
+  `early_stopping_patience` (best weights kept) BPE 2048 was again the best;
+  without it char was. The default stays at BPE 512, the setting without a
+  bad case here: use 2048 or more for a megabyte of text or more, and turn on
+  early stopping for small files.
 * **Context length.** It no longer multiplies the length of an epoch. An
   epoch is always the same number of tokens, about `tokens / (batch_size *
-  seq_length)` steps, so a longer context means fewer, larger steps.
+  seq_length)` steps, so a longer context means fewer, larger steps. Since
+  2.11 a short `seq_length` no longer limits how long a generation can run:
+  generation attends to the newest `seq_length` tokens (docs/engine.md,
+  section 9). For the default model a longer window did not lower the loss
+  anywhere (§ 7).
 
-## 7. Reproduce
+## 7. Train short, extend long (2.11)
+
+`continue_training` with a longer `seq_length` now extends the model: its
+`max_seq_len`, the RoPE tables and the generation window follow the new
+length and are saved with the checkpoint. RoPE scaling settings that derive
+their base length from `max_seq_len` (YaRN, NTK) are pinned to the old length,
+so the frequencies the model learned do not move. 2.10 trained on the longer
+windows but kept the old `max_seq_len`.
+
+```bash
+auralite train --text corpus.txt --params short.json --model short.pt
+auralite train --text corpus.txt --params long.json --resume short.pt --model long.pt
+```
+
+In the GUI: keep the model, tick *Continue training*, raise *Seq Length*.
+
+Does it pay off? Same char model and corpus as in docs/engine.md § 9 (4
+layers, `d_model` 128, tinyshakespeare). Every run reads the training text 4
+times. Loss per position on held-out 512-character windows, each model with
+its own window:
+
+| run | steps | time | 0–63 | 64–127 | 128–255 | 256–511 |
+|---|---|---|---|---|---|---|
+| A: `seq_length` 64, 4 epochs | 1 964 | 176 s | **1.546** | **1.571** | 1.519 | **1.481** |
+| B: 64 for 3 epochs, then 256 for 1, batch 32 | 1 596 | 184 s | 1.564 | 1.629 | 1.546 | 1.511 |
+| C: as B, YaRN ×4 for the extension | 1 596 | — | 1.623 | 1.674 | 1.634 | 1.597 |
+| D: 256, 4 epochs, batch 32 | 492 | 209 s | 1.619 | 1.651 | 1.582 | 1.542 |
+| E: as B, batch 8 at 256 | 1 963 | 200 s | 1.554 | 1.594 | **1.517** | 1.484 |
+| F: 256, 4 epochs, batch 8 | 1 960 | 225 s | 1.564 | 1.581 | 1.525 | 1.493 |
+
+* For this model and text a window longer than 64 tokens does not lower the
+  loss anywhere. Run A, short training plus the 2.11 window, is the best or
+  within 0.002 of it in every column, and the fastest.
+* If you extend, keep the tokens per optimizer step: divide `batch_size` by
+  the length factor (E against B). The same epochs at 4× the tokens per step
+  are 4× fewer steps. `train()` logs the batch size that keeps them.
+* Extend with plain RoPE. YaRN ×4 for the extension was worse than no
+  scaling in every column (C against B).
+* Extending beats training long from scratch for the same number of steps (E
+  against F, except 64–127) and takes 11 % less time.
+
+A larger model, or text whose meaning depends on things said hundreds of
+tokens earlier (dialogue, stories, code), may gain from the longer window.
+Measure it with `benchmarks/context_bench.py loss --seq <your length>`.
+Times are for 2 CPU threads; B and C ran next to other work, and D is the run
+from the 2.11 planning notes.
+
+## 8. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -240,7 +322,8 @@ python benchmarks/train_bench.py train --text tinyshakespeare.txt
 ```
 
 For a before/after, copy `benchmarks/train_bench.py` into an older checkout
-and run it there. Sections that need a 2.9 API print `n/a`. The quality runs
+and run it there. The § 7 runs used `engine.train` with the parameters in the
+docs/engine.md § 9 setup and `continue_training=True` for the extension. Sections that need a 2.9 API print `n/a`. The quality runs
 used `engine.train` with the parameters in the tables above and
 `max_steps=1500`. The loss on the entire held-out split was then computed over
 all of its non-overlapping 64-token windows.

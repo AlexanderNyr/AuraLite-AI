@@ -110,8 +110,8 @@ class TestGenerationLengthRecommendations:
         assert recommend_gen_length("x", tok, max_seq_len=100) == 30
 
     def test_recommend_gen_length_scales_past_hard_max_for_long_prompt(self):
-        # v2.6: the ceiling is max(hard_max, 2*max_seq_len, 1024) — RoPE
-        # extrapolation makes long outputs past the training window legitimate.
+        # The ceiling is max(hard_max, 2*max_seq_len, 1024): the context
+        # window (2.11) keeps outputs past the training window coherent.
         tok = FixedLengthTokenizer(1_000)
         assert recommend_gen_length("long", tok, max_seq_len=2_000, hard_max=123) == 4_000
 
@@ -120,6 +120,13 @@ class TestGenerationLengthRecommendations:
         # only the [hard_min, effective_max] band applies -> 7 * 8 = 56.
         tok = FixedLengthTokenizer(7)
         assert recommend_gen_length("abcdefg", tok, max_seq_len=10, hard_min=30) == 56
+
+    def test_full_context_stops_at_the_room_the_prompt_leaves(self):
+        # 2.11: without the window everything past max_seq_len is noise.
+        assert recommend_gen_length("x" * 50, None, max_seq_len=64, full_context=True) == 14
+        assert recommend_gen_length("x" * 50, None, max_seq_len=64) == 400
+        # a prompt that already fills the window still gets one token
+        assert recommend_gen_length("x" * 80, None, max_seq_len=64, full_context=True) == 1
 
     def test_recommend_gen_length_falls_back_to_character_length_on_tokenizer_error(self):
         assert recommend_gen_length("abcd", BrokenTokenizer(), max_seq_len=100, multiplier=8) == 32

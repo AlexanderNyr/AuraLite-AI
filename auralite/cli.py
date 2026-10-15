@@ -47,6 +47,24 @@ def _add_common_flags(parser: argparse.ArgumentParser, *,
                         help="library log level (default: INFO or $AURALITE_LOG_LEVEL)")
 
 
+def _add_context_flags(parser: argparse.ArgumentParser) -> None:
+    """`--context-window` / `--full-context` (2.11) for the generating commands."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--context-window", default=None, metavar="N",
+                       help="tokens a generated token attends to: 'auto' (default: the "
+                            "length the model was trained on), 'full' or a number")
+    group.add_argument("--full-context", action="store_true",
+                       help="attend to the whole history (the 2.10 behaviour); past the "
+                            "trained length the output degrades into noise")
+
+
+def _context_window_arg(args: argparse.Namespace) -> str:
+    if getattr(args, "full_context", False):
+        return "full"
+    value = getattr(args, "context_window", None)
+    return str(value) if value not in (None, "") else "auto"
+
+
 def _configure_logging(args: argparse.Namespace) -> None:
     """Apply --quiet/--log-level (and $AURALITE_LOG_LEVEL) to library loggers.
 
@@ -114,6 +132,8 @@ def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
         print(f"  epoch {epoch}/{total} | validating…", flush=True)
         return
     val = f" | val={val_loss:.4f}" if val_loss is not None else ""
+    if val and info.get("val_bpb") is not None:
+        val += f" ({float(info['val_bpb']):.4f} bits/byte)"
     print(f"  epoch {epoch}/{total} done | loss={train_loss:.4f}{val}", flush=True)
 
 
@@ -151,10 +171,25 @@ def cmd_train(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     engine = AuraLiteEngine()
+    if getattr(args, "resume", None):
+        # 2.11: continue a checkpoint — e.g. on longer windows ("train short,
+        # extend long", docs/training.md); a longer seq_length extends the
+        # model's context.
+        if not os.path.exists(args.resume):
+            print(f"error: checkpoint not found: {args.resume}", file=sys.stderr)
+            return 2
+        engine.load_model(args.resume)
+        params["continue_training"] = True
     engine.train(text, params,
                  progress_callback=None if getattr(args, "quiet", False) else _progress)
     engine.save_model(args.model)
-    print(f"saved: {args.model}")
+    line = f"saved: {args.model}"
+    summary = engine.last_train_summary or {}
+    if summary.get("val_loss") is not None:
+        line += f" | val loss {summary['val_loss']:.4f}"
+        if summary.get("val_bpb") is not None:
+            line += f" ({summary['val_bpb']:.4f} bits/byte)"
+    print(line)
     return 0
 
 
@@ -162,6 +197,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     from auralite.engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(args.model)
+    engine.set_context_window(_context_window_arg(args))
     if getattr(args, "compile", False):
         seconds = engine.enable_inference_compile()
         if seconds:
@@ -179,6 +215,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     from auralite.engine import AuraLiteEngine
     engine = AuraLiteEngine()
     engine.load_model(args.model)
+    engine.set_context_window(_context_window_arg(args))
     if getattr(args, "compile", False):
         engine.enable_inference_compile()
     history: list[dict] = []
@@ -381,6 +418,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     os.environ["AURALITE_MODEL"] = os.path.abspath(args.model)
+    window = _context_window_arg(args)
+    if window != "auto" or "AURALITE_CONTEXT_WINDOW" not in os.environ:
+        os.environ["AURALITE_CONTEXT_WINDOW"] = window
     # Single worker on purpose: engine/KV-cache and the rate limiter live in
     # process memory (see the auralite/server/openai_server.py docstring).
     uvicorn.run(SERVER_APP, host=args.host, port=args.port, workers=1)
@@ -505,10 +545,15 @@ def cmd_info(args: argparse.Namespace) -> int:
         return 2
     keys = ["checkpoint_version", "chat_template", "vocab_size", "d_model", "n_heads",
             "n_kv_heads", "n_layers", "d_ff", "max_seq_len", "use_alibi", "use_qk_norm",
-            "sliding_window", "dropout", "lora_rank"]
+            "sliding_window", "rope_scaling", "dropout", "lora_rank"]
     for k in keys:
         if k in ckpt:
             print(f"{k}: {ckpt[k]}")
+    if ckpt.get("max_seq_len"):
+        trained = ckpt.get("sliding_window")
+        window = min(int(trained), int(ckpt["max_seq_len"])) if trained else int(ckpt["max_seq_len"])
+        print(f"generation_window: {window} tokens (the trained length; "
+              f"generate/chat/serve --full-context lifts it)")
     tok = ckpt.get("tokenizer") or {}
     if tok:
         print(f"tokenizer: {tok.get('kind', '?')} (vocab={len(tok.get('vocab', []))})")
@@ -549,6 +594,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "temporary file is deleted when training ends")
     p.add_argument("--corpus-cache", metavar="PATH",
                    help="where to keep the tokenised corpus (implies --mmap)")
+    p.add_argument("--resume", metavar="CHECKPOINT",
+                   help="continue training this checkpoint (a longer seq_length in "
+                        "--params extends its context)")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("generate", help="generate text from a checkpoint")
@@ -562,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model for prompt processing "
                         "(kernel cache in $AURALITE_HOME/torch_inductor)")
+    _add_context_flags(p)
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("chat", help="chat with a checkpoint (interactive or one-shot)")
@@ -576,6 +625,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model for prompt processing")
+    _add_context_flags(p)
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("serve", help="start the OpenAI-compatible API server")
@@ -583,6 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
+    _add_context_flags(p)
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("info", help="inspect a checkpoint")

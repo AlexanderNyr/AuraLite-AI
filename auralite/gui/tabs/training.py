@@ -161,6 +161,11 @@ class TrainTabMixin:
         ttk.Label(rope_row, text="Factor:").pack(side=tk.LEFT, padx=(12, 4))
         self.rope_factor_var = tk.StringVar(value="1.0")
         ttk.Entry(rope_row, textvariable=self.rope_factor_var, width=6).pack(side=tk.LEFT, padx=2)
+        # 2.11: measured — scaling alone does not let a model read past the
+        # length it was trained on (docs/engine.md, "Context length").
+        ttk.Label(rope_row, style="Sub.TLabel",
+                  text="not a free extension: train on longer windows to read further"
+                  ).pack(side=tk.LEFT, padx=(8, 2))
 
         # NEW: Modern training stack (v2.6) — QK-norm + Muon + WSD
         modern_row = ttk.Frame(tok_frame)
@@ -377,7 +382,9 @@ class TrainTabMixin:
         max_seq_len = (self.engine.model.max_seq_len
                        if self.engine.model is not None else 4096)
 
-        length = recommend_gen_length(seed, tokenizer, max_seq_len=max_seq_len)
+        full = bool(getattr(self.engine, "full_context", False))
+        length = recommend_gen_length(seed, tokenizer, max_seq_len=max_seq_len,
+                                      full_context=full)
         # Keep the slider in its own range; bump the upper bound if needed.
         try:
             slider_max = float(self.len_scale.cget("to"))
@@ -388,7 +395,8 @@ class TrainTabMixin:
         self.len_scale.set(length)
         self._update_len_display(length)
         print(f"[AuraLite] Auto-recommend gen length: {length} tokens "
-              f"(seed≈{len(seed)} chars, max_seq_len={max_seq_len})")
+              f"(seed≈{len(seed)} chars, max_seq_len={max_seq_len}"
+              f"{', full context' if full else ''})")
 
 
     def select_file(self):
@@ -531,6 +539,13 @@ class TrainTabMixin:
                 val_part = f"  |  Val: {float(val_loss):.4f}"
             except (TypeError, ValueError):
                 val_part = f"  |  Val: {val_loss}"
+            # 2.11: bits per byte compares char and BPE models
+            bpb = (info or {}).get("val_bpb") if isinstance(info, dict) else None
+            try:
+                if bpb is not None:
+                    val_part += f" ({float(bpb):.3f} bits/byte)"
+            except (TypeError, ValueError):
+                pass
         loss_part = ""
         try:
             if loss is not None and float(loss) > 0:

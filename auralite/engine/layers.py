@@ -11,6 +11,7 @@ import math
 import torch.nn.functional as F
 import torch.nn as nn
 import logging
+from typing import Any
 
 from .kv_cache import KVCache
 
@@ -144,6 +145,10 @@ def _get_flex_attention():
             _FLEX_COMPILED = False
     return _FLEX_COMPILED
 
+#: Marks "use `Attention.attention_window()`" in the mask builders.
+_DEFAULT_WINDOW: Any = object()
+
+
 def _flex_block_mask(batch: int, heads: int, q_len: int, kv_len: int,
                      start_pos: int, key_start_pos: int, window: int | None,
                      device):
@@ -202,6 +207,9 @@ class Attention(nn.Module):
         self.use_alibi = use_alibi
         self.rope_scaling = rope_scaling or {}  # {'type': 'yarn'|'ntk'|'linear', 'factor': float}
         self.sliding_window = int(sliding_window) if sliding_window else None
+        # 2.11: the inference context window (see `attention_window`). Set by
+        # the model, normally to the length it was trained on; not saved.
+        self.context_window: int | None = None
         self.kv_cache_dtype = kv_cache_dtype
         self.use_flex_attention = bool(use_flex_attention)
         self.use_qk_norm = bool(use_qk_norm)
@@ -244,13 +252,27 @@ class Attention(nn.Module):
         linear = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
         return torch.clamp(linear, 0.0, 1.0)
 
+    def _ntk_base(self) -> float:
+        """RoPE base (theta) of NTK-aware scaling; `ntk_base` pins it."""
+        scaling = self.rope_scaling or {}
+        if "ntk_base" in scaling:
+            return float(scaling["ntk_base"])
+        base = float(scaling.get("base", 10000.0))
+        factor = float(scaling.get("factor", 1.0) or 1.0)
+        original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
+        seq_len = max(self.max_seq_len, original + 1)
+        return base * (((factor * seq_len / max(1, original)) - (factor - 1.0))
+                       ** (self.head_dim / max(1, self.head_dim - 2)))
+
     def _rope_inv_freq_and_scale(self) -> tuple[torch.Tensor, float]:
         """Return inverse frequencies and post-scale for LLaMA-compatible RoPE.
 
         Standard RoPE uses exactly `1 / theta ** (i / dim)` for even rotary
-        dimensions. Linear scaling divides positions by `factor`; dynamic NTK
-        changes theta for extrapolation; YaRN blends interpolated and extrapolated
-        frequencies with the public beta-fast/beta-slow ramp and mscale.
+        dimensions. Linear scaling divides positions by `factor`; NTK-aware
+        scaling raises theta; YaRN blends interpolated and extrapolated
+        frequencies with the public beta-fast/beta-slow ramp and mscale. None
+        of them lets a model attend past its trained length without training
+        on longer windows first (docs/engine.md, "Context length").
         """
         base = float((self.rope_scaling or {}).get("base", 10000.0))
         scaling = self.rope_scaling or {}
@@ -263,12 +285,12 @@ class Attention(nn.Module):
         if factor <= 1.0 or scale_type in {"none", ""}:
             return inv_freq, mscale
         if scale_type in {"ntk", "dynamic_ntk"}:
-            # Dynamic NTK scaling as used by LLaMA-family implementations.
-            # At the original context length this reduces to regular RoPE.
-            seq_len = max(self.max_seq_len, int(scaling.get("original_max_position_embeddings", self.max_seq_len)) + 1)
-            original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
-            ntk_base = base * (((factor * seq_len / max(1, original)) - (factor - 1.0)) ** (self.head_dim / max(1, self.head_dim - 2)))
-            inv_freq = 1.0 / (ntk_base ** (dim_range / self.head_dim))
+            # NTK-aware scaling with the LLaMA-family "dynamic NTK" formula,
+            # evaluated once at max_seq_len: the frequencies are static (they
+            # do not follow the current sequence length), so "dynamic_ntk" is
+            # an alias of "ntk". At the original length this is regular RoPE.
+            # `ntk_base` pins the result (ModernTransformer.extend_context).
+            inv_freq = 1.0 / (self._ntk_base() ** (dim_range / self.head_dim))
         elif scale_type == "yarn":
             original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
             beta_fast = float(scaling.get("beta_fast", 32.0))
@@ -302,7 +324,7 @@ class Attention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         # NOTE (v2.6.1): buffers are NON-persistent. They are a pure function of
         # (head_dim, theta, scaling, seq_len), rebuilt in __init__ and extended on
-        # demand by _apply_rope (RoPE extrapolation past max_seq_len). Persisting
+        # demand by _apply_rope (positions past max_seq_len). Persisting
         # them poisoned checkpoints: after a long generation the buffers grew past
         # max_seq_len and load_state_dict() failed with a size mismatch, making the
         # saved model unloadable.
@@ -330,7 +352,9 @@ class Attention(nn.Module):
         cos/sin buffers to within normal floating point tolerance.
         """
         if start_pos + seq_len > self.rope_cos.shape[0]:
-            self._build_rope_buffers(start_pos + seq_len)
+            # Grow geometrically (2.11): 2.10 rebuilt the whole table for
+            # every new position past it, O(n) work per generated token.
+            self._build_rope_buffers(max(start_pos + seq_len, 2 * self.rope_cos.shape[0]))
             self.rope_cos = self.rope_cos.to(x.device)
             self.rope_sin = self.rope_sin.to(x.device)
         cos = self.rope_cos[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
@@ -342,19 +366,23 @@ class Attention(nn.Module):
 
     def _get_causal_keep_mask(self, q_len: int, k_len: int,
                               device: torch.device, start_pos: int = 0,
-                              key_start_pos: int = 0) -> torch.Tensor:
+                              key_start_pos: int = 0,
+                              window: Any = _DEFAULT_WINDOW) -> torch.Tensor:
         """Boolean causal/sliding-window keep-mask for SDPA (True = allowed)."""
         q_pos = torch.arange(start_pos, start_pos + q_len, device=device)
         k_pos = torch.arange(key_start_pos, key_start_pos + k_len, device=device)
         keep = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-        if self.sliding_window is not None and self.sliding_window > 0:
-            keep = keep & (k_pos.unsqueeze(0) > (q_pos.unsqueeze(1) - self.sliding_window))
+        if window is _DEFAULT_WINDOW:
+            window = self.attention_window()
+        if window is not None:
+            keep = keep & (k_pos.unsqueeze(0) > (q_pos.unsqueeze(1) - window))
         return keep
 
     # ---- ALiBi bias --------------------------------------------------
     def _get_alibi_bias(self, q_len: int, k_len: int,
                         device: torch.device, start_pos: int = 0,
-                        key_start_pos: int = 0) -> torch.Tensor:
+                        key_start_pos: int = 0,
+                        window: Any = _DEFAULT_WINDOW) -> torch.Tensor:
         """Create an ALiBi attention bias with a hard causal mask.
 
         Returned shape: (n_heads, q_len, k_len). Past/current positions get a
@@ -369,10 +397,28 @@ class Attention(nn.Module):
 
         bias = self.alibi_slopes[:, None, None] * rel_pos.to(torch.float32)
         blocked = future
-        if self.sliding_window is not None and self.sliding_window > 0:
-            blocked = blocked | (k_pos.unsqueeze(0) <= (q_pos.unsqueeze(1) - self.sliding_window))
+        if window is _DEFAULT_WINDOW:
+            window = self.attention_window()
+        if window is not None:
+            blocked = blocked | (k_pos.unsqueeze(0) <= (q_pos.unsqueeze(1) - window))
         bias = bias.masked_fill(blocked.unsqueeze(0), float("-inf"))
         return bias
+
+    # ---- Attention window (2.11) --------------------------------------
+    def attention_window(self) -> int | None:
+        """How many positions a query may attend to (itself included).
+
+        The trained `sliding_window` always applies. Outside training the
+        `context_window` applies as well: the model sets it to the length it
+        was trained on, because RoPE attention has never seen longer
+        distances and degrades to noise past them (docs/engine.md, "Context
+        length"). ``None`` = unlimited.
+        """
+        window = self.sliding_window
+        context = self.context_window
+        if context and not self.training:
+            window = min(window, context) if window else context
+        return window if window and window > 0 else None
 
     # ---- KV cache ----------------------------------------------------
     @property
@@ -381,14 +427,15 @@ class Attention(nn.Module):
 
         Read-only view kept for diagnostics and 2.7 callers: unquantized
         storage is returned without a copy, int8/fp8 storage is dequantized
-        into fresh tensors. With a sliding window only the last `window`
-        positions are shown (the storage keeps a little more for rollback).
+        into fresh tensors. With a window (a trained sliding window or the
+        2.11 context window) only the last `window` positions are shown (the
+        storage keeps a little more for rollback).
         """
         cache = self._cache
         if cache is None or cache.length == 0:
             return None
         dtype = self.W_k.weight.dtype
-        return cache.read(dtype, last=self.sliding_window)
+        return cache.read(dtype, last=cache.window)
 
     @property
     def kv_cache_start_pos(self) -> int:
@@ -396,8 +443,8 @@ class Attention(nn.Module):
         cache = self._cache
         if cache is None or cache.length == 0:
             return 0
-        if self.sliding_window is not None and cache.length > self.sliding_window:
-            return cache.end - self.sliding_window
+        if cache.window is not None and cache.length > cache.window:
+            return cache.end - cache.window
         return cache.start
 
     @property
@@ -411,7 +458,7 @@ class Attention(nn.Module):
         cache = self._cache
         if cache is None or cache.length == 0:
             return None
-        return cache.read(dtype, last=self.sliding_window)
+        return cache.read(dtype, last=cache.window)
 
     def kv_cache_bytes(self) -> int:
         """Memory held by this layer's cache storage, in bytes."""
@@ -444,6 +491,12 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)   # (B, n_kv_heads, T, hd) — cache stays unrepeated
         v = v.transpose(1, 2)
 
+        # The trained sliding window, or (inference only) the 2.11 context
+        # window. A cache keeps the window it was created with.
+        window = self.attention_window()
+        if use_cache and self._cache is not None:
+            window = self._cache.window
+
         # Diagnostic tap for `AuraLiteEngine.attention_maps()` (Chat tab heatmap).
         # `capture` is None on every training/generation path, so this costs a
         # single `is not None` check per layer.
@@ -451,22 +504,22 @@ class Attention(nn.Module):
             capture["q"] = q.detach()
             capture["k"] = k.detach()
             capture["n_rep"] = self.n_rep
-            capture["sliding_window"] = self.sliding_window
+            capture["sliding_window"] = window
             capture["key_start_pos"] = 0
 
         key_start_pos = 0
         if use_cache:
             if self._cache is None:
-                self._cache = KVCache(self.kv_cache_dtype, self.sliding_window,
+                self._cache = KVCache(self.kv_cache_dtype, window,
                                       reserve=self._cache_reserve)
             # In-place write into preallocated storage; returns every cached
             # key/value (views when unquantized) and the position of the first.
             k, v, key_start_pos = self._cache.append(k, v, start_pos)
-            if self.sliding_window is not None and self.sliding_window > 0:
+            if window is not None:
                 # Attend to exactly what the chunk's windows need: keys from
                 # (first query - window + 1) on. The 2.7 cache evicted *before*
                 # attending, so a chunk longer than the window lost keys.
-                first = max(key_start_pos, start_pos - self.sliding_window + 1)
+                first = max(key_start_pos, start_pos - window + 1)
                 if first > key_start_pos:
                     k = k[:, :, first - key_start_pos:]
                     v = v[:, :, first - key_start_pos:]
@@ -499,7 +552,7 @@ class Attention(nn.Module):
                 try:
                     mask = _flex_block_mask(
                         B, self.n_heads, T, S, start_pos, key_start_pos,
-                        self.sliding_window, x.device)
+                        window, x.device)
                     out = flex(q, k, v, block_mask=mask, enable_gqa=use_native_gqa)
                     out = out.transpose(1, 2).contiguous().view(B, T, -1)
                     return self.W_o(out)
@@ -510,18 +563,25 @@ class Attention(nn.Module):
                         "for the rest of the session.", err)
         # Flash / memory-efficient attention via PyTorch SDPA.
         if self.use_alibi:
-            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
+            attn_mask = self._get_alibi_bias(T, S, x.device, start_pos=start_pos,
+                                             key_start_pos=key_start_pos, window=window)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, **sdpa_gqa_kw)
-        elif T == S and start_pos == 0 and self.sliding_window is None:
+        elif T == S and start_pos == 0 and (
+                window is None or (self.sliding_window is None and T <= window)):
+            # Plain causal attention. A context window no shorter than the
+            # sequence masks nothing more (2.11). Trained sliding windows keep
+            # the masked path: under torch.export `T <= window` would split
+            # the dynamic length range, which is bounded by max_seq_len.
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **sdpa_gqa_kw)
-        elif T == 1 and (self.sliding_window is None or (
+        elif T == 1 and (window is None or (
                 use_cache and key_start_pos + S - 1 == start_pos
-                and S <= self.sliding_window)):
+                and S <= window)):
             # One query at the newest position: every cached key is allowed
             # (for a window, the slice above already kept exactly the window).
             out = F.scaled_dot_product_attention(q, k, v, **sdpa_gqa_kw)
         else:
-            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos, key_start_pos=key_start_pos)
+            keep = self._get_causal_keep_mask(T, S, x.device, start_pos=start_pos,
+                                              key_start_pos=key_start_pos, window=window)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, **sdpa_gqa_kw)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)

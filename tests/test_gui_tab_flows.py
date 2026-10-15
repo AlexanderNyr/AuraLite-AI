@@ -556,6 +556,37 @@ class TestGenerationFlow:
         assert "Prompt 1: First prompt" in content and "FIRST PROMPT" in content
         assert "✅ Batch generation complete (2 prompts)" in content
 
+    def test_full_context_checkbox_reaches_the_engine(self, gen_app, monkeypatch):
+        # 2.11: applied when a generation starts, never under a running one
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        for name in ("batch_var", "thinking_var", "websearch_var", "stream_var"):
+            getattr(gen_app, name).set(False)
+        window = gen_app.engine.model.max_seq_len
+        assert gen_app.engine.context_window == window
+        gen_app.full_context_var.set(True)
+        gen_app._update_context_hint()
+        assert "degrades" in gen_app.context_hint.config.call_args.kwargs["text"]
+        assert gen_app.engine.full_context is False          # not applied on click
+        gen_app.generate_text()
+        assert gen_app.engine.full_context is True
+        assert gen_app.engine.model.context_window is None
+        gen_app.full_context_var.set(False)
+        gen_app.generate_text()
+        assert gen_app.engine.context_window == window
+        assert f"newest {window} tokens" in gen_app.context_hint.config.call_args.kwargs["text"]
+
+    def test_auto_length_respects_full_context(self, gen_app):
+        gen_app.full_context_var.set(True)
+        gen_app._apply_context_choice()
+        gen_app.seed_entry.get.return_value = "AuraLite trains"
+        gen_app._auto_gen_length()
+        length = gen_app.len_scale.set.call_args.args[0]
+        assert length == gen_app.engine.model.max_seq_len - len("AuraLite trains")
+        gen_app.full_context_var.set(False)
+        gen_app._apply_context_choice()
+        gen_app._auto_gen_length()
+        assert gen_app.len_scale.set.call_args.args[0] > length
+
     def test_batch_generation_requires_prompts(self, gen_app, monkeypatch):
         monkeypatch.setattr(threading, "Thread", InlineThread)
         warning = sys.modules["tkinter.messagebox"].showwarning

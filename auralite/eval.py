@@ -111,6 +111,29 @@ def compute_bpc(engine: AuraLiteEngine, text: str, batch_size: int = 32) -> floa
     return total_nll_bits / max(1, len(text) - 1)
 
 
+def _bits_per_byte(engine: AuraLiteEngine, text: str, avg_loss: float, n_pred: int) -> float:
+    if n_pred == 0 or not math.isfinite(avg_loss):
+        return float("inf")
+    ids = engine.encode(text)
+    # every token after the first is predicted exactly once
+    n_bytes = len(engine.decode(ids[1:1 + n_pred]).encode("utf-8"))
+    if n_bytes == 0:
+        return float("inf")
+    return (avg_loss * n_pred) / math.log(2) / n_bytes
+
+
+def compute_bpb(engine: AuraLiteEngine, text: str, batch_size: int = 32) -> float:
+    """Compute bits per UTF-8 byte of the predicted text (2.11).
+
+    The one metric that compares models with different tokenizers: nats per
+    token reward a tokenizer whose tokens cover more text, while bits per byte
+    measure the information the model needs for the text itself. The training
+    summary reports the same number for the validation split.
+    """
+    avg_loss, n_pred = _compute_avg_token_loss(engine, text, batch_size)
+    return _bits_per_byte(engine, text, avg_loss, n_pred)
+
+
 def generate_sample(engine: AuraLiteEngine, seed: str, length: int = 200) -> str:
     """Generate a sample text for visual inspection."""
     return engine.generate(seed, length=length, temperature=0.8, top_k=50, top_p=0.9)
@@ -151,14 +174,20 @@ def main(argv: list[str] | None = None) -> int:
     print("\nComputing metrics...")
     start = time.time()
 
-    perplexity = compute_perplexity(engine, test_text, args.batch_size)
-    bpt = compute_bpt(engine, test_text, args.batch_size)
-    bpc = compute_bpc(engine, test_text, args.batch_size)
+    # One pass over the text; 2.10 ran the model three times (one per metric).
+    avg_loss, n_pred = _compute_avg_token_loss(engine, test_text, args.batch_size)
+    finite = n_pred > 0 and math.isfinite(avg_loss)
+    perplexity = math.exp(min(avg_loss, 100)) if finite else float("inf")
+    bpt = avg_loss / math.log(2) if finite else float("inf")
+    bpc = ((avg_loss / math.log(2)) * n_pred / max(1, len(test_text) - 1)
+           if finite and len(test_text) > 1 else float("inf"))
+    bpb = _bits_per_byte(engine, test_text, avg_loss, n_pred)
 
     elapsed = time.time() - start
     print(f"  Perplexity: {perplexity:.2f}")
     print(f"  Bits-per-token: {bpt:.4f}")
     print(f"  Bits-per-character: {bpc:.4f}")
+    print(f"  Bits-per-byte: {bpb:.4f}  (compares models across tokenizers)")
     if engine.tokenizer.kind != "char":
         print("  Note: BPC is normalized by original character count (not mislabeled BPT).")
     print(f"  Evaluation time: {elapsed:.2f}s")

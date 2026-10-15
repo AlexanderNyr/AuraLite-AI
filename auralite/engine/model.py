@@ -149,6 +149,77 @@ class ModernTransformer(nn.Module):
         self.lora_adapters: list | None = None
         self.lora_rank = 0
 
+        # 2.11: generation attends to the trained length at most (see
+        # `default_context_window`); `set_context_window(None)` lifts it.
+        self.context_window: int | None = None
+        self.set_context_window(self.default_context_window())
+
+    # ---- Context window (2.11) -------------------------------------------
+    def default_context_window(self) -> int | None:
+        """The inference window a model of this configuration gets by default.
+
+        RoPE attention scores depend on the distance between tokens, and a
+        model trained on ``max_seq_len``-token windows has never seen a longer
+        distance. Past that length 2.10 generated noise (docs/engine.md,
+        "Context length"); attending to the newest ``max_seq_len`` positions
+        keeps every distance inside the trained range. A model trained with its
+        own (shorter) ``sliding_window`` already has a window: ``None``.
+        """
+        if self.sliding_window and self.sliding_window <= int(self.max_seq_len or 0):
+            return None
+        return int(self.max_seq_len) if self.max_seq_len else None
+
+    def set_context_window(self, window: int | None) -> None:
+        """Attend to at most the `window` newest positions outside training.
+
+        ``None`` (or 0) removes the limit, which is the 2.10 behaviour. The
+        window never applies in ``train()`` mode and changes nothing for
+        sequences that fit into it. Drops every layer's KV cache.
+        """
+        value = int(window) if window else None
+        if value is not None and value < 1:
+            raise ValueError(f"context window must be a positive number of tokens, got {window!r}")
+        self.context_window = value
+        for attn in self._attention_layers():
+            attn.context_window = value
+            attn.reset_cache()
+
+    def extend_context(self, max_seq_len: int) -> bool:
+        """Raise the trained length to `max_seq_len` before training on it (2.11).
+
+        Continued training on longer windows ("train short, extend long")
+        calls this: the RoPE tables grow, and a context window that followed
+        the old length follows the new one. RoPE scaling settings that derive
+        their original length from ``max_seq_len`` are pinned to the old
+        length, so the rotary frequencies the model was trained with do not
+        change underneath it. Returns False when nothing had to change.
+        """
+        new_len = int(max_seq_len)
+        old_len = int(self.max_seq_len or 0)
+        if new_len <= old_len:
+            return False
+        follow = self.context_window is not None and self.context_window == self.default_context_window()
+        layers = self._attention_layers()
+        scaling = dict(self.rope_scaling or {})
+        kind = str(scaling.get("type", "none")).lower()
+        if kind in ("ntk", "dynamic_ntk") and "ntk_base" not in scaling and layers:
+            # NTK derives its base from max_seq_len: keep the trained one.
+            scaling["ntk_base"] = layers[0]._ntk_base()
+        if kind not in ("none", "") and "original_max_position_embeddings" not in scaling:
+            scaling["original_max_position_embeddings"] = old_len
+        self.rope_scaling = scaling
+        self.max_seq_len = new_len
+        for attn in layers:
+            attn.rope_scaling = dict(self.rope_scaling or {})
+            attn.max_seq_len = new_len
+            device = attn.rope_cos.device
+            attn._build_rope_buffers(new_len)
+            attn.rope_cos = attn.rope_cos.to(device)
+            attn.rope_sin = attn.rope_sin.to(device)
+        if follow:
+            self.set_context_window(self.default_context_window())
+        return True
+
     def tie_weights(self):
         """Tie output projection and token embedding weights in-place.
 

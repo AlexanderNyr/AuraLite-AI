@@ -1,3 +1,113 @@
+# 📦 v2.11.0 — long context: coherent generation past the trained length, train short/extend long, bits per byte, Ollama `num_predict`
+
+A native model is trained on `seq_length`-token windows and has never seen an
+attention distance of `seq_length` or more. Until 2.10 generation attended to
+the whole history anyway, so everything past the trained length turned into
+noise. This release fixes that, measures what longer training windows and
+RoPE scaling really buy, and adds a loss metric that compares tokenizers.
+Tables and setups: [docs/engine.md § 9](docs/engine.md#9-context-length) and
+[docs/training.md § 7](docs/training.md#7-train-short-extend-long-211).
+
+**Generation past the trained length**
+
+- **The context window.** Every generated token now attends to the newest
+  `max_seq_len` tokens (the trained length). Held-out loss of a char model
+  trained with `seq_length` 64, positions 256–511: **1.481 instead of 3.973**
+  (a uniform guess over the 65 characters scores 4.174). In a 600-character
+  generation the 2.10 text turned to garbage after ~70 characters; it now stays
+  coherent to the end.
+  - Inside the trained length nothing changes: the logits are bit-identical.
+  - Training is unaffected; the window applies outside `model.train()` only.
+  - A model trained with its own `sliding_window` keeps it.
+  - ALiBi models get the window too: ALiBi degrades much less than RoPE (1.619
+    at 256–511 with the whole history), but the window is still better (1.483).
+- **One setting for every path:** generate, streaming, chat, thinking mode,
+  batch, speculative decoding (the draft model uses its own window), the
+  server and the GUI.
+  - Python: `engine.set_context_window("auto" | "full" | N)`,
+    `engine.full_context = True`, `engine.context_window`.
+  - CLI: `auralite generate/chat/serve --full-context` or `--context-window N`;
+    `auralite info` prints the generation window of a checkpoint.
+  - Server: `AURALITE_CONTEXT_WINDOW=auto|full|N`.
+  - GUI: *Full context (no window)* on the Generation tab (applies to Chat too),
+    with a hint that names the window; the model info shows it.
+  - `"full"` restores the 2.10 behaviour; a test checks it token for token
+    against a from-scratch full-attention reference.
+- **Bounded memory, flat time per token.** The KV cache holds about two
+  windows instead of the whole history. The RoPE tables grow geometrically:
+  2.10 rebuilt the whole table for every generated token past the trained
+  length. On the benchmark model of docs/engine.md (trained length 256), 1,000
+  generated tokens run at 646–665 tokens/s instead of 552–568 (+17 %) with
+  1.25 MiB of KV cache instead of 4 MiB. Past the window a decode step costs
+  1.35 ms at any context (2.10: 1.94 ms at 256–511, 2.22 ms at 1,024–1,279);
+  inside it the step time is unchanged. `full_context` is faster than 2.10 as
+  well (592–619 tokens/s) because of the RoPE tables.
+- **Long prompts are prefilled in chunks** of `max(256, 2 × window)` tokens.
+  Every chunk attends to the cached window plus itself, the same keys as one
+  pass over the whole prompt (the tests compare both), but the work grows
+  linearly and the cache never holds the whole prompt.
+- Fixed: a prompt cut to the 8,191-token cap got exactly one generated token;
+  it now gets all `max_new_tokens`.
+- The *Auto* length button: unchanged with the window; with *Full context* it
+  stops at the room the prompt leaves inside the trained length. The "RoPE
+  extrapolates" comments in the length helpers are gone.
+
+**Train short, extend long; RoPE scaling labels**
+
+- `continue_training` with a longer `seq_length` now **extends the model**:
+  `max_seq_len`, the RoPE tables and the generation window follow the new
+  length and are saved. YaRN/NTK settings that derive their base length from
+  `max_seq_len` are pinned, so the learned frequencies do not move. 2.10 trained
+  on the longer windows but kept the old length.
+  - `auralite train --resume short.pt --params long.json --model long.pt`.
+  - When the tokens per optimizer step grow, `train()` logs the batch size that
+    keeps them.
+- Measured with the same model and text, 4 epochs each: **training on 64 tokens
+  plus the window was the best or within 0.002 of the best at every position**
+  and the fastest. Extending to 256 for the last epoch was no better; with the
+  batch size divided by 4 (same tokens per step) it came within 0.002–0.023,
+  without it 0.018–0.058 behind. YaRN ×4 for the extension was worse than no
+  scaling everywhere. The docs say when a longer window may still pay off and
+  how to measure it.
+- **RoPE scaling is not a free extension.** The README promised "2k →
+  16k–32k" from `rope_scaling`. Measured at inference: NTK ×8 hurt every
+  position inside the trained length (1.709 instead of 1.546) and YaRN ×8 was
+  near chance (3.10–4.00); both lose to the window everywhere. The README,
+  the GUI (a hint next to the RoPE setting) and the docs now say so. The
+  *Medium*, *Large* and *GQA-efficient* presets no longer turn on YaRN/NTK
+  ("4x context"). `dynamic_ntk` is documented as an alias of the static `ntk`.
+
+**Bits per byte**
+
+- Validation is also reported in **bits per UTF-8 byte**, which compares char
+  and BPE runs: `val_bpb` / `best_val_bpb` in the summary, `val_bpb` in the
+  epoch-end progress, the GUI status line and model info, `auralite train`.
+- `python -m auralite.eval` prints bits per byte too and computes every metric
+  from one pass over the text (2.10 ran the model three times).
+- **Tokenizer study** at equal training time, in bits per byte (docs/training.md
+  § 6): on a megabyte of text BPE 2048–4096 beats the BPE 512 default by 4–6 %
+  and char by 13–23 %. On 100 KB every BPE run memorised the text within a
+  minute; with early stopping BPE 2048 was again the best, without it char.
+  The default stays BPE 512, the setting without a bad case in these runs; the
+  docs give the rule of thumb.
+
+**Server: Ollama `num_predict`**
+
+- `-1` ("no limit") and `-2` ("fill the context") meant an empty answer; they
+  now mean the server cap. Values above the cap are clamped instead of being
+  passed through; non-integers are an HTTP 400 in Ollama's `{"error": "..."}`
+  shape instead of a 500; `null` means unset.
+- The cap is shared with the OpenAI endpoints (422 above it) and configurable
+  with `AURALITE_MAX_TOKENS` (default 8192).
+
+**Other**
+
+- `auralite/engine/context.py`: the context-window mixin of `AuraLiteEngine`.
+- `benchmarks/context_bench.py` (`loss`, `speed`) reproduces the tables; a test
+  keeps it running.
+- Tests: 1,409 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  environments (2.10: 1,316); pyright errors 260 → 259.
+
 # 📦 v2.10.0 — image generator: 2.6x faster training, correct schedules and EMA, DPM-Solver++, classes with guidance
 
 This release is about the from-scratch image generator (`ImageGenEngine`, the

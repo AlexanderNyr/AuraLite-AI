@@ -19,6 +19,13 @@ Environment:
     AURALITE_CPU_INT8       =1 to dynamically INT8-quantize the model at load
                             (inference-only; faster on VNNI-class CPUs, can be
                             slower on tiny containers — benchmark first)
+    AURALITE_MAX_TOKENS     most tokens one request may generate (default
+                            8192): OpenAI `max_tokens` above it is rejected
+                            with 422, Ollama `num_predict` is clamped to it and
+                            -1 / -2 ("no limit" / "fill the context") mean it
+    AURALITE_CONTEXT_WINDOW tokens a generated token attends to: auto (default,
+                            the trained length), full (the 2.10 behaviour) or
+                            a number — see AuraLiteEngine.set_context_window
 
 NOTE: run with a single uvicorn worker (the default). Generation state and the
 rate limiter are per-process; multiple workers would load N model copies and
@@ -39,7 +46,7 @@ try:
     from fastapi import Depends, FastAPI, HTTPException, Request, Response
     from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, field_validator
     from starlette.exceptions import HTTPException as StarletteHTTPException
 except Exception as e:  # pragma: no cover - optional dependency
     raise ImportError("Install serving dependencies: pip install fastapi uvicorn pydantic") from e
@@ -221,6 +228,25 @@ app = create_app()
 MODEL_ID = os.environ.get("AURALITE_MODEL_ID", "auralite")
 
 
+DEFAULT_MAX_TOKENS_CAP = 8192
+
+
+def max_tokens_cap() -> int:
+    """Most tokens one request may generate (`AURALITE_MAX_TOKENS`, 2.11)."""
+    raw = os.environ.get("AURALITE_MAX_TOKENS", "")
+    try:
+        return max(1, int(raw)) if raw.strip() else DEFAULT_MAX_TOKENS_CAP
+    except ValueError:
+        return DEFAULT_MAX_TOKENS_CAP
+
+
+def _check_max_tokens(value: int) -> int:
+    cap = max_tokens_cap()
+    if value > cap:
+        raise ValueError(f"max_tokens must be <= {cap} (the server's AURALITE_MAX_TOKENS)")
+    return value
+
+
 class _SamplingOptions(BaseModel):
     """Sampling knobs shared by both OpenAI-shaped endpoints.
 
@@ -255,7 +281,7 @@ class _SamplingOptions(BaseModel):
 class CompletionRequest(_SamplingOptions):
     model: str = MODEL_ID
     prompt: str | list[str]
-    max_tokens: int = Field(default=128, ge=0, le=8192)
+    max_tokens: int = Field(default=128, ge=0)
     stream: bool = False
     # Declared so that requests asking for them get an honest 400 instead of
     # being silently ignored (see `_unsupported`); the defaults are accepted.
@@ -264,6 +290,8 @@ class CompletionRequest(_SamplingOptions):
     logprobs: int | None = None
     echo: bool = False
     suffix: str | None = None
+
+    _cap_max_tokens = field_validator("max_tokens")(_check_max_tokens)
 
 
 class ChatMessage(BaseModel):
@@ -274,7 +302,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(_SamplingOptions):
     model: str = MODEL_ID
     messages: list[ChatMessage]
-    max_tokens: int = Field(default=128, ge=0, le=8192)
+    max_tokens: int = Field(default=128, ge=0)
     temperature: float = Field(default=0.7, ge=0.0, le=5.0)
     stream: bool = False
     n: int = 1
@@ -285,6 +313,8 @@ class ChatCompletionRequest(_SamplingOptions):
     tool_choice: str | dict[str, Any] | None = None
     functions: list[dict[str, Any]] | None = None
     function_call: str | dict[str, Any] | None = None
+
+    _cap_max_tokens = field_validator("max_tokens")(_check_max_tokens)
 
 
 class OllamaGenerateRequest(BaseModel):
@@ -359,9 +389,12 @@ def get_engine() -> AuraLiteEngine:
     global _engine
     if _engine is None:
         path = os.environ.get("AURALITE_MODEL")
-        _engine = AuraLiteEngine()
+        engine = AuraLiteEngine()
         if path:
-            _engine.load_model(path)
+            engine.load_model(path)
+        # 2.11: generation window ("auto" = the trained length).
+        engine.set_context_window(os.environ.get("AURALITE_CONTEXT_WINDOW", "auto"))
+        _engine = engine
     return _engine
 
 
@@ -804,12 +837,36 @@ def ollama_list_models() -> dict[str, Any]:
     return ollama_tags(MODEL_ID, size=size)
 
 
+def _ollama_num_predict(value: Any) -> int:
+    """Ollama `num_predict` as a token budget (2.11).
+
+    -1 ("no limit", Ollama's default) and -2 ("fill the context") mean the
+    server cap; larger values are clamped to it, as in the OpenAI paths.
+    2.10 turned -1/-2 into an empty answer, passed huge values through and
+    answered non-numbers with HTTP 500.
+    """
+    cap = max_tokens_cap()
+    integral = isinstance(value, int) or (isinstance(value, float) and value.is_integer())
+    if isinstance(value, bool) or not integral:
+        # Ollama's own error shape: {"error": "<message>"}
+        raise HTTPException(status_code=400, detail=ollama_error(
+            f"options.num_predict must be an integer (-1 = up to the server cap of "
+            f"{cap} tokens), got {value!r}"))
+    n = int(value)
+    if n in (-1, -2):
+        return cap
+    if n < 0:
+        raise HTTPException(status_code=400, detail=ollama_error(
+            f"options.num_predict must be -1, -2 or >= 0, got {n}"))
+    return min(n, cap)
+
+
 def _ollama_options(options: dict[str, Any] | None) -> dict[str, Any]:
     """Map Ollama sampling options onto engine kwargs (unknown keys ignored)."""
     options = options or {}
     out: dict[str, Any] = {}
-    if "num_predict" in options:
-        out["max_tokens"] = max(0, int(options["num_predict"]))
+    if options.get("num_predict") is not None:     # null = unset, as in Ollama
+        out["max_tokens"] = _ollama_num_predict(options["num_predict"])
     for src, dst in (("temperature", "temperature"), ("top_k", "top_k"),
                      ("top_p", "top_p"), ("repeat_penalty", "repetition_penalty"),
                      ("min_p", "min_p"), ("presence_penalty", "presence_penalty"),

@@ -447,11 +447,17 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             lines.append(f"n_kv_heads      : {n_kv} "
                          f"({'GQA' if m.n_kv_heads and m.n_kv_heads < m.n_heads else 'MHA'})")
             lines.append(f"max_seq_len     : {m.max_seq_len}")
+            window = getattr(self.engine, "context_window", None)
+            lines.append(f"gen. window     : {window if window else 'full context'}"
+                         f"{' (trained length)' if window and window == m.max_seq_len else ''}")
             lines.append(f"dropout         : {m.dropout}")
             lines.append(f"ALiBi           : {'Yes ✅' if m.use_alibi else 'No'}")
             lines.append(f"device          : {self.engine.device}")
             if self.engine.last_val_loss is not None:
                 lines.append(f"last val loss   : {self.engine.last_val_loss:.4f}")
+            last_bpb = getattr(self.engine, "last_val_bpb", None)
+            if last_bpb is not None:
+                lines.append(f"last val BPB    : {last_bpb:.4f} bits/byte")
             if self.engine.params_used:
                 lines.append("")
                 lines.append("Last training params:")
@@ -461,6 +467,9 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.model_info.delete("1.0", tk.END)
         self.model_info.insert(tk.END, "\n".join(lines))
         self.model_info.config(state=tk.DISABLED)
+        update_hint = getattr(self, "_update_context_hint", None)
+        if update_hint is not None and hasattr(self, "context_hint"):
+            update_hint()
 
 
     def save_config(self):

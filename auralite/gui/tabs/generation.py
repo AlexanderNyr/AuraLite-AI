@@ -56,6 +56,17 @@ class GenerationTabMixin:
                   style="Sub.TLabel").grid(row=1, column=4, columnspan=3,
                                            sticky=tk.W, pady=(6, 0))
 
+        # 2.11: generation window (applies to the Chat tab as well)
+        ctx_row = ttk.Frame(gen_settings)
+        ctx_row.pack(fill=tk.X, pady=(6, 0))
+        self.full_context_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctx_row, text="Full context (no window)",
+                        variable=self.full_context_var,
+                        command=self._update_context_hint).pack(side=tk.LEFT, padx=4)
+        self.context_hint = ttk.Label(ctx_row, text="", style="Sub.TLabel")
+        self.context_hint.pack(side=tk.LEFT, padx=8)
+        self._update_context_hint()
+
         # --- Seed + length ---
         seed_frame = ttk.LabelFrame(tab, text="  🌱  Prompt  ", padding="10")
         seed_frame.pack(fill=tk.X, pady=(0, 8))
@@ -218,7 +229,37 @@ class GenerationTabMixin:
             return ""
 
 
+    def _update_context_hint(self, *_):
+        """Explain what the window checkbox does for the loaded model."""
+        model = getattr(self.engine, "model", None)
+        trained = getattr(model, "max_seq_len", None)
+        if self.full_context_var.get():
+            text = ("whole history: past the trained length "
+                    f"({trained} tokens) the output degrades" if trained else
+                    "whole history: past the trained length the output degrades")
+        else:
+            text = (f"each token sees the newest {trained} tokens (the trained length)"
+                    if trained else "each token sees as many tokens as the model was trained on")
+        self.context_hint.config(text=text)
+
+    def _apply_context_choice(self):
+        """Hand the checkbox to the engine before a generation starts (2.11).
+
+        Applied here, between generations, rather than on click: changing the
+        window drops the KV cache, which must not happen under a running
+        generation.
+        """
+        var = getattr(self, "full_context_var", None)
+        if var is None:
+            return
+        try:
+            self.engine.set_context_window("full" if var.get() else "auto")
+        except Exception as err:  # an engine without the 2.11 API
+            print(f"[AuraLite] context window not applied: {err}")
+        self._update_context_hint()
+
     def generate_text(self):
+        self._apply_context_choice()
         # Handle batch mode
         if self.batch_var.get():
             self._generate_batch()

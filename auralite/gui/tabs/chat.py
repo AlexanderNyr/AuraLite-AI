@@ -278,6 +278,11 @@ class ChatTabMixin:
             self._send_agent_message(user_msg)
             return
 
+        # 2.11: the generation tab's window checkbox applies to chat too
+        apply_context = getattr(self, "_apply_context_choice", None)
+        if apply_context is not None:
+            apply_context()
+
         # Add user message to history
         self.chat_history.append({"role": "user", "content": user_msg})
 
