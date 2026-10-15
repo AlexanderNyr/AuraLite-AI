@@ -97,6 +97,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.image_is_trained = False
         self.image_stop_event = threading.Event()
         self.image_loss_history: list[float] = []
+        self.image_val_history: list[float] = []
         self._img_progress_ui_last_ts: float = 0.0
         self._last_generated_images: list = []
 

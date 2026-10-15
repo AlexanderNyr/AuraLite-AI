@@ -1842,6 +1842,118 @@ class TestImageTab:
             app.load_image_model()
         assert errors.call_args.args[0] == "Load Error"
 
+    # ---- 2.10 ----
+    def test_validation_fields_reach_the_engine(self, app, monkeypatch, tmp_path):
+        folder = self.make_folder(tmp_path, count=8)
+        self.tiny_image_params(app, folder)
+        app.img_vars["val_split"].set("0.25")
+        app.img_vars["early_stopping_patience"].set("3")
+        app.img_vars["epochs"].set("2")
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+
+        app.start_image_training()
+
+        summary = app.image_engine.last_train_summary
+        assert summary["val_images"] == 2 and summary["train_images"] == 6
+        assert app.image_engine.config["early_stopping_patience"] == 3
+        assert len(app.image_val_history) == 2
+        status = app.img_status_label.config.call_args_list[-1].kwargs["text"]
+        assert "training complete" in status and "best val" in status
+
+    def test_image_progress_shows_and_plots_val_loss(self, tmp_path, monkeypatch):
+        import auralite.gui.tabs.image as image_module
+        from tests._gui_harness import FakeFigure, make_mock
+
+        def prepare():
+            monkeypatch.setattr(image_module, "Figure", FakeFigure)
+            monkeypatch.setattr(image_module, "FigureCanvasTkAgg", make_mock)
+
+        with build_gui_app(tmp_path, monkeypatch, matplotlib=True, prepare=prepare) as app:
+            app.image_loss_history, app.image_val_history = [], []
+            app.update_image_progress(1, 2, 0.9, 0.8, {"is_epoch_end": True, "percent": 50.0})
+            assert app.image_val_history == [0.8]
+            assert "val 0.8000" in app.img_status_label.config.call_args.kwargs["text"]
+            assert app.img_ax.kinds.count("plot") == 2 and "legend" in app.img_ax.kinds
+
+    def test_sampler_choice_reaches_the_engine(self, app, monkeypatch, tmp_path):
+        folder = self.make_folder(tmp_path)
+        self.tiny_image_params(app, folder)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        app.start_image_training()
+        seen = {}
+        real = app.image_engine.generate
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return real(**kwargs)
+
+        monkeypatch.setattr(app.image_engine, "generate", spy)
+        assert app.img_sampler_var.get() == "dpm++2m" and app.img_steps_var.get() == "20"
+        app.img_n_var.set("2")
+        app.img_steps_var.set("3")
+        app.generate_images()
+        assert seen["sampler"] == "dpm++2m" and seen["steps"] == 3 and seen["eta"] == 0.0
+        app.img_sampler_var.set("ddpm")
+        app.generate_images()
+        assert seen["sampler"] == "ddpm" and seen["eta"] == 1.0
+
+        out = tmp_path / "samples"
+        out.mkdir()
+        with dialog_double("filedialog.askdirectory", str(out)):
+            app.save_generated_images()
+        assert (out / "grid.png").exists() and (out / "sample_001.png").exists()
+        assert "grid.png" in app.img_status_label.config.call_args.kwargs["text"]
+
+    def test_image_dialogs_offer_safetensors(self, app, monkeypatch, tmp_path):
+        folder = self.make_folder(tmp_path)
+        self.tiny_image_params(app, folder)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        app.start_image_training()
+        target = tmp_path / "gen.safetensors"
+        with dialog_double("filedialog.asksaveasfilename", str(target)) as dialog:
+            app.save_image_model()
+        patterns = [pattern for _, pattern in dialog.call_args.kwargs["filetypes"]]
+        assert "*.safetensors" in patterns and target.exists()
+        with dialog_double("filedialog.askopenfilename", str(target)) as dialog:
+            app.load_image_model()
+        assert "*.safetensors" in [p for _, p in dialog.call_args.kwargs["filetypes"]]
+        assert app.image_engine.model is not None
+
+    def test_class_conditional_training_fills_the_class_picker(self, app, monkeypatch, tmp_path):
+        from PIL import Image
+
+        root = tmp_path / "classes"
+        for name, color in (("cats", (200, 50, 50)), ("dogs", (50, 50, 200))):
+            (root / name).mkdir(parents=True)
+            for i in range(3):
+                Image.new("RGB", (16, 16), color).save(root / name / f"{i}.png")
+        self.tiny_image_params(app, root)
+        app.img_classes_var.set(True)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        app.start_image_training()
+
+        values = app.img_class_combo.config.call_args.kwargs["values"]
+        assert list(values)[-2:] == ["cats", "dogs"] and len(values) == 4
+        seen = {}
+        real = app.image_engine.generate
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return real(**kwargs)
+
+        monkeypatch.setattr(app.image_engine, "generate", spy)
+        app.img_n_var.set("2")
+        app.img_steps_var.set("2")
+        app.generate_images()
+        assert "class_label" not in seen                   # "(any)" → unconditional
+        app.img_class_var.set("dogs")
+        app.img_guidance_var.set("3")
+        app.generate_images()
+        assert seen["class_label"] == "dogs" and seen["guidance_scale"] == 3.0
+        app.img_class_var.set(values[1])                   # one of each
+        app.generate_images()
+        assert seen["class_label"] == "all"
+
 
 # ----------------------------------------------------------------------
 #  Chat tab

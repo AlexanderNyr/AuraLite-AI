@@ -6,6 +6,8 @@
     auralite serve     --model out.pt [--host 0.0.0.0] [--port 8000]
     auralite info      --model out.pt
     auralite export    --model out.pt [--format pt2|onnx|torchscript] [--out PATH]
+    auralite image-train    --images DIR [--preset small] [--params p.json] --model img.pt
+    auralite image-generate --model img.pt [-n 16] [--steps 20] [--out grid.png]
 
 `--mmap` (or `--corpus-cache PATH`) streams the corpus into a uint32 memory map
 instead of an in-RAM int64 tensor — the same tokens, ~4x less memory and no
@@ -255,6 +257,120 @@ def cmd_export(args: argparse.Namespace) -> int:
 #: installed AuraLite, where only the `auralite` package exists (the 2.6 flat name
 #: `server.openai_server:app` would only work inside a checkout).
 SERVER_APP = "auralite.server.openai_server:app"
+
+
+def _image_train_params(args: argparse.Namespace) -> tuple[dict, str | None]:
+    """Merge --preset, --params and the flag overrides; validate strictly.
+
+    The image CLI is new in 2.10, so unlike `train` it has no legacy keys to
+    tolerate: every key must be known, and near-misses get a suggestion.
+    """
+    import difflib
+
+    from auralite.image_engine import (_TRAIN_EXTRAS, IMAGE_PRESETS, ImageGenEngine,
+                                       validate_image_params)
+    params: dict = {}
+    if args.preset:
+        wanted = args.preset.strip().lower()
+        names = [n for n in IMAGE_PRESETS if n.lower().startswith(wanted)]
+        if len(names) != 1:
+            choices = ", ".join(n.split(" ")[0].lower() for n in IMAGE_PRESETS)
+            return {}, f"unknown --preset {args.preset!r} (choose: {choices})"
+        params.update(IMAGE_PRESETS[names[0]])
+    if args.params:
+        with open(args.params, "r", encoding="utf-8") as f:
+            params.update(json.load(f))
+    for key in ("epochs", "batch_size", "seed", "val_split", "img_size"):
+        value = getattr(args, key, None)
+        if value is not None:
+            params[key] = value
+    if getattr(args, "grayscale", False):
+        params["channels"] = 1
+    if getattr(args, "classes", False):
+        params["class_conditional"] = True
+    known = set(ImageGenEngine.DEFAULTS) | set(_TRAIN_EXTRAS)
+    unknown = sorted(k for k in params if k not in known)
+    if unknown:
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(key, sorted(known), n=1)
+            hints.append(f"{key!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
+        return {}, "unknown image training parameter(s): " + ", ".join(hints)
+    errors = validate_image_params({**ImageGenEngine.DEFAULTS, **params})
+    if errors:
+        return {}, "invalid image training parameters: " + "; ".join(errors)
+    return params, None
+
+
+def cmd_image_train(args: argparse.Namespace) -> int:
+    if not os.path.isdir(args.images):
+        print(f"error: image folder not found: {args.images}", file=sys.stderr)
+        return 2
+    params, error = _image_train_params(args)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    from auralite.image_engine import ImageGenEngine, save_image_grid, scan_image_folder
+    if not scan_image_folder(args.images):
+        print(f"error: no supported images under {args.images}", file=sys.stderr)
+        return 2
+    engine = ImageGenEngine()
+    if args.resume:
+        engine.load_model(args.resume)
+        params["continue_training"] = True
+    engine.train(args.images, params,
+                 progress_callback=None if getattr(args, "quiet", False) else _progress)
+    engine.save_model(args.model)
+    summary = engine.last_train_summary
+    line = (f"saved: {args.model} | {summary.get('steps')} steps in "
+            f"{summary.get('seconds')}s")
+    if engine.class_names:
+        line += f" | classes: {', '.join(engine.class_names)}"
+    if summary.get("best_val_loss") is not None:
+        line += (f" | best val {summary['best_val_loss']:.4f} "
+                 f"(epoch {summary.get('best_epoch')})")
+    print(line)
+    if args.samples:
+        images = engine.generate(n=16, steps=20, sampler="dpm++2m", seed=0,
+                                 class_label="all" if engine.class_names else None,
+                                 guidance_scale=2.0)
+        save_image_grid(images, args.samples)
+        print(f"samples: {args.samples}")
+    return 0
+
+
+def cmd_image_generate(args: argparse.Namespace) -> int:
+    from auralite.image_engine import ImageGenEngine, save_image_grid
+    if not os.path.exists(args.model):
+        print(f"error: checkpoint not found: {args.model}", file=sys.stderr)
+        return 2
+    engine = ImageGenEngine()
+    engine.load_model(args.model)
+    if args.class_label is not None and not engine.class_names:
+        print("error: --class needs a class-conditional model (image-train --classes)",
+              file=sys.stderr)
+        return 2
+    t0 = time.perf_counter()
+    try:
+        images = engine.generate(n=args.n, steps=args.steps, eta=args.eta, seed=args.seed,
+                                 use_ema=not args.no_ema, sampler=args.sampler,
+                                 class_label=args.class_label,
+                                 guidance_scale=args.guidance)
+    except ValueError as err:          # unknown class name / index
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    seconds = time.perf_counter() - t0
+    if args.out_dir:
+        from PIL import Image
+        os.makedirs(args.out_dir, exist_ok=True)
+        for i, im in enumerate(images):
+            Image.fromarray(im).save(os.path.join(args.out_dir, f"sample_{i:03d}.png"))
+        print(f"saved {len(images)} images to {args.out_dir}")
+    if args.out:
+        save_image_grid(images, args.out)
+        print(f"saved: {args.out}")
+    print(f"{len(images)} images, {args.sampler} x {args.steps} steps, {seconds:.2f}s")
+    return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -509,6 +625,49 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ONNX exporter (default auto: torch.export-based when onnxscript "
                         "is installed)")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("image-train", help="train a from-scratch image generator "
+                                           "(diffusion) on a folder of images")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--images", required=True, help="folder of training images (recursive)")
+    p.add_argument("--preset", help="tiny | small | medium | large (see the GUI presets)")
+    p.add_argument("--params", help="JSON file with image training params "
+                                    "(keys of ImageGenEngine.DEFAULTS)")
+    p.add_argument("--model", default="image_model.pt",
+                   help="output checkpoint (.pt or .safetensors)")
+    p.add_argument("--epochs", type=int)
+    p.add_argument("--batch-size", dest="batch_size", type=int)
+    p.add_argument("--img-size", dest="img_size", type=int)
+    p.add_argument("--grayscale", action="store_true", help="train a 1-channel model")
+    p.add_argument("--seed", type=int)
+    p.add_argument("--val-split", dest="val_split", type=float, default=0.05,
+                   help="held-out fraction for the validation loss (default 0.05; 0 = off)")
+    p.add_argument("--resume", metavar="CKPT",
+                   help="continue training this checkpoint (its architecture is kept)")
+    p.add_argument("--samples", metavar="PNG",
+                   help="also save a 4x4 grid of samples here after training")
+    p.add_argument("--classes", action="store_true",
+                   help="class-conditional: every first-level sub-folder is a class")
+    p.set_defaults(func=cmd_image_train)
+
+    p = sub.add_parser("image-generate", help="sample images from an image-generator "
+                                              "checkpoint")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("-n", type=int, default=16, help="number of images (default 16)")
+    p.add_argument("--steps", type=int, default=20, help="sampler steps (default 20)")
+    p.add_argument("--sampler", choices=["dpm++2m", "ddim", "ddpm"], default="dpm++2m")
+    p.add_argument("--eta", type=float, default=0.0,
+                   help="DDIM stochasticity (0 = deterministic; ddpm uses 1)")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--no-ema", action="store_true", help="sample with the raw weights")
+    p.add_argument("--class", dest="class_label", metavar="NAME",
+                   help="class name or index of a class-conditional model, or 'all'")
+    p.add_argument("--guidance", type=float, default=2.0,
+                   help="classifier-free guidance scale with --class (default 2.0; 1 = off)")
+    p.add_argument("--out", default="samples.png", help="grid image (default samples.png)")
+    p.add_argument("--out-dir", help="also save every image separately here")
+    p.set_defaults(func=cmd_image_generate)
     return parser
 
 

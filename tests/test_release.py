@@ -317,7 +317,7 @@ def test_pypi_readme_has_only_absolute_links():
 def test_readme_advertises_the_documentation_set():
     readme = README.read_text(encoding="utf-8")
     for target in ("docs/quickstart.md", "docs/faq.md", "docs/quantization.md",
-                   "docs/engine.md", "docs/training.md"):
+                   "docs/engine.md", "docs/training.md", "docs/image.md"):
         assert target in readme, target
     # The badges must not promise a version the code does not have.
     from auralite.engine import __version__

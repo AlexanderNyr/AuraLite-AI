@@ -1,3 +1,112 @@
+# 📦 v2.10.0 — image generator: 2.6x faster training, correct schedules and EMA, DPM-Solver++, classes with guidance
+
+This release is about the from-scratch image generator (`ImageGenEngine`, the
+GUI *Image* tab, and new `auralite image-train` / `image-generate` commands).
+Speed numbers come from `benchmarks/image_bench.py` (CPU). Quality numbers are
+classifier-FID on MNIST at 16 px with the *Tiny* preset and 1,570 steps,
+1,000 samples; the floor for real images is 8.0. Each row is one run, so
+differences of a few tens of points are indicative. Details and tables are in
+[docs/image.md](docs/image.md).
+
+**Faster**
+
+- **Attention used the slow kernel.** The U-Net's attention handed
+  `scaled_dot_product_attention` q/k/v with a strided head dimension, which
+  rules out the fused kernels. Every call ran the math fallback (53 % of a
+  *Tiny* step). The projections now run on a token-major view with the same
+  weights; outputs match to 1e-5. SDPA forward+backward is 2.5–3.2x faster.
+- **channels-last on CPU** for the model, the EMA copy and the batches
+  (`channels_last`, automatic).
+- **Automatic attention heads** (`attn_heads=0`: one head per 32 channels).
+  Head dimensions of 8–16 were the slowest case. The new default also scored
+  better in its run (FID 245 vs 275).
+- Result, at 2 threads:
+  - a *Tiny* step (batch 32) is 2.6x faster, 403 → 154 ms;
+  - a *Small* step (batch 8) is 1.45x faster, 644 → 447 ms;
+  - *Small* at batch 32 peaks at 1,330 MB instead of 1,533 MB.
+- **The image engine on its own ran one thread.** torch defaults to the
+  physical cores, and only the GUI/CLI applied the text engine's policy.
+  `AURALITE_NUM_THREADS` (default: every logical CPU) now applies here too:
+  243 → 154 ms per *Tiny* step on a 2-vCPU VM.
+- **Images are decoded once** into one uint8 tensor, in a thread pool. JPEGs
+  use draft mode (DCT downscaling: 53 → 6.9 ms per 3000x2000 file at 32 px). Batching and flips are
+  vectorised, and *continue training* reuses the decoded folder.
+- `torch.compile` was measured: no gain on CPU for this model (330 vs 331 ms,
+  73 s compile). It stays optional.
+
+**Fixed**
+
+- **The linear and sigmoid schedules never reached pure noise for T < 1000.**
+  At the default T = 200, 36 % of the signal survived the last step while
+  sampling started from pure noise, so samples were too bright and grey: mean
+  pixel 0.249 against 0.131 for real MNIST, and 0.159 after the fix. The range
+  is now scaled by 1000/T.
+  - New checkpoints record `schedule_version: 2`; older files keep their
+    betas.
+  - FID was unchanged at this budget (308 → 305).
+  - The cosine schedule (all presets except *Tiny*) was already right.
+- **EMA averaged in the random initialisation.** A fixed decay from step 1
+  kept `decay**steps` of the initial weights: 21 % after 1,570 steps at 0.999,
+  the GUI default. Sampling uses EMA by default. In the same run the fixed
+  decay scored FID 1502.6 and the warmup decay, `min(decay, (1+n)/(10+n))`,
+  scored 275.2. The update is one multi-tensor `lerp`, and the update count
+  is saved.
+- **Continue training ignored new settings.** It reused the old config, so new
+  epochs and learning rate did nothing. Now architecture, diffusion and class
+  settings come from the model and everything else from the new params.
+- **The LR schedule ignored gradient accumulation.** With accumulation 4,
+  cosine ended at 87 % of the base LR instead of 10 %. A partial accumulation
+  group at the end of an epoch is now applied.
+- The `torch.compile` probe runs a real training step. Compiled runs drop the
+  last partial batch, so they never recompile.
+- `grad_clip=0` zeroed every gradient; now it disables clipping.
+- `tensor_to_uint8` rounds instead of truncating.
+- EXIF orientation is applied, so phone photos are not learned sideways.
+- Unreadable images are skipped with a warning instead of aborting training.
+- Unknown training params are logged as ignored.
+
+**New**
+
+- **DPM-Solver++(2M)** (`sampler="dpm++2m"`, log-SNR spacing; the GUI/CLI
+  default at 20 steps).
+  - With an exact denoiser its sample std is within 1.7 % of the truth at
+    20 steps, against -10 to -19 % for DDIM.
+  - On the trained MNIST model, 10 steps score FID 271.9 against 275.2 for
+    DDIM with 50 steps.
+- **Class-conditional training** from sub-folders, with **classifier-free
+  guidance**:
+  - API: `class_conditional`, `class_dropout`, and
+    `generate(class_label=..., guidance_scale=...)`;
+  - GUI: a class picker and a guidance field;
+  - CLI: `--classes`, `--class`, `--guidance`.
+  - On MNIST with one folder per digit, guidance 2 scores FID 52.7 (235 for
+    the unconditional model at the same budget). 94 % of samples are the
+    requested digit, against 75 % without guidance.
+- **Held-out validation**:
+  - `val_split` (GUI/CLI default 5 %) gives a deterministic held-out denoising
+    loss: fixed timesteps, seeded noise, EMA weights. It is reported per
+    epoch, plotted in the GUI, and summarised in `last_train_summary`.
+  - `early_stopping_patience` and `restore_best_weights`.
+- **CLI.** `auralite image-train` (presets, params JSON with typo
+  suggestions, `--resume`, `--samples`) and `auralite image-generate` (grid
+  and/or individual PNGs).
+- **GUI.**
+  - `.safetensors` in the save/load dialogs.
+  - Sizes 96 and 128 in the image size combo.
+  - *Save Samples* also writes `grid.png`.
+- `scale_shift_norm` (AdaGN) and `zero_init` options. Zero-initialised output
+  layers are now the default for new models; AdaGN stays off (mixed evidence,
+  see docs).
+- `make_image_grid`, `save_image_grid`, `load_image_folder`,
+  `folder_class_labels`.
+
+**Compatibility**
+
+- 2.9 image checkpoints load and sample as before: legacy betas, their stored
+  head count, no class embedding, EMA treated as warmed up.
+- `ImageGenEngine.generate` still defaults to DDIM, and `train()` still returns
+  the epoch losses.
+
 # 📦 v2.9.0 — training: one-pass epochs, honest validation, early stopping, faster steps
 
 This release changes how the native engine trains, not how it generates. The
