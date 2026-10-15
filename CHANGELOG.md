@@ -1,3 +1,125 @@
+# 📦 v2.12.0 — training that ends well: one recipe, early stopping by default, Stop with a cooldown, time limits; correct concurrent generation
+
+Two things in this release. Training: the GUI, `train()` and the CLI now share
+one measured default recipe, stop when the validation loss stops improving,
+and end a run that is stopped by hand or by a time limit with a learning-rate
+decay instead of at the peak. Generation: concurrent generations on one engine
+(server requests, the GUI's tabs) no longer corrupt each other. Tables and
+setups: [docs/training.md § 8–9](docs/training.md#8-one-default-recipe-212)
+and [docs/faq.md § 8–9](docs/faq.md#9-is-the-openai-server-multi-worker).
+
+**Defaults that changed**
+
+| setting | 2.12 | 2.11 GUI | 2.11 `train()` | 2.11 CLI |
+|---|---|---|---|---|
+| optimizer | Muon lr 0.02 (+ AdamW lr 1e-3 for embeddings, norms, head) | same | AdamW 1e-3 | AdamW 1e-3 |
+| QK-norm | on | on | off | off |
+| tokenizer | BPE 512 | BPE 512 | **char** | BPE 512 |
+| batch size | 32 | 32 | 32 | **16** |
+| early stopping | **3 epochs**, best epoch restored | off | off | off |
+| Stop / Ctrl+C | finishes with a decay of 0.2 × the steps so far; again: stops | stops | — | interrupts, nothing saved |
+
+Everything else (WSD, dropout 0.1, lr 1e-3, val split 0.1, model size,
+epochs) is unchanged. Explicit parameters win as before. A model continued
+with `continue_training` keeps the optimizer it was trained with unless the
+parameters name one, so 2.11 AdamW models keep their Adam moments. Pass
+`"tokenizer": "char"`, `"optimizer": "adamw"`, `"use_qk_norm": False` or
+`"early_stopping_patience": 0` to get a 2.11 `train()` run back.
+
+**Fixed: concurrent generations shared one KV cache**
+
+- The cache lived in the attention layers, so everything that generated with
+  one engine at the same time wrote into it. With the server's default
+  `AURALITE_MAX_CONCURRENT=4`, four threads sending four greedy prompts got
+  **20 of 20** texts that differed from the same prompts sent one at a time,
+  through `/v1/completions` and through the engine. The GUI's generation and
+  chat tabs could collide the same way, and so could two streams advanced
+  alternately in one thread.
+- Each generation now owns its cache (`auralite/engine/decode_slots.py`). A
+  decode step takes the engine's model lock, installs the cache, runs and takes
+  it back out, so generations interleave token by token: **0 of 20** differ.
+  The lock is never held across a `yield` (a streaming response may resume on
+  another thread), so an abandoned stream blocks nobody. Batch generation,
+  speculative decoding (and its draft model), the compile warm-up and the
+  benchmarks hold the model for the whole call; a context-window change waits
+  for the running step. A generation whose model is replaced mid-way (training
+  or loading another model) raises instead of decoding with the wrong cache.
+- GGUF: one generation at a time on the llama.cpp context (a stream holds it
+  until it is exhausted, closed or collected).
+- `tests/test_concurrency_v212.py` reproduces the 2.11 failure (it fails on
+  2.11) and checks threads, streams, batches, `/v1/completions`, abandoned
+  streams and the GGUF lock.
+- Measured on the way: generation on a worker thread (the server, the GUI) is
+  up to 3× slower than on the main thread when torch uses every core, because
+  the OpenMP runtime stops spin-waiting once two threads have used it (2 vCPU:
+  324 vs 969 tokens/s; one request at a time through the server: 287).
+  `AURALITE_NUM_THREADS=1` gave 974 and 694 tokens/s. Documented in
+  docs/faq.md § 8; the engine itself is unchanged here.
+
+**One default recipe** (`auralite/engine/recipe.py`, docs/training.md § 8)
+
+- `DEFAULT_RECIPE` is read by `train()`, the GUI's training tab and the CLI.
+- **Muon + QK-norm** stays the GUI default and becomes the default of
+  `train()` and the CLI. With early stopping on the first 100 KB of
+  tinyshakespeare it reached **2.196** bits per byte against 2.308 for AdamW +
+  QK-norm (three seeds; 48 s vs 35 s); on 300 KB 1.988 against 2.043 (two
+  seeds). On a megabyte it was 0.3 % better per step (2.1093 vs 2.1148, three
+  seeds) and ties at equal time, because a Muon step costs ~21 % more on a CPU.
+- **Early stopping is on by default** (patience 3, best weights restored,
+  needs the validation split). The GUI's 100-epoch default on 100 KB used to
+  end at 3.68 bits per byte after 239 s and now ends at **2.195 after 46 s**;
+  on 300 KB 2.918 after 13 min became **1.989 after 131 s**. Runs whose
+  validation loss improves every epoch are unchanged (2.1042 at 1,400 steps on
+  all of tinyshakespeare, with and without).
+- `early_stopping_cooldown=True` decays the learning rate before an early
+  stop. It gained 0.3 % on 100 KB and nothing on 300 KB, so it stays off.
+
+**Ending a run well** (`auralite/engine/train_control.py`, docs/training.md § 9)
+
+- WSD keeps the learning rate at its peak for 80 % of the plan. Stopping at
+  step 1,400 of a 2,800-step plan cost **2.7 %** bits per byte against a run
+  planned for 1,400 steps (2.1535 vs 2.0974).
+- **Finish:** `train(..., finish_event=event)` decays from the current
+  learning rate to the floor over `cooldown_ratio` (default 0.2) × the steps
+  taken, then ends with `stop_reason="finished"`. Same run, finished at step
+  1,400: **2.0931** (0.1: 2.1051). The GUI's first Stop and the CLI's first
+  Ctrl+C finish; the second stops at once. The CLI now saves the model after
+  either (2.11 lost it on Ctrl+C).
+- **Time limits:** `time_budget_s` (GUI *Time limit* in minutes, CLI
+  `--time-budget 10m`) measures the step time and moves the end of the plan
+  until the decay begins. A 150 s budget ended after 149.5 s and matched a run
+  sized by hand to the same 1,349 steps (2.1061 vs 2.1100). The budget counts
+  from the start of `train()` and leaves room for the last validation.
+- Both schedulers gained `begin_decay(n)` and `replan(max_steps)`; a forced
+  decay never raises the learning rate and is not saved in `state_dict()`.
+- The summary reports `cooldown_steps`; `stop_reason` can be `"finished"` or
+  `"time_budget"`. With a time limit the progress percentage and ETA follow
+  the budget.
+- New parameters are validated and known to the typo check
+  (`time_budget` → `time_budget_s`).
+
+**GUI**
+
+- Training defaults come from the recipe; *Early stop* defaults to 3; a *Time
+  limit* field; Stop turns into *Stop now* while finishing; the status line
+  says how a run ended. *Save/Load Config* now include early stopping and the
+  time limit.
+
+**Other fixes**
+
+- GGUF and `llama-server` backends rejected `presence_penalty` /
+  `frequency_penalty` with a `TypeError` (server requests with either failed);
+  they are passed to llama.cpp now.
+
+**Other**
+
+- `benchmarks/recipe_bench.py` (`recipe`, `defaults`, `ending`, `budget`,
+  `concurrency`) reproduces the tables; a test keeps it running.
+- `bench_prefill` / `bench_generation_modes` moved to
+  `auralite/engine/inference_bench.py` (unchanged API).
+- Tests: 1,470 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  environments (2.11: 1,409); pyright errors 259 → 251.
+
 # 📦 v2.11.0 — long context: coherent generation past the trained length, train short/extend long, bits per byte, Ollama `num_predict`
 
 A native model is trained on `seq_length`-token windows and has never seen an

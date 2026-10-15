@@ -16,6 +16,8 @@ from auralite.engine import (
     HAS_CHAT_SUPPORT,
     CHAT_TEMPLATES,
 )
+# 2.12: the training tab's defaults are the engine's recipe.
+from auralite.engine.recipe import DEFAULT_RECIPE
 from auralite.web_tools import build_web_context
 # Agent framework (optional)
 try:

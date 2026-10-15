@@ -20,7 +20,7 @@ from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
 from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, sys, threading, tk, ttk)
+from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -89,6 +89,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.is_trained = False
         self.selected_file_path = None
         self.stop_event = threading.Event()
+        self.finish_event = threading.Event()   # 2.12: Stop = finish with a cooldown
         self.loss_history = []  # [(epoch, train_loss, val_loss), ...]
 
         # ---- Image generator (from-scratch diffusion) state ----
@@ -495,6 +496,8 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 "tokenizer": self.tok_var.get(),
                 "bpe_vocab_size": int(self.bpe_vocab_var.get()),
                 "val_split": float(self.val_split_var.get()),
+                "early_stopping_patience": int(self.early_stop_var.get() or 0),
+                "time_budget_s": 60.0 * float(str(self.time_limit_var.get() or 0)),
                 "use_compile": bool(self.compile_var.get()),
                 "continue_training": bool(self.continue_var.get()),
                 "autosave_every": int(self.autosave_var.get()),
@@ -544,6 +547,10 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 self.bpe_vocab_var.set(str(config["bpe_vocab_size"]))
             if "val_split" in config:
                 self.val_split_var.set(str(config["val_split"]))
+            if "early_stopping_patience" in config:
+                self.early_stop_var.set(str(config["early_stopping_patience"]))
+            if "time_budget_s" in config:
+                self.time_limit_var.set(f"{float(config['time_budget_s'] or 0) / 60.0:g}")
             if "n_kv_heads" in config:
                 self.n_kv_heads_var.set(str(config["n_kv_heads"] or 0))
             if "accumulation_steps" in config:
@@ -567,7 +574,8 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             if "use_qk_norm" in config:
                 self.qk_norm_var.set(bool(config["use_qk_norm"]))
             if "optimizer" in config:
-                self.opt_var.set(config["optimizer"] if config["optimizer"] in ("muon", "adamw") else "muon")
+                self.opt_var.set(config["optimizer"] if config["optimizer"] in ("muon", "adamw")
+                                 else DEFAULT_RECIPE["optimizer"])
             if "muon_lr" in config:
                 self.muon_lr_var.set(str(config["muon_lr"]))
             if "lr_schedule" in config:

@@ -3,7 +3,9 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 8.
+to reproduce them are in § 10. Since 2.12 the three entry points share one
+default recipe (§ 8), and a run that is stopped or has a time limit ends with
+a learning-rate decay (§ 9).
 
 ## 1. An epoch is one pass over the text
 
@@ -77,12 +79,15 @@ the validation windows; those windows are fixed, so the ratio is computed once.
 ## 3. Early stopping and the best weights
 
 ```python
-summary = engine.train(text, {"epochs": 50, "early_stopping_patience": 3})
+summary = engine.train(text, {"epochs": 50})        # early stopping is on by default
 summary["stop_reason"], summary["best_epoch"], summary["best_val_loss"]
 ```
 
 * `early_stopping_patience=N` stops after N epochs without a better validation
-  loss. The default is 0 (off).
+  loss. The default is 3 since 2.12 (it was 0, off); 0 switches it off. It
+  needs a validation split (`val_split`, default 0.1).
+* `early_stopping_cooldown=True` (2.12, off by default) decays the learning
+  rate before the stop instead of stopping at the peak; see § 9.
 * `restore_best_weights` ends the run with the weights of the best validation
   epoch. It is on by default when early stopping is on, and can also be used
   alone. The copy lives in memory and is refreshed only when the validation
@@ -90,9 +95,9 @@ summary["stop_reason"], summary["best_epoch"], summary["best_val_loss"]
 * `train()` now returns a summary, also kept as `engine.last_train_summary`:
   `epochs_completed`, `optimizer_steps`, `tokens`, `train_loss`, `val_loss`,
   `best_val_loss`, `best_epoch`, `restored_best`, `stop_reason` (`None`,
-  `"max_steps"`, `"early_stopping"` or `"stopped"`) and `seconds`. The same
-  facts end the training log: `Training done: 12 epochs, 5,892 optimizer
-  steps, …`.
+  `"max_steps"`, `"early_stopping"`, `"finished"`, `"time_budget"` or
+  `"stopped"`), `cooldown_steps` and `seconds`. The same facts end the training
+  log: `Training done: 12 epochs, 5,892 optimizer steps, …`.
 
 ## 4. Speed
 
@@ -232,9 +237,10 @@ near-miss instead of training with the default.
 
 ## 6. Choosing settings
 
-* **How long to train.** Start with `max_steps` or a few epochs and watch the
-  validation loss. If it stops improving while the training loss keeps
-  falling, more epochs will not help — set `early_stopping_patience`.
+* **How long to train.** Plan generously and let early stopping (on by
+  default) end the run when the validation loss stops improving. With a
+  deadline, set `time_budget_s` (§ 9) rather than guessing `max_steps`. If you
+  stop a run by hand, the first Stop / Ctrl+C finishes it with a decay.
 * **Dropout.** Use 0 for a large corpus that you read a few times. Keep 0.1 or
   more for a small corpus that you read dozens of times.
 * **Tokenizer (2.11, measured in bits per byte).** The GUI's *Small* preset
@@ -313,7 +319,117 @@ Measure it with `benchmarks/context_bench.py loss --seq <your length>`.
 Times are for 2 CPU threads; B and C ran next to other work, and D is the run
 from the 2.11 planning notes.
 
-## 8. Reproduce
+## 8. One default recipe (2.12)
+
+Up to 2.11 the three ways to train used three recipes, and none of them
+stopped when the validation loss stopped improving. They now read one recipe,
+`auralite.engine.recipe.DEFAULT_RECIPE`; explicit parameters still win.
+
+| setting | 2.12 default (all three) | 2.11 GUI | 2.11 `train()` | 2.11 CLI |
+|---|---|---|---|---|
+| optimizer | Muon lr 0.02, AdamW lr 1e-3 for embeddings, norms and head | same | AdamW 1e-3 | AdamW 1e-3 |
+| QK-norm | on | on | off | off |
+| tokenizer | BPE 512 | BPE 512 | char | BPE 512 |
+| batch size | 32 | 32 | 32 | 16 |
+| early stopping | after 3 epochs without a better val loss, best epoch restored | off | off | off |
+| schedule, dropout, val split | WSD, 0.1, 0.1 | same | same | same |
+
+The model size and the planned epochs stay with each entry point (the GUI and
+`train()` 100, the CLI 10). A model that is continued with
+`continue_training` keeps the optimizer it was trained with unless the
+parameters name one, so a 2.11 AdamW model keeps its Adam moments.
+
+**Optimizer and QK-norm on a megabyte.** *Small* model, BPE 512, WSD, lr 1e-3,
+1,400 optimizer steps (7 epochs of tinyshakespeare, 8 of the first 1.2 MB of
+TinyStories), validation bits per byte:
+
+| | Shakespeare seed 0 | seed 1 | seed 2 | mean | TinyStories seed 0 | ms per step |
+|---|---|---|---|---|---|---|
+| AdamW (2.11 `train()`, CLI) | 2.1210 | 2.1313 | 2.1402 | 2.1308 | 1.3053 | 105 |
+| AdamW + QK-norm | 2.1042 | 2.1203 | 2.1199 | 2.1148 | 1.3079 | 108 |
+| **Muon + QK-norm (default)** | 2.1117 | 2.1080 | 2.1082 | **2.1093** | **1.3036** | 131 |
+| Muon without QK-norm | 2.2133 | | | | | 163 |
+
+Per step Muon + QK-norm is 0.3 % better than AdamW + QK-norm, but each step
+costs 21 % more on this CPU: Muon's Newton–Schulz iterations take 25 ms of a
+131 ms step (AdamW's update: 4 ms). In the time of 1,400 Muon steps AdamW +
+QK-norm takes about 1,750; on seed 0 that gave 2.0995, 0.6 % better than Muon,
+while on seeds 1 and 2 Muon's per-step lead is 0.55 %. On a megabyte the two
+tie at equal time. QK-norm helps AdamW on Shakespeare (0.8 %, all three seeds)
+but not on TinyStories, and Muon needs it (4.6 %).
+
+**Small texts decide it.** Most texts people train on are small, so a run
+reads them many times and early stopping ends it. With early stopping (the new
+default) Muon + QK-norm is clearly better: AdamW starts to memorise sooner and
+its best epoch is worse.
+
+| text (tinyshakespeare) | AdamW + QK-norm | Muon + QK-norm (default) |
+|---|---|---|
+| first 100 KB, seeds 0 / 1 / 2 | 2.3184 / 2.3003 / 2.3063, mean 2.308 in 35 s | 2.1951 / 2.1930 / 2.1989, mean **2.196** in 48 s |
+| first 300 KB, seeds 0 / 1 | 2.0418 / 2.0445, mean 2.043 in 101 s | 1.9889 / 1.9868, mean **1.988** in 134 s |
+
+That is 5 % and 2.7 % fewer bits per byte for a third more time, so Muon +
+QK-norm stays the GUI default and becomes the default of `train()` and the
+CLI. For the fastest steps, set `"optimizer": "adamw"`.
+
+**The GUI default on small texts.** The 2.11 GUI default ran its 100 epochs
+whatever the validation loss did:
+
+| text | 2.11 GUI default | 2.12 default |
+|---|---|---|
+| first 100 KB | 3.679 after 100 epochs, 239 s (best: 2.180 at epoch 20) | **2.195** in 46 s (stopped after epoch 19, epoch 16 kept) |
+| first 300 KB | 2.918 after 100 epochs, 783 s (best: 1.989 at epoch 14) | **1.989** in 131 s (stopped after epoch 17, epoch 14 kept) |
+
+Early stopping changes nothing while the validation loss improves every epoch:
+1,400 steps on all of tinyshakespeare (AdamW + QK-norm) gave 2.1042 with and
+without it.
+
+**`early_stopping_cooldown`** decays the learning rate (§ 9) before an early
+stop instead of stopping at the peak. Measured with AdamW + QK-norm it gained
+0.3 % on 100 KB (2.3105 vs 2.3184, 3 s more) and nothing on 300 KB (2.0418,
+21 s more): the epochs after the best one have already started to memorise,
+and the decay cannot undo that. It stays off.
+
+## 9. Ending a run: Stop, Ctrl+C and time limits (2.12)
+
+WSD keeps the learning rate at its peak for 80 % of the plan and earns most of
+its final drop in the decay at the end. A run that is cut short ends at the
+peak, without that drop. 2.12 ends such runs with a decay:
+
+* **Finish** (`train(..., finish_event=event)`; the GUI's first **Stop**, the
+  CLI's first **Ctrl+C**): the learning rate decays from where it is to the
+  schedule's floor over `cooldown_ratio` (default 0.2) times the steps taken
+  so far, then the run ends with `stop_reason="finished"`. The decay never
+  outlasts the planned run and never restarts one that is already running.
+  The second Stop / Ctrl+C (`stop_event`) stops at once; the CLI saves the
+  model either way.
+* **Time limit** (`time_budget_s`; GUI *Time limit* in minutes; CLI
+  `--time-budget 10m`): the step time is measured and the end of the plan
+  moves with it, about every 5 % of the budget, until the decay begins. The
+  budget counts from the start of `train()`, so tokenizer training and data
+  preparation spend it too, and the last validation pass is left room. The
+  run ends with `stop_reason="time_budget"` (at the latest at 110 % of the
+  budget).
+
+Measured on tinyshakespeare (*Small*, BPE 512, AdamW + QK-norm, seed 0; bits
+per byte on the last 10 % of the text with `auralite.eval.compute_bpb`):
+
+| run | steps | bits per byte | time |
+|---|---|---|---|
+| planned for 1,400 steps | 1,400 | 2.0974 | 155 s |
+| planned for 2,800, stopped at step 1,400 (2.11 Stop) | 1,400 | 2.1535 | 158 s |
+| planned for 2,800, finished at step 1,400, `cooldown_ratio` 0.1 | 1,542 | 2.1051 | 182 s |
+| planned for 2,800, finished at step 1,400, `cooldown_ratio` 0.2 (default) | 1,682 | **2.0931** | 197 s |
+| `time_budget_s=150` | 1,349 | 2.1061 | 149.5 s |
+| `max_steps=1349` set by hand | 1,349 | 2.1100 | 155.5 s |
+
+Stopping at the peak cost 2.7 % against a run planned for those steps; the
+default finish turns that into a 0.2 % gain for 25 % more time (the decay plus
+the validation of the partial last epoch). The time limit ended 0.5 s early
+and matched a run sized by hand to the same steps (0.2 % better, within seed
+noise).
+
+## 10. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -322,7 +438,17 @@ python benchmarks/train_bench.py train --text tinyshakespeare.txt
 ```
 
 For a before/after, copy `benchmarks/train_bench.py` into an older checkout
-and run it there. The § 7 runs used `engine.train` with the parameters in the
+and run it there. The 2.12 tables (§ 8–9) come from
+`benchmarks/recipe_bench.py`:
+
+```bash
+python benchmarks/recipe_bench.py recipe   --text tinyshakespeare.txt --seeds 0,1,2
+python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 100000 \
+    --variants adamw_qk,muon_qk --seeds 0,1,2
+python benchmarks/recipe_bench.py ending   --text tinyshakespeare.txt --ratios 0.1,0.2
+python benchmarks/recipe_bench.py budget   --text tinyshakespeare.txt --budget 150
+python benchmarks/recipe_bench.py concurrency
+``` The § 7 runs used `engine.train` with the parameters in the
 docs/engine.md § 9 setup and `continue_training=True` for the extension. Sections that need a 2.9 API print `n/a`. The quality runs
 used `engine.train` with the parameters in the tables above and
 `max_steps=1500`. The loss on the entire held-out split was then computed over

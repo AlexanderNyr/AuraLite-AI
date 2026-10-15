@@ -102,9 +102,13 @@ from auralite.engine.model import (  # noqa: E402,F401
 )
 from auralite.engine.dataset import CharDataset, WindowBatches, spread_indices  # noqa: E402,F401
 from auralite.engine.context import ContextWindowMixin  # noqa: E402
+from auralite.engine.decode_slots import DecodeSlot, DecodeSlotsMixin  # noqa: E402
+from auralite.engine.inference_bench import InferenceBenchMixin  # noqa: E402
 from auralite.engine import sampling as _sampling  # noqa: E402
 from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
+from auralite.engine.recipe import DEFAULT_RECIPE  # noqa: E402
+from auralite.engine.train_control import TrainControl  # noqa: E402
 from auralite.engine.optimizers import (  # noqa: E402,F401
     Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
     split_parameters_for_muon,
@@ -180,14 +184,15 @@ class ParamValidationError(Exception):
 KNOWN_TRAIN_PARAMS = frozenset({
     "accumulation_steps", "amp_dtype", "autosave_every", "autosave_every_steps",
     "autosave_path", "batch_size", "bpe_pretokenizer", "bpe_vocab_size",
-    "chat_template", "continue_training", "corpus_cache", "corpus_cache_path",
-    "d_ff", "d_model", "dropout", "early_stopping_patience", "epochs", "grad_clip",
+    "chat_template", "continue_training", "cooldown_ratio", "corpus_cache",
+    "corpus_cache_path", "d_ff", "d_model", "dropout", "early_stopping_cooldown",
+    "early_stopping_patience", "epochs", "grad_clip",
     "kv_cache_dtype", "lora_rank", "lr", "lr_schedule", "max_steps",
     "muon_adjust_lr", "muon_lr", "muon_momentum", "n_heads", "n_kv_heads",
     "n_layers", "num_experts", "optimizer", "progress_every_batches",
     "progress_every_seconds", "restore_best_weights", "resume_training_state",
     "rope_scaling", "sample_stride", "seed", "seq_length", "sliding_window",
-    "tie_word_embeddings", "tokenizer", "use_alibi", "use_compile", "use_ddp",
+    "tie_word_embeddings", "time_budget_s", "tokenizer", "use_alibi", "use_compile", "use_ddp",
     "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
     "val_max_tokens", "val_split", "weight_decay", "wsd_decay", "wsd_min_lr_ratio",
     "wsd_stable_ratio",
@@ -203,6 +208,7 @@ _TRAIN_PARAM_SYNONYMS = {
     "num_attention_heads": "n_heads", "intermediate_size": "d_ff",
     "num_epochs": "epochs", "num_train_epochs": "epochs", "max_iters": "max_steps",
     "gradient_accumulation_steps": "accumulation_steps", "vocab_size": "bpe_vocab_size",
+    "time_budget": "time_budget_s", "max_time": "time_budget_s", "time_limit": "time_budget_s",
 }
 
 
@@ -296,6 +302,16 @@ def validate_params(params: dict) -> list[str]:
             errors.append(f"{key} must be an integer, got {value!r}")
         elif value < low:
             errors.append(f"{key} must be >= {low}, got {value}")
+    # 2.12: ending a run (train_control.py)
+    for key, high in (("time_budget_s", None), ("cooldown_ratio", 1.0)):
+        value = params.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            errors.append(f"{key} must be a number, got {value!r}")
+        elif value < 0 or (high is not None and value > high):
+            errors.append(f"{key} must be in [0, {high}], got {value}" if high is not None
+                          else f"{key} must be >= 0 (0 = no budget), got {value}")
 
     # Gradient checkpointing validation
     if use_gradient_checkpointing and not isinstance(use_gradient_checkpointing, bool):
@@ -306,7 +322,7 @@ def validate_params(params: dict) -> list[str]:
         errors.append("Multi-GPU (DDP) requires CUDA")
 
     # v2.6: modern training stack validation
-    optimizer_name = str(params.get("optimizer", "adamw")).lower()
+    optimizer_name = str(params.get("optimizer", DEFAULT_RECIPE["optimizer"])).lower()
     if optimizer_name not in ("adamw", "muon"):
         errors.append(f"optimizer must be 'adamw' or 'muon', got {optimizer_name!r}")
     if optimizer_name == "muon":
@@ -592,16 +608,26 @@ class _DraftSession:
     def __init__(self, engine, capacity: int):
         self.engine = engine
         self.model = engine.model
-        self.model.eval()
-        sync = getattr(engine, "_sync_context_window", None)
-        if callable(sync):               # the draft engine's own window (2.11)
-            sync()
+        # The session drives the draft model's cache directly, so the draft
+        # engine stays locked until close() (2.12); its suspended streams keep
+        # their caches in their own slots meanwhile.
+        self._lock = getattr(engine, "model_lock", None)
+        if self._lock is not None:
+            self._lock.acquire()
         self.cached: list[int] = []
-        self.supported = callable(getattr(self.model, "truncate_cache", None))
         try:
-            self.model.reset_cache(capacity=capacity)
-        except TypeError:
-            self.model.reset_cache()
+            self.model.eval()
+            sync = getattr(engine, "_sync_context_window", None)
+            if callable(sync):               # the draft engine's own window (2.11)
+                sync()
+            self.supported = callable(getattr(self.model, "truncate_cache", None))
+            try:
+                self.model.reset_cache(capacity=capacity)
+            except TypeError:
+                self.model.reset_cache()
+        except BaseException:
+            self.close()
+            raise
 
     def _step(self, tokens: list[int], start: int) -> torch.Tensor:
         t = torch.tensor([tokens], dtype=torch.long, device=self.engine.device)
@@ -655,9 +681,12 @@ class _DraftSession:
         except Exception:
             pass
         self.cached = []
+        lock, self._lock = self._lock, None
+        if lock is not None:
+            lock.release()
 
 
-class AuraLiteEngine(ContextWindowMixin):
+class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
     """Modern training & inference engine for AuraLite AI v2.1.
 
     IMPROVED (v2.1+):
@@ -1570,17 +1599,6 @@ class AuraLiteEngine(ContextWindowMixin):
         self._ltk_support = (model, ok)
         return ok
 
-    def _reset_model_cache(self, model=None, capacity: int | None = None) -> None:
-        """reset_cache(capacity=…) when the model supports preallocation."""
-        model = self.model if model is None else model
-        if capacity:
-            try:
-                model.reset_cache(capacity=capacity)
-                return
-            except TypeError:          # a model without the 2.8 signature
-                pass
-        model.reset_cache()
-
     def enable_inference_compile(self, mode: str = "default",
                                  warmup_tokens: int = 2) -> float:
         """Compile the model for generation; returns the compile time in seconds.
@@ -1657,134 +1675,6 @@ class AuraLiteEngine(ContextWindowMixin):
             "tie_word_embeddings": getattr(model, "tie_word_embeddings", False),
             "use_qk_norm": getattr(model, "use_qk_norm", False),
         }
-
-    def bench_prefill(self, shapes: tuple = ((1, 64), (4, 64), (1, 256), (4, 256)),
-                      repeats: int = 3) -> list[dict]:
-        """Compare eager vs `torch.compile`d prompt processing (prefill).
-
-        Prefill is where compilation actually pays off: one big matmul-heavy
-        forward per prompt. Decode steps (T=1) are measured by
-        `bench_generation_modes()` and stay eager on purpose.
-
-        Returns `[{shape, batch, tokens, eager_tokens_per_sec,
-        compiled_tokens_per_sec, speedup, compile_seconds}]`.
-        """
-        model = self._native_model()
-        if model is None:
-            raise RuntimeError("bench_prefill needs a native AuraLite model")
-        vocab = model.embedding.num_embeddings
-        repeats = max(1, int(repeats))
-
-        def _measure(fn, x):
-            best = 1e9
-            for _ in range(repeats):
-                start = time.perf_counter()
-                with torch.inference_mode():
-                    fn(x)
-                best = min(best, time.perf_counter() - start)
-            return best
-
-        rows = []
-        self.disable_inference_compile()
-        eager_times = {}
-        for batch, tokens in shapes:
-            x = torch.randint(0, vocab, (int(batch), int(tokens)), device=self.device)
-            eager_times[(int(batch), int(tokens))] = _measure(self.model, x)
-        compile_seconds = self.enable_inference_compile()
-        for batch, tokens in shapes:
-            key = (int(batch), int(tokens))
-            x = torch.randint(0, vocab, key, device=self.device)
-            compiled_time = _measure(self._infer, x)
-            eager_time = eager_times[key]
-            rows.append({
-                "shape": f"B={key[0]} T={key[1]}",
-                "batch": key[0], "tokens": key[1],
-                "eager_tokens_per_sec": key[0] * key[1] / max(1e-9, eager_time),
-                "compiled_tokens_per_sec": key[0] * key[1] / max(1e-9, compiled_time),
-                "speedup": eager_time / max(1e-9, compiled_time),
-                "compile_seconds": compile_seconds,
-            })
-        self.disable_inference_compile()
-        return rows
-
-    def bench_generation_modes(self, tokens: int = 32, prompt: str = "hello",
-                               modes: tuple = ("fp32", "fp16", "int8"),
-                               include_compile: bool = False,
-                               repeats: int = 2) -> list[dict]:
-        """Measure decode speed and KV-cache size per configuration.
-
-        Returns `[{mode, tokens_per_sec, seconds, kv_bytes_per_token, notes}]`
-        for every requested KV-cache dtype (the model is rebuilt with the same
-        weights and a different `kv_cache_dtype`) and, when `include_compile`,
-        for the `torch.compile`d variant. The loaded model is restored before
-        returning, so callers can keep using the engine.
-        """
-        model = self._native_model()
-        if model is None:
-            raise RuntimeError("bench_generation_modes needs a native AuraLite model")
-        tokens = max(1, int(tokens))
-        repeats = max(1, int(repeats))
-        arch = self._model_arch_kwargs(model)
-        head_dim = arch["d_model"] // arch["n_heads"]
-        kv_heads = arch["n_kv_heads"] or arch["n_heads"]
-
-        def kv_bytes_per_token(spec: str | None) -> int:
-            # Measured on the real storage (2.8): int8/fp8 include their
-            # per-(token, head) scales, fp16/bf16 really are 2 bytes.
-            from auralite.engine.kv_cache import KVCache
-            probe = torch.zeros(1, kv_heads, 1, head_dim)
-            cache = KVCache(spec)
-            cache.append(probe, probe, start_pos=0)
-            return cache.bytes_per_token() * arch["n_layers"]
-
-        state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        original = self.model
-        results: list[dict] = []
-        try:
-            for mode in modes:
-                mode_key = str(mode).lower()
-                variant = type(model)(**arch, kv_cache_dtype=("none" if mode_key == "fp32" else mode_key))
-                variant.load_state_dict(state)
-                variant.to(self.device)
-                variant.eval()
-                self.model = variant
-                self._compiled_inference_model = None
-                speeds = []
-                for _ in range(repeats):
-                    self.generate(prompt, 1, temperature=0.0, top_k=1)      # warm-up
-                    start = time.perf_counter()
-                    self.generate(prompt, tokens, temperature=0.0, top_k=1)
-                    speeds.append(tokens / max(1e-9, time.perf_counter() - start))
-                results.append({
-                    "mode": f"kv={mode_key}",
-                    "tokens_per_sec": max(speeds) if repeats > 1 else speeds[0],
-                    "seconds": tokens / (max(speeds) if repeats > 1 else speeds[0]),
-                    "kv_bytes_per_token": kv_bytes_per_token(
-                        None if mode_key == "fp32" else mode_key),
-                    "notes": "",
-                })
-            if include_compile:
-                self.model = original
-                self.disable_inference_compile()
-                compile_seconds = self.enable_inference_compile()
-                speeds = []
-                for _ in range(repeats):
-                    self.generate(prompt, 1, temperature=0.0, top_k=1)
-                    start = time.perf_counter()
-                    self.generate(prompt, tokens, temperature=0.0, top_k=1)
-                    speeds.append(tokens / max(1e-9, time.perf_counter() - start))
-                best = max(speeds)
-                results.append({
-                    "mode": "kv=fp32+compile",
-                    "tokens_per_sec": best,
-                    "seconds": tokens / best,
-                    "kv_bytes_per_token": kv_bytes_per_token(None),
-                    "notes": f"compile={compile_seconds:.1f}s (cached for later runs)",
-                })
-        finally:
-            self._compiled_inference_model = None
-            self.model = original
-        return results
 
     # ---- Diagnostics (GUI visualisations, v2.6.5) ----------------------
     def attention_maps(self, text: str, layer: int = 0, head: int | None = None,
@@ -1933,21 +1823,6 @@ class AuraLiteEngine(ContextWindowMixin):
         return max(self.model.max_seq_len + length, self.model.max_seq_len * 4, 8192,
                    int(prompt_len) + length)
 
-    def _claim_cache(self) -> object:
-        """Mark the model's KV cache as owned by a new generation (2.8).
-
-        A suspended stream that is closed later may only free the cache if no
-        other generation has claimed it in the meantime.
-        """
-        token = object()
-        self._decode_owner = token
-        return token
-
-    def _release_cache(self, token: object, model=None) -> None:
-        if getattr(self, "_decode_owner", None) is token:
-            (self.model if model is None else model).reset_cache()
-            self._decode_owner = None
-
     def _iter_token_ids(self, ids: list[int], length: int, sp: SamplingParams,
                         stop_token_ids: set[int] | None = None) -> Iterator[int]:
         """The decode loop every native generation path shares (2.8).
@@ -1959,21 +1834,25 @@ class AuraLiteEngine(ContextWindowMixin):
 
         Inference mode is entered per step, not across `yield`: a suspended
         generator must not leave the caller's thread in inference mode.
+
+        2.12: the KV cache belongs to this generation (a `DecodeSlot`) and is
+        installed into the model for each step under the model lock, so
+        generations running at the same time interleave token by token instead
+        of overwriting each other's cache. The lock is never held across
+        `yield`: an abandoned stream blocks nobody.
         """
         if self.model is None:
             raise ValueError("Train or load a model first!")
         if length <= 0:
             return
-        model = self.model
-        model.eval()
+        self.model.eval()
         self._sync_context_window()
         hard_cap = self._hard_cap(length, len(ids))
         stop = stop_token_ids or set()
         history = list(ids)
-        owner = self._claim_cache()
-        self._reset_model_cache(model, capacity=min(len(ids) + length, hard_cap))
+        slot = DecodeSlot(min(len(ids) + length, hard_cap))
         try:
-            with torch.inference_mode():
+            with self._decode_step(slot), torch.inference_mode():
                 t = torch.tensor([ids], dtype=torch.long, device=self.device)
                 logits = self._prefill(t)
                 nxt = self._sample_with(logits[0, -1], sp, history)
@@ -1985,7 +1864,7 @@ class AuraLiteEngine(ContextWindowMixin):
                 pos = len(history) - 1
                 if pos + 1 >= hard_cap:
                     break
-                with torch.inference_mode():
+                with self._decode_step(slot), torch.inference_mode():
                     t = torch.tensor([[nxt]], dtype=torch.long, device=self.device)
                     logits = self._infer(t, start_pos=pos, use_cache=True)
                     nxt = self._sample_with(logits[0, -1], sp, history)
@@ -1994,9 +1873,7 @@ class AuraLiteEngine(ContextWindowMixin):
                 if nxt in stop:
                     return
         finally:
-            # Only the generation that owns the cache may drop it: a stream the
-            # client abandoned can be closed after a newer generation started.
-            self._release_cache(owner, model)
+            slot.close()       # an abandoned stream only drops its own cache
 
     def _generate_ids(self, ids: list[int], length: int = 50,
                       temperature: float = 0.8,
@@ -2103,8 +1980,14 @@ class AuraLiteEngine(ContextWindowMixin):
             yield ids
 
     def train(self, training_text: str, params: dict,
-              progress_callback=None, stop_event=None):
+              progress_callback=None, stop_event=None, finish_event=None):
         """Train (or continue training) the model.
+
+        `stop_event` (a ``threading.Event``) stops at the next batch;
+        `finish_event` (2.12) ends the run well instead: the learning rate
+        decays for ``cooldown_ratio`` x the steps taken so far, then the run
+        ends with ``stop_reason="finished"``. The GUI's first Stop and the
+        CLI's first Ctrl+C finish, the second one stops.
 
         progress_callback(epoch, total_epochs, train_loss, val_loss_or_None, info=None)
 
@@ -2120,8 +2003,15 @@ class AuraLiteEngine(ContextWindowMixin):
           progress_every_batches  : emit at least every N batches (default ~1%)
           progress_every_seconds  : also emit at least every N seconds (default 0.5)
 
+        Defaults not listed come from ``auralite.engine.recipe.DEFAULT_RECIPE``
+        (2.12: the GUI and the CLI read the same recipe): Muon lr 0.02 with
+        QK-norm (AdamW lr 1e-3 for the embeddings, norms and head), WSD,
+        BPE 512, batch 32, dropout 0.1, early stopping after 3 epochs. A
+        continued model keeps the optimizer it was trained with unless
+        ``optimizer`` is given.
+
         params (beyond architecture/optimizer):
-          tokenizer        : "char" (default) or "bpe"
+          tokenizer        : "bpe" (default since 2.12) or "char"
           bpe_vocab_size   : target BPE vocab (default 512)
           val_split        : fraction of text held out for validation (default 0.1)
           use_compile      : try torch.compile for the training loop (default False)
@@ -2139,20 +2029,30 @@ class AuraLiteEngine(ContextWindowMixin):
                              50 * batch_size * seq_length), spread evenly over
                              the validation split in non-overlapping windows
           early_stopping_patience: stop after N epochs without a better
-                             validation loss (default 0 = off)
+                             validation loss (default 3 since 2.12; 0 = off;
+                             needs a validation split)
           restore_best_weights: end with the weights of the best validation
                              epoch (default: on when early stopping is on)
+          early_stopping_cooldown: decay the learning rate before an early
+                             stop instead of stopping at once (default False)
+          time_budget_s    : end the run after this many seconds, counted from
+                             the start of train(), with the LR decay sized to
+                             end at the deadline (default 0 = no budget)
+          cooldown_ratio   : length of the decay that ends a finished run, as
+                             a fraction of the steps taken (default 0.2)
 
         Returns a summary dict (also kept as ``engine.last_train_summary``):
         epochs_completed, optimizer_steps, tokens, train_loss, val_loss,
         best_val_loss, val_bpb, best_val_bpb (bits per UTF-8 byte, 2.11),
-        best_epoch, restored_best, stop_reason
-        (None | "max_steps" | "early_stopping" | "stopped"), seconds.
+        best_epoch, restored_best, stop_reason (None | "max_steps" |
+        "early_stopping" | "finished" | "time_budget" | "stopped"),
+        cooldown_steps, seconds.
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
         try:
-            return self._train_impl(training_text, params, progress_callback, stop_event)
+            return self._train_impl(training_text, params, progress_callback, stop_event,
+                                    finish_event)
         finally:
             # Success, Ctrl+C/stop_event and exceptions alike: never leave the
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
@@ -2195,7 +2095,7 @@ class AuraLiteEngine(ContextWindowMixin):
         logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
 
     def _train_impl(self, training_text: str, params: dict,
-                    progress_callback=None, stop_event=None):
+                    progress_callback=None, stop_event=None, finish_event=None):
         """Body of :meth:`train`, split out so its temp files are released on every exit."""
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
@@ -2227,18 +2127,19 @@ class AuraLiteEngine(ContextWindowMixin):
         # previously reached ModernTransformer where the %-modulo raised ZeroDivisionError.
         if n_kv_heads in (0, "0"):
             n_kv_heads = None
-        # 2.9: 1e-3 (was 3e-4) — measured best for the default model size,
-        # see docs/training.md § 5.
-        lr         = params.get("lr", 1e-3)
+        # Training defaults come from one recipe (2.12, auralite/engine/recipe.py);
+        # the measurements behind each value are in docs/training.md § 8.
+        recipe = DEFAULT_RECIPE
+        lr         = params.get("lr", recipe["lr"])
         epochs     = params.get("epochs", 100)
-        batch_size = params.get("batch_size", 32)
-        dropout    = params.get("dropout", 0.1)
-        grad_clip  = params.get("grad_clip", 1.0)
-        weight_decay = params.get("weight_decay", 0.01)
+        batch_size = params.get("batch_size", recipe["batch_size"])
+        dropout    = params.get("dropout", recipe["dropout"])
+        grad_clip  = params.get("grad_clip", recipe["grad_clip"])
+        weight_decay = params.get("weight_decay", recipe["weight_decay"])
 
-        tok_kind     = params.get("tokenizer", "char")
-        bpe_vocab    = params.get("bpe_vocab_size", 512)
-        val_split    = params.get("val_split", 0.1)
+        tok_kind     = params.get("tokenizer", recipe["tokenizer"])
+        bpe_vocab    = params.get("bpe_vocab_size", recipe["bpe_vocab_size"])
+        val_split    = params.get("val_split", recipe["val_split"])
         use_compile  = params.get("use_compile", False)
         autosave_every = params.get("autosave_every", 0)
         autosave_every_steps = params.get("autosave_every_steps", 0)
@@ -2255,9 +2156,13 @@ class AuraLiteEngine(ContextWindowMixin):
         sample_stride = params.get("sample_stride")
         sample_stride = max(1, int(sample_stride)) if sample_stride else int(seq_length)
         val_max_tokens = params.get("val_max_tokens")
-        early_stopping_patience = max(0, int(params.get("early_stopping_patience", 0) or 0))
+        early_stopping_patience = max(0, int(params.get(
+            "early_stopping_patience", recipe["early_stopping_patience"]) or 0))
         restore_best_weights = bool(params.get("restore_best_weights",
                                                early_stopping_patience > 0))
+        early_stopping_cooldown = bool(params.get("early_stopping_cooldown", False))
+        time_budget_s = max(0.0, float(params.get("time_budget_s", 0) or 0))
+        cooldown_ratio = float(params.get("cooldown_ratio", recipe["cooldown_ratio"]))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
         resume_training_state = params.get("resume_training_state", True)
@@ -2282,18 +2187,18 @@ class AuraLiteEngine(ContextWindowMixin):
         #                      hidden 2-D matrices (embeddings/head/norms stay
         #                      on AdamW)
         #   WSD schedule     — Warmup-Stable-Decay replaces plain cosine decay
-        use_qk_norm     = bool(params.get("use_qk_norm", False))
+        use_qk_norm     = bool(params.get("use_qk_norm", recipe["use_qk_norm"]))
         # v2.6.2: reproducibility + AMP dtype + persisted chat template
         seed             = params.get("seed", None)
         amp_dtype        = str(params.get("amp_dtype", "fp16")).strip().lower()
         chat_template    = params.get("chat_template", None)
         if chat_template:
             self.default_chat_template = str(chat_template)
-        optimizer_name  = str(params.get("optimizer", "adamw")).strip().lower()
-        muon_lr         = float(params.get("muon_lr", 0.02))
+        optimizer_name  = str(params.get("optimizer", recipe["optimizer"])).strip().lower()
+        muon_lr         = float(params.get("muon_lr", recipe["muon_lr"]))
         muon_momentum   = float(params.get("muon_momentum", 0.95))
         muon_adjust_lr  = str(params.get("muon_adjust_lr", "match_rms_adamw")).strip()
-        lr_schedule     = str(params.get("lr_schedule", "wsd")).strip().lower()
+        lr_schedule     = str(params.get("lr_schedule", recipe["lr_schedule"])).strip().lower()
         wsd_stable_ratio  = float(params.get("wsd_stable_ratio", 0.8))
         wsd_min_lr_ratio  = float(params.get("wsd_min_lr_ratio", 0.2))
         wsd_decay       = str(params.get("wsd_decay", "cosine")).strip().lower()
@@ -2350,6 +2255,11 @@ class AuraLiteEngine(ContextWindowMixin):
                     scaler_state_to_restore = None
             elif self._resume_scaler_state is not None:
                 scaler_state_to_restore = self._resume_scaler_state
+        if "optimizer" not in params and optimizer_state_to_restore is not None:
+            # 2.12: the default optimizer changed from AdamW to Muon. A model
+            # continued with default params keeps the optimizer whose state is
+            # restored (a chained Muon state is a list, an AdamW state a dict).
+            optimizer_name = "muon" if isinstance(optimizer_state_to_restore, list) else "adamw"
 
         # ---- Live progress helpers ------------------------------------
         # progress_every_batches: 0 = auto (≈1% of epoch, min 1, max 25)
@@ -2830,6 +2740,11 @@ class AuraLiteEngine(ContextWindowMixin):
         completed_batches_total = 0
         run_opt_steps = 0           # optimizer steps taken in this run (max_steps)
         budget_done = False
+        # 2.12: a finish (finish_event) or a time budget ends the run with a
+        # learning-rate decay instead of at the peak (train_control.py).
+        ctl = TrainControl(self.scheduler, start_time=train_t0, finish_event=finish_event,
+                           time_budget_s=time_budget_s, cooldown_ratio=cooldown_ratio,
+                           max_run_steps=total_steps, steps_per_epoch=opt_steps_per_epoch)
 
         best_val = None
         best_epoch = None
@@ -2897,7 +2812,7 @@ class AuraLiteEngine(ContextWindowMixin):
                 seen_batches += 1
                 completed_batches_total += 1
                 tokens_seen += yb.numel()
-                if max_steps and run_opt_steps >= max_steps:
+                if (max_steps and run_opt_steps >= max_steps) or ctl.after_step(run_opt_steps):
                     budget_done = True
 
                 # ---- Live batch progress (between epochs) ----------------
@@ -2914,7 +2829,7 @@ class AuraLiteEngine(ContextWindowMixin):
                         avg_loss = running_loss / max(1, seen_batches)
                         epoch_frac = seen_batches / float(n_loader_batches)
                         # overall percent across all epochs
-                        overall_frac = (epoch + epoch_frac) / float(max(1, epochs))
+                        overall_frac = ctl.fraction((epoch + epoch_frac) / float(max(1, epochs)))
                         elapsed = now - train_t0
                         epoch_elapsed = now - epoch_t0
                         # speed from this epoch so far
@@ -2922,7 +2837,7 @@ class AuraLiteEngine(ContextWindowMixin):
                         tps = sps * tokens_per_batch
                         # ETA: remaining batches in this epoch + future epochs
                         remain_batches = (n_loader_batches - seen_batches) +                             max(0, epochs - epoch - 1) * n_loader_batches
-                        eta = (remain_batches / sps) if sps > 0 else None
+                        eta = ctl.eta_seconds((remain_batches / sps) if sps > 0 else None)
                         cur_lr = self.scheduler.get_lr() if self.scheduler else lr
                         self._invoke_progress(
                             progress_callback,
@@ -3011,7 +2926,9 @@ class AuraLiteEngine(ContextWindowMixin):
                             "lr": self.scheduler.get_lr() if self.scheduler else lr,
                         },
                     )
+                val_t0 = time.time()
                 val_loss = self._evaluate(val_loader, criterion)
+                ctl.note_validation(time.time() - val_t0)
                 self.last_val_loss = val_loss
                 self.last_val_bpb = _bpb(val_loss)
                 if val_loss is not None:
@@ -3036,7 +2953,7 @@ class AuraLiteEngine(ContextWindowMixin):
                 # ETA for remaining full epochs after this one
                 remain_epochs = max(0, epochs - (epoch + 1))
                 epoch_dur = time.time() - epoch_t0
-                eta = (epoch_dur * remain_epochs) if epoch_dur > 0 else None
+                eta = ctl.eta_seconds((epoch_dur * remain_epochs) if epoch_dur > 0 else None)
                 self._invoke_progress(
                     progress_callback, epoch + 1, epochs, avg_loss, val_loss,
                     info={
@@ -3061,11 +2978,20 @@ class AuraLiteEngine(ContextWindowMixin):
                 )
 
             if budget_done:
-                stop_reason = "max_steps"
-                logger.info(f"[AuraLite] max_steps={max_steps} reached "
-                            f"(epoch {epoch + 1}/{epochs}); training stops.")
+                stop_reason = ctl.stop_reason or "max_steps"
+                what = {"max_steps": f"max_steps={max_steps} reached",
+                        "finished": "finished after a learning-rate cooldown",
+                        "time_budget": f"time budget of {time_budget_s:g}s spent",
+                        "early_stopping": "early stopping after a learning-rate cooldown",
+                        }.get(stop_reason, stop_reason)
+                logger.info(f"[AuraLite] {what} (epoch {epoch + 1}/{epochs}); training stops.")
                 break
-            if early_stopping_patience and epochs_without_gain >= early_stopping_patience:
+            if (early_stopping_patience and epochs_without_gain >= early_stopping_patience
+                    and not ctl.finishing):
+                if early_stopping_cooldown and ctl.finish("early_stopping"):
+                    logger.info(f"[AuraLite] No better validation loss for {epochs_without_gain} "
+                                f"epochs: decaying the learning rate before stopping.")
+                    continue
                 stop_reason = "early_stopping"
                 logger.info(f"[AuraLite] Early stopping: no better validation loss for "
                             f"{epochs_without_gain} epochs (best {best_val:.4f} at epoch "
@@ -3105,6 +3031,8 @@ class AuraLiteEngine(ContextWindowMixin):
             "best_epoch": best_epoch,
             "restored_best": restored,
             "stop_reason": stop_reason,
+            "cooldown_steps": (ctl.run_steps - ctl.finish_started_at
+                               if ctl.finish_started_at is not None else 0),
             "seconds": elapsed,
         }
         return dict(self.last_train_summary)
@@ -3151,18 +3079,11 @@ class AuraLiteEngine(ContextWindowMixin):
         Runs the same call shape generation uses (single token, use_cache=True)
         so any backend-compile error surfaces now rather than mid-generation.
         """
-        try:
-            if hasattr(compiled_model, "reset_cache"):
-                compiled_model.reset_cache()
-            with torch.inference_mode():
-                dummy = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-                compiled_model(dummy, start_pos=0, use_cache=True)
-        finally:
-            if hasattr(compiled_model, "reset_cache"):
-                try:
-                    compiled_model.reset_cache()
-                except Exception:
-                    pass
+        # A fresh cache of its own under the model lock (2.12): the warm-up
+        # must not write into a running generation's cache.
+        with self._exclusive_decode(), torch.inference_mode():
+            dummy = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+            compiled_model(dummy, start_pos=0, use_cache=True)
 
     def _propose_prompt_lookup(self, ids: list[int], max_proposals: int,
                                ngram: int = 2, max_lookback: int = 512) -> list[int]:
@@ -3280,11 +3201,9 @@ class AuraLiteEngine(ContextWindowMixin):
                 self._prefill(torch.tensor([result_ids[:end]], dtype=torch.long,
                                            device=self.device))
 
-        owner = self._claim_cache()
-        self._reset_model_cache(model, capacity=min(len(ids) + length + draft_tokens + 1,
-                                                    hard_cap + draft_tokens))
         try:
-            with torch.inference_mode():
+            with self._exclusive_decode(min(len(ids) + length + draft_tokens + 1,
+                                            hard_cap + draft_tokens)), torch.inference_mode():
                 pending = self._prefill(torch.tensor([result_ids], dtype=torch.long,
                                                      device=self.device))[0, -1]
                 while len(result_ids) - len(ids) < length:
@@ -3337,7 +3256,6 @@ class AuraLiteEngine(ContextWindowMixin):
                     _rollback(base + rejected_at)
                     pending = _forward([corrected], base + rejected_at)[0, -1]
         finally:
-            self._release_cache(owner, model)
             if draft is not None:
                 draft.close()
             if stats is not None:
@@ -3661,32 +3579,29 @@ class AuraLiteEngine(ContextWindowMixin):
         self._sync_context_window()
         hard_cap = self._hard_cap(length, len(batch_ids[0]))
         B = len(batch_ids)
-        owner = self._claim_cache()
-        self._reset_model_cache(capacity=min(len(batch_ids[0]) + length, hard_cap))
-        try:
-            with torch.inference_mode():
-                batch = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
-                logits = self._prefill(batch)
+        # The batch holds the model for the whole call, with its own cache (2.12).
+        with self._exclusive_decode(min(len(batch_ids[0]) + length, hard_cap)), \
+                torch.inference_mode():
+            batch = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
+            logits = self._prefill(batch)
+            next_tokens = []
+            for b in range(B):
+                nxt = self._sample_with(logits[b, -1], sp, result_ids[b])
+                result_ids[b].append(nxt)
+                next_tokens.append(nxt)
+
+            for _ in range(length - 1):
+                pos = len(result_ids[0]) - 1
+                if pos + 1 >= hard_cap:
+                    break
+                next_input = torch.tensor(next_tokens, dtype=torch.long,
+                                          device=self.device).unsqueeze(1)
+                logits = self._infer(next_input, start_pos=pos, use_cache=True)
                 next_tokens = []
                 for b in range(B):
                     nxt = self._sample_with(logits[b, -1], sp, result_ids[b])
                     result_ids[b].append(nxt)
                     next_tokens.append(nxt)
-
-                for _ in range(length - 1):
-                    pos = len(result_ids[0]) - 1
-                    if pos + 1 >= hard_cap:
-                        break
-                    next_input = torch.tensor(next_tokens, dtype=torch.long,
-                                              device=self.device).unsqueeze(1)
-                    logits = self._infer(next_input, start_pos=pos, use_cache=True)
-                    next_tokens = []
-                    for b in range(B):
-                        nxt = self._sample_with(logits[b, -1], sp, result_ids[b])
-                        result_ids[b].append(nxt)
-                        next_tokens.append(nxt)
-        finally:
-            self._release_cache(owner)
         return result_ids
 
     # ---- Batch Generation (NEW) ---------------------------------------
@@ -3748,7 +3663,6 @@ class AuraLiteEngine(ContextWindowMixin):
                 out_text = self.decode(out_ids)
                 results[orig_idx] = unique_prompts[orig_idx] + out_text[len(used_prompt):]
 
-        self.model.reset_cache()
         unique_final = [r if r is not None else "" for r in results]
         return [unique_final[first_index[p]] for p in prompts]
 

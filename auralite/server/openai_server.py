@@ -479,9 +479,12 @@ def check_rate_limit(request: Request, max_per_minute: int | None = None) -> Non
 class _Busy:
     """Context manager: wait for a free generation slot, then 503.
 
-    The torch engine keeps mutable KV-cache state, so unbounded concurrent
-    generations on one engine would interleave caches. A small semaphore keeps
-    throughput predictable.
+    ``AURALITE_MAX_CONCURRENT`` (default 4) requests generate at the same
+    time; more would only make every one of them slower. Since 2.12 the
+    concurrent generations are correct: each owns its KV cache and the engine
+    interleaves their decode steps token by token (2.11 and earlier shared one
+    cache, and concurrent requests returned corrupted text). A GGUF model runs
+    one generation at a time and the others wait for it.
 
     v2.6.5: instead of rejecting immediately when all slots are taken, a request
     queues for ``AURALITE_QUEUE_TIMEOUT`` seconds (default 10). Bursty clients

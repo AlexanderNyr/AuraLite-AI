@@ -33,9 +33,10 @@ DATA = Path(__file__).parent / "data"
 CORPUS = ("the quick brown fox jumps over the lazy dog. "
           "a journey of a thousand miles begins with a single step. "
           "to be or not to be, that is the question. ") * 40
+# A fixed-length run: early stopping (on by default since 2.12) is switched off.
 PARAMS = {"tokenizer": "char", "d_model": 64, "d_ff": 128, "n_heads": 4, "n_layers": 2,
           "n_kv_heads": 2, "seq_length": 64, "batch_size": 16, "lr": 3e-3, "epochs": 64,
-          "val_split": 0.1, "seed": 0, "optimizer": "adamw"}
+          "val_split": 0.1, "seed": 0, "optimizer": "adamw", "early_stopping_patience": 0}
 
 
 def _forward_logits(engine, ids: list[int], model=None) -> torch.Tensor:

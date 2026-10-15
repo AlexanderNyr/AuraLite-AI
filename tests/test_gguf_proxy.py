@@ -36,7 +36,8 @@ class FakeLlama:
         self.reset_calls += 1
 
     def create_completion(self, **kwargs):
-        return {"choices": [{"text": " done"}], "kwargs": kwargs}
+        result = {"choices": [{"text": " done"}], "kwargs": kwargs}
+        return iter([result]) if kwargs.get("stream") else result
 
     def create_chat_completion(self, **kwargs):
         return {"choices": [{"message": {"content": "chat"}}], "kwargs": kwargs}
@@ -169,7 +170,9 @@ class TestGGUFModelProxy:
             min_p=0.1,
             stream=True,
         )
-        kwargs = result["kwargs"]
+        # 2.12: a stream is a lazy iterator that holds the llama.cpp context
+        # while it is consumed (one generation at a time).
+        kwargs = next(iter(result))["kwargs"]
         assert kwargs["prompt"] == "prompt"
         assert kwargs["max_tokens"] == 0
         assert kwargs["temperature"] == 0.0

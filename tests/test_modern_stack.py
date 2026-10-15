@@ -334,15 +334,30 @@ class TestEngineModernStack:
         assert len(out) > 0
 
     def test_old_checkpoints_load_with_qk_norm_off(self, tmp_path):
-        """Models trained before v2.6 (no use_qk_norm key) must still load."""
+        """Models trained before v2.6 (no use_qk_norm key) must still load.
+
+        2.12 trains with QK-norm by default, so the old file is simulated:
+        a model without QK-norm whose checkpoint lacks the key.
+        """
+        import torch
+
         engine = AuraLiteEngine()
-        engine.train(TINY_TEXT, {**TINY_PARAMS})  # no qk_norm
+        engine.train(TINY_TEXT, {**TINY_PARAMS, "use_qk_norm": False})
         path = str(tmp_path / "legacy.pt")
         engine.save_model(path)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint.pop("use_qk_norm", None)
+        torch.save(checkpoint, path)
         engine2 = AuraLiteEngine()
         engine2.load_model(path)
         assert engine2.model.use_qk_norm is False
         assert len(engine2.generate("the cat", length=5)) > 0
+
+    def test_new_models_train_with_qk_norm_by_default(self):
+        """2.12: QK-norm is part of the default recipe."""
+        engine = AuraLiteEngine()
+        engine.train(TINY_TEXT, {**TINY_PARAMS})
+        assert engine.model.use_qk_norm is True
 
     def test_continue_training_with_muon_restores_states(self):
         engine = AuraLiteEngine()

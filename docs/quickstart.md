@@ -29,14 +29,15 @@ auralite train --text corpus.txt --params params.json
 ```
 
 `params.json` is optional — `auralite train --help` lists every flag, and the
-engine has sensible defaults. A minimal parametrisation for a CPU laptop:
+engine, the GUI and the CLI share one measured default recipe (2.12: AdamW
+1e-3 with QK-norm, WSD, BPE 512, batch 32, early stopping after 3 epochs
+without a better validation loss; [training.md](training.md) § 8). A
+parametrisation for a megabyte of text on a CPU laptop:
 
 ```json
 {
   "d_model": 128, "n_layers": 4, "n_heads": 4, "d_ff": 512,
-  "seq_length": 128, "batch_size": 32, "epochs": 20,
-  "tokenizer": "bpe", "bpe_vocab_size": 2048,
-  "optimizer": "muon", "lr_schedule": "wsd"
+  "seq_length": 128, "epochs": 20, "bpe_vocab_size": 2048
 }
 ```
 
@@ -55,9 +56,13 @@ Notes that save time later:
   tokenised corpus between runs yet. Engine equivalents:
   `corpus_cache="mmap"`, `corpus_cache_path="…"`, or
   `AURALITE_CORPUS_CACHE=mmap`.
-- Training is interruptible (Ctrl+C keeps the weights), autosaves every N epochs,
-  and logs through the `auralite` logger — the CLI shows INFO lines on stdout,
-  `--quiet` silences them, `AURALITE_LOG_LEVEL=WARNING` keeps them out of scripts.
+- Training ends well when you stop it (2.12): the first Ctrl+C decays the
+  learning rate for a fifth of the steps taken so far and saves the model, a
+  second Ctrl+C stops at once (and still saves). `--time-budget 10m` sizes the
+  run to a time limit instead. Autosave every N epochs is available, and the
+  engine logs through the `auralite` logger — the CLI shows INFO lines on
+  stdout, `--quiet` silences them, `AURALITE_LOG_LEVEL=WARNING` keeps them out
+  of scripts.
 
 ## 3. Generate
 

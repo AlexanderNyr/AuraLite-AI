@@ -3,7 +3,9 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
-from ..common import (CONFIG_PRESETS, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, estimate_n_params, filedialog, messagebox, os, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
+from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, estimate_n_params, filedialog, messagebox, os, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
+
+R = DEFAULT_RECIPE      # 2.12: one recipe for the GUI, the CLI and train()
 
 class TrainTabMixin:
     def _build_training_tab(self):
@@ -32,16 +34,16 @@ class TrainTabMixin:
         grid.pack(fill=tk.X)
 
         self.params = {
-            "lr":         tk.StringVar(value="0.001"),
+            "lr":         tk.StringVar(value=str(R["lr"])),
             "epochs":     tk.StringVar(value="100"),
             "d_model":    tk.StringVar(value="128"),
             "d_ff":       tk.StringVar(value="256"),
             "n_heads":    tk.StringVar(value="4"),
             "n_layers":   tk.StringVar(value="4"),
             "seq_length": tk.StringVar(value="64"),
-            "batch_size": tk.StringVar(value="32"),
-            "dropout":    tk.StringVar(value="0.1"),
-            "grad_clip":  tk.StringVar(value="1.0"),
+            "batch_size": tk.StringVar(value=str(R["batch_size"])),
+            "dropout":    tk.StringVar(value=str(R["dropout"])),
+            "grad_clip":  tk.StringVar(value=str(R["grad_clip"])),
         }
 
         labels = [
@@ -88,29 +90,37 @@ class TrainTabMixin:
         row1.pack(fill=tk.X, pady=2)
 
         ttk.Label(row1, text="Tokenizer:").pack(side=tk.LEFT, padx=4)
-        self.tok_var = tk.StringVar(value="bpe")
+        self.tok_var = tk.StringVar(value=R["tokenizer"])
         ttk.Radiobutton(row1, text="BPE (recommended)", value="bpe",
                         variable=self.tok_var).pack(side=tk.LEFT, padx=4)
         ttk.Radiobutton(row1, text="Char-level", value="char",
                         variable=self.tok_var).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(row1, text="BPE Vocab:").pack(side=tk.LEFT, padx=(16, 4))
-        self.bpe_vocab_var = tk.StringVar(value="512")
+        self.bpe_vocab_var = tk.StringVar(value=str(R["bpe_vocab_size"]))
         ttk.Entry(row1, textvariable=self.bpe_vocab_var,
                   width=7).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(row1, text="Val Split:").pack(side=tk.LEFT, padx=(16, 4))
-        self.val_split_var = tk.StringVar(value="0.1")
+        self.val_split_var = tk.StringVar(value=str(R["val_split"]))
         ttk.Entry(row1, textvariable=self.val_split_var,
                   width=6).pack(side=tk.LEFT, padx=4)
 
         # 2.9: stop when val loss has not improved for N epochs and keep the
-        # best epoch's weights (needs a validation split).
+        # best epoch's weights (needs a validation split). 2.12: on by default.
         ttk.Label(row1, text="Early stop:").pack(side=tk.LEFT, padx=(12, 4))
-        self.early_stop_var = tk.StringVar(value="0")
+        self.early_stop_var = tk.StringVar(value=str(R["early_stopping_patience"]))
         ttk.Entry(row1, textvariable=self.early_stop_var,
                   width=4).pack(side=tk.LEFT, padx=2)
         ttk.Label(row1, text="(epochs, 0=off)", style="Sub.TLabel").pack(
+            side=tk.LEFT, padx=2)
+
+        # 2.12: a time limit; the learning-rate decay is sized to end at it.
+        ttk.Label(row1, text="Time limit:").pack(side=tk.LEFT, padx=(12, 4))
+        self.time_limit_var = tk.StringVar(value="0")
+        ttk.Entry(row1, textvariable=self.time_limit_var,
+                  width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="(min, 0=off)", style="Sub.TLabel").pack(
             side=tk.LEFT, padx=2)
 
         # NEW: GQA, Accumulation, ALiBi, LoRA
@@ -171,23 +181,25 @@ class TrainTabMixin:
         modern_row = ttk.Frame(tok_frame)
         modern_row.pack(fill=tk.X, pady=2)
 
-        self.qk_norm_var = tk.BooleanVar(value=True)
+        self.qk_norm_var = tk.BooleanVar(value=bool(R["use_qk_norm"]))
         ttk.Checkbutton(modern_row, text="QK-norm (modern, stable attention)",
                         variable=self.qk_norm_var).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(modern_row, text="Optimizer:").pack(side=tk.LEFT, padx=(12, 4))
-        self.opt_var = tk.StringVar(value="muon")
+        # Muon + QK-norm: 5 % fewer bits per byte than AdamW on a 100 KB text
+        # and a tie on a megabyte at equal time (docs/training.md § 8).
+        self.opt_var = tk.StringVar(value=R["optimizer"])
         ttk.Combobox(modern_row, textvariable=self.opt_var,
                      values=["muon", "adamw"],
                      state="readonly", width=7).pack(side=tk.LEFT, padx=2)
 
         ttk.Label(modern_row, text="Muon LR:").pack(side=tk.LEFT, padx=(8, 2))
-        self.muon_lr_var = tk.StringVar(value="0.02")
+        self.muon_lr_var = tk.StringVar(value=str(R["muon_lr"]))
         ttk.Entry(modern_row, textvariable=self.muon_lr_var,
                   width=7).pack(side=tk.LEFT, padx=2)
 
         ttk.Label(modern_row, text="LR Schedule:").pack(side=tk.LEFT, padx=(12, 4))
-        self.sched_var = tk.StringVar(value="wsd")
+        self.sched_var = tk.StringVar(value=R["lr_schedule"])
         ttk.Combobox(modern_row, textvariable=self.sched_var,
                      values=["wsd", "cosine"],
                      state="readonly", width=7).pack(side=tk.LEFT, padx=2)
@@ -613,6 +625,16 @@ class TrainTabMixin:
 
 
     def stop_training(self):
+        # 2.12: the first press finishes the run with a short learning-rate
+        # decay (a run that ends at the peak LR is measurably worse); the
+        # second press stops at once.
+        if not self.finish_event.is_set():
+            self.finish_event.set()
+            self.stop_btn.config(text="🛑 Stop now")
+            self.status_label.config(
+                text="Status: Finishing — cooling down the learning rate… "
+                     "(press Stop again to stop now) ⏳")
+            return
         self.stop_event.set()
         self.status_label.config(text="Status: Stopping… 🛑")
 
@@ -637,6 +659,7 @@ class TrainTabMixin:
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
                 "val_split":       float(self.val_split_var.get()),
                 "early_stopping_patience": int(self.early_stop_var.get() or 0),
+                "time_budget_s": 60.0 * float(str(self.time_limit_var.get() or 0)),
                 # Live progress bar: ~1% of epoch + time-based ticks
                 "progress_every_seconds": 0.5,
                 "use_compile":     bool(self.compile_var.get()),
@@ -712,6 +735,8 @@ class TrainTabMixin:
             return
 
         self.stop_event.clear()
+        self.finish_event.clear()
+        self.stop_btn.config(text="🛑 Stop")
         self.loss_history = []
         # Reset ETA tracking
         self.train_start_time = time.time()
@@ -748,6 +773,7 @@ class TrainTabMixin:
                     text, params,
                     progress_callback=self.update_progress,
                     stop_event=self.stop_event,
+                    finish_event=self.finish_event,
                 )
                 summary = summary if isinstance(summary, dict) else {}
                 total_time = (time.time() - self.train_start_time
@@ -761,6 +787,12 @@ class TrainTabMixin:
                            f"val loss {summary.get('best_val_loss', 0.0):.4f} at epoch "
                            f"{summary.get('best_epoch')} ✅  |  Total: {total_str}")
                     print(f"[AuraLite] Training stopped early after {total_str}.")
+                elif summary.get("stop_reason") in ("finished", "time_budget"):
+                    why = ("time limit reached" if summary["stop_reason"] == "time_budget"
+                           else "finished early")
+                    msg = (f"Status: Training {why} after a learning-rate cooldown ✅  |  "
+                           f"Total: {total_str}")
+                    print(f"[AuraLite] Training {why} after {total_str}.")
                 elif self.stop_event.is_set():
                     msg = (f"Status: Stopped. 🛑 Weights preserved — "
                            f"you can generate or save.  |  Total: {total_str}")
@@ -801,7 +833,7 @@ class TrainTabMixin:
         self.train_btn.config(state=tk.NORMAL)
         self.file_btn.config(state=tk.NORMAL)
         self.load_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED, text="🛑 Stop")
 
 
     def _append_loss_line(self, line):

@@ -2,6 +2,12 @@
 
 Extracted verbatim from `auralite/engine/_legacy.py` (v2.6.5); `_legacy` re-exports
 every name below, so `auralite.engine.<name>` keeps working.
+
+2.12: both schedulers can end a run early with a decay (`begin_decay`, used by
+the finish button and time budgets in `train_control.py`) and move the end of
+their plan while the learning rate is still at its peak (`replan`). A forced
+decay is state of the current run and is not saved in `state_dict()`: a
+continued run extends the plan anyway.
 """
 from __future__ import annotations
 
@@ -37,9 +43,46 @@ class CosineWarmupScheduler:
         self.min_lr       = min_lr
         self.base_lrs     = [pg["lr"] for pg in optimizer.param_groups]
         self.step_count   = 0
+        self.decay_from: int | None = None      # 2.12: begin_decay()
+        self.decay_from_lrs: list[float] = []
+
+    @property
+    def decaying(self) -> bool:
+        """True once the plan may no longer move: past half of the cosine."""
+        if self.decay_from is not None:
+            return True
+        return self.step_count >= self.warmup_steps + (self.max_steps - self.warmup_steps) // 2
+
+    def begin_decay(self, n_steps: int) -> int:
+        """Decay from the current LR to ``min_lr`` over the next `n_steps` (2.12).
+
+        Returns the step at which the decay ends (the new ``max_steps``).
+        """
+        self.decay_from = self.step_count
+        self.decay_from_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+        self.max_steps = self.step_count + max(1, int(n_steps))
+        return self.max_steps
+
+    def replan(self, max_steps: int) -> int:
+        """Move the end of the plan to `max_steps` unless it is frozen (2.12)."""
+        if self.decaying:
+            return self.max_steps
+        new_max = max(self.step_count + 1, int(max_steps))
+        if self.step_count < self.warmup_steps:
+            self.warmup_steps = max(1, min(200, new_max // 10))
+        self.max_steps = new_max
+        return self.max_steps
 
     def step(self):
         self.step_count += 1
+        if self.decay_from is not None:
+            span = max(1, self.max_steps - self.decay_from)
+            progress = min(1.0, (self.step_count - self.decay_from) / span)
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+            for pg, start in zip(self.optimizer.param_groups, self.decay_from_lrs, strict=True):
+                floor = min(self.min_lr, start)
+                pg["lr"] = floor + (start - floor) * scale
+            return
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
             if self.step_count < self.warmup_steps:
                 lr = base_lr * self.step_count / self.warmup_steps
@@ -107,11 +150,30 @@ class WSDScheduler:
         self.decay_type   = decay_type if decay_type in self.VALID_DECAYS else "cosine"
         self.base_lrs     = [pg["lr"] for pg in optimizer.param_groups]
         self.step_count   = 0
+        self.decay_from: int | None = None      # 2.12: begin_decay()
+        self.decay_from_mult = 1.0
 
     def _decay_start(self) -> int:
         return max(self.warmup_steps, int(self.max_steps * self.stable_ratio))
 
+    def _scale(self, progress: float) -> float:
+        """Decay shape: 1 at the start of the decay, 0 at its end."""
+        if self.decay_type == "linear":
+            return 1.0 - progress
+        if self.decay_type == "sqrt":
+            # 1 - sqrt(p): spends more of the decay at a useful LR
+            return 1.0 - math.sqrt(progress)
+        # cosine decay inside the decay phase (MiniCPM-style)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def _multiplier(self, step: int) -> float:
+        if self.decay_from is not None and step >= self.decay_from:
+            # A decay started early (2.12): from the multiplier it started at
+            # down to the floor, in the same shape as the planned decay.
+            span = max(1, self.max_steps - self.decay_from)
+            progress = min(1.0, (step - self.decay_from) / span)
+            floor = min(self.min_lr_ratio, self.decay_from_mult)
+            return floor + (self.decay_from_mult - floor) * self._scale(progress)
         if step < self.warmup_steps:
             return step / self.warmup_steps
         decay_start = self._decay_start()
@@ -119,14 +181,41 @@ class WSDScheduler:
             return 1.0
         decay_steps = max(1, self.max_steps - decay_start)
         progress = min(1.0, (step - decay_start) / decay_steps)
-        if self.decay_type == "linear":
-            scale = 1.0 - progress
-        elif self.decay_type == "sqrt":
-            # 1 - sqrt(p): spends more of the decay at a useful LR
-            scale = 1.0 - math.sqrt(progress)
-        else:  # cosine decay inside the decay phase (MiniCPM-style)
-            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * scale
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * self._scale(progress)
+
+    @property
+    def decaying(self) -> bool:
+        """True once the decay has begun (planned or started early)."""
+        return self.decay_from is not None or self.step_count >= self._decay_start()
+
+    def begin_decay(self, n_steps: int) -> int:
+        """Decay from the current LR to the floor over the next `n_steps` (2.12).
+
+        From the warmup, the stable phase or the middle of the planned decay
+        alike: the LR never jumps up. Returns the step at which the decay ends
+        (the new ``max_steps``).
+        """
+        self.decay_from_mult = self._multiplier(self.step_count)
+        self.decay_from = self.step_count
+        self.max_steps = self.step_count + max(1, int(n_steps))
+        return self.max_steps
+
+    def replan(self, max_steps: int) -> int:
+        """Move the end of the plan to `max_steps` while the LR is stable (2.12).
+
+        Time budgets call this as the measured step time changes. Once the
+        decay has begun the plan is frozen. A plan whose decay should already
+        have begun starts it now, over the steps that are left.
+        """
+        if self.decaying:
+            return self.max_steps
+        new_max = max(self.step_count + 1, int(max_steps))
+        if self.step_count < self.warmup_steps:
+            self.warmup_steps = max(1, min(200, new_max // 10))
+        self.max_steps = new_max
+        if self.step_count >= self._decay_start():
+            return self.begin_decay(new_max - self.step_count)
+        return self.max_steps
 
     def step(self):
         self.step_count += 1

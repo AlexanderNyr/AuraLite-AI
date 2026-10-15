@@ -245,11 +245,69 @@ class TestTrainingFlow:
         assert seen["autosave_path"] == os.path.splitext(corpus)[0] + "_autosave.pt"
         assert seen["progress_every_seconds"] == pytest.approx(0.5)
 
-    def test_stop_training_requests_a_clean_stop(self, app):
+    def test_stop_training_finishes_first_and_stops_on_the_second_press(self, app):
+        # 2.12: the first press ends the run with a learning-rate cooldown.
         app.stop_event.clear()
+        app.finish_event.clear()
+        app.stop_training()
+        assert app.finish_event.is_set() and not app.stop_event.is_set()
+        assert "Finishing" in app.status_label.config.call_args.kwargs["text"]
+        assert app.stop_btn.config.call_args.kwargs["text"] == "🛑 Stop now"
         app.stop_training()
         assert app.stop_event.is_set()
         assert "Stopping" in app.status_label.config.call_args.kwargs["text"]
+
+    def test_training_defaults_are_the_engine_recipe(self, app):
+        from auralite.engine.recipe import DEFAULT_RECIPE as R
+
+        assert app.opt_var.get() == R["optimizer"] == "muon"
+        assert float(app.muon_lr_var.get()) == R["muon_lr"]
+        assert app.tok_var.get() == R["tokenizer"]
+        assert app.qk_norm_var.get() is R["use_qk_norm"]
+        assert app.sched_var.get() == R["lr_schedule"]
+        assert int(app.early_stop_var.get()) == R["early_stopping_patience"]
+        assert int(app.bpe_vocab_var.get()) == R["bpe_vocab_size"]
+        assert float(app.params["lr"].get()) == R["lr"]
+        assert int(app.params["batch_size"].get()) == R["batch_size"]
+        assert float(app.params["dropout"].get()) == R["dropout"]
+        assert float(app.val_split_var.get()) == R["val_split"]
+        assert app.time_limit_var.get() == "0"
+
+    def test_time_limit_and_finish_event_reach_train(self, app, tmp_path, monkeypatch):
+        corpus = write_corpus(tmp_path)
+        tiny_train_params(app, corpus)
+        app.time_limit_var.set("2.5")
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        seen = {}
+
+        def fake_train(text, params, **kwargs):
+            seen.update(params, **kwargs)
+            return {"stop_reason": "time_budget"}
+
+        monkeypatch.setattr(app.engine, "train", fake_train)
+        app.start_training()
+        assert seen["time_budget_s"] == pytest.approx(150.0)
+        assert seen["finish_event"] is app.finish_event
+        assert "time limit reached" in app.status_label.config.call_args.kwargs["text"]
+
+    def test_config_round_trip_keeps_early_stop_and_time_limit(self, app, tmp_path):
+        path = str(tmp_path / "train_config.json")
+        app.early_stop_var.set("5")
+        app.time_limit_var.set("1.5")
+        with dialog_double("filedialog.asksaveasfilename", path):
+            app.save_config()
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["early_stopping_patience"] == 5
+        assert data["time_budget_s"] == pytest.approx(90.0)
+        assert data["optimizer"] == "muon"          # the recipe default
+        app.early_stop_var.set("0")
+        app.time_limit_var.set("0")
+        with dialog_double("filedialog.askopenfilename", path), \
+                dialog_double("messagebox.showinfo", None):
+            app.load_config()
+        assert app.early_stop_var.get() == "5"
+        assert app.time_limit_var.get() == "1.5"
 
     def test_reset_train_buttons_restores_the_idle_state(self, app):
         app._reset_train_buttons()

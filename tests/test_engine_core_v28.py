@@ -285,18 +285,18 @@ def test_streaming_does_not_leak_inference_mode(trained_engine):
 
 
 def test_abandoned_stream_does_not_reset_a_newer_generation(trained_engine):
-    model = trained_engine.model
+    # 2.12: every generation owns its cache (a DecodeSlot), so closing an old
+    # stream can only drop its own; the newer generation decodes unchanged.
+    prompt = trained_engine.encode("Aura")
+    expected = trained_engine._generate_ids(prompt, 5, temperature=0.0, top_k=1)
     stale = trained_engine.generate_streaming("AuraLite", 20, temperature=0.0, top_k=1)
     next(stale)                                    # suspended with a live cache
-    fresh = trained_engine._iter_token_ids(trained_engine.encode("Aura"), 5,
-                                           S.SamplingParams(top_k=1))
-    next(fresh)
-    position = model.cache_length
+    fresh = trained_engine._iter_token_ids(prompt, 5, S.SamplingParams(top_k=1))
+    first = next(fresh)
     stale.close()                                  # the old stream goes away
-    assert model.cache_length == position          # newer cache untouched
     rest = list(fresh)
-    assert len(rest) == 4
-    assert model.cache_length == 0                 # freed by its owner
+    assert prompt + [first] + rest == expected
+    assert trained_engine.model.cache_length == 0  # the model holds no cache between steps
 
 
 def test_greedy_generate_matches_a_manual_decode(trained_engine):
@@ -450,10 +450,10 @@ TRAIN = {"tokenizer": "char", "d_model": 16, "d_ff": 32, "n_heads": 2, "n_layers
 
 def test_max_steps_bounds_the_run_and_sizes_the_schedule(tiny_text):
     engine = AuraLiteEngine()
-    engine.train(tiny_text, {**TRAIN, "max_steps": 7})
+    engine.train(tiny_text, {**TRAIN, "max_steps": 7, "optimizer": "adamw"})
     assert engine.scheduler.step_count == 7
     assert engine.scheduler.max_steps == 7
-    assert len(engine.optimizer.param_groups) == 2          # decay groups (2.8)
+    assert len(engine.optimizer.param_groups) == 2          # AdamW decay groups (2.8)
 
 
 def test_accumulation_does_not_stretch_the_schedule(tiny_text):

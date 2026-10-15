@@ -119,41 +119,76 @@ workers. On a laptop, `torch_threads=4` can be *faster* than
   preset's shape ([training.md](training.md) § 4).
 - `batch_size` × `seq_length` is the memory knob; `d_model` is the compute knob.
 - Watch **val loss**, not loss: if val stops improving while loss keeps falling,
-  more epochs will not help — `early_stopping_patience=3` ends the run there and
-  keeps the best epoch's weights. `engine.recommend_epochs(corpus_size)` gives a
-  starting point.
+  more epochs will not help. Since 2.12 early stopping is on by default
+  (`early_stopping_patience=3`): the run ends there and keeps the best epoch's
+  weights. `engine.recommend_epochs(corpus_size)` gives a starting point.
+- Short on time? `time_budget_s` (GUI: *Time limit*, CLI: `--time-budget 10m`)
+  sizes the learning-rate schedule to the deadline, and the GUI's Stop button /
+  the CLI's Ctrl+C now finish the run with a short decay instead of cutting it
+  at the peak learning rate ([training.md](training.md) § 9).
 - Coming from 2.8? An epoch is now one pass over the text, not `seq_length`
   passes ([training.md](training.md) § 1); `sample_stride=1` restores the old
   epoch.
 
-## 8. The GUI generation is slower than the CLI with the same model
+## 8. Generation in the GUI or the server is slower than in the CLI
 
-The GUI runs generation on a worker thread (so the window stays responsive) and
-optionally renders the attention map afterwards — and `attention_maps()` is a
-**second forward pass**, so it costs roughly one extra generation of time. Turn
-the visualisations off (or the matplotlib checkbox) when you care about speed.
+Two reasons.
+
+- **Worker threads and OpenMP (measured in 2.12).** The GUI and the server
+  generate on worker threads, the CLI on the main thread. PyTorch's CPU
+  kernels run on an OpenMP team per Python thread that uses them. Once two
+  threads have used torch with every core, the OpenMP runtime has more threads
+  than CPUs and stops spin-waiting between kernels, so every small decode
+  kernel pays a thread wake-up. On a 2-vCPU VM a generation on a second thread
+  ran at 324 tokens/s against 969 on the main thread, and one request at a time
+  through the server at 287. With `AURALITE_NUM_THREADS=1` the same runs
+  reached 974 and 694 tokens/s (the main thread alone: 775). If generation
+  speed in the server or the GUI matters more than training speed, start them
+  with `AURALITE_NUM_THREADS=1` and measure; training on many cores wants the
+  default.
+- **Attention maps.** The GUI optionally renders the attention map after a
+  generation, and `attention_maps()` is a **second forward pass**, so it costs
+  roughly one extra generation of time. Turn the visualisations off (or the
+  matplotlib checkbox) when you care about speed.
 
 ## 9. Is the OpenAI server multi-worker?
 
 No, deliberately: the engine, KV cache and rate limiter live in process memory,
-so `--workers > 1` would multiply the model in RAM and give you independent
-caches. Concurrency is handled instead by a slot semaphore
-(`AURALITE_MAX_CONCURRENT`, default 4) plus a queue: requests wait up to
-`AURALITE_QUEUE_TIMEOUT` seconds (default 10) and only then get `503` +
-`Retry-After`. If you need real parallelism, run several gguf/`llama-server`
-backends and put a proxy in front, or batch your prompts — the engine's
-`generate_batch` does dedup and length grouping, so N identical questions cost one
-forward pass.
+so `--workers > 1` would multiply the model in RAM. Inside the one worker up to
+`AURALITE_MAX_CONCURRENT` requests (default 4) generate at the same time; more
+wait up to `AURALITE_QUEUE_TIMEOUT` seconds (default 10) and only then get
+`503` + `Retry-After`.
+
+**Concurrent requests are correct since 2.12; before that they were not.** Up
+to 2.11 the KV cache lived in the model's attention layers and every generation
+on the engine wrote into it, so concurrent requests corrupted each other: four
+threads sending four greedy prompts got 20 of 20 texts that differed from the
+same prompts sent one at a time, through `/v1/completions` as well as through
+the engine. The GUI's generation and chat tabs could collide the same way. Each
+generation now owns its KV cache, and the engine runs one decode step at a time
+under a lock, so concurrent requests interleave token by token and return
+exactly what they return alone (`tests/test_concurrency_v212.py`). A GGUF model
+serves one generation at a time and the others wait for it.
+
+**Concurrency is not parallelism.** The decode steps of concurrent requests
+take turns on the model, so four requests take as long in total as four
+requests in a row, plus some switching. On a small CPU also try
+`AURALITE_NUM_THREADS=1` (§ 8): four concurrent requests on a 2-vCPU VM reached
+831 tokens/s in total instead of 325. If you need throughput, batch your
+prompts: `generate_batch` runs equal-length prompts as one batch (the *Small*
+model decoded 998 tokens/s alone, 3,073 at 4 prompts and 7,962 at 16) and runs
+identical prompts once. Or run several gguf/`llama-server` backends and put a
+proxy in front.
 
 **Why not merge independent HTTP requests into one batch?** Because it would
 change results, not just timing. Requests carry different sampling parameters
-(temperature/top_k/stop/penalties) and all but one would have to be re-sampled to
-match the batch's settings; streaming clients would have to wait for the slowest
-prompt in the window; and one engine's KV cache is mutable state, so a merge is
-exactly the "interleave two conversations in one cache" bug the slot semaphore
-exists to prevent. The slot limit + queue gives predictable latency today;
-`generate_batch` is the honest way to get batching, one caller at a time. If you
-measure a real workload where a merge would pay off, that is the place to start.
+(temperature/top_k/stop/penalties) and all but one would have to be re-sampled
+to match the batch's settings; streaming clients would have to wait for the
+slowest prompt in the window; and prompts of different lengths would need
+padding, which the batch path avoids by grouping equal lengths. Interleaving
+keeps every request's own settings and latency; `generate_batch` is the honest
+way to get batching, one caller at a time. If you measure a real workload where
+a merge would pay off, that is the place to start.
 
 ## 10. GGUF: in-process or `llama-server`?
 

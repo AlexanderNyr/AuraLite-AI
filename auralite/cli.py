@@ -17,6 +17,10 @@ Python list of the whole corpus.
 n_heads, n_layers, d_ff, seq_length, epochs, batch_size, lr, tokenizer,
 optimizer, muon_lr, lr_schedule, use_qk_norm, sliding_window, seed,
 amp_dtype, chat_template, ...).
+
+`auralite train` (2.12): Ctrl+C finishes the run with a short learning-rate
+decay and saves the model; a second Ctrl+C stops at once (and still saves).
+`--time-budget 10m` sizes the run to a time limit.
 """
 from __future__ import annotations
 
@@ -24,14 +28,56 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 import time
 
+#: Model size and epochs of `auralite train`. Everything else (optimizer,
+#: tokenizer, batch size, early stopping, ...) is the engine's recipe,
+#: `auralite.engine.recipe.DEFAULT_RECIPE` (2.12), which `train()` applies.
 DEFAULT_TRAIN_PARAMS: dict = {
     "d_model": 128, "n_heads": 4, "n_layers": 4, "d_ff": 256,
-    "seq_length": 64, "epochs": 10, "batch_size": 16,
-    "tokenizer": "bpe", "val_split": 0.1,
+    "seq_length": 64, "epochs": 10,
 }
+
+
+def _parse_duration(value: str) -> float:
+    """Seconds from ``"90"``, ``"90s"``, ``"10m"`` or ``"1.5h"`` (``--time-budget``)."""
+    text = str(value).strip().lower()
+    scale = {"s": 1.0, "m": 60.0, "h": 3600.0}.get(text[-1:], None)
+    number = text[:-1] if scale else text
+    try:
+        seconds = float(number) * (scale or 1.0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a duration such as 90, 90s, 10m or 1.5h, got {value!r}") from None
+    if seconds < 0:
+        raise argparse.ArgumentTypeError(f"a duration cannot be negative, got {value!r}")
+    return seconds
+
+
+def _graceful_sigint(finish_event: threading.Event, stop_event: threading.Event):
+    """Ctrl+C: finish with a cooldown, again: stop now, a third time: interrupt.
+
+    Returns the previous handler (None when signals cannot be installed, e.g.
+    outside the main thread).
+    """
+    def handler(signum, frame):
+        if not finish_event.is_set():
+            finish_event.set()
+            print("\n^C: finishing — decaying the learning rate for a few steps "
+                  "(Ctrl+C again to stop now)", file=sys.stderr, flush=True)
+        elif not stop_event.is_set():
+            stop_event.set()
+            print("\n^C: stopping now", file=sys.stderr, flush=True)
+        else:
+            raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):        # not the main thread / no signals
+        return None
 
 
 def _add_common_flags(parser: argparse.ArgumentParser, *,
@@ -180,8 +226,17 @@ def cmd_train(args: argparse.Namespace) -> int:
             return 2
         engine.load_model(args.resume)
         params["continue_training"] = True
-    engine.train(text, params,
-                 progress_callback=None if getattr(args, "quiet", False) else _progress)
+    if getattr(args, "time_budget", None):
+        params["time_budget_s"] = float(args.time_budget)
+    finish_event, stop_event = threading.Event(), threading.Event()
+    previous = _graceful_sigint(finish_event, stop_event)
+    try:
+        engine.train(text, params,
+                     progress_callback=None if getattr(args, "quiet", False) else _progress,
+                     stop_event=stop_event, finish_event=finish_event)
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
     engine.save_model(args.model)
     line = f"saved: {args.model}"
     summary = engine.last_train_summary or {}
@@ -189,6 +244,13 @@ def cmd_train(args: argparse.Namespace) -> int:
         line += f" | val loss {summary['val_loss']:.4f}"
         if summary.get("val_bpb") is not None:
             line += f" ({summary['val_bpb']:.4f} bits/byte)"
+    reason = str(summary.get("stop_reason") or "")
+    if reason:
+        line += " | " + {"early_stopping": "stopped early (best epoch kept)",
+                         "finished": "finished after a learning-rate cooldown",
+                         "time_budget": "time budget spent",
+                         "stopped": "stopped",
+                         "max_steps": "max_steps reached"}.get(reason, reason)
     print(line)
     return 0
 
@@ -597,6 +659,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", metavar="CHECKPOINT",
                    help="continue training this checkpoint (a longer seq_length in "
                         "--params extends its context)")
+    p.add_argument("--time-budget", type=_parse_duration, metavar="DURATION",
+                   help="end training after this long (90, 90s, 10m, 1.5h), counted from "
+                        "the start; the learning-rate decay is sized to end on time")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("generate", help="generate text from a checkpoint")

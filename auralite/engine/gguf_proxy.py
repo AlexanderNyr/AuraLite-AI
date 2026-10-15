@@ -5,16 +5,30 @@ every name below, so `auralite.engine.<name>` keeps working.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
 import os
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import torch
 
 logger = logging.getLogger("auralite")
+
+_LOCK_INIT = threading.Lock()
+
+
+def _penalty_kwargs(presence_penalty: float, frequency_penalty: float) -> dict:
+    """Presence/frequency penalties for llama.cpp, only when requested (2.12)."""
+    kwargs: dict[str, float] = {}
+    if presence_penalty:
+        kwargs["presence_penalty"] = float(presence_penalty)
+    if frequency_penalty:
+        kwargs["frequency_penalty"] = float(frequency_penalty)
+    return kwargs
 
 
 #: How to install llama.cpp support *without* compiling it (v2.6.6): PyPI only
@@ -207,9 +221,12 @@ class GGUFModelProxy:
         processed independently to keep the KV cache within `n_ctx`.
         """
         llama, owns = self._perplexity_llama()
+        # A second instance shares nothing; the generation instance is locked (2.12).
+        guard = contextlib.nullcontext() if owns else self.generation_lock
         try:
-            return _gguf_rolling_loglikelihood(
-                llama, text, self.max_seq_len, self.tokenizer, return_count=True)
+            with guard:
+                return _gguf_rolling_loglikelihood(
+                    llama, text, self.max_seq_len, self.tokenizer, return_count=True)
         finally:
             if owns:
                 close = getattr(llama, "close", None)
@@ -237,12 +254,15 @@ class GGUFModelProxy:
     def reset_cache(self):
         # llama-cpp-python keeps KV-cache internally per completion; reset if the
         # installed version exposes a method, otherwise each call is still safe.
+        # 2.12: skipped while a generation holds the context.
         reset = getattr(self.llama, "reset", None)
-        if callable(reset):
+        if callable(reset) and self.generation_lock.acquire(blocking=False):
             try:
                 reset()
             except Exception:
                 pass
+            finally:
+                self.generation_lock.release()
 
     def count_parameters(self) -> int:
         for key in ("general.parameter_count",):
@@ -261,15 +281,45 @@ class GGUFModelProxy:
     def vocab_size(self) -> int:
         return self.tokenizer.vocab_size
 
+    # ---- one generation at a time (2.12) ------------------------------
+    @property
+    def generation_lock(self) -> Any:
+        """Serialises generations on the llama.cpp context.
+
+        A `Llama` object keeps one KV cache and is not thread-safe, so the
+        server's concurrent requests (and the GUI's tabs) take turns. A plain
+        `threading.Lock`: a stream may finish on another thread than the one
+        that started it.
+        """
+        lock = self.__dict__.get("_generation_lock")
+        if lock is None:
+            with _LOCK_INIT:
+                lock = self.__dict__.setdefault("_generation_lock", threading.Lock())
+        return lock
+
+    def _generate_locked(self, call: Callable[[], Any], stream: bool) -> Any:
+        if stream:
+            return self._locked_stream(call)
+        with self.generation_lock:
+            return call()
+
+    def _locked_stream(self, call: Callable[[], Any]) -> Iterator[Any]:
+        # Held from the first chunk until the stream is exhausted, closed or
+        # garbage-collected (an abandoned stream releases it then).
+        with self.generation_lock:
+            yield from call()
+
     def create_completion(self, prompt: str, *, max_tokens: int = 50,
                           temperature: float = 0.8, top_k: int = 50,
                           top_p: float = 0.9, repeat_penalty: float = 1.0,
                           min_p: float = 0.0, stream: bool = False,
-                          stop: list[str] | None = None):
-        kwargs: dict[str, Any] = {}
+                          stop: list[str] | None = None,
+                          presence_penalty: float = 0.0,
+                          frequency_penalty: float = 0.0):
+        kwargs: dict[str, Any] = _penalty_kwargs(presence_penalty, frequency_penalty)
         if stop:
             kwargs["stop"] = list(stop)
-        return self.llama.create_completion(
+        return self._generate_locked(lambda: self.llama.create_completion(
             prompt=prompt,
             max_tokens=max(0, int(max_tokens)),
             temperature=max(float(temperature), 0.0),
@@ -279,18 +329,20 @@ class GGUFModelProxy:
             repeat_penalty=float(repeat_penalty),
             stream=stream,
             **kwargs,
-        )
+        ), stream)
 
     def create_chat_completion(self, messages: list[dict], *, max_tokens: int = 50,
                                temperature: float = 0.8, top_k: int = 50,
                                top_p: float = 0.9, repeat_penalty: float = 1.0,
                                min_p: float = 0.0, stream: bool = False,
-                               stop: list[str] | None = None):
+                               stop: list[str] | None = None,
+                               presence_penalty: float = 0.0,
+                               frequency_penalty: float = 0.0):
         """Use llama.cpp chat formatting for instruction/chat GGUF models."""
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = _penalty_kwargs(presence_penalty, frequency_penalty)
         if stop:
             kwargs["stop"] = list(stop)
-        return self.llama.create_chat_completion(
+        return self._generate_locked(lambda: self.llama.create_chat_completion(
             messages=messages,
             max_tokens=max(0, int(max_tokens)),
             temperature=max(float(temperature), 0.0),
@@ -300,7 +352,7 @@ class GGUFModelProxy:
             repeat_penalty=float(repeat_penalty),
             stream=stream,
             **kwargs,
-        )
+        ), stream)
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +445,11 @@ class LlamaServerProxy:
                           temperature: float = 0.8, top_k: int = 50,
                           top_p: float = 0.9, repeat_penalty: float = 1.0,
                           min_p: float = 0.0, stream: bool = False,
-                          stop: list[str] | None = None):
+                          stop: list[str] | None = None,
+                          presence_penalty: float = 0.0,
+                          frequency_penalty: float = 0.0):
         payload = {
+            **_penalty_kwargs(presence_penalty, frequency_penalty),
             "prompt": prompt,
             "n_predict": max(0, int(max_tokens)),
             "temperature": max(float(temperature), 0.0),
@@ -412,8 +467,11 @@ class LlamaServerProxy:
                                temperature: float = 0.8, top_k: int = 50,
                                top_p: float = 0.9, repeat_penalty: float = 1.0,
                                min_p: float = 0.0, stream: bool = False,
-                               stop: list[str] | None = None):
+                               stop: list[str] | None = None,
+                               presence_penalty: float = 0.0,
+                               frequency_penalty: float = 0.0):
         payload = {
+            **_penalty_kwargs(presence_penalty, frequency_penalty),
             "messages": messages,
             "n_predict": max(0, int(max_tokens)),
             "temperature": max(float(temperature), 0.0),

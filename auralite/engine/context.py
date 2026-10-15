@@ -118,7 +118,14 @@ class ContextWindowMixin:
             return
         want = self._wanted_context_window(model)
         if getattr(model, "context_window", None) != want:
-            setter(want)
+            # Changing the window drops the caches installed in the layers:
+            # never while another thread runs a decode step (2.12).
+            lock: Any = getattr(self, "model_lock", None)
+            if lock is None:
+                setter(want)
+                return
+            with lock:
+                setter(want)
 
     def _prefill(self, tokens: torch.Tensor) -> torch.Tensor:
         """Run prompt tokens ``(B, T)`` into an empty KV cache (2.11).
