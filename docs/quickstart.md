@@ -129,7 +129,7 @@ not what the marketing usually claims.
 | Format | Train | Generate | Notes |
 |---|---|---|---|
 | `.pt` (AuraLite) | yes | yes | Safe load by default (`weights_only=True`); pre-2.6.5 files load through a scoped numpy allowlist. `AURALITE_UNSAFE_LOAD=1` is the explicit opt-in for exotic old files. |
-| `.safetensors` | save/load | yes | Weights + JSON metadata, no pickle. Text and image models. |
+| `.safetensors` | save/load | yes | Weights + JSON metadata, no pickle. Text and image models. Needs the optional `safetensors` package (`pip install safetensors` or the `[safetensors]` extra). |
 | `.gguf` | no | yes | Inference-only (llama.cpp). Perplexity/cross-entropy scoring supported in-process; `llama-server` mode trades that for shared memory. |
 | Hugging Face | export | via `transformers` | `auralite` export commands / GUI Export tab; needs `.[full]`. |
 

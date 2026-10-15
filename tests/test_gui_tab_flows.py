@@ -33,6 +33,7 @@ from tests._gui_harness import (  # noqa: E402
     dialog_double,
     wait_for,
 )
+from tests._integration import require  # noqa: E402
 
 CORPUS = ("AuraLite trains small models on CPU. RMSNorm, RoPE, SwiGLU. " * 20)
 
@@ -1904,20 +1905,62 @@ class TestImageTab:
         assert (out / "grid.png").exists() and (out / "sample_001.png").exists()
         assert "grid.png" in app.img_status_label.config.call_args.kwargs["text"]
 
-    def test_image_dialogs_offer_safetensors(self, app, monkeypatch, tmp_path):
-        folder = self.make_folder(tmp_path)
-        self.tiny_image_params(app, folder)
+    def train_tiny_image_model(self, app, monkeypatch, tmp_path):
+        self.tiny_image_params(app, self.make_folder(tmp_path))
         monkeypatch.setattr(threading, "Thread", InlineThread)
         app.start_image_training()
-        target = tmp_path / "gen.safetensors"
+        assert app.image_engine.model is not None
+
+    def test_image_dialogs_offer_safetensors(self, app, monkeypatch, tmp_path):
+        """Both dialogs list `*.safetensors`; the `.pt` round trip needs nothing extra."""
+        self.train_tiny_image_model(app, monkeypatch, tmp_path)
+        target = tmp_path / "gen.pt"
         with dialog_double("filedialog.asksaveasfilename", str(target)) as dialog:
             app.save_image_model()
         patterns = [pattern for _, pattern in dialog.call_args.kwargs["filetypes"]]
-        assert "*.safetensors" in patterns and target.exists()
+        assert patterns == ["*.pt", "*.safetensors"] and target.exists()
         with dialog_double("filedialog.askopenfilename", str(target)) as dialog:
             app.load_image_model()
         assert "*.safetensors" in [p for _, p in dialog.call_args.kwargs["filetypes"]]
-        assert app.image_engine.model is not None
+        assert app.image_is_trained and app.image_engine.model is not None
+
+    def test_image_safetensors_round_trip_through_the_dialogs(self, app, monkeypatch, tmp_path):
+        # safetensors is optional (`[safetensors]`/`[full]`), and CI's `.[test]` jobs
+        # do not install it: 2.10.0 assumed it here and failed in every test job.
+        require("safetensors")
+        self.train_tiny_image_model(app, monkeypatch, tmp_path)
+        before = {k: v.clone() for k, v in app.image_engine.model.state_dict().items()}
+        target = tmp_path / "gen.safetensors"
+        with dialog_double("filedialog.asksaveasfilename", str(target)):
+            app.save_image_model()
+        assert target.exists()
+        app.image_engine.model = None
+        with dialog_double("filedialog.askopenfilename", str(target)):
+            app.load_image_model()
+        after = app.image_engine.model.state_dict()
+        assert before.keys() == after.keys()
+        assert all(torch.equal(before[k], after[k]) for k in before)
+
+    def test_image_safetensors_without_the_package_says_how_to_install(
+            self, app, monkeypatch, tmp_path):
+        """Without the optional package both handlers fail loudly, with the fix."""
+        self.train_tiny_image_model(app, monkeypatch, tmp_path)
+        # A None entry makes `import safetensors...` raise ImportError, installed or not.
+        monkeypatch.setitem(sys.modules, "safetensors", None)
+        monkeypatch.setitem(sys.modules, "safetensors.torch", None)
+        errors = sys.modules["tkinter.messagebox"].showerror
+        errors.reset_mock()
+        target = tmp_path / "gen.safetensors"
+        with dialog_double("filedialog.asksaveasfilename", str(target)):
+            app.save_image_model()
+        assert not target.exists()
+        assert errors.call_args.args[0] == "Save Error"
+        assert "pip install safetensors" in errors.call_args.args[1]
+        errors.reset_mock()
+        with dialog_double("filedialog.askopenfilename", str(target)):
+            app.load_image_model()
+        assert errors.call_args.args[0] == "Load Error"
+        assert "pip install safetensors" in errors.call_args.args[1]
 
     def test_class_conditional_training_fills_the_class_picker(self, app, monkeypatch, tmp_path):
         from PIL import Image

@@ -20,6 +20,7 @@ from auralite.image_engine import (  # noqa: E402
     DDPM, EMA, AttnBlock, ImageGenEngine, TinyUNet, load_image_folder, load_image_uint8,
     make_image_grid, save_image_grid, tensor_to_uint8, validate_image_params,
 )
+from tests._integration import require  # noqa: E402
 
 
 def _folder(tmp_path, n=8, size=20, channels=3, name="imgs"):
@@ -204,7 +205,8 @@ def test_ema_update_count_round_trips(tmp_path):
     eng.train(str(_folder(tmp_path)), _tiny_params(epochs=2))
     assert eng.ema is not None and eng.ema.num_updates == eng.last_train_summary["steps"] == 4
     for name in ("m.pt", "m.safetensors"):
-        pytest.importorskip("safetensors") if name.endswith("safetensors") else None
+        if name.endswith("safetensors"):
+            require("safetensors")
         eng.save_model(str(tmp_path / name))
         eng2 = ImageGenEngine()
         eng2.load_model(str(tmp_path / name))
@@ -681,7 +683,7 @@ def test_class_conditional_training_and_generation(tmp_path):
         eng.generate(n=1, steps=2, class_label=7)
     for name in ("c.pt", "c.safetensors"):
         if name.endswith("safetensors"):
-            pytest.importorskip("safetensors")
+            require("safetensors")
         eng.save_model(str(tmp_path / name))
         eng2 = ImageGenEngine()
         eng2.load_model(str(tmp_path / name))

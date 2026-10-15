@@ -14,14 +14,28 @@ Markers:
 """
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+# The suite must never write to the developer's real ~/.auralite. Until 2.10.0 a
+# full run overwrote ~/.auralite/gui_session.json: `auralite.gui.config` computes
+# its paths once, at import, several test modules import the GUI at collection
+# time, and a later test that set AURALITE_GUI_SESSION and closed an app was too
+# late. So the variables are set here, before any test module is collected.
+_TEST_HOME = tempfile.mkdtemp(prefix="auralite-test-home-")
+os.environ["AURALITE_HOME"] = _TEST_HOME
+for _override in ("AURALITE_GUI_CONFIG", "AURALITE_GUI_SESSION"):
+    os.environ.pop(_override, None)
+atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
 TINY_TEXT = (
     "AuraLite trains small language models on CPU. "

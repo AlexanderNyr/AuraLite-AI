@@ -107,6 +107,53 @@ differences of a few tens of points are indicative. Details and tables are in
 - `ImageGenEngine.generate` still defaults to DDIM, and `train()` still returns
   the epoch losses.
 
+**After the merge — the first CI run of `fc54eb6` (run 38733556830)**
+
+Red: all six `tests` legs and `coverage`, each with the same single failure,
+`TestImageTab::test_image_dialogs_offer_safetensors` (on Linux 1312 passed and
+16 skipped besides it; Windows skips one more). Green: lint, package, docker,
+server-smoke, benchmark-smoke, optional-deps and both integrations legs.
+
+- **The test assumed an optional package.** It saved the image model as
+  `gen.safetensors`, which needs `safetensors`. The `tests` legs install only
+  `.[test]`, so `save_model` raised the "pip install safetensors (or save as
+  .pt)" error, the GUI showed it, and no file appeared. The local environment
+  had the package, so the test passed there. The application behaved
+  correctly; the test was wrong. It is now three tests:
+  - both dialogs list `*.safetensors`, and a `.pt` save/load round trip works.
+    This runs everywhere.
+  - the `.safetensors` round trip through the dialogs gives bit-identical
+    weights. This one needs the package.
+  - without the package, save and load both show the error with the install
+    hint, and nothing is written. The package is hidden through `sys.modules`,
+    so this also runs everywhere.
+- **The image engine's `.safetensors` paths ran in no job.** The `tests` legs
+  skip them by design, and optional-deps, which installs `safetensors`, did not
+  run `tests/test_image_v210.py` or the GUI tests. It now runs both, under
+  `AURALITE_REQUIRE_INTEGRATIONS=1`. All six safetensors tests use
+  `require()` from `tests/_integration.py`, so a missing package fails the job
+  instead of skipping. A new release test keeps it that way: no test may
+  `importorskip("safetensors")`, and optional-deps must run every file that
+  needs the package.
+- **The pyright baseline is now 260** (from 266), the number CI measured. The
+  local count of 266 came from extra packages installed locally; it is now
+  measured in an environment with only `.[lint]`, like the lint job.
+- **A local test run no longer overwrites your GUI session.** A full
+  `pytest tests/` rewrote `~/.auralite/gui_session.json` with test defaults,
+  so the next GUI start lost its paths and choices. The cause:
+  `auralite.gui.config` computes its paths once, at import. Several test
+  modules import the GUI while pytest collects them, so a test that set
+  `AURALITE_GUI_SESSION` and then closed an app set it too late. `conftest.py`
+  now points `AURALITE_HOME` at a temporary directory before collection, and a
+  test checks that no GUI path resolves under the real home. On CI nothing
+  changed, because the runners start with an empty home.
+- Checks for this fix, in environments that install exactly what CI installs:
+  - `.[test]` on 3.13 and on 3.11: 1316 passed, 17 skipped each, and no file
+    appears in `~/.auralite`;
+  - `.[test]` plus `safetensors` on 3.11, with `AURALITE_REQUIRE_INTEGRATIONS=1`,
+    for the image, GUI image-tab, v2.6.5 and learning-sanity files: 175 passed,
+    none skipped.
+
 # 📦 v2.9.0 — training: one-pass epochs, honest validation, early stopping, faster steps
 
 This release changes how the native engine trains, not how it generates. The

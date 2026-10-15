@@ -177,10 +177,18 @@ jobs:
           # wheel's CUDA extensions cannot load on CPU-only torch)
           pip install -e '.[test,serve,safetensors,export,torchao]' --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Optional-dependency test suites
+        # 2.10.0: the image engine's .safetensors paths (engine + GUI dialogs) ran in
+        # no job — the `.[test]` legs have no safetensors, and a GUI test that assumed
+        # it failed in all of them. They run here, and a missing package is a failure
+        # (`require()` in tests/_integration.py), not a silent skip.
+        env:
+          AURALITE_REQUIRE_INTEGRATIONS: "1"
         run: |
+          python -c "import safetensors, tkinter; print('safetensors', safetensors.__version__, '| tk', tkinter.TkVersion)"
           pytest tests/test_export.py tests/test_bugfixes_regression.py \
                  tests/test_improvements_v265.py tests/test_hf_integration.py \
-                 tests/test_learning_sanity.py \
+                 tests/test_learning_sanity.py tests/test_image_v210.py \
+                 "tests/test_gui_tab_flows.py::TestImageTab" \
                  -q --tb=short -rs
       - name: torchao backend for real (not skipped)
         # 2.7.0: torchao is the successor of the deprecated torch.ao.quantization;

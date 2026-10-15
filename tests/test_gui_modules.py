@@ -12,6 +12,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import sys
 import time
 
@@ -72,6 +73,19 @@ def test_config_dir_honours_env(monkeypatch, tmp_path):
     assert gui_config.config_dir() == tmp_path / "home"
     monkeypatch.delenv("AURALITE_HOME")
     assert gui_config.config_dir() == gui_config.Path.home() / ".auralite"
+
+
+def test_the_suite_never_writes_to_the_real_home():
+    """conftest points AURALITE_HOME at a temp dir before the GUI is imported.
+
+    The paths below are computed once, at import. A full run used to overwrite
+    the developer's ~/.auralite/gui_session.json through them.
+    """
+    real_home = gui_config.Path.home() / ".auralite"
+    for path in (gui_config.SESSION_PATH, gui_config.DEFAULT_CONFIG_PATH,
+                 gui_session.SESSION_PATH):
+        assert real_home not in path.parents, path
+    assert os.environ["AURALITE_HOME"] in str(gui_config.SESSION_PATH)
 
 
 def test_config_path_env_override(monkeypatch, tmp_path):

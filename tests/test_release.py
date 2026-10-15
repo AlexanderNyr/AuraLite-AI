@@ -435,6 +435,35 @@ def test_integrations_job_runs_real_hf_and_llama_cpp_without_skipping():
         assert f'"{package}=={floor}.' in joined, (package, floor)
 
 
+def test_every_safetensors_test_runs_in_the_optional_deps_job():
+    """The `.[test]` legs have no safetensors, so its tests skip there by design.
+
+    2.10.0 added a GUI test that assumed the package (red in every test job) and
+    image-engine tests that skipped everywhere. Each test file that needs
+    safetensors must be run by optional-deps, through `require()` so a missing
+    package fails instead of skipping.
+    """
+    job = WORKFLOWS["ci.yml"]["jobs"]["optional-deps"]
+    install = next(step["run"] for step in job["steps"]
+                   if str(step.get("name", "")).startswith("Install"))
+    extras = re.search(r"\.\[([a-z,]+)\]", install)
+    assert extras is not None and "safetensors" in extras.group(1).split(",")
+    step = next(step for step in job["steps"]
+                if step.get("name") == "Optional-dependency test suites")
+    assert step["env"]["AURALITE_REQUIRE_INTEGRATIONS"] == "1"
+    assert "import safetensors, tkinter" in step["run"]      # GUI tests cannot skip either
+    soft, hard = 'importorskip("safetensors")', 'require("safetensors")'
+    sources = {path.name: path.read_text(encoding="utf-8")
+               for path in (REPO_ROOT / "tests").glob("test_*.py")
+               if path.name != pathlib.Path(__file__).name}
+    skipping = sorted(name for name, text in sources.items() if soft in text)
+    assert not skipping, f"use tests._integration.require('safetensors') in {skipping}"
+    needing = sorted(name for name, text in sources.items() if hard in text)
+    assert "test_image_v210.py" in needing and "test_gui_tab_flows.py" in needing
+    missing = [name for name in needing if f"tests/{name}" not in step["run"]]
+    assert not missing, f"optional-deps does not run {missing}"
+
+
 def test_docker_job_runs_the_image_it_builds():
     job = WORKFLOWS["ci.yml"]["jobs"]["docker"]
     assert job["needs"] == ["lint"]                  # no longer waits for every test leg

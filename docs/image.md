@@ -312,6 +312,10 @@ misspelt key exits with code 2 and the nearest name. `--preset` accepts
   * The engine API keeps `sampler="ddim"` and `val_split=0`.
   * `train()` still returns the list of epoch losses.
 * **The `.safetensors` format** now appears in the GUI's save and load dialogs.
+  It needs the optional `safetensors` package (`pip install safetensors`, or
+  the `[safetensors]` / `[full]` extra). Without it, choosing a `.safetensors`
+  name shows an error that says so, and nothing is written; `.pt` needs
+  nothing extra.
 
 ## 9. Reproducing
 

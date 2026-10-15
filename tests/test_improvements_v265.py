@@ -30,6 +30,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:  # tests are also run from arbitrary cwd
     sys.path.insert(0, REPO_ROOT)
 
+from tests._integration import require  # noqa: E402
+
 
 # ======================================================================
 #  1. Safe checkpoint I/O
@@ -124,7 +126,7 @@ def test_numpy_rng_state_builtins_are_json_serializable():
 
 
 def test_safetensors_checkpoint_roundtrip(tmp_path):
-    safetensors = pytest.importorskip("safetensors")
+    safetensors = require("safetensors")
     from auralite.engine.safe_io import (
         load_safetensors_checkpoint, save_safetensors_checkpoint,
     )
@@ -145,7 +147,7 @@ def test_safetensors_checkpoint_roundtrip(tmp_path):
 
 def test_safetensors_engine_roundtrip_preserves_generation(tmp_path, trained_tiny_engine):
     """A `.safetensors` save/load must reproduce identical generations."""
-    pytest.importorskip("safetensors")
+    require("safetensors")
     engine, _ = trained_tiny_engine
     path = tmp_path / "tiny.safetensors"
     engine.save_model(str(path))          # .safetensors → pickle-free container

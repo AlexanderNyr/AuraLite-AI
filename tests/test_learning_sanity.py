@@ -27,6 +27,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from auralite.engine import AuraLiteEngine  # noqa: E402
+from tests._integration import require  # noqa: E402
 
 DATA = Path(__file__).parent / "data"
 CORPUS = ("the quick brown fox jumps over the lazy dog. "
@@ -109,7 +110,7 @@ def test_golden_checkpoint_loads_bit_for_bit(stem):
     checkpoint = next(DATA / f"{stem}{ext}" for ext in (".pt", ".safetensors")
                       if (DATA / f"{stem}{ext}").exists())
     if checkpoint.suffix == ".safetensors":
-        pytest.importorskip("safetensors")
+        require("safetensors")
 
     engine = AuraLiteEngine()
     engine.load_model(str(checkpoint))
