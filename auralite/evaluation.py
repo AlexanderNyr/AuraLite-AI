@@ -56,6 +56,20 @@ class AuraLiteLM(LM):
         self.tokenizer = engine.tokenizer
         self.device = engine.device
 
+    def _log_probs(self, ids):
+        """Log-probabilities ``(len(ids), vocab)`` after each token of `ids`.
+
+        One forward pass on the engine's compute thread (2.13), like generation.
+        """
+        import torch
+        from auralite.engine.compute_thread import run_on_compute_thread
+
+        def forward():
+            with torch.inference_mode():
+                logits = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
+                return torch.log_softmax(logits[0], dim=-1)
+        return run_on_compute_thread(forward)
+
     def loglikelihood(self, requests):
         """Compute log-likelihood of continuation given context."""
         import torch
@@ -84,12 +98,7 @@ class AuraLiteLM(LM):
                 res.append((float("-inf"), False))
                 continue
 
-            # Run forward
-            with torch.inference_mode():
-                logits = self.model(
-                    torch.tensor([input_ids], dtype=torch.long, device=self.device)
-                )
-                log_probs = torch.log_softmax(logits[0], dim=-1)
+            log_probs = self._log_probs(input_ids)
 
             # Sum logprobs of the continuation tokens, and check argmax agreement.
             # (is_greedy was previously hardcoded True, which silently inflated
@@ -158,20 +167,16 @@ class AuraLiteLM(LM):
                 res.append(0.0)
                 continue
             total = 0.0
-            with torch.inference_mode():
-                start = 0
-                # First window scores tokens 1..max_seq; then slide.
-                while start < len(ids) - 1:
-                    end = min(start + max_seq, len(ids) - 1)
-                    window_in = ids[start:end]
-                    window_tgt = ids[start + 1:end + 1]
-                    logits = self.model(
-                        torch.tensor([window_in], device=self.device)
-                    )
-                    log_probs = torch.log_softmax(logits[0], dim=-1)
+            start = 0
+            # First window scores tokens 1..max_seq; then slide.
+            while start < len(ids) - 1:
+                end = min(start + max_seq, len(ids) - 1)
+                window_tgt = ids[start + 1:end + 1]
+                log_probs = self._log_probs(ids[start:end])
+                with torch.inference_mode():
                     for j, tid in enumerate(window_tgt):
                         total += log_probs[j, tid].item()
-                    start = end
+                start = end
             res.append(total)
         return res
 

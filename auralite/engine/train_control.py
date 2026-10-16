@@ -43,6 +43,10 @@ class TrainControl:
     REPLAN_EVERY = 0.05
     #: A run that overshoots its budget by this fraction stops regardless.
     HARD_LIMIT = 1.10
+    #: The decay after an early stop lasts at most this many epochs (2.13).
+    #: On all of tinyshakespeare (three seeds) a two-epoch decay ended 0.07 %
+    #: better on average than a three-epoch one, for two thirds of its steps.
+    EARLY_STOP_COOLDOWN_EPOCHS = 2
 
     def __init__(self, scheduler: Any, *, start_time: float,
                  finish_event: Any = None, time_budget_s: float | None = None,
@@ -112,8 +116,9 @@ class TrainControl:
         """Start the cooldown now; returns its length in optimizer steps.
 
         The decay lasts ``cooldown_ratio`` x the steps taken so far, but never
-        longer than the steps the run had left, and never extends a decay
-        that is already running.
+        longer than the steps the run had left, never longer than
+        :attr:`EARLY_STOP_COOLDOWN_EPOCHS` epochs after an early stop, and
+        never extends a decay that is already running.
         """
         self.finishing = True
         self.finish_reason = reason
@@ -121,6 +126,8 @@ class TrainControl:
         sched: Any = self.scheduler
         step = int(getattr(sched, "step_count", self.run_steps))
         n = int(math.ceil(self.cooldown_ratio * self.run_steps))
+        if reason == "early_stopping" and self.steps_per_epoch:
+            n = min(n, self.EARLY_STOP_COOLDOWN_EPOCHS * self.steps_per_epoch)
         if self.max_run_steps:
             n = min(n, self.max_run_steps - self.run_steps)
         if getattr(sched, "decaying", False):

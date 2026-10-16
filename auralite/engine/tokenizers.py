@@ -121,12 +121,18 @@ class BPETokenizer:
         self._cache = {}
 
     # ---- training ----------------------------------------------------
-    def train(self, text: str, vocab_size: int = 512):
+    def train(self, text: str, vocab_size: int = 512, extra_chars: str = ""):
+        """Learn merges from `text`; `extra_chars` only join the base alphabet.
+
+        `train()` (2.13) passes the held-out validation text as `extra_chars`:
+        its characters stay encodable (and can be generated), but no merge is
+        learned from it.
+        """
         # IMPROVED: stratified sampling for large files
         # Instead of just taking the prefix, sample chunks spread across the text
         sample = self._stratified_sample(text, max_chars=2_000_000, n_chunks=100)
 
-        base_chars = sorted(set(sample))
+        base_chars = sorted(set(sample) | set(extra_chars))
         self.vocab = list(base_chars)
         self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
         self.merges = []

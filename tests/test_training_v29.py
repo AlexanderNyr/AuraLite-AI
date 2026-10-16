@@ -205,7 +205,8 @@ def test_early_stopping_restores_the_best_epoch(monkeypatch):
             snapshots[epoch] = {k: v.clone() for k, v in engine.model.state_dict().items()}
 
     _scripted_validation(monkeypatch, engine, [3.0, 2.0, 2.5, 2.6, 2.7, 2.8])
-    summary = engine.train(CORPUS, dict(BASE, epochs=6, early_stopping_patience=2),
+    summary = engine.train(CORPUS, dict(BASE, epochs=6, early_stopping_patience=2,
+                                        early_stopping_cooldown=False),
                            progress_callback=on_progress)
     assert summary["stop_reason"] == "early_stopping"
     assert summary["epochs_completed"] == 4
@@ -220,7 +221,8 @@ def test_early_stopping_can_keep_the_last_weights(monkeypatch):
     engine = AuraLiteEngine()
     _scripted_validation(monkeypatch, engine, [3.0, 3.1, 3.2])
     summary = engine.train(CORPUS, dict(BASE, epochs=5, early_stopping_patience=2,
-                                        restore_best_weights=False))
+                                        restore_best_weights=False,
+                                        early_stopping_cooldown=False))
     assert summary["stop_reason"] == "early_stopping" and summary["epochs_completed"] == 3
     assert summary["restored_best"] is False and engine.last_val_loss == 3.2
 

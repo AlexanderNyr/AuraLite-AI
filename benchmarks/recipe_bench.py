@@ -13,7 +13,9 @@ Sections:
   optimizer steps, per seed (validation bits per byte, ms per step).
 * ``defaults``: the default `train()` run (the recipe, 100 epochs, early
   stopping) on a text, against the 2.11 GUI default (Muon + QK-norm, no early
-  stopping) and with ``early_stopping_cooldown``.
+  stopping), without the 2.13 cooldown after early stopping
+  (``recipe_no_cooldown``) and with BPE 2048 / 4096 (``bpe2048``,
+  ``bpe4096``); ``--time-budget`` limits the runs.
 * ``ending``: a run planned for N steps, a run planned for 2N steps that is
   stopped at N (``stop_event``), and the same run finished at N
   (``finish_event``, one row per ``--ratios`` value). Bits per byte on the
@@ -131,7 +133,10 @@ def bench_defaults() -> None:
     text = _text()
     variants = {
         "recipe": {},
-        "recipe+es_cooldown": {"early_stopping_cooldown": True},
+        "recipe+es_cooldown": {"early_stopping_cooldown": True},     # the 2.13 default
+        "recipe_no_cooldown": {"early_stopping_cooldown": False},    # a 2.12 early stop
+        "bpe2048": {"bpe_vocab_size": 2048},
+        "bpe4096": {"bpe_vocab_size": 4096},
         "adamw_qk": {"optimizer": "adamw", "use_qk_norm": True},
         "muon_qk": {"optimizer": "muon", "muon_lr": 0.02, "use_qk_norm": True},
         "gui_2.11": {"optimizer": "muon", "muon_lr": 0.02, "use_qk_norm": True,
@@ -144,13 +149,15 @@ def bench_defaults() -> None:
                 continue
             params = _size(epochs=ARGS.epochs, seed=seed, max_steps=ARGS.max_steps,
                            **variants[name])
+            if ARGS.time_budget:
+                params["time_budget_s"] = ARGS.time_budget
             _, summary, wall = _train(text, params)
             emit(section="defaults", variant=name, seed=seed, chars=len(text),
                  val_bpb=round(float(summary.get("val_bpb") or 0.0), 4),
                  best_val_bpb=round(float(summary.get("best_val_bpb") or 0.0), 4),
                  epochs=summary.get("epochs_completed"), best_epoch=summary.get("best_epoch"),
                  stop_reason=summary.get("stop_reason"), steps=summary.get("optimizer_steps"),
-                 wall_s=round(wall, 1))
+                 cooldown_steps=summary.get("cooldown_steps"), wall_s=round(wall, 1))
 
 
 def bench_ending() -> None:
@@ -240,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--variants", default="recipe,recipe+es_cooldown,gui_2.11")
     parser.add_argument("--epochs", type=int, default=100, help="planned epochs (defaults)")
     parser.add_argument("--max-steps", type=int, default=0, help="step limit (defaults)")
+    parser.add_argument("--time-budget", type=float, default=0.0,
+                        help="time_budget_s of the default runs (defaults)")
     parser.add_argument("--ratios", default="0.2", help="cooldown ratios (ending)")
     parser.add_argument("--budget", type=float, default=150.0, help="seconds (budget)")
     parser.add_argument("--tokens", type=int, default=48, help="tokens per generation")

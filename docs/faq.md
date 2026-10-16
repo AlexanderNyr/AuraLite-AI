@@ -132,24 +132,27 @@ workers. On a laptop, `torch_threads=4` can be *faster* than
 
 ## 8. Generation in the GUI or the server is slower than in the CLI
 
-Two reasons.
+**Not since 2.13.** The GUI and the server generate on worker threads, the CLI
+on the main thread. PyTorch's CPU kernels run on an OpenMP team per Python
+thread that uses them; once two threads had used torch with every core, the
+OpenMP runtime had more threads than CPUs and stopped spin-waiting between
+kernels, so every small decode kernel paid a thread wake-up. In 2.12 a
+generation on a second thread ran at 324 tokens/s against 969 on the main
+thread of a 2-vCPU VM, and `AURALITE_NUM_THREADS=1` was the workaround.
 
-- **Worker threads and OpenMP (measured in 2.12).** The GUI and the server
-  generate on worker threads, the CLI on the main thread. PyTorch's CPU
-  kernels run on an OpenMP team per Python thread that uses them. Once two
-  threads have used torch with every core, the OpenMP runtime has more threads
-  than CPUs and stops spin-waiting between kernels, so every small decode
-  kernel pays a thread wake-up. On a 2-vCPU VM a generation on a second thread
-  ran at 324 tokens/s against 969 on the main thread, and one request at a time
-  through the server at 287. With `AURALITE_NUM_THREADS=1` the same runs
-  reached 974 and 694 tokens/s (the main thread alone: 775). If generation
-  speed in the server or the GUI matters more than training speed, start them
-  with `AURALITE_NUM_THREADS=1` and measure; training on many cores wants the
-  default.
-- **Attention maps.** The GUI optionally renders the attention map after a
-  generation, and `attention_maps()` is a **second forward pass**, so it costs
-  roughly one extra generation of time. Turn the visualisations off (or the
-  matplotlib checkbox) when you care about speed.
+2.13 runs every generation forward pass on one compute thread and releases
+the OpenMP team of a thread that has finished loading or training a model
+(docs/engine.md § 10). On the same kind of VM a worker thread now decodes at
+824 tokens/s instead of 290 and `/v1/completions` at 696 instead of 298;
+interleaved in one process a worker thread, four threads and the server reach
+0.94, 0.93 and 0.92 of the main thread's speed. `AURALITE_NUM_THREADS=1` is no longer
+needed for this, and `AURALITE_COMPUTE_THREAD=0` brings back the 2.12
+behaviour.
+
+One more cost in the GUI: it optionally renders the attention map after a
+generation, and `attention_maps()` is a **second forward pass**, so it costs
+roughly one extra generation of time. Turn the visualisations off (or the
+matplotlib checkbox) when you care about speed.
 
 ## 9. Is the OpenAI server multi-worker?
 
@@ -172,9 +175,10 @@ serves one generation at a time and the others wait for it.
 
 **Concurrency is not parallelism.** The decode steps of concurrent requests
 take turns on the model, so four requests take as long in total as four
-requests in a row, plus some switching. On a small CPU also try
-`AURALITE_NUM_THREADS=1` (§ 8): four concurrent requests on a 2-vCPU VM reached
-831 tokens/s in total instead of 325. If you need throughput, batch your
+requests in a row, plus some switching. Since 2.13 they also run at full
+speed: four concurrent requests decoded 764 tokens/s in total on 2 vCPU
+(2.12: 296), because every decode step runs on the one compute thread
+(§ 8). If you need throughput, batch your
 prompts: `generate_batch` runs equal-length prompts as one batch (the *Small*
 model decoded 998 tokens/s alone, 3,073 at 4 prompts and 7,962 at 16) and runs
 identical prompts once. Or run several gguf/`llama-server` backends and put a

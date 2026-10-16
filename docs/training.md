@@ -3,9 +3,11 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 10. Since 2.12 the three entry points share one
+to reproduce them are in § 11. Since 2.12 the three entry points share one
 default recipe (§ 8), and a run that is stopped or has a time limit ends with
-a learning-rate decay (§ 9).
+a learning-rate decay (§ 9). Since 2.13 a new BPE tokenizer never sees the
+validation text (§ 10); validation numbers measured before 2.13 are
+optimistic by up to 9 %.
 
 ## 1. An epoch is one pass over the text
 
@@ -86,8 +88,10 @@ summary["stop_reason"], summary["best_epoch"], summary["best_val_loss"]
 * `early_stopping_patience=N` stops after N epochs without a better validation
   loss. The default is 3 since 2.12 (it was 0, off); 0 switches it off. It
   needs a validation split (`val_split`, default 0.1).
-* `early_stopping_cooldown=True` (2.12, off by default) decays the learning
-  rate before the stop instead of stopping at the peak; see § 9.
+* `early_stopping_cooldown` (2.12; on by default since 2.13) decays the
+  learning rate before the stop instead of stopping at the peak: over 0.2 ×
+  the steps taken, at most two epochs. The best epoch is still the one
+  restored; see § 8 and § 9.
 * `restore_best_weights` ends the run with the weights of the best validation
   epoch. It is on by default when early stopping is on, and can also be used
   alone. The copy lives in memory and is refreshed only when the validation
@@ -96,7 +100,8 @@ summary["stop_reason"], summary["best_epoch"], summary["best_val_loss"]
   `epochs_completed`, `optimizer_steps`, `tokens`, `train_loss`, `val_loss`,
   `best_val_loss`, `best_epoch`, `restored_best`, `stop_reason` (`None`,
   `"max_steps"`, `"early_stopping"`, `"finished"`, `"time_budget"` or
-  `"stopped"`), `cooldown_steps` and `seconds`. The same facts end the training
+  `"stopped"`), `cooldown_steps`, `tokenizer_fit_chars`, `train_tokens`,
+  `val_tokens` (2.13, § 10) and `seconds`. The same facts end the training
   log: `Training done: 12 epochs, 5,892 optimizer steps, …`.
 
 ## 4. Speed
@@ -243,27 +248,35 @@ near-miss instead of training with the default.
   stop a run by hand, the first Stop / Ctrl+C finishes it with a decay.
 * **Dropout.** Use 0 for a large corpus that you read a few times. Keep 0.1 or
   more for a small corpus that you read dozens of times.
-* **Tokenizer (2.11, measured in bits per byte).** The GUI's *Small* preset
-  trained for the same wall-clock time with each tokenizer; the time per
-  optimizer step was measured first, then `max_steps` = budget / step time.
-  Validation bits per byte on the last 10 % of each text (lower is better):
+* **Tokenizer (2.13, measured with validation text the tokenizer never saw,
+  § 10).** The *Small* model with the default recipe; bits per byte on the
+  last 10 % of each text (lower is better):
 
-  | corpus, budget | char | BPE 512 (default) | BPE 2048 | BPE 4096 |
-  |---|---|---|---|---|
-  | tinyshakespeare (1.1 MB), 150 s | 2.349 | 2.121 | 2.042 | **2.021** |
-  | TinyStories (first 1.2 MB of the validation file), 150 s | 1.617 | 1.315 | **1.242** | 1.250 |
-  | first 100 KB of tinyshakespeare, 60 s, last epoch | **2.228** | 2.478 | 2.669 | |
-  | same, best epoch | 2.228 | 2.243 | **2.150** | |
+  | text, run | BPE 512 (default) | BPE 2048 | BPE 4096 |
+  |---|---|---|---|
+  | tinyshakespeare (1.1 MB), default run, seeds 0 / 1 / 2 | **2.0965 / 2.1014 / 2.0919**, mean 2.0966 in 690 s | 2.1067 / 2.1113 / 2.0961, mean 2.1047 in 393 s | |
+  | TinyStories (first 1.2 MB of the validation file), 600 s limit | 1.2577 (limit reached) | **1.2205** (early stop after 415 s) | |
+  | TinyStories (first 6 MB), 300 s limit | | 1.0599 | **1.0485** |
+  | first 300 KB of tinyshakespeare, default run | **1.9750** | 2.0200 | |
+  | first 100 KB, default run | **2.2075** | 2.3048 | |
 
-  On a megabyte of text, BPE 2048–4096 beats the 512 default by 4–6 %
-  (TinyStories' 2048 run got 20 % more time than its 512 run, the
-  tinyshakespeare runs within 8 % of each other). On 100 KB every BPE run
-  memorised the text within the minute: a BPE epoch has 2.5–3.5× fewer tokens,
-  so the same time means 33–39 epochs instead of 14. With
-  `early_stopping_patience` (best weights kept) BPE 2048 was again the best;
-  without it char was. The default stays at BPE 512, the setting without a
-  bad case here: use 2048 or more for a megabyte of text or more, and turn on
-  early stopping for small files.
+  The default stays at BPE 512. On Shakespeare it ended 0.4 % better than
+  2,048 in all three seeds, although 2,048 got there in 43 % less time:
+  without the cooldown after early stopping (§ 8) the order was the other
+  way round (2.1120 against 2.1206), but the cooldown gains 512 three times
+  as much. On TinyStories 2,048 was 3 % better and finished sooner, and on 6
+  MB of it 4,096 beat 2,048 by 1 % within five minutes. Text that reuses a
+  small vocabulary (TinyStories: the tokenizer fitted on 90 % compresses the
+  rest just as well) profits from a larger BPE vocabulary; text full of words
+  and names the training part never had (Shakespeare's last plays) does not.
+  So: 2,048 or more for a large text that repeats its vocabulary or when time
+  is short, 512 for small or varied texts. Characters stay behind: 2.349 on
+  tinyshakespeare after 150 s (2.11) against 2.167 for BPE 512. (The
+  default runs in this table decayed for up to three epochs after the early
+  stop; with the 2.13 cap of two, BPE 512 ends at 2.0917 / 2.1036 / 2.0903.)
+  The 2.11 version of this table fitted the tokenizer on the validation
+  text too, which made 2,048 and 4,096 look 4–6 % better than 512 on a
+  megabyte (§ 10).
 * **Context length.** It no longer multiplies the length of an epoch. An
   epoch is always the same number of tokens, about `tokens / (batch_size *
   seq_length)` steps, so a longer context means fewer, larger steps. Since
@@ -385,10 +398,37 @@ Early stopping changes nothing while the validation loss improves every epoch:
 without it.
 
 **`early_stopping_cooldown`** decays the learning rate (§ 9) before an early
-stop instead of stopping at the peak. Measured with AdamW + QK-norm it gained
-0.3 % on 100 KB (2.3105 vs 2.3184, 3 s more) and nothing on 300 KB (2.0418,
-21 s more): the epochs after the best one have already started to memorise,
-and the decay cannot undo that. It stays off.
+stop instead of stopping at the peak. It is on by default since 2.13. The
+decay lasts 0.2 × the steps taken, at most two epochs, and the best epoch is
+still the one restored, so the result can only get better; it costs those
+steps. With the default recipe and the 2.13 validation split (§ 10), on all
+of tinyshakespeare with BPE 512:
+
+| seed | early stopping alone | decay of at most 2 epochs (default) | at most 3 epochs |
+|---|---|---|---|
+| 0 | 2.1319 (best epoch 10, stopped after 13) | **2.0917** (+15 % steps) | 2.0965 (+20 %) |
+| 1 | 2.1203 | 2.1036 (+12 %) | **2.1014** (+18 %) |
+| 2 | 2.1097 | **2.0903** (+11 %) | 2.0919 (+17 %) |
+| mean | 2.1206 | **2.0952** | 2.0966 |
+
+The validation loss had stalled at the peak learning rate (three epochs
+within about 1 % of the best) rather than memorised the text, and the decay
+took it 0.8–1.9 % lower, 1.2 % on average. Two epochs did as well as three on
+average (0.07 % better) for two thirds of the extra steps, so the decay is
+capped at two. The other texts, measured with the three-epoch cap:
+
+| text, vocabulary | early stopping alone | with the cooldown | steps added |
+|---|---|---|---|
+| tinyshakespeare, BPE 2048, seeds 0 / 1 / 2 | 2.1067 / 2.1113 / 2.1179 | 2.1067 / 2.1113 / **2.0961** | +20 % |
+| TinyStories (1.2 MB), BPE 2048 | 1.2260 | **1.2205** | +19 % |
+| first 300 KB of tinyshakespeare, BPE 512 | 1.9760 | 1.9750 | +19 % |
+| first 100 KB, BPE 512 | 2.2075 | 2.2075 | +14 % |
+
+In none of them did the third epoch of the decay bring the best result.
+Where the model had started to memorise (the small texts, two of the three
+BPE 2048 runs) the decay cannot undo that, and the restored epoch is the one
+early stopping alone would have kept. In 2.12, measured with AdamW, the
+cooldown gained 0.3 % on 100 KB and nothing on 300 KB, so it stayed off.
 
 ## 9. Ending a run: Stop, Ctrl+C and time limits (2.12)
 
@@ -429,7 +469,58 @@ the validation of the partial last epoch). The time limit ended 0.5 s early
 and matched a run sized by hand to the same steps (0.2 % better, within seed
 noise).
 
-## 10. Reproduce
+## 10. Honest validation (2.13)
+
+Up to 2.12, `train()` fitted a new BPE tokenizer on the whole text, including
+the last 10 % that validation holds out. BPE merges the most frequent pairs,
+so it also learned the words of the held-out text and encoded that text in
+fewer, longer tokens than it would encode a new text. The validation loss then
+measured partly what the tokenizer had already seen.
+
+How much longer the held-out tokens were: characters per token on the last
+10 % with a tokenizer fitted on the whole text, against one fitted on the
+first 90 %:
+
+| text | 512 | 1,024 | 2,048 | 4,096 |
+|---|---|---|---|---|
+| first 100 KB of tinyshakespeare | +1.3 % | +3.6 % | +6.0 % | +10.1 % |
+| first 300 KB | +7.9 % | +7.1 % | +10.1 % | +11.5 % |
+| tinyshakespeare (1.1 MB) | +1.9 % | +4.4 % | +10.6 % | +13.9 % |
+| TinyStories (first 1.2 MB of the validation file) | +0.3 % | +0.9 % | +1.2 % | +2.5 % |
+
+Shakespeare is the hard case. The last 10 % of the 1.1 MB file is *The Taming
+of the Shrew* and *The Tempest*, and 68 % of its speaker lines belong to
+names that never occur before it; half of the speaker lines at the end of the
+first 300 KB are King Richard's. TinyStories reuses one small vocabulary
+throughout, so the leak there was small. In bits per byte the effect stayed
+within ±1 % (in either direction) at 512 tokens, but it grew with the
+vocabulary, so every larger vocabulary looked better than it was: up to 9 %
+too low (BPE 4,096 on 100 KB: 2.1295 instead of 2.3244; on the megabyte after
+150 s: 2.0549 instead of 2.2034). The 2.11 tokenizer study in § 6 recommended
+2,048 or more for a megabyte on that basis.
+
+**What 2.13 does.** A new BPE tokenizer is fitted on the training part only.
+`auralite.engine.dataset.validation_split_point` puts the cut at the last
+`val_split` of the characters, moved forward to the next line break, and
+validation reads exactly the text after the cut, encoded on its own. Its
+characters still join the tokenizer's alphabet, so nothing in it becomes
+unknown and the model can still write those characters, but no merge is
+learned from it. The summary reports `tokenizer_fit_chars`, `train_tokens`
+and `val_tokens`. Char models, `continue_training` (the tokenizer is kept)
+and runs without validation are unchanged. When the held-out part would be
+shorter than one window, the 2.12 split by tokens is used.
+
+**Older numbers.** The tables of § 8 and § 9 were measured with BPE 512, where
+the effect stayed within ±1 % and every row of a table used the same
+tokenizer, so their comparisons stand. The default runs again with the 2.13
+code (early stopping with the cooldown of § 8):
+
+| text | 2.12 (tokenizer fitted on the whole text) | 2.13 |
+|---|---|---|
+| first 100 KB of tinyshakespeare | 2.195 in 46 s | 2.2075 in 55 s |
+| first 300 KB | 1.989 in 131 s | 1.975 in 134 s |
+
+## 11. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -448,7 +539,20 @@ python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 10
 python benchmarks/recipe_bench.py ending   --text tinyshakespeare.txt --ratios 0.1,0.2
 python benchmarks/recipe_bench.py budget   --text tinyshakespeare.txt --budget 150
 python benchmarks/recipe_bench.py concurrency
-``` The § 7 runs used `engine.train` with the parameters in the
+```
+
+The 2.13 tables (§ 6, § 8, § 10) are default runs with the 2.13 code:
+
+```bash
+python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --seeds 0,1,2 \
+    --variants recipe,recipe_no_cooldown,bpe2048
+python benchmarks/recipe_bench.py defaults --text tinystories_1mb.txt \
+    --variants recipe,bpe2048 --time-budget 600
+python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 300000 \
+    --variants recipe,bpe2048
+```
+
+The § 7 runs used `engine.train` with the parameters in the
 docs/engine.md § 9 setup and `continue_training=True` for the extension. Sections that need a 2.9 API print `n/a`. The quality runs
 used `engine.train` with the parameters in the tables above and
 `max_steps=1500`. The loss on the entire held-out split was then computed over

@@ -127,9 +127,23 @@ def test_default_run_stops_early_and_restores_the_best_epoch(monkeypatch):
     engine = AuraLiteEngine()
     losses = iter([3.0, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5])
     monkeypatch.setattr(engine, "_evaluate", lambda *a, **k: next(losses))
-    summary = engine.train(CORPUS, dict(BASE, epochs=7))
+    summary = engine.train(CORPUS, dict(BASE, epochs=7, early_stopping_cooldown=False))
     assert summary["stop_reason"] == "early_stopping"
     assert summary["epochs_completed"] == 5          # best at 2, then 3 without a gain
+    assert summary["restored_best"] is True and summary["best_epoch"] == 2
+    assert engine.last_val_loss == 2.0
+
+
+def test_default_run_decays_after_an_early_stop(monkeypatch):
+    # 2.13: the decay after an early stop is on by default; when it does not
+    # beat the best epoch, the best epoch's weights are still the result.
+    assert DEFAULT_RECIPE["early_stopping_cooldown"] is True
+    engine = AuraLiteEngine()
+    losses = iter([3.0, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7])
+    monkeypatch.setattr(engine, "_evaluate", lambda *a, **k: next(losses))
+    summary = engine.train(CORPUS, dict(BASE, epochs=9))
+    assert summary["stop_reason"] == "early_stopping"
+    assert summary["cooldown_steps"] > 0 and summary["epochs_completed"] > 5
     assert summary["restored_best"] is True and summary["best_epoch"] == 2
     assert engine.last_val_loss == 2.0
 
@@ -297,6 +311,19 @@ def test_finish_never_outlasts_the_planned_run():
     ctl = TrainControl(sched, start_time=clock(), clock=clock, max_run_steps=100)
     _drive(ctl, sched, clock, 95, 0.1)
     assert ctl.finish() == 5                      # 19 wanted, 5 left
+
+
+def test_early_stop_cooldown_lasts_at_most_two_epochs():
+    # 2.13: 0.2 x 1000 steps would be 200 steps = 10 epochs of 20 steps.
+    sched = WSDScheduler(_optimizer(), warmup_steps=10, max_steps=10_000)
+    clock = _Clock()
+    ctl = TrainControl(sched, start_time=clock(), clock=clock, steps_per_epoch=20)
+    _drive(ctl, sched, clock, 1000, 0.01)
+    assert ctl.finish("early_stopping") == TrainControl.EARLY_STOP_COOLDOWN_EPOCHS * 20 == 40
+    sched2 = WSDScheduler(_optimizer(), warmup_steps=10, max_steps=10_000)
+    ctl2 = TrainControl(sched2, start_time=clock(), clock=clock, steps_per_epoch=20)
+    _drive(ctl2, sched2, clock, 1000, 0.01)
+    assert ctl2.finish() == 200                   # a manual finish keeps 0.2 x the steps
 
 
 def test_zero_cooldown_finishes_at_once():

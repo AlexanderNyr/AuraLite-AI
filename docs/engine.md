@@ -1,9 +1,10 @@
 # Inside the native engine
 
 How a native AuraLite model (`.pt` / `.safetensors`) turns a prompt into
-text, what changed in 2.8, and how much of the history a generated token
-attends to (2.11, section 9). GGUF and Hugging Face models run in their own
-runtimes and are not covered here.
+text, what changed in 2.8, how much of the history a generated token
+attends to (2.11, section 9), and which thread does the work (2.13, section
+10). GGUF and Hugging Face models run in their own runtimes and are not
+covered here.
 
 Speed numbers on this page come from `python benchmarks/core_bench.py`, run
 on a 2-vCPU x86 machine with torch 2.14.1 on CPU (eager mode, batch 1). The
@@ -358,3 +359,62 @@ random held-out windows of 512 characters. Reproduce with
 `tests/test_long_context_v211.py` checks the window on a smaller model
 (positions past 4 windows within 10 % of the first window, and full context
 clearly worse). Longer training windows: docs/training.md § 7.
+
+## 10. Threads (2.13)
+
+PyTorch runs the parallel loops of its CPU kernels on an OpenMP thread team,
+and every Python thread that runs such a loop gets a team of its own. Once
+the teams together have more threads than there are CPUs, the GNU OpenMP
+runtime stops letting idle team threads spin and puts them to sleep after
+every loop, so each of the many small kernels of a decode step pays for
+waking them up. A model trained or loaded on the main thread and used from
+another thread (the API server's request threads, the GUI's generation
+thread, any thread pool) therefore decoded at a third of the main thread's
+speed in 2.12 (docs/faq.md § 8).
+
+2.13 keeps the process at one team:
+
+* **One compute thread.** Every generation forward pass (`generate`, streams,
+  chat, batches, speculative decoding, the server) and `attention_maps` run
+  on one long-lived daemon thread, `auralite-compute`, whichever thread calls
+  the engine (`auralite/engine/compute_thread.py`). The caller waits for the
+  result. Its inference mode and grad mode go along, exceptions come back
+  with their type and traceback, a call made on the compute thread itself
+  runs inline, and Ctrl+C lets the step in flight finish before it
+  interrupts (a call still waiting in the queue is dropped). Sampling (a few
+  small operations on one row of logits) stays on the calling thread. A
+  hand-off costs about 12 µs, against roughly 1.6 ms for a decode step of the
+  benchmark model.
+* **Teams are released.** `load_model`, `quantize_model` and `train()` free the
+  calling thread's team when they finish (`omp_pause_resource_all`, a no-op
+  when torch's OpenMP runtime is not found). `train()` stays on the thread
+  that calls it, and first frees the compute thread's team, so an idle team
+  does not slow training down.
+* **Locks are unchanged.** The compute thread never takes the engine's locks;
+  callers hold them while they wait, so the 2.12 rules (one decode step at a
+  time, every generation with its own KV cache) still hold.
+* `AURALITE_COMPUTE_THREAD=0` turns it off (2.12 behaviour). A process
+  forked from one that used the engine starts a compute thread of its own.
+
+Measured on the 2-vCPU VM with `python benchmarks/thread_bench.py`: a char
+model (`d_model` 128, 4 layers) trained on the main thread, greedy decoding of
+200 tokens per prompt, tokens per second (median of three runs, every case in
+a fresh process, 2.12 = `AURALITE_COMPUTE_THREAD=0`):
+
+| | 2.12 | 2.13 |
+|---|---|---|
+| main thread | 850 | 754 |
+| a worker thread, one request at a time | 290 | **824** |
+| 4 worker threads at once (total) | 296 | **764** |
+| `/v1/completions`, one request at a time | 298 | **696** |
+| `/v1/completions`, 4 at once (total) | 291 | **686** |
+| checkpoint loaded on the main thread (the GUI): main / worker thread | 756 / 305 | 826 / **789** |
+| training on a worker thread after that, optimizer steps/s (clean process) | 5.71 (7.45) | **8.37** (7.35) |
+
+Every output equalled the main thread's. Between fresh processes the same
+measurement varies by about ±10 % on this VM (compare the two main-thread
+rows), so the cost of the hand-off was measured interleaved in one process
+as well, switching `AURALITE_COMPUTE_THREAD` between 8 runs of 400 tokens: the
+main thread decoded 839 tokens/s inline and 802 through the compute thread
+(4 % less); a worker thread, four threads and `/v1/completions` reached 792,
+783 and 774, i.e. 0.94, 0.93 and 0.92 of the inline main thread.

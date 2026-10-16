@@ -14,15 +14,21 @@ measured on CPU with the default "Small" model (docs/training.md, section 8):
   (``"optimizer": "adamw"``) for the fastest steps.
 * **QK-norm** is worth 0.8 % for AdamW on Shakespeare (three seeds) and 4.6 %
   for Muon.
-* **BPE with 512 tokens.** 10 % fewer bits per byte than characters at equal
-  time on 1 MB corpora (2.121 vs 2.349 on Shakespeare, 1.315 vs 1.617 on
-  TinyStories).
+* **BPE with 512 tokens.** 8 % fewer bits per byte than characters at equal
+  time on all of tinyshakespeare (2.167 vs 2.349 after 150 s, with a
+  tokenizer that never saw the validation text). On that text 512 also ends
+  0.4 % better than 2,048 after a default run; on TinyStories 2,048 is 3 %
+  better (docs/training.md, section 6).
 * **Early stopping after 3 epochs without a better validation loss**, with the
   best epoch's weights restored. The GUI's 100-epoch default on a 100 KB text
   ended at 3.68 bits per byte after 239 s; with early stopping it ends at 2.20
   after 48 s.
 * **WSD, batch 32, dropout 0.1, AdamW lr 1e-3** (for the embeddings and the
   head next to Muon) as in 2.9.
+* **A learning-rate decay after an early stop** (2.13), over 0.2 x the steps
+  so far and at most two epochs: on all of tinyshakespeare it took the
+  result from 2.1319 / 2.1203 / 2.1097 to 2.0917 / 2.1036 / 2.0903 bits per
+  byte (seeds 0 / 1 / 2) for 11-15 % more steps.
 
 Model size and the number of epochs stay with each entry point (the GUI and
 `train()` plan 100 epochs, the CLI 10); early stopping ends a run that stopped
@@ -48,6 +54,7 @@ DEFAULT_RECIPE: Mapping[str, Any] = MappingProxyType({
     "grad_clip": 1.0,
     "val_split": 0.1,
     "early_stopping_patience": 3,
+    "early_stopping_cooldown": True,
     "cooldown_ratio": 0.2,
 })
 

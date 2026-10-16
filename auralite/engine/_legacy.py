@@ -100,7 +100,9 @@ from auralite.engine.layers import (  # noqa: E402,F401
 from auralite.engine.model import (  # noqa: E402,F401
     LoRALayer, ModernTransformer, estimate_n_params,
 )
-from auralite.engine.dataset import CharDataset, WindowBatches, spread_indices  # noqa: E402,F401
+from auralite.engine.dataset import (  # noqa: E402,F401
+    CharDataset, WindowBatches, spread_indices, validation_split_point,
+)
 from auralite.engine.context import ContextWindowMixin  # noqa: E402
 from auralite.engine.decode_slots import DecodeSlot, DecodeSlotsMixin  # noqa: E402
 from auralite.engine.inference_bench import InferenceBenchMixin  # noqa: E402
@@ -109,6 +111,7 @@ from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
 from auralite.engine.recipe import DEFAULT_RECIPE  # noqa: E402
 from auralite.engine.train_control import TrainControl  # noqa: E402
+from auralite.engine import compute_thread as _compute  # noqa: E402
 from auralite.engine.optimizers import (  # noqa: E402,F401
     Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
     split_parameters_for_muon,
@@ -1558,8 +1561,12 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
         return self.tokenizer.decode(ids)
 
     # ---- Inference speed (v2.6.5) --------------------------------------
+    @_compute.on_compute_thread
     def _infer(self, *args, **kwargs):
         """Forward pass used by every generation path.
+
+        2.13: runs on the engine's compute thread, whichever thread generates
+        (``auralite/engine/compute_thread.py``).
 
         When `enable_inference_compile()` was called, *prompt/batch* forwards
         (sequence length > 1, i.e. the compute-heavy prefill) run through the
@@ -1677,6 +1684,7 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
         }
 
     # ---- Diagnostics (GUI visualisations, v2.6.5) ----------------------
+    @_compute.on_compute_thread
     def attention_maps(self, text: str, layer: int = 0, head: int | None = None,
                        max_tokens: int = 256) -> "np.ndarray":
         """Attention probabilities of the *native* model for ``text``.
@@ -2033,8 +2041,8 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
                              needs a validation split)
           restore_best_weights: end with the weights of the best validation
                              epoch (default: on when early stopping is on)
-          early_stopping_cooldown: decay the learning rate before an early
-                             stop instead of stopping at once (default False)
+          early_stopping_cooldown: decay the learning rate for at most two
+                             epochs before an early stop (default True, 2.13)
           time_budget_s    : end the run after this many seconds, counted from
                              the start of train(), with the LR decay sized to
                              end at the deadline (default 0 = no budget)
@@ -2046,17 +2054,23 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
         best_val_loss, val_bpb, best_val_bpb (bits per UTF-8 byte, 2.11),
         best_epoch, restored_best, stop_reason (None | "max_steps" |
         "early_stopping" | "finished" | "time_budget" | "stopped"),
-        cooldown_steps, seconds.
+        cooldown_steps, tokenizer_fit_chars (2.13: characters the new BPE
+        was fitted on), train_tokens, val_tokens, seconds.
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
+        # 2.13: training stays on this thread; an idle OpenMP team of the
+        # compute thread would only slow it down (compute_thread.py).
+        _compute.release_compute_pool()
         try:
-            return self._train_impl(training_text, params, progress_callback, stop_event,
-                                    finish_event)
+            with _compute.run_inline():
+                return self._train_impl(training_text, params, progress_callback,
+                                        stop_event, finish_event)
         finally:
             # Success, Ctrl+C/stop_event and exceptions alike: never leave the
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
             self._release_corpus_tempfile()
+            _compute.release_caller_pool()
 
     def _release_corpus_tempfile(self) -> None:
         """Delete the temp-dir corpus memmap that `train()` created for this run.
@@ -2160,7 +2174,8 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
             "early_stopping_patience", recipe["early_stopping_patience"]) or 0))
         restore_best_weights = bool(params.get("restore_best_weights",
                                                early_stopping_patience > 0))
-        early_stopping_cooldown = bool(params.get("early_stopping_cooldown", False))
+        early_stopping_cooldown = bool(params.get("early_stopping_cooldown",
+                                                  recipe["early_stopping_cooldown"]))
         time_budget_s = max(0.0, float(params.get("time_budget_s", 0) or 0))
         cooldown_ratio = float(params.get("cooldown_ratio", recipe["cooldown_ratio"]))
         use_alibi    = params.get("use_alibi", False)
@@ -2286,6 +2301,12 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
         _setup_progress("Preparing: validating parameters…", 0.02)
 
         # ---- Tokenizer ------------------------------------------------
+        # 2.13: a new BPE never sees the validation text. Fitted on all of it,
+        # it learned merges for words found only in the held-out tail, and the
+        # validation loss came out up to 9 % too low (docs/training.md § 10).
+        fit_chars = len(training_text)
+        if not resuming and tok_kind == "bpe" and val_split > 0:
+            fit_chars = validation_split_point(training_text, val_split)
         if not resuming:
             if tok_kind == "bpe":
                 _setup_progress(
@@ -2297,7 +2318,8 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
                 self.tokenizer = BPETokenizer(
                     pretokenizer=str(params.get("bpe_pretokenizer", "gpt")))
                 # IMPROVED: stratified sampling instead of prefix
-                self.tokenizer.train(training_text, vocab_size=bpe_vocab)
+                self.tokenizer.train(training_text[:fit_chars], vocab_size=bpe_vocab,
+                                     extra_chars=training_text[fit_chars:])
             else:
                 _setup_progress("Training char tokenizer…", 0.08)
                 self.tokenizer = CharTokenizer()
@@ -2487,14 +2509,25 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
                     f"auralite_corpus_{uuid4().hex}.uint32.bin")
                 # Unique name, so never reusable: train() deletes it when it returns.
                 self._corpus_tmp_file = str(corpus_file)
-            total_tokens = write_tokens_memmap(
-                corpus_file, self._iter_token_chunks(training_text), dtype="uint32")
+            fit_count = [0]
+
+            def _chunks():
+                for ids in self._iter_token_chunks(training_text[:fit_chars]):
+                    fit_count[0] += len(ids)
+                    yield ids
+                yield from self._iter_token_chunks(training_text[fit_chars:])
+            total_tokens = write_tokens_memmap(corpus_file, _chunks(), dtype="uint32")
+            fit_tokens = fit_count[0]
             size_mib = corpus_file.stat().st_size / (1024 * 1024)
             logger.info(f"[AuraLite] Tokenized corpus once into {total_tokens:,} tokens "
                         f"({size_mib:.2f} MiB uint32 memmap: {corpus_file}).")
             self._corpus_cache_path = str(corpus_file)
         else:
-            encoded = torch.tensor(self.encode(training_text), dtype=torch.long)
+            ids = list(self.encode(training_text[:fit_chars]))
+            fit_tokens = len(ids)
+            if fit_chars < len(training_text):
+                ids += list(self.encode(training_text[fit_chars:]))
+            encoded = torch.tensor(ids, dtype=torch.long)
             encoded_bytes = encoded.numel() * encoded.element_size()
             logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
                         f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
@@ -2533,6 +2566,9 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
                 # Ensure train still has min_train_tokens left.
                 max_val_tokens = total_tokens - min_train_tokens
                 val_tokens = min(val_tokens, max_val_tokens)
+                # 2.13: validate on exactly the text the tokenizer did not see.
+                if min_train_tokens <= fit_tokens <= total_tokens - min_val_tokens:
+                    val_tokens = total_tokens - fit_tokens
 
                 split_at   = total_tokens - val_tokens
                 n_train_tokens = split_at
@@ -3033,6 +3069,9 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
             "stop_reason": stop_reason,
             "cooldown_steps": (ctl.run_steps - ctl.finish_started_at
                                if ctl.finish_started_at is not None else 0),
+            "tokenizer_fit_chars": fit_chars,
+            "train_tokens": n_train_tokens,
+            "val_tokens": total_tokens - split_at,
             "seconds": elapsed,
         }
         return dict(self.last_train_summary)
@@ -3999,6 +4038,7 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
                 except Exception as e:
                     logger.warning("CPU INT8 load-time quantization failed, "
                                    "keeping fp32 model: %s", e)
+        _compute.release_caller_pool()        # 2.13: generation uses the compute thread
 
     # ---- Quantization Integration (NEW v2.2) ---------------------------
     def quantize_model(self, method: str = "dynamic", bits: str = "int8",
@@ -4051,7 +4091,7 @@ class AuraLiteEngine(ContextWindowMixin, InferenceBenchMixin, DecodeSlotsMixin):
             logger.info(f"[AuraLite] Quantization complete: {result.method} {result.bits} "
                         f"({result.original_size_mb:.2f} → {result.quantized_size_mb:.2f} MB, "
                         f"{result.compression_ratio:.2f}×)")
-
+        _compute.release_caller_pool()        # 2.13: generation uses the compute thread
         return q_model, result
 
     def benchmark_quantization(self, original_model, quantized_model,

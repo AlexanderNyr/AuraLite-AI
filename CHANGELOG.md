@@ -1,3 +1,113 @@
+# 📦 v2.13.0 — honest validation, generation at full speed on every thread, early stopping that ends with a decay
+
+Three things in this release. Validation: a new BPE tokenizer no longer sees
+the text it is validated on, so the numbers stop flattering large
+vocabularies. Speed: every generation forward pass runs on one compute
+thread, so the server, the GUI and thread pools decode as fast as a script on
+the main thread. Training: an early stop now ends with a short learning-rate
+decay. Tables and setups: [docs/training.md § 6, 8 and 10](docs/training.md#10-honest-validation-213)
+and [docs/engine.md § 10](docs/engine.md#10-threads-213).
+
+**Defaults that changed**
+
+| setting | 2.13 | 2.12 |
+|---|---|---|
+| a new BPE tokenizer is fitted on | the training part only | the whole text, validation part included |
+| validation split (BPE) | the text after the cut at the last `val_split` of the characters (moved to the next line break), encoded on its own | the last `val_split` of the tokens |
+| `early_stopping_cooldown` | **on**: 0.2 × the steps so far, at most 2 epochs | off |
+| where generation runs | one compute thread for the whole process | the calling thread |
+
+Validation bits per byte of BPE runs are therefore not comparable with 2.12:
+with BPE 512 they moved by up to ±1 %, with larger vocabularies they rise by
+up to 9 %. Char models, `continue_training` and runs without validation are
+unchanged. `"early_stopping_cooldown": False` gives back a 2.12 early stop,
+`AURALITE_COMPUTE_THREAD=0` 2.12 threading. The default vocabulary stays at
+512 (see below for why 2,048 did not become the default).
+
+**Honest validation** (`auralite/engine/dataset.py`, docs/training.md § 10)
+
+- 2.12 fitted a new BPE tokenizer on the whole text, so it learned merges for
+  words that occur only in the held-out 10 % and encoded that part in fewer,
+  longer tokens than any new text (on the last 10 % of tinyshakespeare +10.6 %
+  characters per token at 2,048 tokens, +13.9 % at 4,096; 68 % of its speaker
+  lines belong to names that never occur before it). Bits per byte came out
+  up to 9 % too low, the more the larger the vocabulary: 2.1295 instead of
+  2.3244 for BPE 4,096 on 100 KB.
+- `validation_split_point(text, val_split)` puts the cut at the last
+  `val_split` of the characters, moved to the next line break. The tokenizer
+  is fitted on the text before it; the text after it is the validation split,
+  encoded on its own (RAM and memory-mapped corpora alike). Its characters
+  still join the alphabet (`BPETokenizer.train(..., extra_chars=...)`), so
+  nothing becomes unknown, but no merge comes from it. A held-out part shorter
+  than one window falls back to the 2.12 split.
+- The summary reports `tokenizer_fit_chars`, `train_tokens` and `val_tokens`.
+- The 2.11 tokenizer study is redone (docs/training.md § 6). It had found
+  BPE 2,048–4,096 4–6 % better than 512 on a megabyte. Honestly measured, the
+  default runs on tinyshakespeare end at **2.0966** with 512 and 2.1047 with
+  2,048 (mean of three seeds, 512 better in each; 2,048 takes 43 % less time),
+  while on TinyStories 2,048 is 3 % better (1.2205 vs 1.2577) and on 6 MB of
+  TinyStories 4,096 beats 2,048 by 1 %. A rule by text length cannot tell the
+  two apart, so `bpe_vocab_size` stays at 512 and the docs say when to raise
+  it.
+- The 100 KB and 300 KB default runs, measured again: 2.2075 and 1.9750 (2.12
+  reported 2.195 and 1.989).
+
+**Early stopping ends with a decay** (`auralite/engine/train_control.py`)
+
+- `early_stopping_cooldown` is on by default. When the validation loss has not
+  improved for `early_stopping_patience` epochs, the learning rate decays over
+  0.2 × the steps taken, now capped at two epochs, and the best epoch is
+  still restored. On tinyshakespeare (BPE 512, three seeds) the result went
+  from 2.1319 / 2.1203 / 2.1097 to **2.0917 / 2.1036 / 2.0903** (1.2 % on
+  average) for 11–15 % more steps. The validation loss had stalled at the
+  peak learning rate, not memorised. A three-epoch cap was 0.07 % worse on
+  average for 17–20 % more steps; with it, TinyStories (BPE 2,048) went from
+  1.2260 to 1.2205, and on 100 KB and 300 KB the restored epoch was the same
+  or 0.05 % better.
+
+**Generation runs on one compute thread** (`auralite/engine/compute_thread.py`, docs/engine.md § 10)
+
+- PyTorch gives every Python thread that runs its parallel kernels an OpenMP
+  team of its own. With more team threads than CPUs, GNU OpenMP puts idle
+  threads to sleep after every kernel, so a model trained or loaded on the
+  main thread decoded on any other thread at a third of the speed (2.12, 2
+  vCPU: 242 vs 618 tokens/s); four concurrent requests were no faster.
+- All generation forward passes (`generate`, streams, chat, batches,
+  speculative decoding, the server) and `attention_maps` now run on one daemon
+  thread, `auralite-compute`. Callers wait for the result: inference and grad
+  mode go along, exceptions keep their type and traceback, calls from the
+  compute thread run inline, Ctrl+C lets the step in flight finish (and drops
+  a call that has not started), a forked child starts its own thread. The
+  thread takes no engine lock, so the 2.12 concurrency rules are unchanged.
+- `load_model`, `quantize_model` and `train()` release the calling thread's
+  OpenMP team when they finish (`omp_pause_resource_all`; a no-op if torch's
+  runtime is not found), and `train()` first releases the compute thread's.
+  Training itself stays on the calling thread.
+- Measured on 2 vCPU (`benchmarks/thread_bench.py`): a worker thread decodes at
+  **824** tokens/s instead of 290, four concurrent threads at 764 instead of
+  296 in total, `/v1/completions` at 696 instead of 298. After a checkpoint is
+  loaded on the main thread (the GUI), a worker thread generates at 789
+  instead of 305 tokens/s and trains at 8.4 instead of 5.7 steps/s.
+  Interleaved in one process, the main thread loses 4 % (802 vs 839 tokens/s)
+  and a worker, four threads and the server reach 0.94, 0.93 and 0.92 of the
+  2.12 main thread. Every output is identical.
+- `AURALITE_COMPUTE_THREAD=0` restores 2.12 behaviour.
+- `benchmarks/thread_bench.py` measures every case with the compute thread on
+  and off, each in a fresh process.
+
+**Other**
+
+- `benchmarks/recipe_bench.py defaults` gained the variants
+  `recipe_no_cooldown`, `bpe2048` and `bpe4096` and `--time-budget`; it
+  reproduces the 2.13 tables.
+- `AuraLiteLM` (lm-eval) scores on the compute thread too.
+- Tests: `tests/test_training_v213.py` (the tokenizer never learns from the
+  validation text, the split on both corpus paths, the cooldown default and its
+  cap), `tests/test_compute_thread_v213.py` (same outputs greedy and seeded,
+  exceptions, grad modes, re-entrancy, Ctrl+C, fork, opt-out, training stays
+  on its thread). 1,501 passed / 17 skipped on Python 3.13 and 3.11 in
+  `.[test]`-only environments (2.12: 1,470); pyright errors unchanged (251).
+
 # 📦 v2.12.0 — training that ends well: one recipe, early stopping by default, Stop with a cooldown, time limits; correct concurrent generation
 
 Two things in this release. Training: the GUI, `train()` and the CLI now share

@@ -9,6 +9,27 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+def validation_split_point(text: str, val_split: float, search: int = 2000) -> int:
+    """Index of the first validation character: the last `val_split` of `text` (2.13).
+
+    The cut moves forward to just after the next line break (or space) within
+    `search` characters, so no word is cut in two. ``len(text)`` means there
+    is nothing to hold out. `train()` fits a BPE tokenizer on the text before
+    this point only: fitted on the whole text, it learned merges for words that
+    occur only in the held-out tail, and the validation loss came out too low
+    (docs/training.md, section 10).
+    """
+    n = len(text)
+    if n == 0 or not 0.0 < float(val_split) < 1.0:
+        return n
+    cut = int(n * (1.0 - float(val_split)))
+    for sep in ("\n", " "):
+        found = text.find(sep, cut, min(n, cut + int(search)))
+        if found != -1:
+            return found + 1
+    return cut
+
+
 def _window_count(span: int, stride: int) -> int:
     """Windows per pass for `span` stride-1 windows and the given stride.
 
@@ -303,4 +324,4 @@ class _Subset:
 
 
 __all__ = ["CharDataset", "PagedDataset", "WindowBatches", "spread_indices",
-           "write_tokens_memmap"]
+           "validation_split_point", "write_tokens_memmap"]
