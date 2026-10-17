@@ -9,13 +9,14 @@
 """
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from auralite.engine import AuraLiteEngine  # noqa: E402
-from auralite.engine import _legacy  # noqa: E402
 from auralite.engine.dataset import validation_split_point  # noqa: E402
 from auralite.engine.recipe import DEFAULT_RECIPE  # noqa: E402
 
@@ -56,13 +57,16 @@ class _Recorder:
 
     def __init__(self, monkeypatch):
         self.data: list = []
-        original = _legacy.CharDataset
+        # Wherever the training loop lives (2.14: auralite/engine/trainer.py).
+        module = inspect.getmodule(AuraLiteEngine._train_impl)
+        assert module is not None
+        original = module.CharDataset
 
         def recording(data, *args, **kwargs):
             self.data.append(data.clone())
             return original(data, *args, **kwargs)
 
-        monkeypatch.setattr(_legacy, "CharDataset", recording)
+        monkeypatch.setattr(module, "CharDataset", recording)
 
 
 def _bpe_params(**extra):

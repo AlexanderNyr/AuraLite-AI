@@ -64,6 +64,20 @@ Notes that save time later:
   stdout, `--quiet` silences them, `AURALITE_LOG_LEVEL=WARNING` keeps them out
   of scripts.
 
+### Train on several computers (2.14)
+
+```bash
+auralite cluster-worker 192.168.1.10                     # on each helper computer
+auralite train --text corpus.txt --cluster-workers 2      # on 192.168.1.10
+```
+
+The helpers get the text and the settings from the main computer, and every
+optimizer step is split between all of them; the result is the model one
+computer would train (Windows and Linux can be mixed; same AuraLite and torch
+versions; allow Python through the firewall on private networks). The GUI
+has the same in the training tab's *Cluster* row. Details:
+[training.md](training.md) § 12.
+
 ## 3. Generate
 
 ```bash
@@ -93,12 +107,28 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 Supported: `/v1/chat/completions`, `/v1/completions` (SSE streaming included),
 `stop`, `seed`, `top_k`, `repetition_penalty`, `stream_options.include_usage`,
-`/v1/models`, `/health`, `/metrics` (Prometheus). Rate limiting returns `429` with
-`Retry-After`; when all generation slots are busy requests **queue** for
-`AURALITE_QUEUE_TIMEOUT` seconds (default 10) before answering `503` — a burst of
-clients gets answers, not a `503` storm. Relevant env vars:
-`AURALITE_MAX_CONCURRENT` (default 4), `AURALITE_CORS_ORIGINS`,
-`AURALITE_MAX_BODY_MB` (default 16).
+`n` (up to 16 choices) and `logprobs` / `top_logprobs` (up to 20, native models;
+2.14), `/v1/models`, `/health`, `/metrics` (Prometheus). Rate limiting returns
+`429` with `Retry-After`; when all generation slots are busy requests **queue**
+for `AURALITE_QUEUE_TIMEOUT` seconds (default 10) before answering `503` — a
+burst of clients gets answers, not a `503` storm. Concurrent requests (and the
+`n` choices of one request) decode together, one forward pass per token for
+all of them (2.14, [engine.md](engine.md) § 11). Relevant env vars:
+`AURALITE_MAX_CONCURRENT` (default 4), `AURALITE_MAX_BATCH` (default 4),
+`AURALITE_CORS_ORIGINS`, `AURALITE_MAX_BODY_MB` (default 16).
+
+```bash
+# three choices with the log-probabilities of the two likeliest tokens at each step
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Authorization: Bearer sk-local' -H 'Content-Type: application/json' \
+  -d '{"model":"auralite","messages":[{"role":"user","content":"hi"}],
+       "n":3,"logprobs":true,"top_logprobs":2,"max_tokens":20}'
+```
+
+Log-probabilities are those of the model's own distribution (the raw
+logits), whatever the temperature or top-k/top-p, as vLLM reports them by
+default. A request with a `seed` decodes its choices one after another, so the
+result is reproducible.
 
 A GGUF model can be served without loading it twice: run `llama-server` yourself
 and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or

@@ -168,31 +168,34 @@ on the engine wrote into it, so concurrent requests corrupted each other: four
 threads sending four greedy prompts got 20 of 20 texts that differed from the
 same prompts sent one at a time, through `/v1/completions` as well as through
 the engine. The GUI's generation and chat tabs could collide the same way. Each
-generation now owns its KV cache, and the engine runs one decode step at a time
-under a lock, so concurrent requests interleave token by token and return
-exactly what they return alone (`tests/test_concurrency_v212.py`). A GGUF model
+generation now owns its KV cache (since 2.14 a row of the decode batch), so
+concurrent requests never read each other's keys and values and return what
+they return alone (`tests/test_concurrency_v212.py`,
+`tests/test_batching_v214.py`; see the batching note below). A GGUF model
 serves one generation at a time and the others wait for it.
 
-**Concurrency is not parallelism.** The decode steps of concurrent requests
-take turns on the model, so four requests take as long in total as four
-requests in a row, plus some switching. Since 2.13 they also run at full
-speed: four concurrent requests decoded 764 tokens/s in total on 2 vCPU
-(2.12: 296), because every decode step runs on the one compute thread
-(§ 8). If you need throughput, batch your
-prompts: `generate_batch` runs equal-length prompts as one batch (the *Small*
-model decoded 998 tokens/s alone, 3,073 at 4 prompts and 7,962 at 16) and runs
-identical prompts once. Or run several gguf/`llama-server` backends and put a
-proxy in front.
+**Since 2.14 concurrent requests also share the work.** The decode steps of
+generations running at the same time run as one forward pass on the compute
+thread (docs/engine.md § 11): on 2 vCPU four concurrent streams decoded
+2,125-2,433 tokens/s in total, 2.4-2.8 times one stream (2.13: 748-786, the
+same as one), and a new request's first token came after 3.5-4.2 ms instead
+of 123-272 ms. `AURALITE_MAX_BATCH` (default 4) sets how many generations
+share a pass; `AURALITE_MAX_BATCH=1` gives back 2.13's turn-taking.
+`generate_batch` decodes all its prompts as one batch, whatever their
+lengths, and runs identical prompts once.
 
-**Why not merge independent HTTP requests into one batch?** Because it would
-change results, not just timing. Requests carry different sampling parameters
-(temperature/top_k/stop/penalties) and all but one would have to be re-sampled
-to match the batch's settings; streaming clients would have to wait for the
-slowest prompt in the window; and prompts of different lengths would need
-padding, which the batch path avoids by grouping equal lengths. Interleaving
-keeps every request's own settings and latency; `generate_batch` is the honest
-way to get batching, one caller at a time. If you measure a real workload where
-a merge would pay off, that is the place to start.
+**Does batching change results?** Each request keeps its own sampling
+settings (temperature, top-k/top-p/min-p, penalties, stop sequences), its own
+positions (no padding) and its own pace: a slow streaming client is waited
+for once (at most 2 ms) and then decodes on its own until it catches up. A
+request decoding alone computes exactly what 2.13 computed. With several
+requests in one pass the sums run over a masked key range and over several
+rows, so logits can differ in the last bits; greedy output did not change in
+the tests and the race probe, but a near-tie can flip. A `seed` makes a
+request reproducible when it runs alone; concurrent requests draw from the
+same process random generator, as before. For more throughput than one
+process gives, run several gguf/`llama-server` backends and put a proxy in
+front.
 
 ## 10. GGUF: in-process or `llama-server`?
 
@@ -219,3 +222,17 @@ Corpus memmaps live elsewhere: with only `--mmap` the file goes to the system
 temp directory and is deleted as soon as training ends (success, Ctrl+C or
 error); with `--corpus-cache PATH` it is written to `PATH` and kept (rewritten on
 the next run — there is no cross-run reuse yet).
+
+## 12. Can several computers train one model together?
+
+Yes, since 2.14, over a local network: `auralite cluster-worker MAIN_ADDRESS`
+on the helpers and `auralite train ... --cluster-workers N` on the computer
+with the text (or the training tab's *Cluster* row in the GUI). Windows and
+Linux computers can be mixed. Every optimizer step is split between the
+computers and the gradients are averaged, so the model is the one a single
+computer would train, in less time when the network keeps up: wired Gigabit
+Ethernet moves the 3.2 MB of gradients of the *Small* model in about 30 ms,
+Wi-Fi takes ten times longer. All computers need the same AuraLite and torch
+versions and must let Python through the firewall on private networks.
+Generation on several computers is not part of 2.14. See
+[training.md](training.md) § 12.

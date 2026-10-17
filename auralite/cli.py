@@ -228,6 +228,16 @@ def cmd_train(args: argparse.Namespace) -> int:
         params["continue_training"] = True
     if getattr(args, "time_budget", None):
         params["time_budget_s"] = float(args.time_budget)
+    if getattr(args, "cluster_workers", None):
+        # 2.14: train together with other computers (auralite cluster-worker).
+        params["cluster_workers"] = int(args.cluster_workers)
+        params["cluster_port"] = int(args.cluster_port)
+        if args.cluster_host:
+            params["cluster_host"] = args.cluster_host
+        if args.cluster_token:
+            params["cluster_token"] = args.cluster_token
+        if args.cluster_timeout:
+            params["cluster_timeout_s"] = float(args.cluster_timeout)
     finish_event, stop_event = threading.Event(), threading.Event()
     previous = _graceful_sigint(finish_event, stop_event)
     try:
@@ -252,6 +262,28 @@ def cmd_train(args: argparse.Namespace) -> int:
                          "stopped": "stopped",
                          "max_steps": "max_steps reached"}.get(reason, reason)
     print(line)
+    return 0
+
+
+def cmd_cluster_worker(args: argparse.Namespace) -> int:
+    """Join the training runs of another computer (2.14, auralite/engine/cluster.py)."""
+    from auralite.engine.cluster import ClusterError, run_worker
+
+    def status(message: str) -> None:
+        print(f"[cluster] {message}", flush=True)
+
+    stop = threading.Event()
+    try:
+        served = run_worker(args.main, once=args.once, timeout_s=float(args.timeout),
+                            token=args.token, on_status=status, stop_event=stop)
+    except KeyboardInterrupt:
+        stop.set()
+        print("[cluster] stopped", flush=True)
+        return 130
+    except (ClusterError, ValueError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    print(f"[cluster] served {served} run(s)", flush=True)
     return 0
 
 
@@ -662,7 +694,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--time-budget", type=_parse_duration, metavar="DURATION",
                    help="end training after this long (90, 90s, 10m, 1.5h), counted from "
                         "the start; the learning-rate decay is sized to end on time")
+    p.add_argument("--cluster-workers", type=int, metavar="N",
+                   help="train together with N other computers on the local network: "
+                        "wait for them, then split every step between all of them "
+                        "(they run: auralite cluster-worker THIS_COMPUTER)")
+    p.add_argument("--cluster-port", type=int, default=29500, metavar="PORT",
+                   help="port the workers connect to (default 29500)")
+    p.add_argument("--cluster-host", metavar="ADDRESS",
+                   help="address to listen on (default: every interface)")
+    p.add_argument("--cluster-token", metavar="TEXT",
+                   help="workers must give the same token (keeps runs on one network apart)")
+    p.add_argument("--cluster-timeout", type=_parse_duration, metavar="DURATION",
+                   help="how long to wait for the workers (default 10m)")
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("cluster-worker",
+                       help="help another computer train: join its runs over the network")
+    p.add_argument("main", help="the main computer: HOST or HOST:PORT (default port 29500)")
+    p.add_argument("--once", action="store_true", help="exit after one run")
+    p.add_argument("--token", help="the main computer's --cluster-token")
+    p.add_argument("--timeout", type=_parse_duration, default=600.0, metavar="DURATION",
+                   help="network timeout of a run (default 10m)")
+    p.set_defaults(func=cmd_cluster_worker)
 
     p = sub.add_parser("generate", help="generate text from a checkpoint")
     _add_common_flags(p, suppress_defaults=True)

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.13.0"
+version = "2.14.0"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -120,6 +120,9 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--tb=line"
+# 2.14: a test that runs for 10 minutes dumps the stack of every thread (the
+# 2.13 Windows leg hung without a trace; the CI job also has a time limit).
+faulthandler_timeout = 600
 markers = [
     "integration: requires optional dependencies (onnx, transformers, lm_eval, llama-cpp-python)",
 ]

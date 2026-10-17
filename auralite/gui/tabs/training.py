@@ -3,7 +3,7 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
-from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, estimate_n_params, filedialog, messagebox, os, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
+from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, estimate_n_params, filedialog, messagebox, os, parse_dropout, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
 
 R = DEFAULT_RECIPE      # 2.12: one recipe for the GUI, the CLI and train()
 
@@ -156,6 +156,32 @@ class TrainTabMixin:
         self.ddp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row1b, text="Multi-GPU (DDP)",
                         variable=self.ddp_var).pack(side=tk.LEFT, padx=12)
+
+        # 2.14: training on several computers of the local network
+        # (auralite/engine/cluster.py). This computer either waits for N
+        # workers when training starts, or joins another computer's runs.
+        row_cluster = ttk.Frame(tok_frame)
+        row_cluster.pack(fill=tk.X, pady=2)
+        ttk.Label(row_cluster, text="Cluster workers:").pack(side=tk.LEFT, padx=4)
+        self.cluster_workers_var = tk.StringVar(value="0")
+        ttk.Entry(row_cluster, textvariable=self.cluster_workers_var,
+                  width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row_cluster, text="Port:").pack(side=tk.LEFT, padx=(8, 4))
+        self.cluster_port_var = tk.StringVar(value="29500")
+        ttk.Entry(row_cluster, textvariable=self.cluster_port_var,
+                  width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row_cluster, text=f"(this computer: {cluster_lan_address()}; 0=off)",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
+        ttk.Label(row_cluster, text="Join as worker:").pack(side=tk.LEFT, padx=(16, 4))
+        self.cluster_join_var = tk.StringVar(value="")
+        ttk.Entry(row_cluster, textvariable=self.cluster_join_var,
+                  width=18).pack(side=tk.LEFT, padx=2)
+        self.cluster_join_btn = ttk.Button(row_cluster, text="Join",
+                                           command=self.toggle_cluster_worker)
+        self.cluster_join_btn.pack(side=tk.LEFT, padx=4)
+        self.cluster_status_label = ttk.Label(row_cluster, text="", style="Sub.TLabel")
+        self.cluster_status_label.pack(side=tk.LEFT, padx=4)
+        self._cluster_worker_stop = None
 
         # NEW: RoPE Scaling (v2.4)
         rope_row = ttk.Frame(tok_frame)
@@ -426,6 +452,48 @@ class TrainTabMixin:
             self.status_label.config(text="Status: Ready to train")
 
 
+    # ---- cluster (2.14) ----------------------------------------------
+    def _cluster_train_params(self) -> dict:
+        """`cluster_workers` / `cluster_port` when this computer leads a cluster."""
+        workers = int(str(self.cluster_workers_var.get() or 0).strip() or 0)
+        if workers <= 0:
+            return {}
+        return {"cluster_workers": workers,
+                "cluster_port": int(str(self.cluster_port_var.get() or 29500).strip())}
+
+    def toggle_cluster_worker(self):
+        """Join another computer's training runs, or leave them."""
+        if self._cluster_worker_stop is not None:
+            self._cluster_worker_stop.set()
+            self.cluster_join_btn.config(text="Join")
+            self.cluster_status_label.config(text="Leaving after this step…")
+            return
+        address = str(self.cluster_join_var.get() or "").strip()
+        if not address:
+            messagebox.showerror("Cluster", "Enter the address of the main computer "
+                                            "(for example 192.168.1.10 or 192.168.1.10:29500).")
+            return
+        stop = threading.Event()
+        self._cluster_worker_stop = stop
+        self.cluster_join_btn.config(text="Leave")
+
+        def status(message: str) -> None:
+            self.root.after(0, lambda m=message: self.cluster_status_label.config(text=m))
+            print(f"[cluster] {message}")
+
+        def run():
+            try:
+                run_cluster_worker(address, on_status=status, stop_event=stop)
+            except Exception as err:   # noqa: BLE001 - shown to the user
+                status(f"Cluster error: {err}")
+            finally:
+                def done():
+                    self._cluster_worker_stop = None
+                    self.cluster_join_btn.config(text="Join")
+                self.root.after(0, done)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def update_progress(self, current, total, loss, val_loss=None, info=None):
         """Called from the training thread — marshal the actual UI update
         onto the Tk main loop via root.after (tkinter is not thread-safe).
@@ -440,7 +508,8 @@ class TrainTabMixin:
         info = dict(info)
         phase = str(info.get("phase") or "")
         is_epoch_end = bool(info.get("is_epoch_end")) or phase == "epoch_end"
-        important = is_epoch_end or phase in ("setup", "val", "stopped") or current <= 0
+        important = (is_epoch_end or phase in ("setup", "val", "stopped", "cluster")
+                     or current <= 0)
         now = time.time()
         # Always schedule important events; throttle the rest (~8 UI fps).
         if (not important) and (now - getattr(self, "_progress_ui_last_ts", 0.0) < 0.12):
@@ -565,7 +634,7 @@ class TrainTabMixin:
         except (TypeError, ValueError):
             pass
 
-        if current <= 0 and phase == "setup":
+        if current <= 0 and phase in ("setup", "cluster"):
             head = info.get("message") or "Preparing…"
             self.status_label.config(
                 text=f"Status: {head}  |  Elapsed: {_fmt_duration(elapsed)}"
@@ -653,7 +722,7 @@ class TrainTabMixin:
                 "n_layers":    int(self.params["n_layers"].get()),
                 "seq_length":  int(self.params["seq_length"].get()),
                 "batch_size":  int(self.params["batch_size"].get()),
-                "dropout":     float(self.params["dropout"].get()),
+                "dropout":     parse_dropout(self.params["dropout"].get()),
                 "grad_clip":   float(self.params["grad_clip"].get()),
                 "tokenizer":       self.tok_var.get(),
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
@@ -677,6 +746,8 @@ class TrainTabMixin:
                 } if self.rope_type_var.get() != "none" else None,
                 # NEW: Multi-GPU (DDP) — v2.3
                 "use_ddp": bool(self.ddp_var.get()),
+                # 2.14: other computers that train with this one
+                **self._cluster_train_params(),
                 # NEW: modern training stack — v2.6
                 "use_qk_norm": bool(self.qk_norm_var.get()),
                 "optimizer": self.opt_var.get(),

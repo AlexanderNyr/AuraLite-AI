@@ -26,6 +26,13 @@ Environment:
     AURALITE_CONTEXT_WINDOW tokens a generated token attends to: auto (default,
                             the trained length), full (the 2.10 behaviour) or
                             a number — see AuraLiteEngine.set_context_window
+    AURALITE_MAX_BATCH      generations that decode together in one forward
+                            pass (default 4; 1 = one at a time, as in 2.13)
+
+2.14: `n` (up to 16 choices) and `logprobs` / `top_logprobs` (up to 20, native
+models) on /v1/completions and /v1/chat/completions, streaming included. The
+choices of one request decode together (batched decoding) unless a `seed` asks
+for reproducible output; then they run one after another.
 
 NOTE: run with a single uvicorn worker (the default). Generation state and the
 rate limiter are per-process; multiple workers would load N model copies and
@@ -36,6 +43,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import queue
 import threading
 import time
 import uuid
@@ -52,6 +60,7 @@ except Exception as e:  # pragma: no cover - optional dependency
     raise ImportError("Install serving dependencies: pip install fastapi uvicorn pydantic") from e
 
 from auralite.engine import AuraLiteEngine
+from auralite.engine.sampling import token_logprobs
 from auralite.engine.utils import sanitize_prompt
 
 try:  # backend adapter (Torch / GGUF / HF) used for routing and /health
@@ -285,6 +294,7 @@ class CompletionRequest(_SamplingOptions):
     stream: bool = False
     # Declared so that requests asking for them get an honest 400 instead of
     # being silently ignored (see `_unsupported`); the defaults are accepted.
+    # 2.14: n (1..MAX_CHOICES) and logprobs (0..MAX_LOGPROBS) are served.
     n: int = 1
     best_of: int | None = None
     logprobs: int | None = None
@@ -334,6 +344,11 @@ class OllamaChatRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
 
 
+#: Most choices (`n`) and alternatives per token (`logprobs`) one request may ask for.
+MAX_CHOICES = 16
+MAX_LOGPROBS = 20
+
+
 def _unsupported(req: BaseModel) -> list[tuple[str, str]]:
     """(param, reason) for every requested feature this server cannot honour.
 
@@ -346,14 +361,21 @@ def _unsupported(req: BaseModel) -> list[tuple[str, str]]:
     problems: list[tuple[str, str]] = []
     get = lambda name: getattr(req, name, None)  # noqa: E731 - tiny local accessor
 
-    if (get("n") or 1) != 1:
-        problems.append(("n", "only n=1 is supported"))
+    n = get("n")
+    if n is not None and not 1 <= int(n) <= MAX_CHOICES:
+        problems.append(("n", f"n must be between 1 and {MAX_CHOICES}"))
     if (get("best_of") or 1) != 1:
         problems.append(("best_of", "only best_of=1 is supported"))
-    if get("logprobs") not in (None, False, 0):
-        problems.append(("logprobs", "log-probabilities are not returned by this server"))
-    if get("top_logprobs"):
-        problems.append(("top_logprobs", "log-probabilities are not returned by this server"))
+    logprobs = get("logprobs")
+    if isinstance(logprobs, bool) or logprobs is None:      # chat: true / false
+        top = get("top_logprobs")
+        if top is not None and not 0 <= int(top) <= MAX_LOGPROBS:
+            problems.append(("top_logprobs",
+                             f"top_logprobs must be between 0 and {MAX_LOGPROBS}"))
+        elif top and not logprobs:
+            problems.append(("top_logprobs", "top_logprobs requires logprobs=true"))
+    elif not 0 <= int(logprobs) <= MAX_LOGPROBS:            # completions: a count
+        problems.append(("logprobs", f"logprobs must be between 0 and {MAX_LOGPROBS}"))
     if get("echo"):
         problems.append(("echo", "echo is not supported"))
     if get("suffix"):
@@ -669,6 +691,182 @@ def list_models() -> dict[str, Any]:
     ]}
 
 
+# ---------------------------------------------------------------------------
+# Several choices (`n`) and log-probabilities (2.14)
+# ---------------------------------------------------------------------------
+def _native_engine(engine: Any) -> bool:
+    """Is a native AuraLite model loaded (per-token logits, batched decoding)?"""
+    native = getattr(engine, "_native_model", None)
+    if not callable(native):
+        return False
+    try:
+        return native() is not None
+    except Exception:
+        return False
+
+
+def _require_logprobs_support(engine: Any, param: str) -> None:
+    if not _native_engine(engine):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"Unsupported parameter '{param}': log-probabilities are only "
+                       "returned for native AuraLite models, not GGUF or Hugging Face.",
+            "type": "invalid_request_error", "param": param,
+            "code": "unsupported_parameter"}})
+
+
+class _TokenLog:
+    """Log-probabilities of the tokens one choice generates.
+
+    Passed to the engine as ``on_token``. :meth:`take` hands out the entries
+    whose text starts within the first `upto` characters, so tokens that a
+    stop sequence cut off are not reported. Values are those of the model's
+    own distribution (raw logits), as vLLM reports them by default.
+    """
+
+    def __init__(self, engine: Any, top_n: int) -> None:
+        self.engine = engine
+        self.top_n = max(0, int(top_n))
+        self._raw: list[tuple[int, float, list[tuple[int, float]]]] = []
+        self._next = 0          # first entry not handed out yet
+        self._chars = 0         # characters covered by the entries handed out
+
+    def __call__(self, token_id: int, logits: Any) -> None:
+        logprob, top = token_logprobs(logits, token_id, self.top_n)
+        self._raw.append((int(token_id), logprob, top))
+
+    def _text(self, token_id: int) -> str:
+        try:
+            return str(self.engine.decode([token_id]))
+        except Exception:
+            return ""
+
+    def leading_whitespace(self) -> int:
+        """Characters of whitespace the generated text starts with (chat strips them)."""
+        text = "".join(self._text(t) for t, _lp, _top in self._raw)
+        return len(text) - len(text.lstrip())
+
+    def take(self, upto: int) -> list[tuple[str, float, list[tuple[str, float]]]]:
+        out = []
+        while self._next < len(self._raw) and self._chars < upto:
+            token_id, logprob, top = self._raw[self._next]
+            text = self._text(token_id)
+            out.append((text, logprob, [(self._text(i), v) for i, v in top]))
+            self._chars += len(text)
+            self._next += 1
+        return out
+
+
+def _completion_logprobs(entries: list, top_n: int, offset: int = 0) -> dict[str, Any]:
+    """The `logprobs` object of a /v1/completions choice (legacy OpenAI format)."""
+    tokens, values, tops, offsets = [], [], [], []
+    for text, logprob, top in entries:
+        tokens.append(text)
+        values.append(logprob)
+        offsets.append(offset)
+        offset += len(text)
+        tops.append(dict(top))
+    return {"tokens": tokens, "token_logprobs": values,
+            "top_logprobs": tops if top_n else None, "text_offset": offsets}
+
+
+def _chat_logprobs(entries: list) -> dict[str, Any]:
+    """The `logprobs` object of a /v1/chat/completions choice."""
+    def item(text: str, logprob: float) -> dict[str, Any]:
+        return {"token": text, "logprob": logprob, "bytes": list(text.encode("utf-8"))}
+
+    return {"content": [{**item(text, logprob),
+                         "top_logprobs": [item(t, v) for t, v in top]}
+                        for text, logprob, top in entries]}
+
+
+class _Failure:
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+def _run_choices(work: Any, count: int, together: bool) -> list:
+    """``work(j)`` for every choice; on threads when `together`.
+
+    Threads let the choices' decode steps share forward passes (2.14 batched
+    decoding). A request with a `seed` runs its choices one after another
+    instead: the native engine samples from the process RNG.
+    """
+    if count == 1 or not together:
+        return [work(j) for j in range(count)]
+    results: list = [None] * count
+    errors: list[BaseException] = []
+
+    def run(j: int) -> None:
+        try:
+            results[j] = work(j)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(j,), name=f"auralite-choice-{j}", daemon=True)
+               for j in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
+def _interleave(make: Any, count: int, together: bool) -> Iterator[Any]:
+    """The events of ``make(j)`` (a generator per choice), interleaved.
+
+    With `together` every choice runs on its own thread and events come in
+    the order they are produced; otherwise one choice after another. When
+    the consumer stops early (a client disconnected), the choices stop at
+    their next token.
+    """
+    if count == 1 or not together:
+        for j in range(count):
+            yield from make(j)
+        return
+    events: queue.Queue = queue.Queue()
+    cancel = threading.Event()
+    done = object()
+
+    def pump(j: int) -> None:
+        gen = make(j)
+        try:
+            for event in gen:
+                if cancel.is_set():
+                    break
+                events.put(event)
+        except BaseException as exc:  # noqa: BLE001 - handed to the consumer
+            events.put(_Failure(exc))
+        finally:
+            gen.close()
+            events.put(done)
+
+    for j in range(count):
+        threading.Thread(target=pump, args=(j,), name=f"auralite-choice-{j}",
+                         daemon=True).start()
+    remaining = count
+    try:
+        while remaining:
+            event = events.get()
+            if event is done:
+                remaining -= 1
+            elif isinstance(event, _Failure):
+                raise event.error
+            else:
+                yield event
+    finally:
+        cancel.set()
+
+
+def _close(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+
+
 @app.post("/v1/completions", dependencies=[Depends(require_api_key)])
 def completions(req: CompletionRequest, request: Request):
     check_rate_limit(request)
@@ -678,45 +876,83 @@ def completions(req: CompletionRequest, request: Request):
     prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
     stops = req.stops()
     sampling = _sampling_kwargs(req)
+    n = req.n or 1
+    top_n = req.logprobs                 # None: no log-probabilities
+    if top_n is not None:
+        _require_logprobs_support(engine, "logprobs")
+    together = n > 1 and req.seed is None and _native_engine(engine)
+
+    def engine_kwargs(log: _TokenLog | None) -> dict[str, Any]:
+        return {**sampling, "on_token": log} if log is not None else sampling
 
     if req.stream and len(prompts) == 1:
         stream_id = f"cmpl-{uuid.uuid4().hex}"     # one id for the whole stream
+        prompt = sanitize_prompt(prompts[0])
+
+        def frame(index: int, piece: str, finish_reason: str | None = None,
+                  logprobs: dict[str, Any] | None = None) -> str:
+            """Wrap one piece into an SSE data frame."""
+            choice: dict[str, Any] = {"text": piece, "index": index,
+                                      "finish_reason": finish_reason}
+            if top_n is not None:
+                choice["logprobs"] = logprobs
+            chunk = {"id": stream_id, "object": "text_completion",
+                     "created": int(time.time()), "model": req.model, "choices": [choice]}
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        def produce(j: int) -> Iterator[dict[str, Any]]:
+            collector = StopCollector(stops)
+            log = _TokenLog(engine, top_n) if top_n is not None else None
+            text = ""
+            offset = 0
+
+            def logprobs() -> dict[str, Any] | None:
+                nonlocal offset
+                if log is None:
+                    return None
+                entries = log.take(len(text))
+                out = _completion_logprobs(entries, top_n or 0, offset)
+                offset += sum(len(e[0]) for e in entries)
+                return out
+
+            stream = backend.generate_streaming(prompt, length=req.max_tokens,
+                                                temperature=req.temperature,
+                                                **engine_kwargs(log))
+            try:
+                for tok in stream:
+                    if _shutdown.is_set():
+                        break  # server shutting down: stop generating cleanly
+                    piece = collector.feed(tok)
+                    if piece:
+                        text += piece
+                        yield {"index": j, "text": piece, "logprobs": logprobs()}
+                    if collector.hit:
+                        break
+                tail = collector.flush()   # held-back characters (no stop hit)
+                if tail:
+                    text += tail
+                    yield {"index": j, "text": tail, "logprobs": logprobs()}
+            finally:
+                _close(stream)
+            yield {"index": j, "finish": "stop" if (collector.hit or stops) else "length",
+                   "full": text}
 
         def gen():
-            collector = StopCollector(stops)
-            completion_text = ""
-
-            def frame(piece: str, finish_reason: str | None = None) -> str:
-                """Wrap one piece into an SSE data frame."""
-                chunk = {"id": stream_id, "object": "text_completion",
-                         "created": int(time.time()), "model": req.model,
-                         "choices": [{"text": piece, "index": 0,
-                                      "finish_reason": finish_reason}]}
-                return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
+            texts = [""] * n
             with _Busy():
                 with seeded_rng(req.seed):
-                    for tok in backend.generate_streaming(
-                            sanitize_prompt(prompts[0]), length=req.max_tokens,
-                            temperature=req.temperature, **sampling):
-                        if _shutdown.is_set():
-                            break  # server shutting down: stop generating cleanly
-                        piece = collector.feed(tok)
-                        if piece:
+                    for event in _interleave(produce, n, together):
+                        if "finish" in event:
+                            # The last frame of a choice carries finish_reason,
+                            # like OpenAI's streams.
+                            texts[event["index"]] = event["full"]
+                            yield frame(event["index"], "", event["finish"])
+                        else:
                             _metric("tokens_generated_total")
-                            completion_text += piece
-                            yield frame(piece)
-                        if collector.hit:
-                            break
-                    tail = collector.flush()   # held-back characters (no stop hit)
-                    if tail:
-                        _metric("tokens_generated_total")
-                        completion_text += tail
-                        yield frame(tail)
-                # Final frame carries finish_reason, like OpenAI's streams.
-                yield frame("", "stop" if (collector.hit or stops) else "length")
+                            yield frame(event["index"], event["text"],
+                                        logprobs=event["logprobs"])
                 if req.include_usage():
-                    usage = _usage(engine, prompts[0], completion_text)
+                    usage = _usage(engine, prompts[0], "".join(texts))
                     yield f"data: {_usage_chunk('text_completion', req.model, usage, stream_id)}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
@@ -727,17 +963,26 @@ def completions(req: CompletionRequest, request: Request):
     with _Busy():
         with seeded_rng(req.seed):
             for i, prompt in enumerate(prompts):
-                text = backend.generate(sanitize_prompt(prompt), length=req.max_tokens,
-                                        temperature=req.temperature, **sampling)
-                out = text[len(prompt):] if text.startswith(prompt) else text
-                out = cut_at_stop(out, stops)
-                choices.append({"text": out, "index": i,
-                                "finish_reason": "stop" if stops else "length"})
+                clean = sanitize_prompt(prompt)
+
+                def one(j: int, clean: str = clean, prompt: str = prompt):
+                    log = _TokenLog(engine, top_n) if top_n is not None else None
+                    text = backend.generate(clean, length=req.max_tokens,
+                                            temperature=req.temperature, **engine_kwargs(log))
+                    out = text[len(prompt):] if text.startswith(prompt) else text
+                    return cut_at_stop(out, stops), log
+
+                for j, (out, log) in enumerate(_run_choices(one, n, together)):
+                    choice: dict[str, Any] = {"text": out, "index": i * n + j,
+                                              "finish_reason": "stop" if stops else "length"}
+                    if log is not None:
+                        choice["logprobs"] = _completion_logprobs(log.take(len(out)), top_n or 0)
+                    choices.append(choice)
+                    completion_text_all += out
                 try:
                     prompt_tokens += len(engine.encode(prompt))
                 except Exception:
                     pass
-                completion_text_all += out
     usage = _usage(engine, None, completion_text_all)
     usage["prompt_tokens"] = prompt_tokens
     usage["total_tokens"] = prompt_tokens + usage["completion_tokens"]
@@ -760,6 +1005,15 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     # streamed text is cut inside the engine instead of by a post-filter.
     chat_kwargs = {**sampling, "max_new_tokens": req.max_tokens,
                    "temperature": req.temperature, "stop_tokens": stops or None}
+    n = req.n or 1
+    want_logprobs = bool(req.logprobs)
+    top_n = int(req.top_logprobs or 0)
+    if want_logprobs:
+        _require_logprobs_support(engine, "logprobs")
+    together = n > 1 and req.seed is None and _native_engine(engine)
+
+    def with_log(kwargs: dict[str, Any], log: _TokenLog | None) -> dict[str, Any]:
+        return {**kwargs, "on_token": log} if log is not None else kwargs
 
     # Usage accounting: rebuild the exact prompt the engine will use, so
     # prompt_tokens matches what the model actually saw (streaming included).
@@ -769,55 +1023,88 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     if req.stream:
         stream_id = f"chatcmpl-{uuid.uuid4().hex}"   # one id for the whole stream
 
-        def gen():
-            completion_text = ""
+        def frame(index: int, delta: dict[str, str], reason: str | None = None,
+                  logprobs: dict[str, Any] | None = None) -> str:
+            choice: dict[str, Any] = {"delta": delta, "index": index, "finish_reason": reason}
+            if want_logprobs and reason is None:
+                choice["logprobs"] = logprobs
+            chunk = {"id": stream_id,
+                     "object": "chat.completion.chunk",
+                     "created": int(time.time()), "model": req.model,
+                     "choices": [choice]}
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        def produce(j: int) -> Iterator[dict[str, Any]]:
+            log = _TokenLog(engine, top_n) if want_logprobs else None
+            text = ""
             first = True
+            stream = backend.generate_chat_streaming(messages, **with_log(chat_kwargs, log))
+            try:
+                for tok in stream:
+                    if _shutdown.is_set():
+                        break  # server shutting down: stop generating cleanly
+                    text += tok
+                    entries = None
+                    if log is not None:
+                        entries = _chat_logprobs(log.take(log.leading_whitespace() + len(text)))
+                    # The first delta names the role, as OpenAI's streams do.
+                    yield {"index": j, "logprobs": entries,
+                           "delta": {"role": "assistant", "content": tok} if first
+                           else {"content": tok}}
+                    first = False
+            finally:
+                _close(stream)
+            if first:   # nothing generated: still announce the role
+                yield {"index": j, "delta": {"role": "assistant", "content": ""},
+                       "logprobs": {"content": []} if log is not None else None}
+            yield {"index": j, "finish": finish_reason, "full": text}
 
-            def frame(delta: dict[str, str], reason: str | None = None) -> str:
-                chunk = {"id": stream_id,
-                         "object": "chat.completion.chunk",
-                         "created": int(time.time()), "model": req.model,
-                         "choices": [{"delta": delta, "index": 0,
-                                      "finish_reason": reason}]}
-                return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
+        def gen():
+            texts = [""] * n
             with _Busy():
                 with seeded_rng(req.seed):
-                    for tok in backend.generate_chat_streaming(messages, **chat_kwargs):
-                        if _shutdown.is_set():
-                            break  # server shutting down: stop generating cleanly
-                        _metric("tokens_generated_total")
-                        completion_text += tok
-                        # The first delta names the role, as OpenAI's streams do.
-                        yield frame({"role": "assistant", "content": tok} if first
-                                    else {"content": tok})
-                        first = False
-                if first:   # nothing generated: still announce the role
-                    yield frame({"role": "assistant", "content": ""})
-                yield frame({}, finish_reason)
+                    for event in _interleave(produce, n, together):
+                        if "finish" in event:
+                            texts[event["index"]] = event["full"]
+                            yield frame(event["index"], {}, event["finish"])
+                        else:
+                            _metric("tokens_generated_total")
+                            yield frame(event["index"], event["delta"],
+                                        logprobs=event["logprobs"])
                 if req.include_usage():
-                    usage = _usage(engine, prompt_for_usage, completion_text)
+                    usage = _usage(engine, prompt_for_usage, "".join(texts))
                     yield (f"data: {_usage_chunk('chat.completion.chunk', req.model, usage, stream_id)}"
                            "\n\n")
                 yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    def one(j: int):
+        log = _TokenLog(engine, top_n) if want_logprobs else None
+        try:
+            content = backend.generate_chat(messages, **with_log(chat_kwargs, log))
+        except Exception:
+            log = _TokenLog(engine, top_n) if want_logprobs else None
+            full = backend.generate(prompt_for_usage, length=req.max_tokens,
+                                    temperature=req.temperature, **with_log(sampling, log))
+            content = full[len(prompt_for_usage):] if full.startswith(prompt_for_usage) else full
+        return cut_at_stop(content, stops), log
+
     with _Busy():
         with seeded_rng(req.seed):
-            try:
-                content = backend.generate_chat(messages, **chat_kwargs)
-            except Exception:
-                full = backend.generate(prompt_for_usage, length=req.max_tokens,
-                                        temperature=req.temperature, **sampling)
-                content = full[len(prompt_for_usage):] if full.startswith(prompt_for_usage) else full
-    content = cut_at_stop(content, stops)
-    chat_usage = _usage(engine, prompt_for_usage, content)
+            answers = _run_choices(one, n, together)
+    choices = []
+    for j, (content, log) in enumerate(answers):
+        choice: dict[str, Any] = {"index": j,
+                                  "message": {"role": "assistant", "content": content},
+                                  "finish_reason": finish_reason}
+        if log is not None:
+            choice["logprobs"] = _chat_logprobs(log.take(log.leading_whitespace() + len(content)))
+        choices.append(choice)
+    chat_usage = _usage(engine, prompt_for_usage, "".join(c for c, _ in answers))
     _metric("tokens_generated_total", chat_usage["completion_tokens"])
     return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
             "created": int(time.time()), "model": req.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                         "finish_reason": finish_reason}],
-            "usage": chat_usage}
+            "choices": choices, "usage": chat_usage}
 
 
 # ---------------------------------------------------------------------------

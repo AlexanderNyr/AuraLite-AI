@@ -2,9 +2,9 @@
 
 How a native AuraLite model (`.pt` / `.safetensors`) turns a prompt into
 text, what changed in 2.8, how much of the history a generated token
-attends to (2.11, section 9), and which thread does the work (2.13, section
-10). GGUF and Hugging Face models run in their own runtimes and are not
-covered here.
+attends to (2.11, section 9), which thread does the work (2.13, section 10)
+and how concurrent generations share a forward pass (2.14, section 11). GGUF
+and Hugging Face models run in their own runtimes and are not covered here.
 
 Speed numbers on this page come from `python benchmarks/core_bench.py`, run
 on a 2-vCPU x86 machine with torch 2.14.1 on CPU (eager mode, batch 1). The
@@ -14,9 +14,10 @@ come from short training runs described with their tables in section 8.
 
 ## 1. Generation loop
 
-All native generation paths share one decode loop, `AuraLiteEngine._iter_token_ids`:
-`generate`, `generate_streaming`, the chat methods and thinking mode. 2.7 had
-four copies of it. Each call does this:
+All native generation paths share one decode loop, `AuraLiteEngine._iter_token_ids`
+(`auralite/engine/generation.py` since 2.14): `generate`, `generate_streaming`,
+the chat methods and thinking mode. 2.7 had four copies of it. Each call does
+this:
 
 1. **Reserve the KV cache.** It allocates room for `prompt + max_new_tokens`
    positions once, so the storage never grows during generation. With the
@@ -29,7 +30,8 @@ four copies of it. Each call does this:
    the same result (section 9).
 3. **Sample, feed, repeat.** One token per step. Inference mode is entered per
    step, not across a `yield`, so a paused stream does not leave the caller's
-   thread in inference mode.
+   thread in inference mode. Since 2.14 the steps of generations running at
+   the same time share one forward pass (section 11).
 4. **Release.** The cache is freed when the loop ends. A stream that the
    client abandoned can be closed after a newer generation has started, so
    only the generation that owns the cache may free it.
@@ -386,8 +388,10 @@ speed in 2.12 (docs/faq.md § 8).
   hand-off costs about 12 µs, against roughly 1.6 ms for a decode step of the
   benchmark model.
 * **Teams are released.** `load_model`, `quantize_model` and `train()` free the
-  calling thread's team when they finish (`omp_pause_resource_all`, a no-op
-  when torch's OpenMP runtime is not found). `train()` stays on the thread
+  calling thread's team when they finish (`omp_pause_resource_all` of GNU
+  OpenMP, which PyTorch's Linux wheels use; elsewhere a no-op. 2.14: Intel and
+  LLVM OpenMP on Windows and macOS pause every team of the process at once,
+  and the 2.13 Windows test run hung, so they are left alone). `train()` stays on the thread
   that calls it, and first frees the compute thread's team, so an idle team
   does not slow training down.
 * **Locks are unchanged.** The compute thread never takes the engine's locks;
@@ -418,3 +422,76 @@ as well, switching `AURALITE_COMPUTE_THREAD` between 8 runs of 400 tokens: the
 main thread decoded 839 tokens/s inline and 802 through the compute thread
 (4 % less); a worker thread, four threads and `/v1/completions` reached 792,
 783 and 774, i.e. 0.94, 0.93 and 0.92 of the inline main thread.
+
+## 11. Batched decoding (2.14)
+
+Since 2.13 every forward pass runs on one compute thread, so that thread sees
+every decode step that is waiting. 2.14 runs them as one forward pass. On the
+benchmark model of section 10 a decode step is mostly fixed cost (Python,
+kernel launches, OpenMP wake-ups): four rows take about 1.4 ms, one row
+1.1 ms.
+
+* **Rows.** `DecodeBatch` (`auralite/engine/batching.py`) keeps the KV caches
+  of up to `AURALITE_MAX_BATCH` generations (default 4) in one tensor per
+  layer, `(rows, kv_heads, positions, head_dim)`. A generation runs its prompt
+  as before, with its own `DecodeSlot` under the model lock, samples its first
+  token and then copies its cache into a free row, once. Every later step
+  writes one key and value per layer in place. When the generation ends
+  (finished, stopped at a stop token, or a stream the client abandoned) its
+  row is free again; a batch without rows holds no memory.
+* **A position per row.** Every row has its own length, RoPE position and,
+  with a sliding or context window, its own window. Keys a row must not see
+  (another row's longer history, positions outside its window) are masked,
+  and ALiBi takes its bias from each row's own positions. int8, fp8 and
+  half-precision cache storage and GQA work per row as in the single cache.
+* **One pass for everything waiting.** The compute thread takes every queued
+  step of the batch and waits up to 2 ms for the rows of the previous pass
+  that have not asked yet. A generation that stalls (a slow streaming client)
+  delays the others once and then decodes on its own until it catches up.
+  Other work arriving meanwhile (a new prompt) ends the wait.
+* **Sampling stays with each generation,** on its own thread, with its own
+  temperature, top-k/top-p/min-p, penalties and stop tokens.
+* **The same values.** A batch of one row runs exactly the 2.13 computation:
+  the same logits, bit for bit (tested for plain, GQA, sliding-window, ALiBi,
+  int8 and fp16 cache, QK-norm and MoE models). With several rows the matrix
+  products run over several rows and the attention sums over a masked key
+  range, so the logits can differ from a lone generation in the last bits.
+  Greedy output did not change in the tests or in a race probe (4 threads x
+  5 rounds x 200 tokens, through the engine and `/v1/completions`), but where
+  two tokens are almost tied a batched run can pick the other one.
+* **Falls back to the 2.13 path** (its own slot, one step at a time) when
+  every row is taken; when the model is not a plain native
+  `ModernTransformer` (GGUF, Hugging Face, dynamically quantized or other
+  foreign layers, a subclass with its own forward, forward hooks on the
+  model, a block or an attention layer); when the compute thread is off
+  (`AURALITE_COMPUTE_THREAD=0`); and with `AURALITE_MAX_BATCH=1`.
+* **`generate_batch`** decodes all prompts as one batch, every row at its own
+  position; prompts of equal length still share their prefill. With prompts
+  of one length the result is the 2.13 batch, bit for bit, seeded sampling
+  included. 2.13 decoded one group of equal-length prompts after the other,
+  so with several lengths the random numbers are now drawn in another order.
+* **`on_token(token_id, logits)`.** `generate`, `generate_streaming`,
+  `generate_chat` and `generate_chat_streaming` take a callback that sees
+  every generated token with the raw logits it was drawn from (native models
+  only). The server's `logprobs` use it.
+
+Measured with `python benchmarks/batch_bench.py` on the 2-vCPU VM: the model
+of section 10, greedy streams of 200 tokens on worker threads, medians of 9
+rounds, batched and unbatched (`AURALITE_MAX_BATCH=1`, the 2.13 path)
+interleaved in one process, three runs:
+
+| | 1 client, tokens/s | 4 clients, tokens/s (total) | time to first token, 4 clients |
+|---|---|---|---|
+| unbatched (2.13 path) | 758 / 825 / 779 | 786 / 748 / 751 | 123 / 272 / 176 ms |
+| batched (2.14) | 834 / 879 / 899 | **2,270 / 2,433 / 2,125** | **3.9 / 3.5 / 4.2 ms** |
+
+Four clients get 2.4-2.8 times the throughput of one batched client (2.7-3.0
+times one 2.13 client) and 2.8-3.3 times what four got in 2.13. A lone
+request's time to the first token stays at 2.2-2.4 ms. Four clients without batching took turns at the model lock, which does
+not queue fairly: a request could wait while others decoded dozens of tokens
+before its prompt ran. With sampling (temperature 0.8, top-k 50, top-p 0.9)
+four clients reach 2.2 times one: sampling a token takes about 50 µs of
+Python, and the four generations sample in turn under the GIL between two
+passes. `/v1/completions` through FastAPI's test client, one request at a
+time and four at once, two runs: 991 / 839 and 2,210 / 2,042 tokens/s (2.13
+path: 866 / 776 and 790 / 738).

@@ -49,6 +49,7 @@ def _print_calls(path: pathlib.Path) -> list[int]:
 
 @pytest.mark.parametrize("module", [
     "engine/_legacy.py", "engine/layers.py", "engine/model.py",
+    "engine/trainer.py", "engine/generation.py", "engine/params.py",
     "engine/dataset.py", "engine/scheduler.py", "engine/optimizers.py",
     "engine/tokenizers.py", "engine/gguf_proxy.py", "engine/utils.py",
     "image_engine.py", "hf_integration.py", "export.py", "web_tools.py",

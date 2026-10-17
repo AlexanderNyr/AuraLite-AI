@@ -37,6 +37,11 @@ DECOMPOSED = {
     "safe_io": ["safe_torch_load", "load_safetensors_checkpoint",
                 "save_safetensors_checkpoint"],
     "logging_utils": ["DynamicStreamHandler"],
+    # 2.14: training, generation and parameter validation left _legacy.py too.
+    "params": ["ParamValidationError", "describe_unknown_params", "unknown_train_params",
+               "validate_params"],
+    "trainer": ["TrainerMixin"],
+    "generation": ["GenerationMixin"],
 }
 
 #: Public surface of `model_engine/_legacy.py` at `base/upstream-main` (13d9f47) —
@@ -144,7 +149,7 @@ def test_gui_and_server_use_public_import_paths():
 def test_legacy_shrank_and_stays_focused():
     """The split must keep `_legacy.py` an engine file, not a dumping ground."""
     lines = LEGACY.read_text(encoding="utf-8").splitlines()
-    assert len(lines) < 4200, f"_legacy.py grew back to {len(lines)} lines"
+    assert len(lines) <= 3000, f"_legacy.py grew back to {len(lines)} lines"
     classes = {node.name for node in ast.walk(ast.parse("\n".join(lines)))
                if isinstance(node, ast.ClassDef)}
     assert "AuraLiteEngine" in classes

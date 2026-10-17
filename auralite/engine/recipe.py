@@ -6,7 +6,10 @@ characters without QK-norm, the CLI AdamW on BPE at batch 16, and none of them
 stopped when the validation loss stopped improving. Every value below is
 measured on CPU with the default "Small" model (docs/training.md, section 8):
 
-* **Muon (lr 0.02) with QK-norm.** On the first 100 KB of tinyshakespeare
+* **Muon (lr 0.02, 3 Newton-Schulz iterations) with QK-norm.** 2.14: three
+  iterations instead of five make a step cheaper; at equal time all of
+  tinyshakespeare ended 0.6 % better (2.0870 vs 2.0999, two seeds), the first
+  100 KB 0.45 % better at the same steps. On the first 100 KB of tinyshakespeare
   with early stopping Muon + QK-norm reached 2.196 bits per byte against
   2.308 for AdamW + QK-norm (mean of three seeds, 5 % better). On a megabyte
   it was 0.3 % better per step and ties at equal time: each Muon step costs
@@ -23,8 +26,14 @@ measured on CPU with the default "Small" model (docs/training.md, section 8):
   best epoch's weights restored. The GUI's 100-epoch default on a 100 KB text
   ended at 3.68 bits per byte after 239 s; with early stopping it ends at 2.20
   after 48 s.
-* **WSD, batch 32, dropout 0.1, AdamW lr 1e-3** (for the embeddings and the
-  head next to Muon) as in 2.9.
+* **WSD, batch 32, AdamW lr 1e-3** (for the embeddings and the head next to
+  Muon) as in 2.9.
+* **Dropout "auto"** (2.14): none when the plan reads the training text at
+  most eight times, 0.1 otherwise (:func:`auto_dropout`). A run that sees its
+  text only a few times does not overfit, and dropout then only costs: on
+  tinyshakespeare a 150-second run (6 passes) ended at 2.1005 bits per byte
+  without dropout and 2.1491 with 0.1; after 10 passes 0.1 was ahead by
+  0.24 % (2.0984 vs 2.1035), and with early stopping on 100 KB by 2.3 %.
 * **A learning-rate decay after an early stop** (2.13), over 0.2 x the steps
   so far and at most two epochs: on all of tinyshakespeare it took the
   result from 2.1319 / 2.1203 / 2.1097 to 2.0917 / 2.1036 / 2.0903 bits per
@@ -43,13 +52,14 @@ from typing import Any, Mapping
 DEFAULT_RECIPE: Mapping[str, Any] = MappingProxyType({
     "optimizer": "muon",
     "muon_lr": 0.02,
+    "muon_ns_steps": 3,
     "lr": 1e-3,
     "use_qk_norm": True,
     "lr_schedule": "wsd",
     "tokenizer": "bpe",
     "bpe_vocab_size": 512,
     "batch_size": 32,
-    "dropout": 0.1,
+    "dropout": "auto",
     "weight_decay": 0.01,
     "grad_clip": 1.0,
     "val_split": 0.1,
@@ -59,6 +69,31 @@ DEFAULT_RECIPE: Mapping[str, Any] = MappingProxyType({
 })
 
 
+#: dropout="auto" (2.14): the residual dropout of a plan that reads the
+#: training text more than AUTO_DROPOUT_MAX_PASSES times, and none below. On
+#: tinyshakespeare dropout 0 was 2.3 % better after 6 passes and 0.24 % worse
+#: after 10 (docs/training.md, section 11).
+AUTO_DROPOUT = 0.1
+AUTO_DROPOUT_MAX_PASSES = 8
+
+
+def auto_dropout(passes: float) -> float:
+    """The dropout ``"auto"`` picks for a plan reading the training text `passes` times."""
+    return 0.0 if passes <= AUTO_DROPOUT_MAX_PASSES else AUTO_DROPOUT
+
+
+def is_auto(value: Any) -> bool:
+    """Is `value` the string ``"auto"`` (any case, surrounding spaces ignored)?"""
+    return isinstance(value, str) and value.strip().lower() == "auto"
+
+
+def parse_dropout(value: Any) -> float | str:
+    """``"auto"`` or a float, from a number or the text of a form field."""
+    if is_auto(value):
+        return "auto"
+    return float(value)
+
+
 def recipe_params(**overrides: Any) -> dict[str, Any]:
     """A mutable copy of the recipe with `overrides` applied."""
     params = dict(DEFAULT_RECIPE)
@@ -66,4 +101,5 @@ def recipe_params(**overrides: Any) -> dict[str, Any]:
     return params
 
 
-__all__ = ["DEFAULT_RECIPE", "recipe_params"]
+__all__ = ["AUTO_DROPOUT", "AUTO_DROPOUT_MAX_PASSES", "DEFAULT_RECIPE", "auto_dropout",
+           "is_auto", "parse_dropout", "recipe_params"]

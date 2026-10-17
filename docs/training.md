@@ -3,11 +3,13 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 11. Since 2.12 the three entry points share one
+to reproduce them are in § 13. Since 2.12 the three entry points share one
 default recipe (§ 8), and a run that is stopped or has a time limit ends with
 a learning-rate decay (§ 9). Since 2.13 a new BPE tokenizer never sees the
 validation text (§ 10); validation numbers measured before 2.13 are
-optimistic by up to 9 %.
+optimistic by up to 9 %. Since 2.14 dropout is chosen from the plan and Muon
+runs 3 Newton-Schulz iterations (§ 11), and several computers can train one
+model together (§ 12).
 
 ## 1. An epoch is one pass over the text
 
@@ -211,7 +213,8 @@ Each row is the mean of two seeds, with the loss on the entire held-out split:
 1e-3 and 2e-3 are within noise of each other. 1e-3 is the safer default for
 the larger models that use the same engine default.
 
-**Dropout stays at 0.1.** On a short budget dropout costs quality: 1.5840
+**Dropout stays at 0.1** (2.9; since 2.14 "auto" picks 0 for short plans,
+§ 11). On a short budget dropout costs quality: 1.5840
 without it against 1.6355 with it, after 1,500 steps — about three passes over
 tinyshakespeare. It pays off when a small corpus is read many times. Here the
 corpus is the first 100,000 characters of tinyshakespeare, trained for 40
@@ -520,7 +523,132 @@ code (early stopping with the cooldown of § 8):
 | first 100 KB of tinyshakespeare | 2.195 in 46 s | 2.2075 in 55 s |
 | first 300 KB | 1.989 in 131 s | 1.975 in 134 s |
 
-## 11. Reproduce
+## 11. Dropout "auto" and Muon iterations (2.14)
+
+**Dropout "auto"** is the new default. The training loop knows before it
+starts how many times the plan reads the training text: the epochs, capped
+by `max_steps`; with a time budget, the first plan of § 9 (after 10 steps)
+tells how far the run will get. Up to 8 passes it trains without dropout,
+above 8 with 0.1. A run that sees its text only a few times does not overfit,
+and dropout only costs it: masks for every residual branch (about 4 % of the
+step) and a slower start. The summary reports `dropout` and
+`dropout_planned_passes`, and the choice is logged.
+
+Measured on tinyshakespeare (1.1 MB, BPE 512, the model of § 8), validation
+bits per byte:
+
+| plan | dropout 0 | dropout 0.1 |
+|---|---|---|
+| 150 s (6 passes), seed 0 / 1 | **2.1005 / 2.0993** | 2.1491 / 2.1527 |
+| 10 epochs (10 passes), seed 0 | 2.1035 in 280 s | **2.0984** in 300 s |
+| first 100 KB, 100 epochs with early stopping (18 epochs to the best) | 2.2556 (2.13 code with BPE fitted on 88 %) | **2.2053** |
+
+After 6 passes no dropout is 2.4 % better (mean of two seeds), after 10 dropout
+is ahead by 0.24 %, with early stopping on a small text by 2.3 %. The planned
+GUI and `train()` default (100 epochs with early stopping) therefore keeps 0.1:
+the first 100 KB end at 2.2075 as in 2.13, bit for bit. What changes are short
+runs on large texts, mostly runs with a time limit. `"dropout": 0.1` (or any
+number) keeps a fixed value; the GUI's dropout field takes "auto" or a number.
+
+**Muon runs 3 Newton-Schulz iterations** instead of 5 (`muon_ns_steps`, 1 to
+10). At equal time a megabyte ends better because each step is cheaper:
+
+| run | 5 iterations | 3 iterations |
+|---|---|---|
+| tinyshakespeare, 150 s, no dropout, seed 0 / 1 | 2.1005 / 2.0993 (1,132 / 1,155 steps) | **2.0863 / 2.0877** (1,226 / 1,254 steps) |
+| first 100 KB, default run (414 steps either way) | 2.2075 in 60 s | **2.1975** in 53 s |
+
+0.6 % better on the megabyte, 8 % more steps in the same time; on 100 KB 0.45 %
+better at the same steps and 11 % faster. In 2.12's study three iterations
+had tied with five per step (2.1969 vs 2.1957 on 100 KB, three seeds).
+
+Both defaults together take the 150-second megabyte run from 2.1509 (2.13,
+mean of two seeds) to 2.0870, 3.0 % better. The default runs without a time
+limit (100 epochs with early stopping, so dropout stays 0.1) with the 2.14
+code:
+
+| text | 2.13 | 2.14 |
+|---|---|---|
+| first 100 KB of tinyshakespeare | 2.2075 in 60 s | 2.1975 in 53 s |
+| first 300 KB | 1.9750 in 134 s | 1.9706 in 150 s |
+| tinyshakespeare, seed 0 | 2.0917 | 2.0801 in 579 s (21 epochs) |
+
+## 12. Training on several computers (2.14)
+
+Two or more computers of a local network can train one model together.
+Windows and Linux computers can be mixed. One computer (the main one) has the
+text and starts the run; the others join it and need nothing but AuraLite:
+
+```bash
+# on every other computer (it waits for the main computer, then serves its runs)
+auralite cluster-worker 192.168.1.10          # the main computer's address[:port]
+
+# on the main computer: wait for 2 workers, then train on all 3
+auralite train --text corpus.txt --model model.pt --cluster-workers 2
+```
+
+In the GUI: *Cluster workers* on the training tab (the main computer shows
+its address next to it), or *Join as worker* with the main computer's address
+on the others. From Python: `engine.train(text, {..., "cluster_workers": 2})`
+on the main computer and `auralite.engine.cluster.run_worker("192.168.1.10")`
+on the others. `cluster_port` (default 29500), `cluster_host` (the address to
+listen on, default every interface), `cluster_timeout_s` (default 600) and
+`cluster_token` (workers must give the same one) tune it.
+
+**What happens** (`auralite/engine/cluster.py`):
+
+* The workers connect to the main computer's port (a
+  `torch.distributed.TCPStore`); the main computer waits until all of them are
+  there, then sends them the parameters, the text and its tokenizer. Only JSON
+  and raw tensors cross the network, never pickles.
+* Every computer holds the whole model. `batch_size` stays the batch of one
+  optimizer step and is split between the computers: with two, each computes
+  16 of the 32 windows. The gradients are averaged over the network
+  (`DistributedDataParallel` over gloo) before every step, so every computer
+  takes the same step and a cluster run trains the model one computer trains,
+  window for window.
+* Validation is split between the computers and its sums added up, so all of
+  them see the same validation loss, and early stopping decides alike
+  everywhere. The time limit, Stop and Ctrl+C belong to the main computer:
+  its clock and buttons go to the others before every step, so every computer
+  ends at the same step.
+* Only the main computer reports progress and saves; a worker serves the next
+  run when this one ends.
+
+**Requirements and limits.** The same AuraLite version and the same torch
+major.minor version on every computer (checked when a worker joins). The
+firewall must let Python accept connections on private networks: Windows asks
+the first time, answer *Private networks*. gloo connects every pair of
+computers on free ports, so every computer needs this. A cluster run trains on
+the CPU and starts a new model (`continue_training` stays on one computer).
+The torchrun / `use_ddp` path for several GPUs of one machine is unchanged.
+There is no encryption: run it on a trusted network only, never with the port
+reachable from the internet.
+
+**Is it faster?** Each step moves the gradients once: 4 bytes per parameter,
+3.2 MB for the 0.8 M-parameter *Small* model, while one step of batch 32 takes
+about 0.18 s on one core of the test machine. Two processes with one core each
+on that machine (a perfect network) trained 150 steps 1.43 times as fast as one
+(0.129 instead of 0.185 s per step) and ended at the same validation loss
+(3.6408 against 3.6354). Over a real network the exchange costs time:
+
+| network | gradients of the Small model per step (2 computers) | worth it when a step takes |
+|---|---|---|
+| 1 Gbit/s Ethernet | about 30 ms | more than ~0.1 s |
+| 100 Mbit/s or Wi-Fi | 0.3 s and more | rarely |
+
+Larger models need proportionally more traffic, and so does every extra
+computer (an all-reduce moves about twice the gradient size per computer). The
+slowest computer sets the pace: every step waits for all of them.
+
+**Tests.** `tests/test_cluster_v214.py` plays the computers with processes on
+one machine, connected over 127.0.0.1: two computers end at the main
+computer's single-computer result (same steps, validation loss within 1 %),
+time limits and Stop end every computer, three computers stop early together,
+a worker serves one run after another, and workers of another version, with
+another token or beyond the expected number are refused.
+
+## 13. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -552,7 +680,17 @@ python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 30
     --variants recipe,bpe2048
 ```
 
-The § 7 runs used `engine.train` with the parameters in the
+The 2.14 tables (§ 11):
+
+```bash
+python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --seeds 0,1 \
+    --variants recipe,dropout01,muon_ns3 --time-budget 150
+python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 100000 \
+    --variants recipe,muon_ns3
+```
+
+(`muon_ns3` sets what is now the default; for the 5-iteration rows pass
+`"muon_ns_steps": 5`.) The § 7 runs used `engine.train` with the parameters in the
 docs/engine.md § 9 setup and `continue_training=True` for the extension. Sections that need a 2.9 API print `n/a`. The quality runs
 used `engine.train` with the parameters in the tables above and
 `max_steps=1500`. The loss on the entire held-out split was then computed over

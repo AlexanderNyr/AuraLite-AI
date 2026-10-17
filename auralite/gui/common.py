@@ -17,7 +17,10 @@ from auralite.engine import (
     CHAT_TEMPLATES,
 )
 # 2.12: the training tab's defaults are the engine's recipe.
-from auralite.engine.recipe import DEFAULT_RECIPE
+from auralite.engine.recipe import DEFAULT_RECIPE, parse_dropout
+# 2.14: training on several computers (the training tab's Cluster row).
+from auralite.engine.cluster import lan_address as cluster_lan_address
+from auralite.engine.cluster import run_worker as run_cluster_worker
 from auralite.web_tools import build_web_context
 # Agent framework (optional)
 try:
@@ -92,21 +95,21 @@ CONFIG_PRESETS = {
     "Tiny (CPU-friendly)": {
         "d_model": 64, "d_ff": 128, "n_heads": 2, "n_layers": 2,
         "seq_length": 32, "batch_size": 16, "lr": 0.001, "epochs": 200,
-        "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
     },
     "Small (default)": {
         "d_model": 128, "d_ff": 256, "n_heads": 4, "n_layers": 4,
         "seq_length": 64, "batch_size": 32, "lr": 0.001, "epochs": 100,
-        "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
     },
     "Medium (GPU recommended)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
-        "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         # 2.9: off — recomputing activations made each step ~36 % slower
         # for ~0.9 GB less memory at this size (docs/training.md § 4).
         "use_gradient_checkpointing": False,
@@ -117,14 +120,14 @@ CONFIG_PRESETS = {
     "Large (powerful GPU)": {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
         "seq_length": 256, "batch_size": 32, "lr": 0.0001, "epochs": 30,
-        "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 0,
+        "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": True,
         "rope_scaling": None,
     },
     "GQA-efficient (Medium)": {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
-        "dropout": 0.1, "grad_clip": 1.0, "n_kv_heads": 2,
+        "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 2,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
     },

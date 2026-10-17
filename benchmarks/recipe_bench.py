@@ -14,8 +14,10 @@ Sections:
 * ``defaults``: the default `train()` run (the recipe, 100 epochs, early
   stopping) on a text, against the 2.11 GUI default (Muon + QK-norm, no early
   stopping), without the 2.13 cooldown after early stopping
-  (``recipe_no_cooldown``) and with BPE 2048 / 4096 (``bpe2048``,
-  ``bpe4096``); ``--time-budget`` limits the runs.
+  (``recipe_no_cooldown``), with BPE 2048 / 4096 (``bpe2048``,
+  ``bpe4096``), with the 2.13 dropout of 0.1 instead of "auto"
+  (``dropout01``) and with 3 Newton-Schulz iterations for Muon
+  (``muon_ns3``); ``--time-budget`` limits the runs.
 * ``ending``: a run planned for N steps, a run planned for 2N steps that is
   stopped at N (``stop_event``), and the same run finished at N
   (``finish_event``, one row per ``--ratios`` value). Bits per byte on the
@@ -137,6 +139,8 @@ def bench_defaults() -> None:
         "recipe_no_cooldown": {"early_stopping_cooldown": False},    # a 2.12 early stop
         "bpe2048": {"bpe_vocab_size": 2048},
         "bpe4096": {"bpe_vocab_size": 4096},
+        "dropout01": {"dropout": 0.1},                    # the 2.13 default (2.14: "auto")
+        "muon_ns3": {"muon_ns_steps": 3},
         "adamw_qk": {"optimizer": "adamw", "use_qk_norm": True},
         "muon_qk": {"optimizer": "muon", "muon_lr": 0.02, "use_qk_norm": True},
         "gui_2.11": {"optimizer": "muon", "muon_lr": 0.02, "use_qk_norm": True,
@@ -157,7 +161,8 @@ def bench_defaults() -> None:
                  best_val_bpb=round(float(summary.get("best_val_bpb") or 0.0), 4),
                  epochs=summary.get("epochs_completed"), best_epoch=summary.get("best_epoch"),
                  stop_reason=summary.get("stop_reason"), steps=summary.get("optimizer_steps"),
-                 cooldown_steps=summary.get("cooldown_steps"), wall_s=round(wall, 1))
+                 cooldown_steps=summary.get("cooldown_steps"), dropout=summary.get("dropout"),
+                 wall_s=round(wall, 1))
 
 
 def bench_ending() -> None:

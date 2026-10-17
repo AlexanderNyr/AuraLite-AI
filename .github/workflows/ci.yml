@@ -62,6 +62,8 @@ jobs:
 
   tests:
     runs-on: ${{ matrix.os }}
+    # A leg takes 3-6 minutes; a hang fails after 30 instead of GitHub's 6 hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

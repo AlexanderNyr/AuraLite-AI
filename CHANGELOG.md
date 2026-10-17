@@ -1,3 +1,198 @@
+# 📦 v2.14.0 — training on several computers, concurrent generations share a forward pass, `n` and `logprobs` on the server, dropout "auto"
+
+Training: two or more computers of a local network (Windows and Linux mixed)
+can train one model together; every optimizer step is split between them.
+Generation: the decode steps of generations running at the same time (server
+requests, the `n` choices of one request, `generate_batch`, the GUI's tabs)
+now run as one forward pass, each generation in its own row with its own
+position. On 2 vCPU four concurrent streams decode 2.4–2.8 times as fast as
+one (2.8–3.3 times as fast as four in 2.13), and a new request no longer
+waits behind the others. The server returns
+`n` choices and log-probabilities. Training: dropout is chosen from the
+plan. Tables and setups: [docs/engine.md § 11](docs/engine.md#11-batched-decoding-214)
+and [docs/training.md § 11–12](docs/training.md#12-training-on-several-computers-214).
+
+**Defaults that changed**
+
+| setting | 2.14 | 2.13 |
+|---|---|---|
+| concurrent decode steps | one forward pass for up to `AURALITE_MAX_BATCH` (default 4) generations | one forward pass each, in turn |
+| `dropout` | `"auto"`: 0 when the plan reads the text at most 8 times, else 0.1 | 0.1 |
+| `muon_ns_steps` (new parameter) | 3 | 5 (fixed) |
+| `generate_batch` with prompts of several lengths | one batch | one batch per length, one after another |
+
+`AURALITE_MAX_BATCH=1` gives back 2.13 decoding, `"dropout": 0.1` and
+`"muon_ns_steps": 5` the 2.13 training. A lone generation computes exactly
+what 2.13 computed. The GUI and `train()` default (100 epochs with early
+stopping) keeps dropout 0.1, so the first 100 KB of tinyshakespeare differ
+from 2.13 only by the Muon iterations (2.2075 → 2.1975).
+
+**Training on several computers** (`auralite/engine/cluster.py`, docs/training.md § 12)
+
+- The main computer runs `auralite train ... --cluster-workers N` (GUI: the
+  training tab's *Cluster* row; Python: `"cluster_workers": N`), the others
+  `auralite cluster-worker MAIN[:PORT]` (GUI: *Join as worker*;
+  `cluster.run_worker`). Windows and Linux computers can be mixed; they need
+  the same AuraLite and torch major.minor versions (checked on joining).
+- The workers get the parameters, the text and the tokenizer from the main
+  computer (JSON and raw tensors only, never pickles), so they need no files.
+  A worker serves one run after another until it is stopped.
+- Data parallel: `batch_size` stays the batch of a step and is split between
+  the computers; the gradients are averaged with `DistributedDataParallel`
+  over gloo before every step. The cluster therefore trains the model one
+  computer trains: in the tests two computers ended with the same number of
+  steps and a validation loss within 1 % of one computer's (2.1356 vs 2.1339
+  on a 60 KB run).
+- Validation is split and summed, so every computer sees the same loss and
+  early stopping agrees everywhere. Time limits, Stop and Ctrl+C belong to the
+  main computer, whose clock and buttons go to the others before every step:
+  all computers end at the same step. Only the main computer reports progress
+  and saves.
+- gloo binds to the address that leads to the main computer, not to whatever
+  the host name resolves to (127.0.1.1 on many Linux machines, which other
+  computers cannot reach). `cluster_port` (default 29500), `cluster_host`,
+  `cluster_timeout_s` (default 600) and `cluster_token` tune the run.
+- Measured on one machine with two processes of one core each (a perfect
+  network): 150 steps of the *Small* model 1.43 times as fast as one process
+  (0.129 vs 0.185 s per step), same validation loss (3.6408 vs 3.6354). Over a
+  network each step moves the gradients (3.2 MB for the *Small* model, about
+  30 ms on Gigabit Ethernet), so it pays off on wired networks with steps of
+  0.1 s or more.
+- Not in this release: GPUs (a cluster run trains on the CPU),
+  `continue_training` on a cluster (refused with a clear error), generation on
+  several computers. The torchrun `use_ddp` path is unchanged; for MoE models
+  DDP now looks for parameters a step did not use.
+
+**Batched decoding** (`auralite/engine/batching.py`, docs/engine.md § 11)
+
+- `DecodeBatch` keeps the KV caches of up to `AURALITE_MAX_BATCH` generations
+  in one tensor per layer. A generation runs its prompt as before, then its
+  cache moves into a free row once; each step writes one key and value per
+  layer in place, and the row is freed when the generation ends (a stream the
+  client abandoned included). A batch without rows holds no memory.
+- Every row has its own length, RoPE position and window (sliding or context
+  window); keys a row must not see are masked, ALiBi takes its bias from each
+  row's positions, int8/fp8/half cache storage and GQA work per row.
+- The compute thread runs every queued step of the batch as one pass and
+  waits up to 2 ms for rows of the previous pass that have not asked yet; a
+  new prompt ends the wait. Sampling stays with each generation.
+- One row computes the 2.13 logits bit for bit (tested for plain, GQA,
+  sliding-window, ALiBi, int8 and fp16 cache, QK-norm and MoE models). With
+  several rows the sums run over several rows and a masked key range, so
+  logits can differ in the last bits; greedy outputs matched the lone ones in
+  the tests and in the race probe (0 of 20 differed, engine and HTTP).
+- Falls back to the 2.13 path when every row is taken, for models it cannot
+  run (GGUF, Hugging Face, dynamically quantized or other foreign layers,
+  subclasses with their own forward, forward hooks on the model, a block or an
+  attention layer), and with the compute thread off.
+- Measured (`benchmarks/batch_bench.py`, 2 vCPU, greedy, medians of 9
+  rounds, three runs): one stream 834 / 879 / 899 tokens/s, four streams
+  **2,270 / 2,433 / 2,125** in total (2.13 path: 758 / 825 / 779 and
+  786 / 748 / 751); time to the first token with four streams
+  **3.9 / 3.5 / 4.2 ms** (2.13 path: 123 / 272 / 176 ms, the model lock does
+  not queue fairly); a lone request 2.2–2.4 ms either way. With sampling
+  (temperature 0.8, top-k 50, top-p 0.9) four streams reach 2.2 times one.
+  `/v1/completions` through the test client, two runs: 991 / 839 and
+  2,210 / 2,042 tokens/s (2.13 path: 866 / 776 and 790 / 738).
+- `generate_batch` decodes all prompts as one batch; equal-length prompts
+  still share their prefill, and prompts of one length give the 2.13 result
+  bit for bit, seeded sampling included.
+- `on_token(token_id, logits)` on `generate`, `generate_streaming`,
+  `generate_chat` and `generate_chat_streaming` (native models) sees every
+  generated token with the logits it was drawn from.
+
+**Server: `n` and log-probabilities** (`auralite/server/openai_server.py`)
+
+- `n` (1–16) on `/v1/completions` and `/v1/chat/completions`, streaming
+  included (every frame names its choice, every choice ends with its own
+  `finish_reason`). The choices decode together; with a `seed` they run one
+  after another, so the result is reproducible.
+- `logprobs` (0–20) on `/v1/completions` (`tokens`, `token_logprobs`,
+  `top_logprobs`, `text_offset`) and `logprobs` / `top_logprobs` (0–20) on
+  `/v1/chat/completions` (`content` with `token`, `logprob`, `bytes`,
+  `top_logprobs`), streaming included, for native models; GGUF and Hugging
+  Face models answer 400. Values come from the raw logits (the model's own
+  distribution, as vLLM reports by default), and tokens cut off by a stop
+  sequence are not reported.
+- `n` above 16, `logprobs` above 20 and `top_logprobs` without `logprobs`
+  answer 400 `unsupported_parameter`, as before for everything unsupported.
+
+**Training**
+
+- `dropout="auto"` (the default): no dropout when the plan reads the training
+  text at most 8 times, 0.1 otherwise. The plan is the epochs, capped by
+  `max_steps`; with a time budget the first step-time plan decides (after 10
+  steps). On tinyshakespeare after 150 s (6 passes) no dropout ended at
+  **2.1005 / 2.0993** against 2.1491 / 2.1527 with 0.1 (seeds 0 / 1, 2.4 %
+  better); after 10 passes 0.1 was ahead by 0.24 % (2.0984 vs 2.1035), and
+  with early stopping on 100 KB by 2.3 %. The summary reports `dropout` and
+  `dropout_planned_passes`; the GUI's dropout field takes "auto" or a number
+  (its presets now say "auto"). The plan of round 20 put the limit at 5
+  passes; on this machine the 150-second megabyte run reads 5.2, and the
+  measurements above put the crossing between 6 and 10, so the limit is 8.
+- `muon_ns_steps` (1-10, default **3**, was a fixed 5): Newton-Schulz
+  iterations per Muon step. At equal time on tinyshakespeare (150 s, no
+  dropout) 3 iterations ended at **2.0863 / 2.0877** against 2.1005 / 2.0993
+  (8 % more steps, 0.6 % better); the default run on the first 100 KB at the
+  same 414 steps went from 2.2075 to 2.1975 in 11 % less time, on 300 KB from
+  1.9750 to 1.9706, and the default run on all of tinyshakespeare (seed 0;
+  100 epochs with early stopping, dropout 0.1) from 2.0917 to 2.0801.
+- Together the two defaults take the 150-second megabyte run from 2.1509 to
+  2.0870 (mean of two seeds, 3.0 % better).
+
+**Fixed**
+
+- The Windows leg of the 2.13 CI run hung (the test job ran for hours instead
+  of 3 minutes and never finished). 2.13 released the calling thread's OpenMP
+  team after loading and training with `omp_pause_resource_all`. In GNU
+  OpenMP (Linux) that frees only the caller's team; in Intel and LLVM OpenMP
+  (the Windows and macOS wheels) it pauses every team of the process at once
+  and drives the suspend code that has hung on Windows before
+  (llvm/llvm-project#55929). The release is now done for GNU OpenMP only;
+  elsewhere `release_openmp_pool()` returns False, as when no runtime is
+  found. The CI test job got a 30-minute limit, and pytest dumps every
+  thread's stack when a test runs for 10 minutes, so a hang shows where it is.
+- The compute thread was started with whatever `threading.Thread` was at the
+  time; the GUI tests replace it with an inline stand-in, so running a GUI test
+  file on its own (before anything else had started the thread) hung for
+  ever. It now uses the Thread class captured at import.
+
+**Code layout**
+
+- `_legacy.py` is down from 4,139 to about 1,900 lines. The training loop moved
+  to `auralite/engine/trainer.py` (`TrainerMixin`), the generation code to
+  `auralite/engine/generation.py` (`GenerationMixin`), parameter validation to
+  `auralite/engine/params.py`. Every method keeps its source and every public
+  name its import paths (`auralite.engine.X is auralite.engine._legacy.X`);
+  code that patched `_legacy.CharDataset` to reach the training loop now
+  patches `auralite.engine.trainer.CharDataset`.
+
+**Other**
+
+- `benchmarks/batch_bench.py`: one stream against four, batched and
+  unbatched, interleaved in one process. `benchmarks/recipe_bench.py
+  defaults` gained the variants `dropout01` and `muon_ns3`.
+- Tests: `tests/test_batching_v214.py` (one row bit for bit for nine model
+  variants, concurrent greedy outputs, rows with gaps and in any order,
+  release, fallback, replaced model, no batch without the compute thread,
+  `generate_batch`, which models batch, the compute thread's grouping, errors
+  and Ctrl+C), `tests/test_server_choices_v214.py` (`n`, seeds, streaming,
+  `logprobs` shapes and stop sequences, limits, `on_token`),
+  `tests/test_training_v214.py` (the dropout rule, budgets, explicit values,
+  `muon_ns_steps`), `tests/test_cluster_v214.py` (computers played by
+  processes over 127.0.0.1: the single-computer result, time limits and Stop,
+  three computers with early stopping, consecutive runs, refused workers,
+  the rendezvous, the CLI flags) and two GUI tests for the *Cluster* row.
+  1,573 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  environments (2.13: 1,501); pyright 219 errors against 251
+  for 2.13 in the same environment (the code that moved into the mixins is
+  checked with less type information; nothing was fixed for it). The layout
+  test now caps `_legacy.py` at 3,000 lines and covers the new modules, the
+  no-print test covers them too. Changed tests: three server tests that
+  expected `n=2`/`n=3` to be refused now use `n=17`; the GUI recipe test
+  compares the dropout field as text ("auto"); the 2.13 tokenizer test
+  patches `CharDataset` where the training loop now lives.
+
 # 📦 v2.13.0 — honest validation, generation at full speed on every thread, early stopping that ends with a decay
 
 Three things in this release. Validation: a new BPE tokenizer no longer sees

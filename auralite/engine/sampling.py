@@ -162,5 +162,22 @@ def sample(logits: torch.Tensor, params: SamplingParams,
     return choice if ids is None else int(ids[choice])
 
 
+def token_logprobs(logits: torch.Tensor, token_id: int,
+                   top_n: int = 0) -> tuple[float, list[tuple[int, float]]]:
+    """Log-probability of `token_id` under ``softmax(logits)`` and the `top_n`
+    most likely ``(id, logprob)`` pairs (2.14, the server's ``logprobs``).
+
+    Uses the raw model logits: temperature, penalties and top-k/top-p do not
+    change the reported values, as in vLLM's default.
+    """
+    logp = torch.log_softmax(logits.float(), dim=-1)
+    chosen = float(logp[int(token_id)])
+    top: list[tuple[int, float]] = []
+    if top_n > 0:
+        vals, ids = torch.topk(logp, min(int(top_n), int(logp.shape[-1])))
+        top = [(int(i), float(v)) for i, v in zip(ids.tolist(), vals.tolist(), strict=True)]
+    return chosen, top
+
+
 __all__ = ["PENALTY_WINDOW", "SamplingParams", "apply_penalties", "candidates",
-           "filtered_logits", "sample"]
+           "filtered_logits", "sample", "token_logprobs"]

@@ -269,7 +269,7 @@ class TestTrainingFlow:
         assert int(app.bpe_vocab_var.get()) == R["bpe_vocab_size"]
         assert float(app.params["lr"].get()) == R["lr"]
         assert int(app.params["batch_size"].get()) == R["batch_size"]
-        assert float(app.params["dropout"].get()) == R["dropout"]
+        assert app.params["dropout"].get() == str(R["dropout"])     # 2.14: "auto"
         assert float(app.val_split_var.get()) == R["val_split"]
         assert app.time_limit_var.get() == "0"
 
@@ -289,6 +289,44 @@ class TestTrainingFlow:
         assert seen["time_budget_s"] == pytest.approx(150.0)
         assert seen["finish_event"] is app.finish_event
         assert "time limit reached" in app.status_label.config.call_args.kwargs["text"]
+
+    def test_cluster_workers_reach_train(self, app, tmp_path, monkeypatch):
+        """2.14: the Cluster row adds cluster_workers / cluster_port to the run."""
+        corpus = write_corpus(tmp_path)
+        tiny_train_params(app, corpus)
+        assert app._cluster_train_params() == {}
+        app.cluster_workers_var.set("2")
+        app.cluster_port_var.set("29501")
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        seen = {}
+
+        def fake_train(text, params, **kwargs):
+            seen.update(params)
+            return {}
+
+        monkeypatch.setattr(app.engine, "train", fake_train)
+        app.start_training()
+        assert seen["cluster_workers"] == 2 and seen["cluster_port"] == 29501
+
+    def test_join_as_a_cluster_worker(self, app, monkeypatch):
+        import auralite.gui.tabs.training as training_tab
+
+        calls = []
+
+        def fake_worker(address, on_status, stop_event=None):
+            calls.append(address)
+            on_status("Joined as worker 1/1")
+            return 1
+
+        monkeypatch.setattr(training_tab, "run_cluster_worker", fake_worker)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        app.cluster_join_var.set("")
+        app.toggle_cluster_worker()                 # no address: nothing runs
+        assert calls == []
+        app.cluster_join_var.set("192.168.1.10:29500")
+        app.toggle_cluster_worker()
+        assert calls == ["192.168.1.10:29500"]
+        assert app._cluster_worker_stop is None     # the (inline) run is over
 
     def test_config_round_trip_keeps_early_stop_and_time_limit(self, app, tmp_path):
         path = str(tmp_path / "train_config.json")

@@ -112,6 +112,17 @@ class TrainControl:
             return True
         return False
 
+    def planned_run_steps(self) -> int | None:
+        """Optimizer steps the time budget's latest plan gives this run (2.14).
+
+        None until the first plan (after :attr:`FIRST_PLAN_STEP` steps), and
+        without a time budget.
+        """
+        if self.time_budget_s is None or self._last_plan is None or self.end_step is None:
+            return None
+        step = int(getattr(self.scheduler, "step_count", self.run_steps))
+        return self.run_steps + max(0, self.end_step - step)
+
     def finish(self, reason: str = "finished") -> int:
         """Start the cooldown now; returns its length in optimizer steps.
 

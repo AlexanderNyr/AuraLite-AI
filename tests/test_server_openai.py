@@ -574,8 +574,8 @@ CHAT = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
 
 class TestUnsupportedParameters:
     @pytest.mark.parametrize("extra,param", [
-        ({"n": 2}, "n"),
-        ({"logprobs": True}, "logprobs"),
+        ({"n": 17}, "n"),                       # 2.14: up to 16 choices
+        ({"logprobs": True}, "logprobs"),       # not a native model
         ({"top_logprobs": 3}, "top_logprobs"),
         ({"response_format": {"type": "json_object"}}, "response_format"),
         ({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}},
@@ -602,7 +602,7 @@ class TestUnsupportedParameters:
         assert c.post("/v1/chat/completions", json={**CHAT, **extra}).status_code == 200
 
     @pytest.mark.parametrize("extra,param", [
-        ({"n": 3}, "n"), ({"best_of": 2}, "best_of"), ({"logprobs": 2}, "logprobs"),
+        ({"n": 17}, "n"), ({"best_of": 2}, "best_of"), ({"logprobs": 2}, "logprobs"),
         ({"echo": True}, "echo"), ({"suffix": "tail"}, "suffix"),
     ])
     def test_completions_reject_what_they_cannot_do(self, client, extra, param):
@@ -612,7 +612,7 @@ class TestUnsupportedParameters:
 
     def test_streaming_requests_are_rejected_before_the_stream_starts(self, client):
         c, _ = client
-        r = c.post("/v1/chat/completions", json={**CHAT, "stream": True, "n": 2})
+        r = c.post("/v1/chat/completions", json={**CHAT, "stream": True, "n": 17})
         assert r.status_code == 400
         assert r.headers["content-type"].startswith("application/json")
 

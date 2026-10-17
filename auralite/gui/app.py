@@ -20,7 +20,7 @@ from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
 from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, sys, threading, tk, ttk)
+from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -491,7 +491,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 "n_layers": int(self.params["n_layers"].get()),
                 "seq_length": int(self.params["seq_length"].get()),
                 "batch_size": int(self.params["batch_size"].get()),
-                "dropout": float(self.params["dropout"].get()),
+                "dropout": parse_dropout(self.params["dropout"].get()),
                 "grad_clip": float(self.params["grad_clip"].get()),
                 "tokenizer": self.tok_var.get(),
                 "bpe_vocab_size": int(self.bpe_vocab_var.get()),
