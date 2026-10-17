@@ -1266,6 +1266,11 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
 
         Training and checkpointing never go through here, so a compiled module
         can never leak into a `.pt` file.
+
+        A compiled forward that raises falls back to the eager model for good
+        (2.14.0, see `_eager_after_compile_failure`): Inductor compiles lazily,
+        once per new prompt shape, so a missing C++ compiler can surface on
+        any later prompt, long after the warm-up.
         """
         compiled = self._compiled_inference_model
         x = args[0] if args else kwargs.get("x")
@@ -1273,13 +1278,49 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         if keep is not None and self._accepts_logits_to_keep():
             kwargs["logits_to_keep"] = keep
             keep = None
+        model: Any = self.model
         if compiled is not None and getattr(x, "ndim", 0) >= 2 and x.shape[1] > 1:
-            out = compiled(*args, **kwargs)
+            try:
+                out = compiled(*args, **kwargs)
+            except Exception as exc:              # noqa: BLE001 - optional feature
+                out = self._eager_after_compile_failure(exc, args, kwargs)
+        elif getattr(model, "_orig_mod", None) is not None:
+            try:                                  # installed by compile_for_inference()
+                out = model(*args, **kwargs)
+            except Exception as exc:              # noqa: BLE001 - optional feature
+                out = self._eager_after_compile_failure(exc, args, kwargs)
         else:
-            out = self.model(*args, **kwargs)
+            out = model(*args, **kwargs)
         if keep is not None and out.ndim == 3 and out.shape[1] > keep:
             out = out[:, -int(keep):]           # model without the 2.8 argument
         return out
+
+    def _eager_after_compile_failure(self, exc: Exception, args: tuple, kwargs: dict):
+        """Drop the compiled module after it failed and redo the forward eagerly (2.14.0).
+
+        Without a C++ compiler (no MSVC ``cl`` on Windows, no ``g++`` in a slim
+        image) Inductor fails on the first call of every new prompt shape.
+        Generation must not: the engine logs one warning, forgets the compiled
+        module and runs this forward, and every later one, in the eager model.
+        Cache entries a half-run compiled forward may have written are rolled
+        back first, so the eager pass starts from the same cache.
+        """
+        self._compiled_inference_model = None
+        orig = getattr(self.model, "_orig_mod", None)
+        if orig is not None:
+            self.model = orig                     # compile_for_inference() undone
+        reason = " ".join(line.strip() for line in str(exc).splitlines() if line.strip())
+        logger.warning("[AuraLite] torch.compile failed (%s: %s); generation continues "
+                       "in eager mode.", type(exc).__name__, reason[:200])
+        if kwargs.get("use_cache"):
+            truncate = getattr(self._native_model(), "truncate_cache", None)
+            if callable(truncate):
+                try:
+                    truncate(int(kwargs.get("start_pos", 0)))
+                except ValueError:
+                    raise exc from None           # the cache cannot be rolled back
+        model: Any = self.model
+        return model(*args, **kwargs)
 
     def _accepts_logits_to_keep(self) -> bool:
         """Does the loaded model's forward take `logits_to_keep` (2.8)?"""
@@ -1324,16 +1365,24 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         except Exception as exc:                  # noqa: BLE001 - optional feature
             logger.warning("[AuraLite] torch.compile unavailable (%s); staying eager.", exc)
             return 0.0
+        self._compiled_inference_model = compiled
         if warmup_tokens:
+            # 2.14.0: the warm-up is a real prefill (cache on, last logits
+            # only), so it runs on the compute thread, like generation. Recent
+            # torch keeps Dynamo's settings per thread, so a warm-up on the
+            # caller's thread could pass (e.g. under its `suppress_errors`)
+            # while the first real prompt still failed.
+            tokens = max(2, int(warmup_tokens))
             try:
-                with torch.inference_mode():
-                    probe = torch.zeros((1, max(1, int(warmup_tokens))), dtype=torch.long,
-                                        device=self.device)
-                    compiled(probe, start_pos=0, use_cache=False)
+                with self._exclusive_decode(tokens), torch.inference_mode():
+                    self._prefill(torch.zeros((1, tokens), dtype=torch.long,
+                                              device=self.device))
             except Exception as exc:              # noqa: BLE001
+                self._compiled_inference_model = None
                 logger.warning("[AuraLite] torch.compile warm-up failed (%s); staying eager.", exc)
                 return 0.0
-        self._compiled_inference_model = compiled
+            if self._compiled_inference_model is None:
+                return 0.0                        # `_infer` fell back to eager and said why
         self._compile_seconds = time.perf_counter() - start
         logger.info("[AuraLite] torch.compile enabled (mode=%s) in %.2fs; "
                     "kernels cached in %s", mode, self._compile_seconds, cache_dir)
@@ -1471,14 +1520,15 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             # forward pass. On machines without a C++ compiler (e.g. Windows CI:
             # "InvalidCxxCompiler: Compiler: cl is not found") that lazy step
             # would otherwise blow up later, inside generate(). Two safeguards:
-            #   1) suppress_errors => Dynamo falls back to eager for any frame it
-            #      cannot compile, instead of raising (covers every recompile).
-            #   2) an explicit warm-up so a hard failure is caught here and we
-            #      cleanly revert to the eager model + report False.
-            try:
-                torch._dynamo.config.suppress_errors = True
-            except Exception:
-                pass
+            #   1) a warm-up on the compute thread, where generation runs, so a
+            #      hard failure is caught here and we cleanly revert to the
+            #      eager model + report False;
+            #   2) a later recompile that fails (a new prompt shape) makes
+            #      `_infer` put the eager model back (2.14.0).
+            # Up to 2.13 this also set Dynamo's `suppress_errors`. Recent torch
+            # keeps that per thread, so it only covered the caller's thread,
+            # not the compute thread, and it stayed set for every later
+            # torch.compile on that thread.
             compiled = torch.compile(self.model, mode=mode)
             self._warmup_compiled_model(compiled)
             self.model = compiled
@@ -1499,10 +1549,11 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         so any backend-compile error surfaces now rather than mid-generation.
         """
         # A fresh cache of its own under the model lock (2.12): the warm-up
-        # must not write into a running generation's cache.
+        # must not write into a running generation's cache. It runs on the
+        # compute thread (2.14.0), like the generation it stands in for.
         with self._exclusive_decode(), torch.inference_mode():
             dummy = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-            compiled_model(dummy, start_pos=0, use_cache=True)
+            _compute.run_on_compute_thread(compiled_model, dummy, start_pos=0, use_cache=True)
 
     # ---- Save / Load --------------------------------------------------
     def save_model(self, path: str, include_optimizer: bool = True):

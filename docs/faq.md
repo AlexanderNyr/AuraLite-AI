@@ -66,8 +66,11 @@ forwards with sequence length > 1 to it; single-token steps stay eager. First
 compilation costs ~7 s and is cached in `$AURALITE_HOME/torch_inductor` (a cached
 start is ~2 s), which is why compile is opt-in: `auralite generate --compile`,
 `auralite info --bench-compile`, GUI checkbox. A failing `torch.compile` (old
-PyTorch, unsupported op, no inductor) degrades to eager with a logged warning —
-it never breaks generation.
+PyTorch, unsupported op, no inductor, no C++ compiler such as MSVC `cl` on
+Windows) degrades to eager with a logged warning — it never breaks generation.
+The warm-up is a real prefill on the compute thread, where generation runs, so
+most failures show up right there; a compile that fails later, on a new prompt
+length, is redone in eager mode and compilation stays off (2.14.0).
 
 ## 4. int8/fp8 KV cache saved memory but not time — why?
 

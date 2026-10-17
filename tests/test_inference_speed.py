@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 import pytest
 import torch
 
 from auralite.engine import AuraLiteEngine
+from auralite.engine import compute_thread as _compute
 
 TINY = ("AuraLite learns small models on CPU. " * 40)
 
@@ -106,6 +108,135 @@ def test_warmup_failure_falls_back(engine, monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda model, **kw: Exploding(model))
     assert engine.enable_inference_compile() == 0.0
     assert engine._compiled_inference_model is None
+
+
+# ----------------------------------------------------------------------
+#  2.14.0: a compile that fails after the warm-up never breaks generation
+#  (Windows CI: no MSVC `cl`, so Inductor fails on the first real prompt)
+# ----------------------------------------------------------------------
+def _greedy(engine, prompt="AuraLite"):
+    return engine.generate(prompt, 4, temperature=0.0, top_k=1)
+
+
+def test_warmup_is_a_real_prefill_on_the_compute_thread(engine, monkeypatch):
+    """Dynamo keeps its settings per thread (torch 2.14), so a warm-up on the
+    caller's thread proved nothing about the compute thread, where every
+    prefill runs. The warm-up is now that prefill, in that place."""
+    seen = []
+
+    class Recording(FakeCompiled):
+        def __call__(self, *args, **kwargs):
+            seen.append((threading.current_thread(), dict(kwargs)))
+            return super().__call__(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", lambda model, **kw: Recording(model))
+    assert engine.enable_inference_compile() > 0.0
+    assert len(seen) == 1
+    thread, kwargs = seen[0]
+    assert kwargs["use_cache"] is True and kwargs["start_pos"] == 0
+    assert kwargs["logits_to_keep"] == 1
+    if _compute.offloading():
+        assert thread is not threading.current_thread()
+
+
+def test_compile_failing_only_on_the_compute_thread_is_caught_by_the_warmup(engine, monkeypatch):
+    if not _compute.offloading():
+        pytest.skip("the compute thread is off in this run")
+    caller = threading.current_thread()
+
+    class FailsElsewhere(FakeCompiled):
+        def __call__(self, *args, **kwargs):
+            if threading.current_thread() is not caller:
+                raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found")
+            return super().__call__(*args, **kwargs)
+
+    reference = _greedy(engine)
+    monkeypatch.setattr(torch, "compile", lambda model, **kw: FailsElsewhere(model))
+    assert engine.enable_inference_compile() == 0.0
+    assert engine._compiled_inference_model is None
+    assert _greedy(engine) == reference
+
+
+def test_prefill_compile_failure_falls_back_to_eager(engine, monkeypatch, caplog):
+    """The warm-up shape compiled, the next prompt shape does not."""
+    class FailsOnNewShapes(FakeCompiled):
+        def __call__(self, *args, **kwargs):
+            if self.calls:                         # call 1 was the warm-up
+                raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found")
+            return super().__call__(*args, **kwargs)
+
+    reference = _greedy(engine)
+    monkeypatch.setattr(torch, "compile", lambda model, **kw: FailsOnNewShapes(model))
+    assert engine.enable_inference_compile() > 0.0
+    with caplog.at_level(logging.WARNING, logger="auralite"):
+        assert _greedy(engine) == reference
+    assert engine._compiled_inference_model is None           # eager from now on
+    assert sum("torch.compile failed" in r.message for r in caplog.records) == 1
+    assert "cl is not found" in caplog.text
+    assert _greedy(engine) == reference
+
+
+def test_half_run_compiled_prefill_is_rolled_back(engine, monkeypatch):
+    """The KV cache appends: a compiled forward that wrote it and then raised
+    would leave the prompt cached twice if the eager rerun did not start from
+    the cache as it was."""
+    class WritesThenFails(FakeCompiled):
+        def __call__(self, *args, **kwargs):
+            out = super().__call__(*args, **kwargs)
+            if self.calls > 1:
+                raise RuntimeError("kernel failed after the cache write")
+            return out
+
+    reference = _greedy(engine)
+    monkeypatch.setattr(torch, "compile", lambda model, **kw: WritesThenFails(model))
+    assert engine.enable_inference_compile() > 0.0
+    assert _greedy(engine) == reference
+    assert engine._compiled_inference_model is None
+
+
+@pytest.fixture()
+def failing_dynamo_backend(monkeypatch):
+    """Real Dynamo with a backend that fails once `fail["on"]` is set.
+
+    That is the CI failure without Inductor or a C++ compiler: compiled
+    graphs exist, and the next recompile (a new prompt shape) raises.
+    """
+    fail = {"on": False}
+
+    def backend(gm, example_inputs):
+        if fail["on"]:
+            raise RuntimeError("InvalidCxxCompiler: Compiler: cl is not found")
+        return gm.forward
+
+    real_compile = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda model, **kw: real_compile(
+        model, backend=backend, dynamic=kw.get("dynamic")))
+    yield fail
+    torch._dynamo.reset()
+
+
+def test_real_dynamo_recompile_failure_falls_back(engine, failing_dynamo_backend):
+    reference = _greedy(engine)
+    if engine.enable_inference_compile() == 0.0:
+        pytest.skip("Dynamo unavailable in this runtime")
+    failing_dynamo_backend["on"] = True
+    assert _greedy(engine) == reference
+    assert engine._compiled_inference_model is None
+
+
+def test_compile_for_inference_puts_the_eager_model_back(engine, failing_dynamo_backend):
+    eager = engine.model
+    reference = _greedy(engine)
+    suppress = torch._dynamo.config.suppress_errors
+    try:
+        if not engine.compile_for_inference():
+            pytest.skip("Dynamo unavailable in this runtime")
+        assert torch._dynamo.config.suppress_errors == suppress   # 2.13 leaked True here
+        failing_dynamo_backend["on"] = True
+        assert _greedy(engine) == reference
+        assert engine.model is eager
+    finally:
+        engine.model = eager
 
 
 def test_disable_reports_whether_something_was_compiled(engine, monkeypatch):

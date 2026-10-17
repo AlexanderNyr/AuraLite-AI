@@ -87,7 +87,9 @@ def test_server_usage_is_consistent_between_plain_and_streamed(server):
 
 
 @pytest.mark.parametrize("extra", [
-    {"n": 2}, {"logprobs": True}, {"response_format": {"type": "json_object"}},
+    # 2.14: n up to 16 is served by every backend (see the next test); 17 is
+    # still refused. Log-probabilities stay native-only.
+    {"n": 17}, {"logprobs": True}, {"response_format": {"type": "json_object"}},
     {"tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]},
 ])
 def test_server_refuses_features_it_would_silently_drop(server, extra):
@@ -95,6 +97,24 @@ def test_server_refuses_features_it_would_silently_drop(server, extra):
                     json={"messages": MESSAGES, "max_tokens": 4, **extra})
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "unsupported_parameter"
+
+
+def test_server_serves_n_choices_on_a_real_gguf_model(server):
+    """2.14: a GGUF model answers `n` by generating the choices one by one."""
+    body = {"messages": MESSAGES, "max_tokens": 4, "n": 2}
+    r = server.post("/v1/chat/completions", json=body)
+    assert r.status_code == 200
+    payload = r.json()
+    assert [c["index"] for c in payload["choices"]] == [0, 1]
+    assert all(c["finish_reason"] in ("stop", "length") for c in payload["choices"])
+    assert 0 < payload["usage"]["completion_tokens"] <= 8
+    r = server.post("/v1/chat/completions", json={**body, "stream": True})
+    chunks = [json.loads(line[6:]) for line in r.text.splitlines()
+              if line.startswith("data: {")]
+    finished = {c["choices"][0]["index"] for c in chunks
+                if c.get("choices") and c["choices"][0].get("finish_reason")}
+    assert finished == {0, 1}
+    assert r.text.rstrip().endswith("data: [DONE]")
 
 
 def test_ollama_surface_on_a_real_model(server):

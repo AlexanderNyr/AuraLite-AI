@@ -204,9 +204,14 @@ class TestFallbacks:
         compiled = []
         monkeypatch.setattr(torch, "compile",
                             lambda model, **kw: compiled.append(kw) or model)
+        suppress = torch._dynamo.config.suppress_errors
         e = make_fake_engine()
         assert e.compile_for_inference() is True
         assert compiled == [{"mode": "reduce-overhead"}]
+        # 2.14.0: no Dynamo setting is left behind. Up to 2.13 this switched
+        # `suppress_errors` on for the calling thread for good, which made a
+        # later enable_inference_compile() warm-up "pass" without a compiler.
+        assert torch._dynamo.config.suppress_errors == suppress
         out = e.generate("ab", length=2, temperature=1.0, top_k=1, top_p=1.0)
         assert out == "abcd"  # prompt + 2 new chars
 

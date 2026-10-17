@@ -156,6 +156,27 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   time; the GUI tests replace it with an inline stand-in, so running a GUI test
   file on its own (before anything else had started the thread) hung for
   ever. It now uses the Thread class captured at import.
+- `torch.compile` for generation (`auralite generate --compile`, the GUI
+  checkbox, `enable_inference_compile()`) could make generation fail on a
+  computer without a C++ compiler; the Windows leg of the first 2.14.0 CI run
+  failed with "InvalidCxxCompiler: Compiler: cl is not found". Inductor
+  compiles once per new prompt length, on the thread that runs the forward,
+  and every prefill runs on the compute thread (2.13), but the warm-up ran on
+  the calling thread. There an earlier `compile_for_inference()` had left
+  Dynamo's `suppress_errors` on; torch 2.14 keeps that setting per thread, so
+  the warm-up passed in eager mode and the first prompt raised. Now a compiled
+  forward that raises is redone in eager mode (cache entries it wrote are
+  rolled back), the compiled module is dropped and one warning says why; the
+  warm-up is a real prefill (cache on, last logits only) on the compute
+  thread, so a missing compiler shows up at enable time, which returns 0.0
+  and stays eager; `compile_for_inference()` no longer touches
+  `suppress_errors`, warms up on the compute thread, and a recompile that
+  fails later puts the eager model back.
+- The real llama.cpp suite still expected a GGUF model to refuse `n=2`
+  (the integrations jobs of the same run). 2.14.0 serves `n` for every
+  backend, a GGUF model generating the choices one after another, so that
+  test asks for `n=17` and a new one checks two choices, plain and streamed,
+  on the real model.
 
 **Code layout**
 
@@ -183,13 +204,20 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   processes over 127.0.0.1: the single-computer result, time limits and Stop,
   three computers with early stopping, consecutive runs, refused workers,
   the rendezvous, the CLI flags) and two GUI tests for the *Cluster* row.
-  1,573 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
-  environments (2.13: 1,501); pyright 219 errors against 251
+  1,579 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  environments (2.13: 1,501), and the integration suites (real Hugging Face
+  and llama.cpp models) 56 passed; pyright 217 errors against 251
   for 2.13 in the same environment (the code that moved into the mixins is
   checked with less type information; nothing was fixed for it). The layout
   test now caps `_legacy.py` at 3,000 lines and covers the new modules, the
-  no-print test covers them too. Changed tests: three server tests that
-  expected `n=2`/`n=3` to be refused now use `n=17`; the GUI recipe test
+  no-print test covers them too. Six tests in `tests/test_inference_speed.py`
+  cover the compile fallback: where and how the warm-up runs, a compile that
+  fails only on the compute thread, a failing recompile with a fake and with
+  real Dynamo, a compiled forward that wrote the cache before it failed, and
+  `compile_for_inference()`. Changed tests: three server tests and the real
+  llama.cpp test that expected `n=2`/`n=3` to be refused now use `n=17`; the
+  `compile_for_inference()` test also checks that `suppress_errors` is left
+  as it was; the GUI recipe test
   compares the dropout field as text ("auto"); the 2.13 tokenizer test
   patches `CharDataset` where the training loop now lives.
 
