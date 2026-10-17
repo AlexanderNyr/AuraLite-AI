@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -64,6 +65,10 @@ _CHUNK = 32 * 1024 * 1024                 # bytes per broadcast of a large paylo
 _registered = False
 _bind_ip = ""                             # the address this process's gloo device uses
 _register_lock = threading.Lock()
+#: How long a collective waits for gloo's worker thread to let go of its
+#: tensor (`_collective`); one wait that long turns the waiting off.
+_SETTLE_TIMEOUT_S = 2.0
+_settle_enabled = True
 
 
 class ClusterError(RuntimeError):
@@ -167,6 +172,39 @@ def _register_backend() -> str:
         return _BACKEND
 
 
+def _collective(op: Callable[[Any], Any], tensor: Any) -> None:
+    """Run the blocking collective ``op(tensor)``, then wait until gloo let go of `tensor`.
+
+    torch 2.14 keeps a tensor's Python object alive while C++ code holds the
+    tensor as well; whoever drops the last C++ reference releases the Python
+    object, and that takes the GIL. After a collective that is gloo's worker
+    thread, a moment *after* it has woken the caller. When the caller's
+    process exits in that moment (a worker right after its last run), Python
+    can end the thread that waits for the GIL with ``pthread_exit``, inside
+    C++ code that must not be unwound, and the process aborts: "terminate
+    called without an active exception" (2.14.0 CI: Linux, Python 3.11 and
+    3.12). Returning only once `tensor` is back to its own references
+    (`sys.getrefcount`) leaves the worker thread nothing to do in Python.
+
+    A collective that raises returns at once: its traceback holds the tensor,
+    and the session ends anyway.
+    """
+    global _settle_enabled
+    before = sys.getrefcount(tensor)
+    op(tensor)
+    if _settle_enabled:
+        deadline = time.monotonic() + _SETTLE_TIMEOUT_S
+        while sys.getrefcount(tensor) > before:
+            if time.monotonic() > deadline:
+                _settle_enabled = False        # held elsewhere: stop waiting for it
+                break
+            time.sleep(0.0002)                 # the worker thread needs the GIL
+
+
+def _broadcast_from_main(tensor: Any) -> None:
+    dist.broadcast(tensor, 0)
+
+
 class ClusterSession:
     """One computer's side of a training run on several computers.
 
@@ -219,7 +257,7 @@ class ClusterSession:
         """Rank 0's `data` on every computer (sent in chunks)."""
         size = torch.tensor([len(data) if self.is_main and data is not None else 0],
                             dtype=torch.int64)
-        dist.broadcast(size, 0)
+        _collective(_broadcast_from_main, size)
         total = int(size.item())
         out = bytearray(total) if not self.is_main else bytearray(data or b"")
         for start in range(0, total, _CHUNK):
@@ -229,7 +267,7 @@ class ClusterSession:
                                          count=end - start).clone()
             else:
                 chunk = torch.empty(end - start, dtype=torch.uint8)
-            dist.broadcast(chunk, 0)
+            _collective(_broadcast_from_main, chunk)
             if not self.is_main:
                 out[start:end] = chunk.numpy().tobytes()
         return bytes(out)
@@ -240,12 +278,12 @@ class ClusterSession:
 
     def broadcast_floats(self, values: list[float]) -> list[float]:
         t = torch.tensor([float(v) for v in values], dtype=torch.float64)
-        dist.broadcast(t, 0)
+        _collective(_broadcast_from_main, t)
         return [float(v) for v in t.tolist()]
 
     def allreduce_sum(self, values: list[float]) -> list[float]:
         t = torch.tensor([float(v) for v in values], dtype=torch.float64)
-        dist.all_reduce(t)
+        _collective(dist.all_reduce, t)
         return [float(v) for v in t.tolist()]
 
     # ---- the job -------------------------------------------------------

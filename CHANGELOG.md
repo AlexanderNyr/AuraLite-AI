@@ -177,6 +177,20 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   backend, a GGUF model generating the choices one after another, so that
   test asks for `n=17` and a new one checks two choices, plain and streamed,
   on the real model.
+- A computer of a cluster run could abort right after a run that had gone
+  well: "terminate called without an active exception", exit code -6, in two
+  Linux legs (Python 3.11 and 3.12) of the next 2.14.0 CI run. torch 2.14
+  keeps a tensor's Python object alive while C++ code holds the tensor as
+  well, and whoever drops the last C++ reference releases the Python object,
+  which takes the GIL. After a collective that is gloo's worker thread, a
+  moment after it has woken the caller. A worker process exits right after
+  its last collective; when the exit fell into that moment, Python ended the
+  gloo thread that was waiting for the GIL with `pthread_exit`, inside C++
+  code that must not be unwound. The collectives of `ClusterSession` now
+  return only once gloo has let go of their tensor. Two processes that exit
+  right after ten collectives: before, 36 of 160 processes aborted (Python
+  3.11 and 3.12); after, none of 200 (Python 3.13 aborted in neither case).
+  The step time is unchanged.
 
 **Code layout**
 
@@ -204,7 +218,7 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   processes over 127.0.0.1: the single-computer result, time limits and Stop,
   three computers with early stopping, consecutive runs, refused workers,
   the rendezvous, the CLI flags) and two GUI tests for the *Cluster* row.
-  1,579 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  1,583 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
   environments (2.13: 1,501), and the integration suites (real Hugging Face
   and llama.cpp models) 56 passed; pyright 217 errors against 251
   for 2.13 in the same environment (the code that moved into the mixins is
@@ -214,7 +228,12 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   cover the compile fallback: where and how the warm-up runs, a compile that
   fails only on the compute thread, a failing recompile with a fake and with
   real Dynamo, a compiled forward that wrote the cache before it failed, and
-  `compile_for_inference()`. Changed tests: three server tests and the real
+  `compile_for_inference()`. Four tests in `tests/test_cluster_v214.py` cover
+  the abort at exit: a collective returns only after a late release (a timer
+  plays gloo's thread), a failed collective raises at once, a tensor held
+  elsewhere turns the waiting off after one wait, and two processes that exit
+  right after their last collective exit cleanly (on the old code that test
+  aborts like the CI run). Changed tests: three server tests and the real
   llama.cpp test that expected `n=2`/`n=3` to be refused now use `n=17`; the
   `compile_for_inference()` test also checks that `suppress_errors` is left
   as it was; the GUI recipe test

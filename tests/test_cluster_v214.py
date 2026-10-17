@@ -255,3 +255,99 @@ def test_the_cli_flags():
     assert args.cluster_timeout == 120
     args = build_parser().parse_args(["cluster-worker", "192.168.1.10:29501", "--once"])
     assert args.func is cmd_cluster_worker and args.main == "192.168.1.10:29501" and args.once
+
+
+# ----------------------------------------------------------------------
+#  2.14.0 CI: a computer that exits right after its last collective
+# ----------------------------------------------------------------------
+def _bare_session() -> cluster.ClusterSession:
+    """A session whose collectives the test replaces (no process group)."""
+    return cluster.ClusterSession(None, rank=0, world_size=2, bind_ip="127.0.0.1",
+                                  timeout_s=5, job_id="test")
+
+
+def test_a_collective_returns_once_gloo_has_let_go_of_its_tensor(monkeypatch):
+    """gloo's worker thread drops its reference to a collective's tensor a
+    moment after it has woken the caller, and with torch 2.14 that release
+    takes the GIL. A timer plays the worker thread: the collective may only
+    return once the timer has let go."""
+    held = []
+
+    def late_release(tensor, *args, **kwargs):
+        held.append(tensor)
+        threading.Timer(0.2, held.clear).start()
+
+    monkeypatch.setattr(cluster, "_settle_enabled", True)
+    monkeypatch.setattr(cluster.dist, "all_reduce", late_release)
+    monkeypatch.setattr(cluster.dist, "broadcast", late_release)
+    session = _bare_session()
+    start = time.monotonic()
+    assert session.allreduce_sum([1.0, 2.0]) == [1.0, 2.0]
+    assert held == [] and time.monotonic() - start >= 0.15
+    assert session.broadcast_floats([3.0]) == [3.0]
+    assert held == []
+    assert session.broadcast_json({"a": 1}) == {"a": 1}       # the size and the chunk
+    assert held == []
+
+
+def test_a_failed_collective_raises_at_once(monkeypatch):
+    """Its traceback holds the tensor: waiting would only run into the time limit."""
+    def fails(tensor, *args, **kwargs):
+        raise RuntimeError("Connection closed by peer")
+
+    monkeypatch.setattr(cluster, "_settle_enabled", True)
+    monkeypatch.setattr(cluster.dist, "all_reduce", fails)
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="closed by peer"):
+        _bare_session().allreduce_sum([1.0])
+    assert time.monotonic() - start < 1.0
+    assert cluster._settle_enabled is True
+
+
+def test_a_tensor_that_stays_held_turns_the_waiting_off(monkeypatch):
+    """Something else keeping the tensor (a future torch) costs one wait, not one per step."""
+    held = []
+    monkeypatch.setattr(cluster, "_settle_enabled", True)
+    monkeypatch.setattr(cluster, "_SETTLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cluster.dist, "all_reduce", lambda t, *a, **k: held.append(t))
+    session = _bare_session()
+    start = time.monotonic()
+    session.allreduce_sum([1.0])
+    assert 0.15 <= time.monotonic() - start < 5
+    assert cluster._settle_enabled is False
+    start = time.monotonic()
+    session.allreduce_sum([1.0])
+    assert time.monotonic() - start < 0.1
+
+
+_EXITING_COMPUTER = """
+import sys
+sys.path.insert(0, {repo!r})
+from auralite.engine import cluster
+if {main!r}:
+    session = cluster.host_cluster(1, port={port}, host="127.0.0.1", timeout_s=60)
+else:
+    session = cluster.join_cluster("127.0.0.1:{port}", timeout_s=60)
+for i in range(10):
+    session.allreduce_sum([float(i), 1.0])
+    session.broadcast_floats([float(i)])
+print("done", flush=True)
+"""
+
+
+def test_computers_that_exit_right_after_their_last_collective_exit_cleanly():
+    """The 2.14.0 CI failure on purpose: two processes run collectives and
+    exit at once, without closing the session. Before the fix about one
+    process in five aborted on Linux with Python 3.11 and 3.12 ("terminate
+    called without an active exception", exit code -6)."""
+    env = dict(os.environ, AURALITE_NUM_THREADS="1", PYTHONIOENCODING="utf-8")
+    for _ in range(3):
+        port = _free_port()
+        procs = [subprocess.Popen(
+            [sys.executable, "-c", _EXITING_COMPUTER.format(repo=REPO, main=main, port=port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+            encoding="utf-8") for main in (True, False)]
+        for proc in procs:
+            out = _finish(proc, timeout=120)
+            assert proc.returncode == 0, out
+            assert "done" in out, out
