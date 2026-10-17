@@ -75,6 +75,12 @@ _settle_enabled = True
 _PROBE_TIMEOUT_S = 3.0
 #: Seconds without any worker after which the main computer says what to check.
 _NO_WORKER_HINT_S = 20.0
+#: Seconds a worker waits for the run silently once it is connected.
+_NO_RUN_HINT_S = 3.0
+#: Seconds the main computer's store may take to connect to itself.
+_MASTER_CONNECT_S = 30.0
+#: Addresses a server listens on, which nothing can connect to.
+_ANY_ADDRESS = ("", "0.0.0.0", "::")
 
 
 class ClusterError(RuntimeError):
@@ -247,6 +253,16 @@ def _token_hash(token: str | None) -> str:
 
 
 def _make_store(host: str, port: int, *, is_master: bool, timeout_s: float) -> Any:
+    """torch's TCPStore: the main computer's server, or a worker's client.
+
+    The server listens on every interface whatever `host` says, and then
+    connects to `host` as a client of its own. Windows refuses a connection
+    to 0.0.0.0 (WSAEADDRNOTAVAIL, 10049) and torch retries it until the
+    timeout, so on a Windows main computer the default address opened no
+    run at all; the loopback reaches the server on every system (2.14.0).
+    """
+    if is_master and host in _ANY_ADDRESS:
+        host = "127.0.0.1"
     kwargs: dict[str, Any] = dict(host_name=host, port=int(port), world_size=None,
                                   is_master=is_master, timeout=timedelta(seconds=timeout_s),
                                   wait_for_workers=False)
@@ -460,11 +476,13 @@ def host_cluster(workers: int, *, port: int = DEFAULT_PORT, host: str = "0.0.0.0
     deadline = time.monotonic() + 10.0
     while store is None:                  # the previous run's port may still close
         try:
-            store = _make_store(host, port, is_master=True, timeout_s=max(timeout_s, 60.0))
+            store = _make_store(host, port, is_master=True, timeout_s=_MASTER_CONNECT_S)
         except (RuntimeError, OSError) as exc:
             if time.monotonic() > deadline:
-                raise ClusterError(f"cannot open port {port} for the cluster: {exc}") from exc
+                raise ClusterError(f"cannot open port {port} for the cluster: "
+                                   f"{_first_line(exc)}") from exc
             time.sleep(0.5)
+    store.set_timeout(timedelta(seconds=max(timeout_s, 60.0)))
     probe_port = _open_probe_port(host or "0.0.0.0")
     if probe_port is not None:            # before the run opens: workers look for it then
         store.set(_KEY + "probe/0", str(probe_port.port))
@@ -677,14 +695,19 @@ def _worker_rendezvous(store: Any, *, token: str | None = None, skip_job: str | 
     """
     status = on_status or (lambda _msg: None)
 
-    def wait_for(key: str) -> bytes:
+    def wait_for(key: str, slow: str = "") -> bytes:
+        started = time.monotonic()
         while not store.check([_KEY + key]):
             if stop_event is not None and stop_event.is_set():
                 raise ClusterError("stopped")
+            if slow and time.monotonic() - started > _NO_RUN_HINT_S:
+                status(slow)               # once
+                slow = ""
             time.sleep(0.2)
         return store.get(_KEY + key)
 
-    job_id = wait_for("job_id").decode("utf-8")
+    job_id = wait_for("job_id", "Connected to the main computer; waiting for it to open the "
+                                "run (if this lasts, see the main computer's window)").decode("utf-8")
     if job_id == skip_job:
         raise ClusterError("already served this run")
     versions = json.loads(wait_for("versions").decode("utf-8"))

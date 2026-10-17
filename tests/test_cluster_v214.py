@@ -176,6 +176,20 @@ def test_two_computers_train_the_model_one_computer_trains():
     assert main.generate("The quick", 12, temperature=0.0, top_k=1).startswith("The quick")
 
 
+def test_a_main_computer_on_its_default_address():
+    """No cluster_host: the main computer listens on every interface (the GUI
+    and the CLI default). On Windows its store connected to 0.0.0.0 and
+    never opened the run; this runs in the windows-latest CI leg too."""
+    port = _free_port()
+    worker = _start_worker(port)
+    params = _cluster_params(port, epochs=1)
+    del params["cluster_host"]
+    summary = AuraLiteEngine().train(TEXT, params)
+    out = _finish(worker)
+    assert worker.returncode == 0, out
+    assert summary["cluster_size"] == 2 and "served 1" in out
+
+
 def test_the_main_computer_decides_when_the_run_ends():
     """A time limit on the main computer ends the run on every computer."""
     port = _free_port()

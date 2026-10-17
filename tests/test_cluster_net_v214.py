@@ -318,3 +318,65 @@ def test_a_worker_that_reaches_only_the_cluster_port_stops_the_run(monkeypatch):
     assert "worker 1 (127.0.0.3) reaches port" in main and "not only port" in main
     assert "cannot connect to worker" not in main          # its own port answered
     assert worker == {"error": f"the main computer cancelled the run ({main})"}
+
+
+# ----------------------------------------------------------------------
+#  The main computer's own store (Windows)
+# ----------------------------------------------------------------------
+def test_the_main_computers_store_connects_to_itself_over_the_loopback(monkeypatch):
+    """torch's server listens on every interface and then connects to the
+    given address; Windows refuses a connection to 0.0.0.0 (10049)."""
+    seen = []
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            seen.append((kwargs["host_name"], kwargs["is_master"]))
+
+    monkeypatch.setattr(cluster.dist, "TCPStore", Recorder)
+    for host in ("0.0.0.0", "::", ""):
+        cluster._make_store(host, 29500, is_master=True, timeout_s=5)
+    cluster._make_store("192.168.1.25", 29500, is_master=True, timeout_s=5)
+    cluster._make_store("192.168.1.25", 29500, is_master=False, timeout_s=5)
+    assert seen == [("127.0.0.1", True)] * 3 + [("192.168.1.25", True),
+                                                ("192.168.1.25", False)]
+
+
+def test_a_main_computer_on_the_default_address_opens_its_run_as_on_windows(monkeypatch):
+    """A TCPStore that refuses connections to 0.0.0.0 as Windows does: the
+    run must open (and then time out without workers), not fail to open."""
+    real = cluster.dist.TCPStore
+
+    def windows_like(**kwargs):
+        if kwargs["host_name"] in ("", "0.0.0.0", "::"):
+            raise RuntimeError("The client socket has failed to connect to any network address "
+                               "of (0.0.0.0, 29500). (system error: 10049 - The requested "
+                               "address is not valid in its context.)")
+        return real(**kwargs)
+
+    monkeypatch.setattr(cluster.dist, "TCPStore", windows_like)
+    statuses: list[str] = []
+    with pytest.raises(cluster.ClusterError, match="only 0 of 1 workers"):
+        cluster.host_cluster(1, port=_free_port(), host="0.0.0.0", timeout_s=1.5,
+                             on_status=statuses.append)
+    assert statuses and "0/1 workers joined" in statuses[0]
+
+
+def test_a_connected_worker_says_so_while_the_run_does_not_open(monkeypatch):
+    monkeypatch.setattr(cluster, "_NO_RUN_HINT_S", 0.2)
+    port = _free_port()
+    main = cluster._make_store("127.0.0.1", port, is_master=True, timeout_s=30)
+
+    def open_late():
+        cluster._open_run(main, 1, token=None)
+        main.set("auralite/start", json.dumps({"cancelled": True, "reason": "a test"}))
+
+    timer = threading.Timer(1.0, open_late)
+    timer.start()
+    statuses: list[str] = []
+    try:
+        with pytest.raises(cluster.ClusterError, match=r"cancelled the run \(a test\)"):
+            cluster._worker_rendezvous(_client(port), on_status=statuses.append)
+    finally:
+        timer.join()
+    connected = [s for s in statuses if s.startswith("Connected to the main computer")]
+    assert len(connected) == 1 and "main computer's window" in connected[0]

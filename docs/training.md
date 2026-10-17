@@ -631,8 +631,10 @@ plain socket before torch connects and says once why it is still waiting:
 training has not started: start it, or check the port), *no answer* (a
 firewall drops the connection, or nothing is at that address), *does not
 resolve* (a host name) or *cannot be reached* (no route: another network).
-The main computer names its addresses and the firewall when no worker has
-come within 20 s. In order:
+*Connected to the main computer; waiting for it to open the run* means the
+connection works and the main computer has not opened its run: its window
+says why. The main computer names its addresses and the firewall when no
+worker has come within 20 s. In order:
 
 1. Start the training on the main computer (`--cluster-workers N`, or the
    *Cluster workers* field), check the address it shows, and give that one
@@ -706,7 +708,9 @@ connection fails, a waiting worker that says why once per reason and leaves
 torch's client out until the port answers, the main computer's hint, gloo's
 direction (the larger address connects), a run stopped at once for a
 connection it needs, to a worker or to the main computer (two loopback
-addresses play the computers), and a note for one it does not need.
+addresses play the computers), a note for one it does not need, and the main
+computer's store on the default address, which connects to itself over the
+loopback because Windows refuses connections to 0.0.0.0.
 
 ## 13. Reproduce
 
