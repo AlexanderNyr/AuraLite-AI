@@ -625,6 +625,60 @@ The torchrun / `use_ddp` path for several GPUs of one machine is unchanged.
 There is no encryption: run it on a trusted network only, never with the port
 reachable from the internet.
 
+**If a worker cannot connect.** A worker asks the main computer's port with a
+plain socket before torch connects and says once why it is still waiting:
+*nothing listens on port 29500 yet* (the main computer answers, but its
+training has not started: start it, or check the port), *no answer* (a
+firewall drops the connection, or nothing is at that address), *does not
+resolve* (a host name) or *cannot be reached* (no route: another network).
+The main computer names its addresses and the firewall when no worker has
+come within 20 s. In order:
+
+1. Start the training on the main computer (`--cluster-workers N`, or the
+   *Cluster workers* field), check the address it shows, and give that one
+   to the workers. They may start first; they wait.
+2. On Windows the network must be a private one: *Settings > Network &
+   internet > Wi-Fi* (or *Ethernet*) *> network properties > Private
+   network*, or in an administrator PowerShell
+   `Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private`
+   (`Get-NetConnectionProfile` lists the names). A public network blocks the
+   connections even when Python is allowed on private ones.
+3. Let Python accept connections, on **every** computer: *Windows Security >
+   Firewall & network protection > Allow an app through firewall*, tick
+   *Private* for every *Python* entry (an unticked entry is a block rule
+   left by an earlier *Cancel* in the firewall's question, and blocks win).
+   Or in an administrator PowerShell, with the Python that runs AuraLite:
+
+   ```powershell
+   $py = python -c "import sys; print(getattr(sys, '_base_executable', sys.executable))"
+   New-NetFirewallRule -DisplayName "AuraLite cluster" -Direction Inbound -Program $py -Action Allow -Profile Private
+   ```
+
+   A virtual environment's `python.exe` only starts the base interpreter,
+   which is the program that listens, hence `_base_executable`; the main
+   computer prints that path in its hint. On Linux: `sudo ufw allow from
+   192.168.1.0/24` (ufw) or `sudo firewall-cmd --zone=trusted
+   --add-source=192.168.1.0/24` (firewalld), with your network's prefix.
+4. Check from a worker while the main computer waits: `Test-NetConnection
+   192.168.1.25 -Port 29500` in PowerShell must report `TcpTestSucceeded :
+   True`, `nc -vz 192.168.1.25 29500` on Linux must succeed.
+5. Guest Wi-Fi networks and access points with client isolation keep
+   computers apart: use the main network or a cable.
+
+Opening port 29500 alone is not enough: gloo connects every pair of computers
+on free ports, from the computer with the larger address to the one with the
+smaller (192.168.1.30 connects to 192.168.1.25). Before gloo starts, every
+worker tries a second port of the main computer and the main computer a port
+of every worker. A failed connection that gloo will need stops the run at once
+and names the computer whose firewall to open (gloo itself would wait at
+least `cluster_timeout_s`, 10 minutes by default, and then fail with *Connect
+timeout*); the workers show the same message and wait for the next run. A
+failed connection this run does not need is reported as a note, since it
+would stop a run once the addresses change. On Windows torch also prints
+`failed to connect to [NAME]:29500 (system error: 10049, ...)` once per
+connection: it tries an IPv6 address first and then IPv4, so the line is
+harmless.
+
 **Is it faster?** Each step moves the gradients once: 4 bytes per parameter,
 3.2 MB for the 0.8 M-parameter *Small* model, while one step of batch 32 takes
 about 0.18 s on one core of the test machine. Two processes with one core each
@@ -647,6 +701,12 @@ computer's single-computer result (same steps, validation loss within 1 %),
 time limits and Stop end every computer, three computers stop early together,
 a worker serves one run after another, and workers of another version, with
 another token or beyond the expected number are refused.
+`tests/test_cluster_net_v214.py` covers the connection checks: the reasons a
+connection fails, a waiting worker that says why once per reason and leaves
+torch's client out until the port answers, the main computer's hint, gloo's
+direction (the larger address connects), a run stopped at once for a
+connection it needs, to a worker or to the main computer (two loopback
+addresses play the computers), and a note for one it does not need.
 
 ## 13. Reproduce
 

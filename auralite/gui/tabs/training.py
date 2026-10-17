@@ -179,8 +179,10 @@ class TrainTabMixin:
         self.cluster_join_btn = ttk.Button(row_cluster, text="Join",
                                            command=self.toggle_cluster_worker)
         self.cluster_join_btn.pack(side=tk.LEFT, padx=4)
-        self.cluster_status_label = ttk.Label(row_cluster, text="", style="Sub.TLabel")
-        self.cluster_status_label.pack(side=tk.LEFT, padx=4)
+        # its own line: a worker that cannot connect says why, at some length
+        self.cluster_status_label = ttk.Label(tok_frame, text="", style="Sub.TLabel",
+                                              wraplength=900, justify=tk.LEFT)
+        self.cluster_status_label.pack(fill=tk.X, padx=4)
         self._cluster_worker_stop = None
 
         # NEW: RoPE Scaling (v2.4)

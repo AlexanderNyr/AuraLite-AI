@@ -239,3 +239,13 @@ Wi-Fi takes ten times longer. All computers need the same AuraLite and torch
 versions and must let Python through the firewall on private networks.
 Generation on several computers is not part of 2.14. See
 [training.md](training.md) § 12.
+
+**A worker keeps waiting for the main computer.** It says why: *nothing
+listens on port 29500 yet* means the main computer's training has not started
+(start it; the worker waits), *no answer* almost always means a firewall.
+Make the network a private one on Windows, allow Python in the firewall of
+every computer (not only port 29500: gloo also connects the computers on free
+ports), and check with `Test-NetConnection MAIN_ADDRESS -Port 29500` from the
+worker. A line `failed to connect to [NAME]:29500 (system error: 10049, ...)`
+is harmless (torch tries IPv6 first). The steps and commands are in
+[training.md](training.md) § 12, *If a worker cannot connect*.

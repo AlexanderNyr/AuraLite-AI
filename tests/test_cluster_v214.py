@@ -169,6 +169,7 @@ def test_two_computers_train_the_model_one_computer_trains():
     assert together["optimizer_steps"] == alone["optimizer_steps"]
     assert together["val_loss"] == pytest.approx(alone["val_loss"], rel=0.01)
     assert any("1/1 workers joined" in s for s in statuses)
+    assert not any("note -" in s for s in statuses)     # the connection checks passed
     # the engine is an ordinary single-computer engine again
     assert (main.is_distributed, main.world_size) == (False, 1)
     assert not dist.is_initialized()

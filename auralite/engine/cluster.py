@@ -35,6 +35,7 @@ Python accept connections on private networks.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import socket
 import sys
@@ -48,7 +49,8 @@ import torch
 import torch.distributed as dist
 
 __all__ = ["DEFAULT_PORT", "ClusterError", "ClusterSession", "cluster_params",
-           "host_cluster", "join_cluster", "lan_address", "parse_address", "run_worker"]
+           "connection_problem", "host_cluster", "join_cluster", "lan_address",
+           "lan_addresses", "parse_address", "run_worker"]
 
 DEFAULT_PORT = 29500
 #: Bumped whenever the rendezvous or the job format changes.
@@ -69,6 +71,10 @@ _register_lock = threading.Lock()
 #: tensor (`_collective`); one wait that long turns the waiting off.
 _SETTLE_TIMEOUT_S = 2.0
 _settle_enabled = True
+#: Seconds one connection check waits for an answer (`connection_problem`).
+_PROBE_TIMEOUT_S = 3.0
+#: Seconds without any worker after which the main computer says what to check.
+_NO_WORKER_HINT_S = 20.0
 
 
 class ClusterError(RuntimeError):
@@ -120,6 +126,111 @@ def lan_address() -> str:
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return "127.0.0.1"
+
+
+def lan_addresses() -> list[str]:
+    """Every IPv4 address of this computer, :func:`lan_address` first (2.14.0).
+
+    Loopback and link-local addresses are left out. A computer with a VPN or
+    a virtual machine adapter has several; the one the workers must type is
+    the one on the network they share.
+    """
+    main = lan_address()
+    found = [] if main.startswith("127.") else [main]
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        infos = []
+    for info in infos:
+        ip = str(info[4][0])
+        if not ip.startswith(("127.", "169.254.")) and ip not in found:
+            found.append(ip)
+    return found
+
+
+def connection_problem(host: str, port: int,
+                       timeout_s: float = _PROBE_TIMEOUT_S) -> tuple[str, str] | None:
+    """None when ``host:port`` accepts a TCP connection, else ``(kind, detail)`` (2.14.0).
+
+    `kind` is ``"refused"`` (the computer answers, nothing listens on the
+    port), ``"timeout"`` (no answer at all: a firewall drops the packets, or
+    nothing is at that address), ``"name"`` (the host name does not resolve)
+    or ``"unreachable"`` (no route). A plain socket, because torch's TCPStore
+    client tells none of these apart: it retries for its whole timeout and
+    logs every failed try with a C++ stack trace.
+    """
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_s):
+            return None
+    except socket.gaierror as exc:
+        return "name", str(exc)
+    except ConnectionRefusedError as exc:
+        return "refused", str(exc)
+    except TimeoutError as exc:
+        return "timeout", str(exc) or "timed out"
+    except OSError as exc:
+        return "unreachable", str(exc.strerror or exc)
+
+
+def _python_program() -> str:
+    """The program a Windows firewall rule must name, else "" (2.14.0).
+
+    A venv's python.exe only starts the base interpreter, and that one
+    listens, so the rule must name `sys._base_executable`.
+    """
+    if sys.platform != "win32":
+        return ""
+    return str(getattr(sys, "_base_executable", "") or sys.executable)
+
+
+def _main_computer_hint(host: str, port: int, problem: tuple[str, str]) -> str:
+    """What a worker that cannot reach the main computer should check."""
+    kind, detail = problem
+    if kind == "refused":
+        return (f"{host} answers, but nothing listens on port {port} yet: start the "
+                f"training there with cluster workers, or check the port")
+    if kind == "name":
+        return f"the name {host!r} does not resolve: use the address the main computer shows"
+    if kind == "unreachable":
+        return (f"{host} cannot be reached ({detail}): check the address, and that both "
+                f"computers are on the same network")
+    return (f"no answer. Start the training there first, check that {host} is the address "
+            f"it shows, and let Python accept connections in its firewall (on Windows: allow "
+            f"python.exe on private networks, and make the network a private one)")
+
+
+class _ProbePort:
+    """A listening socket the other computers try before the run (2.14.0).
+
+    gloo connects every pair of computers on free ports. A firewall that
+    drops those connections leaves gloo waiting for the whole cluster
+    timeout without a word; trying a port of the same program first names
+    the computer to fix. The kernel completes the connections in the backlog,
+    so nothing has to accept them.
+    """
+
+    def __init__(self, ip: str) -> None:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        self._sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if family == socket.AF_INET6:  # IPv4 too, as torch's own server does
+                self._sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            self._sock.bind((ip, 0))
+            self._sock.listen(16)
+        except OSError:
+            self._sock.close()
+            raise
+        self.port = int(self._sock.getsockname()[1])
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _open_probe_port(ip: str) -> _ProbePort | None:
+    try:
+        return _ProbePort(ip)
+    except OSError:
+        return None                        # no check then; gloo will tell
 
 
 # ----------------------------------------------------------------------
@@ -354,10 +465,15 @@ def host_cluster(workers: int, *, port: int = DEFAULT_PORT, host: str = "0.0.0.0
             if time.monotonic() > deadline:
                 raise ClusterError(f"cannot open port {port} for the cluster: {exc}") from exc
             time.sleep(0.5)
+    probe_port = _open_probe_port(host or "0.0.0.0")
+    if probe_port is not None:            # before the run opens: workers look for it then
+        store.set(_KEY + "probe/0", str(probe_port.port))
     job_id = _open_run(store, workers, token)
     shown = lan_address() if host in ("", "0.0.0.0", "::") else host
-    deadline = time.monotonic() + float(timeout_s)
+    started = time.monotonic()
+    deadline = started + float(timeout_s)
     joined = -1
+    hint_shown = False
     try:
         while True:
             now_joined = int(store.add(_KEY + "joined", 0))
@@ -372,21 +488,133 @@ def host_cluster(workers: int, *, port: int = DEFAULT_PORT, host: str = "0.0.0.0
             if time.monotonic() > deadline:
                 raise ClusterError(f"only {joined} of {workers} workers joined within "
                                    f"{timeout_s:g} s")
+            if not hint_shown and time.monotonic() - started > _NO_WORKER_HINT_S:
+                hint_shown = True
+                status(_no_worker_hint(shown, port))
             time.sleep(0.2)
         first_worker = store.get(_KEY + "ip/1").decode("utf-8")
         bind_ip = host if host not in ("", "0.0.0.0", "::") else local_ip_towards(first_worker)
+        error, notes = _check_connections(store, workers, bind_ip, port)
+        for note in notes:
+            status(f"Cluster: note - {note}")
+        if error:
+            raise ClusterError(error)
         store.set(_KEY + "start", json.dumps({"world_size": workers + 1}))
         session = ClusterSession(store, rank=0, world_size=workers + 1, bind_ip=bind_ip,
                                  timeout_s=timeout_s, job_id=job_id)
         session.start()
-    except BaseException:
+    except BaseException as exc:
+        reason = (str(exc) if isinstance(exc, ClusterError)
+                  else _first_line(exc) if isinstance(exc, Exception) else "stopped")
         try:
-            store.set(_KEY + "start", json.dumps({"cancelled": True}))
+            store.set(_KEY + "start", json.dumps({"cancelled": True, "reason": reason}))
+            # The port closes with this function: let the workers read why first.
+            waiting = min(max(joined, 0), workers)
+            give_up = time.monotonic() + 3.0
+            while (waiting and int(store.add(_KEY + "start_seen", 0)) < waiting
+                   and time.monotonic() < give_up):
+                time.sleep(0.05)
         except Exception:                  # noqa: BLE001
             pass
         raise
+    finally:
+        if probe_port is not None:
+            probe_port.close()
     status(f"Cluster: training on {workers + 1} computers")
     return session
+
+
+def _first_line(exc: BaseException) -> str:
+    """The first line of an error, without torch's C++ stack trace."""
+    lines = str(exc).strip().splitlines()
+    return (lines[0] if lines else type(exc).__name__)[:300]
+
+
+def _no_worker_hint(shown: str, port: int) -> str:
+    """Main computer: what to check when the workers do not come (2.14.0)."""
+    others = [ip for ip in lan_addresses() if ip != shown]
+    also = f" (this computer also has {', '.join(others)})" if others else ""
+    program = _python_program()
+    python = f"Python ({program})" if program else "Python"
+    return (f"Cluster: still waiting. Workers must reach {shown}:{port}{also}. A worker "
+            f"that gets no answer is blocked by this computer's firewall: let {python} accept "
+            f"connections on private networks (docs/training.md, section 12)")
+
+
+def _gloo_dials(a: str, b: str) -> bool | None:
+    """Whether gloo makes the computer at address `a` connect to the one at `b`.
+
+    gloo opens one connection per pair of computers, from the larger address
+    to the smaller one (``Device::isInitiator`` in gloo/transport/tcp: the
+    addresses compared byte for byte, then the ports). None when the
+    addresses are equal or not IP addresses: the ports decide then.
+    """
+    try:
+        x, y = ipaddress.ip_address(a), ipaddress.ip_address(b)
+    except ValueError:
+        return None
+    if x.version != y.version or x == y:
+        return None
+    return x.packed > y.packed            # memcmp, as gloo compares them
+
+
+def _try_connect(host: str, port: int) -> tuple[str, str] | None:
+    """:func:`connection_problem`, asked twice when there was no answer.
+
+    Windows sends the first repeat of a connection request after 3 s, so one
+    lost packet on Wi-Fi would otherwise read as a firewall.
+    """
+    problem = connection_problem(host, port)
+    if problem is not None and problem[0] == "timeout":
+        problem = connection_problem(host, port)
+    return problem
+
+
+def _check_connections(store: Any, workers: int, main_ip: str,
+                       port: int) -> tuple[str, list[str]]:
+    """Main computer: try the connections of the run before gloo does (2.14.0).
+
+    Each worker tried a second port of this computer (``reach/{rank}``) and
+    offers one of its own (``probe/{rank}``); workers of a build without
+    these keys are not checked. A computer that cannot be connected to stops
+    the run when gloo will connect to it (from a computer with a larger
+    address): gloo would wait for the whole cluster timeout and then fail
+    without naming anyone. Returns ``(error, notes)``: the error ("" when
+    none), and the failures this run does not need, which another address
+    (DHCP) would.
+    """
+    ips = {0: main_ip}
+    for rank in range(1, workers + 1):
+        ips[rank] = store.get(f"{_KEY}ip/{rank}").decode("utf-8")
+    failed: dict[int, list[str]] = {}     # rank that could not be reached -> what failed
+    program = _python_program()
+    python = f"Python ({program})" if program else "Python"
+    for rank in range(1, workers + 1):
+        if store.check([f"{_KEY}reach/{rank}"]):
+            kind = store.get(f"{_KEY}reach/{rank}").decode("utf-8")
+            if kind != "ok":
+                failed.setdefault(0, []).append(
+                    f"worker {rank} ({ips[rank]}) reaches port {port} of the main computer "
+                    f"({main_ip}) but not its other ports ({kind}): let {python} accept "
+                    f"connections in the main computer's firewall on private networks, not "
+                    f"only port {port}")
+        if store.check([f"{_KEY}probe/{rank}"]):
+            problem = _try_connect(ips[rank], int(store.get(f"{_KEY}probe/{rank}").decode("utf-8")))
+            if problem is not None:
+                failed.setdefault(rank, []).append(
+                    f"the main computer ({main_ip}) cannot connect to worker {rank} "
+                    f"({ips[rank]}, {problem[0]}): let Python accept connections in the "
+                    f"firewall of {ips[rank]} on private networks")
+    errors: list[str] = []
+    notes: list[str] = []
+    for target, texts in failed.items():
+        needed = any(_gloo_dials(ips[other], ips[target]) for other in ips if other != target)
+        (errors if needed else notes).extend(texts)
+    if not errors:
+        return "", [f"{text} (this run does not need that connection, a computer with "
+                    f"another address would)" for text in notes]
+    return ("the computers cannot open the connections training needs: " + "; ".join(errors)
+            + ". Then start the training again; the workers wait for it."), notes
 
 
 def join_cluster(main: str, *, timeout_s: float = 600.0, token: str | None = None,
@@ -396,38 +624,57 @@ def join_cluster(main: str, *, timeout_s: float = 600.0, token: str | None = Non
     """Worker: connect to the main computer and join its next run.
 
     Waits (polling, so `stop_event` can end it) for a main computer that
-    offers a run other than `skip_job`. Raises :class:`ClusterError` when this
-    worker cannot take part (versions, token, enough workers already).
+    offers a run other than `skip_job`, saying why it cannot connect yet.
+    Raises :class:`ClusterError` when this worker cannot take part (versions,
+    token, enough workers already).
     """
     host, port = parse_address(main)
     status = on_status or (lambda _msg: None)
     store = None
-    waiting_shown = False
+    shown = ""
     while store is None:                  # short tries, so `stop_event` can end the wait
-        try:
-            store = _make_store(host, port, is_master=False, timeout_s=5.0)
-        except (RuntimeError, OSError) as exc:
-            if stop_event is not None and stop_event.is_set():
-                raise ClusterError("stopped") from exc
-            if not waiting_shown:
-                status(f"Waiting for the main computer at {host}:{port}...")
-                waiting_shown = True
-            time.sleep(1.0)
+        if stop_event is not None and stop_event.is_set():
+            raise ClusterError("stopped")
+        problem = connection_problem(host, port)
+        if problem is None:               # only then torch's client: it logs every failure
+            try:
+                store = _make_store(host, port, is_master=False, timeout_s=5.0)
+                break
+            except (RuntimeError, OSError) as exc:
+                message = f"{host}:{port} answers but does not serve a run: {_first_line(exc)}"
+        else:
+            message = _main_computer_hint(host, port, problem)
+        if message != shown:              # once per reason, not once per try
+            status(f"Waiting for the main computer at {host}:{port} - {message}")
+            shown = message
+        time.sleep(1.0)
     store.set_timeout(timedelta(seconds=max(timeout_s, 60.0)))
-    rank, world_size, job_id = _worker_rendezvous(store, token=token, skip_job=skip_job,
-                                                  on_status=status, stop_event=stop_event,
-                                                  my_ip=local_ip_towards(host, port))
-    session = ClusterSession(store, rank=rank, world_size=world_size,
-                             bind_ip=local_ip_towards(host, port), timeout_s=timeout_s,
-                             job_id=job_id)
+    my_ip = local_ip_towards(host, port)
+    probe_port = _open_probe_port(my_ip)
+    try:
+        rank, world_size, job_id = _worker_rendezvous(
+            store, token=token, skip_job=skip_job, on_status=status, stop_event=stop_event,
+            my_ip=my_ip, probe_port=probe_port.port if probe_port is not None else 0,
+            main_host=host)
+    finally:
+        if probe_port is not None:
+            probe_port.close()
+    session = ClusterSession(store, rank=rank, world_size=world_size, bind_ip=my_ip,
+                             timeout_s=timeout_s, job_id=job_id)
     session.start()
     return session
 
 
 def _worker_rendezvous(store: Any, *, token: str | None = None, skip_job: str | None = None,
                        on_status: Callable[[str], None] | None = None,
-                       stop_event: Any = None, my_ip: str = "") -> tuple[int, int, str]:
-    """A worker's side of the rendezvous: ``(rank, world_size, job_id)``."""
+                       stop_event: Any = None, my_ip: str = "", probe_port: int = 0,
+                       main_host: str = "") -> tuple[int, int, str]:
+    """A worker's side of the rendezvous: ``(rank, world_size, job_id)``.
+
+    With `probe_port` the main computer tries to connect to this worker
+    before the run, with `main_host` this worker tries a second port of the
+    main computer (see :func:`_check_connections`).
+    """
     status = on_status or (lambda _msg: None)
 
     def wait_for(key: str) -> bytes:
@@ -453,11 +700,20 @@ def _worker_rendezvous(store: Any, *, token: str | None = None, skip_job: str | 
     rank = int(store.add(_KEY + "joined", 1))
     if rank > expected:
         raise ClusterError(f"the main computer already has its {expected} worker(s)")
+    # before ip/{rank}: the main computer reads these once that key is there
+    if probe_port:
+        store.set(f"{_KEY}probe/{rank}", str(int(probe_port)))
+    if main_host and store.check([_KEY + "probe/0"]):
+        problem = _try_connect(main_host, int(store.get(_KEY + "probe/0").decode("utf-8")))
+        store.set(f"{_KEY}reach/{rank}", "ok" if problem is None else problem[0])
     store.set(f"{_KEY}ip/{rank}", my_ip or "127.0.0.1")
     status(f"Joined as worker {rank}/{expected}; waiting for the main computer")
     start = json.loads(wait_for("start").decode("utf-8"))
+    store.add(_KEY + "start_seen", 1)     # the main computer may close the port now
     if start.get("cancelled"):
-        raise ClusterError("the main computer cancelled the run")
+        reason = start.get("reason")
+        raise ClusterError("the main computer cancelled the run"
+                           + (f" ({reason})" if reason else ""))
     return rank, int(start["world_size"]), job_id
 
 
@@ -503,7 +759,7 @@ def run_worker(main: str, *, once: bool = False, timeout_s: float = 600.0,
         except (RuntimeError, OSError) as exc:
             if stop_event is not None and stop_event.is_set():
                 break
-            status(f"The run ended with an error: {exc}; retrying")
+            status(f"The run ended with an error: {_first_line(exc)}; retrying")
             time.sleep(2.0)
         finally:
             if session is not None:

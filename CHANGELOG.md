@@ -52,6 +52,23 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   the host name resolves to (127.0.1.1 on many Linux machines, which other
   computers cannot reach). `cluster_port` (default 29500), `cluster_host`,
   `cluster_timeout_s` (default 600) and `cluster_token` tune the run.
+- A computer that cannot connect says why. A worker asks the main computer's
+  port with a plain socket first, and only then lets torch's TCPStore client
+  connect, which retries in silence and then logs every failed try with a C++
+  stack trace, the same for every cause. The worker says once per reason
+  what to check: nothing listens there yet (start the training), no answer
+  (firewall, address), the name does not resolve, no route. The main
+  computer names its addresses, its Python and the firewall when no worker
+  has come within 20 s. Before gloo starts, every worker tries a second port
+  of the main computer and the main computer a port of every worker. gloo
+  connects each pair of computers from the larger address to the smaller, so
+  a failed connection gloo will need stops the run at once and names the
+  computer whose firewall to open (gloo itself waited at least
+  `cluster_timeout_s`, 10 minutes by default, then failed with "Connect
+  timeout"); one this run
+  does not need is a note. Workers show why a run was cancelled and wait for
+  the next one. docs/training.md § 12 lists the steps (start order, private
+  network, firewall rule for the interpreter, `Test-NetConnection`).
 - Measured on one machine with two processes of one core each (a perfect
   network): 150 steps of the *Small* model 1.43 times as fast as one process
   (0.129 vs 0.185 s per step), same validation loss (3.6408 vs 3.6354). Over a
@@ -218,7 +235,7 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   processes over 127.0.0.1: the single-computer result, time limits and Stop,
   three computers with early stopping, consecutive runs, refused workers,
   the rendezvous, the CLI flags) and two GUI tests for the *Cluster* row.
-  1,583 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  1,596 passed / 17 skipped on Python 3.13 and 3.11 in `.[test]`-only
   environments (2.13: 1,501), and the integration suites (real Hugging Face
   and llama.cpp models) 56 passed; pyright 217 errors against 251
   for 2.13 in the same environment (the code that moved into the mixins is
@@ -233,7 +250,14 @@ from 2.13 only by the Muon iterations (2.2075 → 2.1975).
   plays gloo's thread), a failed collective raises at once, a tensor held
   elsewhere turns the waiting off after one wait, and two processes that exit
   right after their last collective exit cleanly (on the old code that test
-  aborts like the CI run). Changed tests: three server tests and the real
+  aborts like the CI run). `tests/test_cluster_net_v214.py` (13 tests) covers
+  the connection checks: the reasons, a waiting worker that says why once per
+  reason and starts no TCPStore client while nothing answers, a worker process
+  without a main computer that prints no C++ traces (the old code printed
+  them after 5 s), the main computer's hint, gloo's direction, a run stopped
+  at once for a connection it needs in either direction and only a note for
+  one it does not (two loopback addresses play the computers), and the
+  reason a worker hears. Changed tests: three server tests and the real
   llama.cpp test that expected `n=2`/`n=3` to be refused now use `n=17`; the
   `compile_for_inference()` test also checks that `suppress_errors` is left
   as it was; the GUI recipe test
