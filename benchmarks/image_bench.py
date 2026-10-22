@@ -1,9 +1,10 @@
 """Image-generator benchmarks (CPU): attention layout, training step, samplers,
-image decoding. Used for the 2.10 numbers in docs/image.md.
+image decoding, model types. Used for the 2.10 and 2.14.2 numbers in docs/image.md.
 
-    python benchmarks/image_bench.py                     # attn, step, sampler, decode
+    python benchmarks/image_bench.py                     # attn, step, sampler, decode, types
     python benchmarks/image_bench.py step --preset small --batch 8
     python benchmarks/image_bench.py sampler             # exact-denoiser step study
+    python benchmarks/image_bench.py types --size 16     # diffusion vs flow vs GAN (2.14.2)
     python benchmarks/image_bench.py --json > out.jsonl
 
 `step` compares, in one process and alternating rounds, the pre-2.10 attention
@@ -225,8 +226,51 @@ def bench_decode(args) -> None:
          speedup=round(full / draft, 1))
 
 
+def bench_types(args) -> None:
+    """2.14.2: a training step and the sampling time per image of each model type.
+
+    The real `ImageGenEngine.train` loop on synthetic images (its summary times
+    the loop only, not the setup): the *Tiny* presets of diffusion, flow
+    matching and the GAN (R1 + R2 every step, and every 4 steps), then
+    `generate` with DPM-Solver++ at 20 steps (diffusion, flow) or one call (GAN).
+    """
+    from PIL import Image
+
+    tmp = Path(args.tmp) / f"types_{args.size}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    gen = torch.Generator().manual_seed(0)
+    count = max(4, args.files)
+    for i in range(count):
+        arr = torch.randint(0, 255, (args.size, args.size, 3), generator=gen, dtype=torch.uint8)
+        Image.fromarray(arr.numpy()).save(tmp / f"img_{i:03d}.png")
+    presets = {"diffusion": "Tiny (CPU-friendly)", "flow": "Flow Tiny (CPU-friendly)",
+               "gan": "GAN Tiny (CPU-friendly)"}
+    runs = [("diffusion", {}), ("flow", {}), ("gan", {"gan_reg_every": 1}),
+            ("gan", {"gan_reg_every": 4})]
+    batch = args.batch or 32
+    for kind, extra in runs:
+        cfg = dict(ie.IMAGE_PRESETS[presets[kind]], img_size=args.size, channels=3,
+                   batch_size=batch, epochs=max(1, args.repeats), seed=1, val_split=0.0,
+                   progress_every_seconds=1e9, **extra)
+        eng = ie.ImageGenEngine()
+        eng.train(str(tmp), cfg)
+        summary = eng.last_train_summary
+        steps = max(1, int(summary["steps"]))
+        n = max(2, min(32, count))
+        kwargs = {} if kind == "gan" else {"steps": 20, "sampler": "dpm++2m"}
+        eng.generate(n=2, seed=0, **kwargs)                 # warm-up
+        t0 = time.perf_counter()
+        eng.generate(n=n, seed=0, **kwargs)
+        sample_ms = 1000 * (time.perf_counter() - t0) / n
+        label = kind if kind != "gan" else f"gan (R1+R2 every {extra['gan_reg_every']})"
+        emit(section="types", model=label, size=args.size, batch=batch,
+             params=eng.parameter_summary(),
+             ms_per_step=round(1000 * float(summary["seconds"]) / steps, 1),
+             sample_ms_per_image=round(sample_ms, 2), threads=torch.get_num_threads())
+
+
 SECTIONS = {"attn": bench_attn, "step": bench_step, "sampler": bench_sampler,
-            "decode": bench_decode}
+            "decode": bench_decode, "types": bench_types}
 
 
 def main(argv=None) -> int:
@@ -236,7 +280,7 @@ def main(argv=None) -> int:
     p.add_argument("--batch", type=int, default=0, help="step: batch size (default: preset)")
     p.add_argument("--repeats", type=int, default=6)
     p.add_argument("--files", type=int, default=24, help="decode: number of JPEGs")
-    p.add_argument("--size", type=int, default=32, help="decode: target size")
+    p.add_argument("--size", type=int, default=32, help="decode, types: image size")
     p.add_argument("--tmp", default=str(Path(tempfile.gettempdir()) / "auralite_image_bench"))
     p.add_argument("--json", action="store_true", help="one JSON object per line")
     p.add_argument("--threads", type=int, default=0,

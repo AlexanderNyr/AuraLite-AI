@@ -1467,7 +1467,7 @@ class TrainerMixin:
                                 "eta_seconds": eta,
                                 "is_epoch_end": False,
                                 "epoch_loss": avg_loss,
-                                # 2.14.1: the stage bar follows the epoch
+                                # 2.14.1: the stage line follows the epoch
                                 "stage": "train",
                                 "stage_label": f"Epoch {epoch + 1}/{epochs}",
                                 "stage_step": "batches",
@@ -1546,7 +1546,7 @@ class TrainerMixin:
                 val_t0 = time.time()
                 val_hook: Callable[[int, int], None] | None = None
                 if report_rank_ok and progress_callback is not None:
-                    # 2.14.1: validation batches on the stage bar
+                    # 2.14.1: validation batches as a stage
                     val_info = {"batch": n_loader_batches, "batches": n_loader_batches,
                                 "global_step": completed_batches_total,
                                 "total_steps": total_opt_steps,

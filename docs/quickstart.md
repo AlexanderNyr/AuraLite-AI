@@ -78,7 +78,7 @@ do without the file. `--tokenizer` also takes a Hugging Face `tokenizer.json`
 (BPE: GPT-2, Llama, Mistral, Qwen style), GPT-2 `vocab.json` + `merges.txt` or
 a checkpoint. In the GUI: *Train tokenizer only*, *Load tokenizer…* and the
 choice *Own file* in the training tab. The progress lines (and the GUI's
-second bar) show every stage: tokenizer, tokenizing, epoch, validation.
+progress bar) show every stage: tokenizer, tokenizing, epoch, validation.
 Details: [training.md](training.md) § 13.
 
 ### Train on several computers (2.14)
@@ -94,6 +94,23 @@ computer would train (Windows and Linux can be mixed; same AuraLite and torch
 versions; allow Python through the firewall on private networks). The GUI
 has the same in the training tab's *Cluster* row. Details:
 [training.md](training.md) § 12.
+
+### Your own image generator (model types: 2.14.2)
+
+```bash
+auralite image-train --images photos/ --preset small --model gen.pt             # diffusion
+auralite image-train --images photos/ --type flow --preset small --model flow.pt
+auralite image-train --images photos/ --type gan --preset tiny --model gan.pt
+auralite image-generate --model gan.pt -n 16 --out grid.png        # GAN: --truncation 1.5
+auralite image-eval --model flow.pt --images photos/               # quality: SWD, lower is better
+```
+
+No pretrained weights: the model learns from your folder (sub-folders are
+classes with `--classes`). Flow matching trains the same U-Net as diffusion
+with the objective of Stable Diffusion 3 and gave the better images at the
+same budget in our tests; a GAN samples an image with one network call. The
+GUI's *Image* tab has the same three types. Details and measurements:
+[image.md](image.md) § 10–14.
 
 ## 3. Generate
 
@@ -158,7 +175,7 @@ and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or
 auralite-gui          # installed; from a source checkout: python gui_app.py
 ```
 
-The GUI covers training (text *and* image diffusion), generation, chat with
+The GUI covers training (text, and images: diffusion, flow matching or a GAN), generation, chat with
 attention/token-frequency plots, model management, quantization, evaluation and
 export. Settings live in `$AURALITE_HOME/gui_config.json`, the last session
 (corpus path, tab) is restored on start.

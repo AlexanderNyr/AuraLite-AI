@@ -55,6 +55,7 @@ try:
     from auralite.image_engine import (
         ImageGenEngine, validate_image_params, tensor_to_uint8, HAS_PIL,
         IMAGE_PRESETS, PREDICTION_TYPES, NOISE_SCHEDULES, LR_SCHEDULES, AMP_DTYPES,
+        MODEL_TYPES, SAMPLERS_BY_TYPE, GAN_LOSSES, GAN_AUGMENTS, FLOW_TIME_SAMPLING,
     )
     HAS_IMAGEGEN = True
 except Exception:
@@ -67,6 +68,13 @@ except Exception:
     NOISE_SCHEDULES = ("linear", "cosine", "sigmoid")
     LR_SCHEDULES = ("constant", "cosine", "warmup_cosine")
     AMP_DTYPES = ("fp16", "bf16", "none")
+    # 2.14.2: image model types and their settings
+    MODEL_TYPES = ("diffusion", "flow", "gan")
+    SAMPLERS_BY_TYPE = {"diffusion": ("ddim", "ddpm", "dpm++2m"),
+                        "flow": ("euler", "heun", "dpm++2m"), "gan": ()}
+    GAN_LOSSES = ("rpgan", "hinge", "nonsaturating")
+    GAN_AUGMENTS = ("ada", "diffaug", "off")
+    FLOW_TIME_SAMPLING = ("logit_normal", "uniform")
 import threading
 import multiprocessing
 import os

@@ -262,3 +262,29 @@ Unigram tokenizers (BERT, T5) are refused, and so is a SentencePiece `.model`
 (convert it to `tokenizer.json` once). A big vocabulary makes a big model:
 GPT-2's 50,257 tokens are most of the parameters of a small AuraLite model.
 See [training.md](training.md) § 13.
+
+## 14. Which image model should I train: diffusion, flow matching or a GAN?
+
+Since 2.14.2 the *Image* tab (*Model Type*) and `auralite image-train --type`
+offer all three; they read the same folders and save the same way.
+
+* **Flow matching** (`--type flow`, presets *Flow Tiny* / *Flow Small*) is the
+  first choice for quality: the same U-Net as diffusion trained with the
+  objective of Stable Diffusion 3. On MNIST at 16 px it reached a
+  classifier-FID of 74 where diffusion reached 187 after the same 1,570 steps.
+  Sample with DPM-Solver++ at 20 steps.
+* **Diffusion** (the default) stays for compatibility with your 2.10–2.14.1
+  checkpoints and for its options (ε/x0/v prediction, Min-SNR, noise
+  schedules).
+* **A GAN** (`--type gan`, *GAN Tiny* / *GAN Small*) when sampling speed matters:
+  one network call per image (1,000 images in 0.2 s on 2 vCPU, against 27 s
+  for the other two). In the same test it scored 156 (the mean of three
+  seeds, 131–195): better than diffusion, behind flow matching. It depends
+  more on its settings (`gan_lr_g` / `gan_lr_d`, `gan_gamma`) and on the seed,
+  and its losses do not tell how good it is — watch the validation SWD and the
+  samples.
+
+To compare models on your own images, use the same folder and number of
+images: `auralite image-eval --model m.pt --images photos/` (or *📏 Measure
+Quality*) prints the patch SWD next to the score of two sets of real images.
+See [image.md](image.md) § 10–13.

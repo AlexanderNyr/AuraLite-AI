@@ -1,4 +1,6 @@
-"""2.14.1 GUI: the tokenizer row (own file, train only the tokenizer) and the stage bar.
+"""2.14.1 GUI: the tokenizer row (own file, train only the tokenizer) and the stage progress.
+
+2.14.2: the stages run on the one progress bar (2.14.1 drew a second bar).
 
 tkinter is replaced by the recording doubles of ``tests/_gui_harness.py``;
 the engine, the tokenizer files and the training behind the buttons are real.
@@ -84,7 +86,7 @@ def test_train_tokenizer_only_saves_selects_and_reports(app, tmp_path, monkeypat
     assert app.tok_var.get() == "file" and app.tokenizer_path_var.get() == out
     assert "Tokenizer trained and saved" in _status(app) and "chars/token" in _status(app)
     assert "mine.json" in app.tokenizer_label.config.call_args.kwargs["text"]
-    assert app.stage_var.get() == 100.0
+    assert app.progress_var.get() == 100.0
     assert any(s.get("stage_step") == "merge" for s in stages)
     assert app.stop_btn.config.call_args.kwargs["state"] == "disabled"
     assert app.tok_train_btn.config.call_args.kwargs["state"] == "normal"
@@ -166,27 +168,46 @@ def test_saving_needs_a_model_tokenizer(app):
     assert info.called
 
 
-def test_the_stage_bar_follows_setup_epochs_and_validation(app):
+def test_one_bar_follows_the_setup_stages_then_the_run(app):
+    """2.14.2: no second bar — the stages before the first step run on the one bar."""
+    assert not hasattr(app, "stage_bar") and not hasattr(app, "stage_var")
     app.update_progress(0, 3, None, None, {
         "phase": "setup", "stage": "tokenizer", "stage_step": "merge", "stage_done": 40,
         "stage_total": 100, "stage_percent": 40.0,
         "message": "Training the BPE tokenizer · learning merges: 40 / 100 (40%)"})
-    assert app.stage_var.get() == pytest.approx(40.0)
-    assert app.stage_detail_var.get().startswith("Training the BPE tokenizer")
+    assert app.progress_var.get() == pytest.approx(40.0)
+    assert app.progress_detail_var.get().startswith("Training the BPE tokenizer")
     assert "learning merges" in _status(app)
+    assert not app._bar_busy
+    # a step without a count (building the model, compiling): a busy bar
+    app.update_progress(0, 3, None, None, {"phase": "setup", "stage": "model",
+                                           "stage_label": "Building the model",
+                                           "message": "Building the model…"})
+    assert app._bar_busy and app.progress_bar.start.called
+    assert app.progress_detail_var.get() == "Building the model…"
     app._progress_ui_last_ts = 0.0
     app.update_progress(1, 3, 2.0, None, {
         "phase": "train", "percent": 10.0, "stage": "train", "stage_label": "Epoch 1/3",
         "stage_done": 5, "stage_total": 10, "stage_unit": "batches", "stage_percent": 50.0,
         "stage_rate": 2.5, "stage_eta_seconds": 2.0, "message": "Epoch 1/3 · batch 5/10"})
-    assert app.stage_var.get() == pytest.approx(50.0)
-    assert app.stage_detail_var.get() == "Epoch 1/3 · 5/10 batches (50%) · 2.5 batches/s · ~2s left"
+    assert not app._bar_busy and app.progress_bar.stop.called
+    assert app.progress_var.get() == pytest.approx(10.0)          # the whole run
+    assert app.progress_detail_var.get().startswith("Epoch 1/3 · batch 5/10")
     app.update_progress(1, 3, 2.0, None, {
-        "phase": "val", "stage": "val", "stage_done": 3, "stage_total": 4,
+        "phase": "val", "percent": 33.3, "stage": "val", "stage_label": "Validation",
+        "stage_done": 3, "stage_total": 4, "stage_unit": "batches",
         "message": "Epoch 1/3 — validation · 3 / 4 batches (75%)"})
-    assert app.stage_var.get() == pytest.approx(75.0)
+    assert app.progress_var.get() == pytest.approx(33.3)          # stays on the run
+    assert "3 / 4 batches" in app.progress_detail_var.get()
     app.update_progress(1, 3, 2.0, None, {"phase": "setup", "stage": "x", "stage_done": "?",
                                           "stage_total": "?"})          # junk is tolerated
+
+
+def test_a_run_that_ends_in_the_setup_stops_the_busy_bar(app):
+    app._apply_stage({"phase": "setup", "message": "Waiting for the workers…"})
+    assert app._bar_busy
+    app._reset_train_buttons()
+    assert not app._bar_busy and app.progress_var.get() == 0.0
 
 
 def test_stop_before_the_first_step_acts_at_once(app, tmp_path, monkeypatch):

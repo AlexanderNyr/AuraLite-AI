@@ -13,7 +13,7 @@ _NO_TOKENIZER_FILE = "Own tokenizer: none — BPE is trained with the model"
 
 
 def _stage_text(info: dict) -> str:
-    """2.14.1: the line under the stage bar (tokenizer, tokenizing, epoch, validation)."""
+    """The line under the progress bar for a stage (tokenizer, tokenizing, epoch, validation)."""
     if info.get("phase") != "train" and info.get("message"):
         return str(info["message"])
     parts = [str(info.get("stage_label") or info.get("stage") or "")]
@@ -340,22 +340,16 @@ class TrainTabMixin:
                                             maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=4)
 
-        # Live detail line under the bar (batch / phase / speed / ETA)
+        # Live detail line under the bar (batch / phase / speed / ETA). 2.14.2: the
+        # one bar also shows the stages before training — training the tokenizer,
+        # tokenizing the corpus — with done/total, speed and time left on this line
+        # (2.14.1 had a second bar for them).
         self.progress_detail_var = tk.StringVar(value="")
         self.progress_detail_label = ttk.Label(
             run_frame, textvariable=self.progress_detail_var, style="Sub.TLabel")
         self.progress_detail_label.pack(fill=tk.X, pady=(0, 2), anchor=tk.W)
-
-        # 2.14.1: the current stage — tokenizer training, tokenizing the corpus,
-        # the epoch, the validation — with done/total, speed and time left.
-        self.stage_var = tk.DoubleVar()
-        self.stage_bar = ttk.Progressbar(run_frame, variable=self.stage_var, maximum=100)
-        self.stage_bar.pack(fill=tk.X, pady=(2, 0))
-        self.stage_detail_var = tk.StringVar(value="")
-        self.stage_detail_label = ttk.Label(
-            run_frame, textvariable=self.stage_detail_var, style="Sub.TLabel")
-        self.stage_detail_label.pack(fill=tk.X, pady=(0, 2), anchor=tk.W)
         self._train_phase = ""
+        self._bar_busy = False
 
         self.status_label = ttk.Label(run_frame,
                                       text="Status: Waiting for file…")
@@ -589,7 +583,19 @@ class TrainTabMixin:
         is_epoch_end = bool(info.get("is_epoch_end")) or phase == "epoch_end"
         if getattr(self, "_train_phase", ""):
             self._train_phase = phase          # 2.14.1: Stop acts at once before training
-        self._apply_stage(info)
+        if current <= 0 and phase in ("setup", "cluster"):
+            # 2.14.2: before the first step the one bar follows the current stage
+            self._apply_stage(info)
+            try:
+                elapsed = float(info.get("elapsed") or 0.0)
+            except (TypeError, ValueError):
+                elapsed = 0.0
+            if not elapsed and self.train_start_time:
+                elapsed = time.time() - self.train_start_time
+            head = info.get("message") or "Preparing…"
+            self.status_label.config(
+                text=f"Status: {head}  |  Elapsed: {_fmt_duration(elapsed)}")
+            return
 
         # Prefer engine-provided overall percent (includes intra-epoch fraction).
         if "percent" in info and info["percent"] is not None:
@@ -600,7 +606,7 @@ class TrainTabMixin:
         else:
             percent = (current / max(1, total)) * 100.0
         percent = max(0.0, min(100.0, percent))
-        self.progress_var.set(percent)
+        self._set_progress_bar(percent)
 
         # LR: prefer info, fall back to live scheduler
         lr = info.get("lr")
@@ -699,12 +705,7 @@ class TrainTabMixin:
         except (TypeError, ValueError):
             pass
 
-        if current <= 0 and phase in ("setup", "cluster"):
-            head = info.get("message") or "Preparing…"
-            self.status_label.config(
-                text=f"Status: {head}  |  Elapsed: {_fmt_duration(elapsed)}"
-            )
-        elif phase == "val":
+        if phase == "val":
             head = info.get("message") or f"Epoch {current}/{total} — validation…"
             self.status_label.config(
                 text=f"Status: {head}{loss_part}"
@@ -724,7 +725,7 @@ class TrainTabMixin:
 
         # Detail strip under the bar — always shows "what is happening now"
         detail_bits = []
-        msg = info.get("message")
+        msg = _stage_text(info) if phase == "val" and info.get("stage") else info.get("message")
         if msg:
             detail_bits.append(str(msg))
         gstep = info.get("global_step")
@@ -758,22 +759,52 @@ class TrainTabMixin:
                 self._update_loss_plot()
 
 
-    def _apply_stage(self, info) -> None:
-        """2.14.1: the stage bar and its line, from the stage fields of `info`."""
-        if not isinstance(info, dict) or not info.get("stage"):
+    def _set_progress_bar(self, percent) -> None:
+        """2.14.2: the one progress bar — a percentage, or (``None``) a busy
+        animation for a step without a count (building the model, compiling)."""
+        bar = getattr(self, "progress_bar", None)
+        if percent is None:
+            if not getattr(self, "_bar_busy", False):
+                self._bar_busy = True
+                try:
+                    if bar is not None:
+                        bar.config(mode="indeterminate")
+                        bar.start(15)
+                except Exception:
+                    pass
             return
+        if getattr(self, "_bar_busy", False):
+            self._bar_busy = False
+            try:
+                if bar is not None:
+                    bar.stop()
+                    bar.config(mode="determinate")
+            except Exception:
+                pass
+        try:
+            self.progress_var.set(max(0.0, min(100.0, float(percent))))
+        except (TypeError, ValueError):
+            pass
+
+    def _apply_stage(self, info) -> None:
+        """A stage on the one bar (2.14.2; 2.14.1 drew a second bar): its percent
+        (a busy animation without a count) and its line — done/total, speed,
+        time left — under the bar."""
+        if not isinstance(info, dict):
+            return
+        percent = None
         try:
             percent = info.get("stage_percent")
             if percent is None:
                 done = float(info.get("stage_done") or 0)
                 total = float(info.get("stage_total") or 0)
                 percent = 100.0 * done / total if total else None
-            if percent is not None:
-                self.stage_var.set(max(0.0, min(100.0, float(percent))))
         except (TypeError, ValueError):
-            pass
+            percent = None
+        self._set_progress_bar(percent)
         try:
-            self.stage_detail_var.set(_stage_text(info))
+            text = _stage_text(info) if info.get("stage") else str(info.get("message") or "")
+            self.progress_detail_var.set(text or "Preparing…")
         except Exception:
             pass
 
@@ -921,13 +952,11 @@ class TrainTabMixin:
         self.train_start_time = time.time()
         self.epoch_times = []
         self._last_epoch_ts = self.train_start_time
-        self.progress_var.set(0)
+        self._set_progress_bar(0.0)
         self._progress_ui_last_ts = 0.0
         self._progress_ui_pending = None
         try:
             self.progress_detail_var.set("Preparing for training…")
-            self.stage_var.set(0)
-            self.stage_detail_var.set("")
         except Exception:
             pass
         self._train_phase = "setup"
@@ -1021,6 +1050,8 @@ class TrainTabMixin:
 
     def _reset_train_buttons(self):
         self._train_phase = ""
+        if getattr(self, "_bar_busy", False):        # a run that ended during the setup
+            self._set_progress_bar(0.0)
         self.train_btn.config(state=tk.NORMAL)
         self.file_btn.config(state=tk.NORMAL)
         self.load_btn.config(state=tk.NORMAL)
@@ -1113,8 +1144,8 @@ class TrainTabMixin:
         self.stop_event.clear()
         self.finish_event.clear()
         self._train_phase = "tokenizer"
-        self.stage_var.set(0)
-        self.stage_detail_var.set("Training the tokenizer…")
+        self._set_progress_bar(0.0)
+        self.progress_detail_var.set("Training the tokenizer…")
         self.status_label.config(text="Status: Training the tokenizer… ⏳ (Stop keeps the "
                                       "merges learned so far)")
         self._set_tokenizer_buttons(tk.DISABLED)
@@ -1152,7 +1183,7 @@ class TrainTabMixin:
             details.append("stopped early with the merges learned so far")
         elif info.get("exhausted"):
             details.append("the text had no more pairs to merge")
-        self.stage_var.set(100.0)
+        self._set_progress_bar(100.0)
         self.status_label.config(
             text=f"Status: Tokenizer trained and saved ✅ ({os.path.basename(path)}: "
                  f"{'; '.join(details)})  |  {_fmt_duration(seconds)} — the next training "

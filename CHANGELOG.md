@@ -1,3 +1,105 @@
+# 📦 v2.14.2 — GAN and flow-matching image training, a quality score, one progress bar
+
+Images: the image generator trains three model types — the diffusion model
+of 2.10, **flow matching** (rectified flow, the objective of Stable Diffusion 3)
+on the same U-Net, and a **GAN** after R3GAN (relativistic loss with R1 + R2,
+a ResNet generator and discriminator without normalisation, an EMA
+generator, optional adaptive differentiable augmentation) that samples an
+image with one network call. A **quality score that needs no pretrained network** (the patch
+sliced Wasserstein distance of ProGAN) measures any of them against a folder
+of real images. Progress: decoding the images and the other stages of an
+image run report done/total, speed and time left, and in the GUI the stages
+run on **one progress bar** — the training tab's second bar of 2.14.1 is gone.
+Details: [docs/image.md § 10–15](docs/image.md#2142-three-model-types-a-quality-score-detailed-progress).
+
+**Defaults that changed**
+
+| setting | 2.14.2 | 2.14.1 |
+|---|---|---|
+| progress of the stages before training (GUI training tab) | the one progress bar shows the stage (a busy animation when it has no count), the line under it its done/total, speed and time left | a second bar under the first |
+| sampler in the GUI's Generate row | the samplers of the model in memory (flow: DPM-Solver++, Euler, Heun; GAN: none) | DPM-Solver++, DDIM, DDPM |
+| Stop while an image run decodes its folder | stops at once; `train()` returns `[]`, the model in memory is unchanged, the summary says `stopped_during: "decode"` | the folder was decoded and a model built before the run stopped |
+| Ctrl+C in `auralite image-train` | stops after the current batch and saves what was trained (during the decoding: nothing saved, exit code 130); twice: abort | aborted with a traceback, nothing saved |
+
+Diffusion training computes what 2.14.1 computed (the batches, the noise and
+the losses are the same for the same seed), and diffusion checkpoints keep
+their 2.10 format, so 2.14.1 loads them.
+
+**Model types** (`auralite/image_engine.py`)
+
+- `model_type`: `"diffusion"` (default), `"flow"`, `"gan"`; GUI: *Model Type*
+  radio buttons (the settings of the other types are greyed out); CLI:
+  `auralite image-train --type flow|gan`; presets *Flow Tiny*, *Flow Small*,
+  *GAN Tiny*, *GAN Small* (CLI: `--preset gan-tiny`, or `--type gan --preset
+  tiny`).
+- MNIST-16, same budget (1,570 steps), classifier-FID (lower is better):
+  diffusion 187.5, **flow matching 74.4**, GAN 155.5 (mean of three seeds);
+  sampling 1,000 images: 27.7 s, 27.3 s, **0.2 s**.
+
+**Flow matching** (`auralite/image_flow.py`)
+
+- Straight path `x_t = (1 - t) * x0 + t * noise`, velocity target, logit-normal
+  training times (`flow_time_sampling`, or `uniform`).
+- Samplers: DPM-Solver++(2M) (the path is a Gaussian diffusion with
+  `alpha = 1 - t`, `sigma = t`), Euler (= DDIM), Heun. On an exact velocity
+  field DPM-Solver++ reaches -0.2 % sample-std error in 20 calls where Euler
+  has -9.9 %.
+- Validation: the velocity loss at 8 fixed times with fixed noise;
+  classifier-free guidance as for diffusion.
+
+**GAN** (`auralite/image_gan.py`)
+
+- RpGAN loss (or `hinge`, `nonsaturating`), R1 + R2 zero-centred penalties
+  (`gan_gamma`, every `gan_reg_every` steps: lazy regularisation), gamma
+  decaying with a cosine LR schedule. Defaults from 23 runs on MNIST-16
+  (three seeds for the finalists): learning rate 1e-3 for both networks
+  (R3GAN's 2e-4 scored 394, 2e-3 diverged), gamma 0.5, R1 + R2 every step.
+- R3GAN networks: inverted-bottleneck residual blocks with grouped 3x3
+  convolutions, bilinear resampling, fix-up initialisation, no normalisation;
+  a learned 4x4 basis (3x3 for 24/48/96 px) in the generator.
+- Adam (0, 0.99) at `gan_lr_g` / `gan_lr_d`; EMA generator; truncation trick
+  (`generate(truncation=1.5)`, GUI *Truncation*, CLI `--truncation`).
+- DiffAugment (colour, translation, cutout) on real and generated images,
+  twice differentiable for R1/R2, with ADA's adaptive probability
+  (`gan_augment="ada"`, target `gan_ada_target`) or always (`diffaug`). Off
+  by default: at CPU budgets it did not pay off, even with 500 images
+  (FID 138 without, 186 with ADA).
+- Class-conditional with a projection discriminator; validation and early
+  stopping on the patch SWD of EMA samples against the held-out images.
+- Checkpoints hold generator, EMA and discriminator (to continue training)
+  and ADA's probability; `save_model(path, include_discriminator=False)` for
+  a generation-only file.
+
+**Quality score** (`auralite/image_metrics.py`)
+
+- `sliced_wasserstein_distance(real, fake)`: Laplacian pyramid down to 8 px,
+  7x7 patches normalised with the real images' statistics, 4 x 128 random
+  directions; seeded.
+- `ImageGenEngine.evaluate(folder, n=256)` → SWD per level and the
+  real-vs-real floor; `auralite image-eval --model M --images DIR [--json]`;
+  GUI *📏 Measure Quality*.
+
+**Progress**
+
+- Image runs report the stages `decode`, `model`, `compile`, `train` (per
+  batch, with images per second) and `val` with the text engine's stage
+  fields; `load_image_folder(progress=...)`, `validation_loss(progress=...)`.
+- GUI, both tabs: one bar — the stage before the first step, the run after
+  it; the line under it carries the stage's numbers. CLI `image-train`: the
+  stage lines of `auralite train`, G/D losses for a GAN.
+
+**Fixes**
+
+- A class-conditional U-Net built its "no class" label with the dtype of the
+  timestep: a float timestep (flow matching) would have failed.
+
+**Tests**: `tests/test_image_v2142.py` (45 tests: networks, losses and
+penalties, augmentation and ADA, flow samplers against an exact velocity,
+SWD, engine training/saving/continuing per type, stages and stop, presets,
+CLI, the benchmark), `tests/test_gui_image_v2142.py` (10: model type
+switching, GAN and flow runs through the tab, quality button, the bar);
+`tests/test_gui_tokenizer_v2141.py` checks the single bar.
+
 # 📦 v2.14.1 — your own BPE tokenizer, training only the tokenizer, progress for every stage
 
 Tokenizers: a model can be trained with your own BPE tokenizer: a file of the

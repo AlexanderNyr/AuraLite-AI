@@ -6,8 +6,9 @@
     auralite serve     --model out.pt [--host 0.0.0.0] [--port 8000]
     auralite info      --model out.pt
     auralite export    --model out.pt [--format pt2|onnx|torchscript] [--out PATH]
-    auralite image-train    --images DIR [--preset small] [--params p.json] --model img.pt
+    auralite image-train    --images DIR [--type gan|flow] [--preset small] [--params p.json] --model img.pt
     auralite image-generate --model img.pt [-n 16] [--steps 20] [--out grid.png]
+    auralite image-eval     --model img.pt --images DIR [-n 256]
     auralite tokenizer train   --text corpus.txt --vocab-size 4096 --out tok.json
     auralite tokenizer info    tok.json [--text sample.txt]
     auralite tokenizer encode  tok.json "some text"
@@ -31,6 +32,10 @@ amp_dtype, chat_template, ...).
 `auralite train` (2.12): Ctrl+C finishes the run with a short learning-rate
 decay and saves the model; a second Ctrl+C stops at once (and still saves).
 `--time-budget 10m` sizes the run to a time limit.
+
+2.14.2: `auralite image-train --type flow|gan` trains a flow-matching or a GAN
+image generator instead of the diffusion model; `auralite image-eval` measures
+an image generator (patch SWD against a folder of real images).
 """
 from __future__ import annotations
 
@@ -42,6 +47,7 @@ import signal
 import sys
 import threading
 import time
+from typing import Any
 
 #: Model size and epochs of `auralite train`. Everything else (optimizer,
 #: tokenizer, batch size, early stopping, ...) is the engine's recipe,
@@ -81,6 +87,24 @@ def _graceful_sigint(finish_event: threading.Event, stop_event: threading.Event)
         elif not stop_event.is_set():
             stop_event.set()
             print("\n^C: stopping now", file=sys.stderr, flush=True)
+        else:
+            raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):        # not the main thread / no signals
+        return None
+
+
+def _stop_on_sigint(stop_event: threading.Event, message: str):
+    """Ctrl+C sets `stop_event` (2.14.2, image-train); a second Ctrl+C interrupts.
+
+    Returns the previous handler (None when signals cannot be installed).
+    """
+    def handler(signum, frame):
+        if not stop_event.is_set():
+            stop_event.set()
+            print(f"\n^C: {message} (Ctrl+C again to abort)", file=sys.stderr, flush=True)
         else:
             raise KeyboardInterrupt
 
@@ -254,10 +278,16 @@ class _ProgressPrinter:
             parts = [f"  epoch {epoch}/{total}"]
             if batch is not None and batches is not None:
                 parts.append(f"batch {batch}/{batches}")
-            if train_loss:
+            if info.get("d_loss") is not None:          # 2.14.2: image GAN
+                parts.append(f"G={float(train_loss):.4f} D={float(info['d_loss']):.4f}")
+                if info.get("aug_p") is not None:
+                    parts.append(f"aug p={float(info['aug_p']):.2f}")
+            elif train_loss:
                 parts.append(f"loss={train_loss:.4f}")
             if tps:
                 parts.append(f"{float(tps):.0f} tok/s")
+            elif info.get("images_per_second"):
+                parts.append(f"{float(info['images_per_second']):.0f} img/s")
             if pct is not None:
                 parts.append(f"{float(pct):.1f}%")
             if eta is not None:
@@ -269,10 +299,17 @@ class _ProgressPrinter:
         if phase == "stopped":
             self._line(f"  {info.get('message') or 'stopped'}", final=True)
             return
-        val = f" | val={val_loss:.4f}" if val_loss is not None else ""
+        metric = "val SWD" if info.get("val_metric") == "swd" else "val"
+        val = f" | {metric}={val_loss:.4f}" if val_loss is not None else ""
         if val and info.get("val_bpb") is not None:
             val += f" ({float(info['val_bpb']):.4f} bits/byte)"
-        self._line(f"  epoch {epoch}/{total} done | loss={train_loss:.4f}{val}", final=True)
+        if info.get("d_loss") is not None:              # 2.14.2: image GAN
+            losses = f"G={float(train_loss):.4f} D={float(info['d_loss']):.4f}"
+            if info.get("aug_p") is not None:
+                losses += f" | aug p={float(info['aug_p']):.2f}"
+        else:
+            losses = f"loss={train_loss:.4f}"
+        self._line(f"  epoch {epoch}/{total} done | {losses}{val}", final=True)
 
 
 def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
@@ -513,18 +550,28 @@ def _image_train_params(args: argparse.Namespace) -> tuple[dict, str | None]:
     import difflib
 
     from auralite.image_engine import (_TRAIN_EXTRAS, IMAGE_PRESETS, ImageGenEngine,
-                                       validate_image_params)
+                                       preset_slug, validate_image_params)
     params: dict = {}
+    model_type = getattr(args, "model_type", None)
     if args.preset:
         wanted = args.preset.strip().lower()
-        names = [n for n in IMAGE_PRESETS if n.lower().startswith(wanted)]
+        slugs = {preset_slug(n): n for n in IMAGE_PRESETS}
+        typed = f"{model_type}-{wanted}"
+        if model_type and model_type != "diffusion" and typed in slugs:
+            names = [slugs[typed]]       # 2.14.2: `--type gan --preset tiny` → "GAN Tiny"
+        else:
+            names = [slugs[wanted]] if wanted in slugs else []
+        if not names:
+            names = [n for n in IMAGE_PRESETS if n.lower().startswith(wanted)]
         if len(names) != 1:
-            choices = ", ".join(n.split(" ")[0].lower() for n in IMAGE_PRESETS)
+            choices = ", ".join(slugs)
             return {}, f"unknown --preset {args.preset!r} (choose: {choices})"
         params.update(IMAGE_PRESETS[names[0]])
     if args.params:
         with open(args.params, "r", encoding="utf-8") as f:
             params.update(json.load(f))
+    if model_type:
+        params["model_type"] = model_type
     for key in ("epochs", "batch_size", "seed", "val_split", "img_size"):
         value = getattr(args, key, None)
         if value is not None:
@@ -563,17 +610,33 @@ def cmd_image_train(args: argparse.Namespace) -> int:
     if args.resume:
         engine.load_model(args.resume)
         params["continue_training"] = True
-    engine.train(args.images, params,
-                 progress_callback=None if getattr(args, "quiet", False) else _progress)
-    engine.save_model(args.model)
+    stop_event = threading.Event()
+    previous = _stop_on_sigint(stop_event, "stopping after this batch; the weights trained "
+                                           "so far are saved")
+    try:
+        engine.train(args.images, params,
+                     progress_callback=None if getattr(args, "quiet", False)
+                     else _ProgressPrinter(), stop_event=stop_event)
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
     summary = engine.last_train_summary
-    line = (f"saved: {args.model} | {summary.get('steps')} steps in "
-            f"{summary.get('seconds')}s")
+    if summary.get("stopped_during"):
+        print("stopped while decoding the images; nothing saved")
+        return 130
+    engine.save_model(args.model)
+    line = (f"saved: {args.model} | {engine.model_type} | {summary.get('steps')} steps in "
+            f"{summary.get('seconds')}s | params {engine.parameter_summary()}")
     if engine.class_names:
         line += f" | classes: {', '.join(engine.class_names)}"
     if summary.get("best_val_loss") is not None:
-        line += (f" | best val {summary['best_val_loss']:.4f} "
+        metric = "SWD " if summary.get("val_metric") == "swd" else ""
+        line += (f" | best val {metric}{summary['best_val_loss']:.4f} "
                  f"(epoch {summary.get('best_epoch')})")
+    if summary.get("augment") == "ada":
+        line += f" | augmentation p {summary['augment_p']:.2f}"
+    elif summary.get("augment") == "diffaug":
+        line += " | DiffAugment"
     print(line)
     if args.samples:
         images = engine.generate(n=16, steps=20, sampler="dpm++2m", seed=0,
@@ -597,11 +660,8 @@ def cmd_image_generate(args: argparse.Namespace) -> int:
         return 2
     t0 = time.perf_counter()
     try:
-        images = engine.generate(n=args.n, steps=args.steps, eta=args.eta, seed=args.seed,
-                                 use_ema=not args.no_ema, sampler=args.sampler,
-                                 class_label=args.class_label,
-                                 guidance_scale=args.guidance)
-    except ValueError as err:          # unknown class name / index
+        images = engine.generate(**_image_generate_kwargs(args, args.n))
+    except ValueError as err:          # unknown class name / index, sampler of another type
         print(f"error: {err}", file=sys.stderr)
         return 2
     seconds = time.perf_counter() - t0
@@ -614,7 +674,60 @@ def cmd_image_generate(args: argparse.Namespace) -> int:
     if args.out:
         save_image_grid(images, args.out)
         print(f"saved: {args.out}")
-    print(f"{len(images)} images, {args.sampler} x {args.steps} steps, {seconds:.2f}s")
+    if engine.model_type == "gan":
+        print(f"{len(images)} images, GAN (one network call each), {seconds:.2f}s")
+    else:
+        print(f"{len(images)} images, {args.sampler} x {args.steps} steps, {seconds:.2f}s")
+    return 0
+
+
+def _image_generate_kwargs(args: argparse.Namespace, n: int) -> dict:
+    """`ImageGenEngine.generate` keyword arguments from the image-generate/-eval flags."""
+    kwargs: dict[str, Any] = dict(n=n, steps=args.steps, eta=args.eta, seed=args.seed,
+                                  use_ema=not args.no_ema, sampler=args.sampler,
+                                  class_label=args.class_label, guidance_scale=args.guidance)
+    if getattr(args, "truncation", None):
+        kwargs["truncation"] = float(args.truncation)
+    return kwargs
+
+
+def cmd_image_eval(args: argparse.Namespace) -> int:
+    """2.14.2: patch SWD of generated images against a folder of real images."""
+    from auralite.image_engine import ImageGenEngine, scan_image_folder
+    if not os.path.exists(args.model):
+        print(f"error: checkpoint not found: {args.model}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(args.images) or not scan_image_folder(args.images):
+        print(f"error: no supported images under {args.images}", file=sys.stderr)
+        return 2
+    engine = ImageGenEngine()
+    engine.load_model(args.model)
+    if args.class_label is not None and not engine.class_names:
+        print("error: --class needs a class-conditional model (image-train --classes)",
+              file=sys.stderr)
+        return 2
+    kwargs = _image_generate_kwargs(args, args.n)
+    kwargs.pop("n")
+    seed = kwargs.pop("seed")
+    try:
+        result = engine.evaluate(args.images, n=args.n,
+                                 seed=0 if seed is None else int(seed), **kwargs)
+    except ValueError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"model": args.model, "model_type": engine.model_type, **{
+            k: ({str(r): v for r, v in val.items()} if k == "levels" else val)
+            for k, val in result.items()}}))
+        return 0
+    levels = ", ".join(f"{r}px {v:.2f}" for r, v in result["levels"].items())
+    print(f"model: {args.model} ({engine.model_type}, {engine.parameter_summary()} params)")
+    print(f"SWD: {result['swd']:.2f}  (lower is better; per level: {levels})")
+    if result.get("real_floor") is not None:
+        print(f"real-vs-real floor: {result['real_floor']:.2f}  "
+              f"({result['floor_images']} vs {result['floor_images']} real images)")
+    print(f"{result['images']} generated vs {result['images']} real images, "
+          f"{result['seconds']:.2f}s")
     return 0
 
 
@@ -1087,11 +1200,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "is installed)")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("image-train", help="train a from-scratch image generator "
-                                           "(diffusion) on a folder of images")
+    p = sub.add_parser("image-train", help="train a from-scratch image generator (diffusion, "
+                                           "flow matching or GAN) on a folder of images")
     _add_common_flags(p, suppress_defaults=True)
     p.add_argument("--images", required=True, help="folder of training images (recursive)")
-    p.add_argument("--preset", help="tiny | small | medium | large (see the GUI presets)")
+    p.add_argument("--type", dest="model_type", choices=["diffusion", "flow", "gan"],
+                   help="model type (default: the preset's, else diffusion): DDPM diffusion, "
+                        "flow matching (rectified flow) or a GAN (R3GAN-style)")
+    p.add_argument("--preset", help="tiny | small | medium | large | flow-tiny | flow-small | "
+                                    "gan-tiny | gan-small (with --type: tiny = <type>-tiny)")
     p.add_argument("--params", help="JSON file with image training params "
                                     "(keys of ImageGenEngine.DEFAULTS)")
     p.add_argument("--model", default="image_model.pt",
@@ -1116,8 +1233,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_flags(p, suppress_defaults=True)
     p.add_argument("--model", required=True)
     p.add_argument("-n", type=int, default=16, help="number of images (default 16)")
+    _add_image_sampling_flags(p)
+    p.add_argument("--out", default="samples.png", help="grid image (default samples.png)")
+    p.add_argument("--out-dir", help="also save every image separately here")
+    p.set_defaults(func=cmd_image_generate)
+
+    p = sub.add_parser("image-eval", help="measure an image generator: patch sliced "
+                                          "Wasserstein distance (SWD) to real images")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--images", required=True, help="folder of real images to compare with")
+    p.add_argument("-n", type=int, default=256,
+                   help="generated images, and real ones (default 256; fewer if the folder "
+                        "is smaller)")
+    _add_image_sampling_flags(p)
+    p.add_argument("--json", action="store_true", help="print the result as one JSON line")
+    p.set_defaults(func=cmd_image_eval)
+    return parser
+
+
+def _add_image_sampling_flags(p: argparse.ArgumentParser) -> None:
+    """The sampling flags of image-generate and image-eval."""
     p.add_argument("--steps", type=int, default=20, help="sampler steps (default 20)")
-    p.add_argument("--sampler", choices=["dpm++2m", "ddim", "ddpm"], default="dpm++2m")
+    p.add_argument("--sampler", choices=["dpm++2m", "ddim", "ddpm", "euler", "heun"],
+                   default="dpm++2m",
+                   help="diffusion: dpm++2m | ddim | ddpm; flow matching: dpm++2m | euler | "
+                        "heun (ddim = euler); a GAN needs none")
     p.add_argument("--eta", type=float, default=0.0,
                    help="DDIM stochasticity (0 = deterministic; ddpm uses 1)")
     p.add_argument("--seed", type=int, default=None)
@@ -1126,10 +1267,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="class name or index of a class-conditional model, or 'all'")
     p.add_argument("--guidance", type=float, default=2.0,
                    help="classifier-free guidance scale with --class (default 2.0; 1 = off)")
-    p.add_argument("--out", default="samples.png", help="grid image (default samples.png)")
-    p.add_argument("--out-dir", help="also save every image separately here")
-    p.set_defaults(func=cmd_image_generate)
-    return parser
+    p.add_argument("--truncation", type=float, default=0.0,
+                   help="GAN: resample latent values beyond this magnitude (e.g. 1.5: cleaner, "
+                        "less varied images; default 0 = off)")
 
 
 def main(argv: list[str] | None = None) -> int:

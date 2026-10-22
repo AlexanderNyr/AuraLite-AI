@@ -1,9 +1,19 @@
-"""AuraLite image generator — a from-scratch denoising diffusion model.
+"""AuraLite image generator — diffusion, flow matching and GAN models from scratch.
 
 No pretrained weights: point it at a folder of images and it learns to generate
-new images in that style with a small time-conditioned U-Net trained with the
-DDPM objective. The stack mirrors the text engine's "tune everything + modern
-techniques" philosophy.
+new images in that style. Three model types (``model_type``, 2.14.2):
+
+* ``"diffusion"`` (the default) — a small time-conditioned U-Net trained with
+  the DDPM objective;
+* ``"flow"`` — the same U-Net trained with **rectified flow / flow
+  matching** (``image_flow.py``), the objective of Stable Diffusion 3;
+* ``"gan"`` — a **modern GAN** after R3GAN (``image_gan.py``): relativistic
+  pairing loss with R1 + R2 penalties, a ResNet generator and discriminator
+  without normalisation, an EMA generator, optional adaptive differentiable
+  augmentation; one network call per image.
+
+The stack mirrors the text engine's "tune everything + modern techniques"
+philosophy.
 
 Modern techniques implemented
 -----------------------------
@@ -26,12 +36,19 @@ Modern techniques implemented
 * Images are decoded once into a uint8 tensor (threaded, JPEG draft mode,
   EXIF orientation) and batched in memory (2.10).
 * Random horizontal-flip augmentation, seeding, continue-training, autosave.
+* Detailed progress (2.14.2): decoding the images, building the networks,
+  compiling, every batch and the validation report done/total, rate and ETA.
+* A quality score without pretrained networks (2.14.2): the multi-scale patch
+  **sliced Wasserstein distance** of ProGAN (``image_metrics.py``), used as
+  the GAN's validation metric and by :meth:`ImageGenEngine.evaluate`.
 
 Public API
 ----------
-* :class:`ImageGenEngine`     — train / generate / save / load
+* :class:`ImageGenEngine`     — train / generate / evaluate / save / load
 * :class:`TinyUNet`           — the denoiser network (eps/x0/v head)
 * :class:`DDPM`               — schedule + q_sample + weighted loss + sampling
+* :class:`~auralite.image_flow.FlowMatching` — rectified flow (same API as DDPM)
+* :class:`~auralite.image_gan.GanGenerator`, :class:`~auralite.image_gan.GanDiscriminator`
 * :class:`ImageFolderDataset` — folder → [-1, 1] tensors
 * :class:`EMA`
 * :func:`validate_image_params`, :func:`load_image_folder`,
@@ -55,6 +72,12 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 from torch.utils.data import Dataset
 
+from auralite.image_flow import FLOW_SAMPLERS, FLOW_TIME_SAMPLING, FlowMatching
+from auralite.image_gan import (GAN_AUGMENTS, GAN_LOSSES, AdaptiveAugment, GanDiscriminator,
+                                GanGenerator, discriminator_loss, gan_widths, generator_loss,
+                                sample_latents, zero_centered_penalty)
+from auralite.image_metrics import sliced_wasserstein_distance
+
 logger = logging.getLogger("auralite.image")
 
 
@@ -72,6 +95,17 @@ NOISE_SCHEDULES = ("linear", "cosine", "sigmoid")
 LR_SCHEDULES = ("constant", "cosine", "warmup_cosine")
 AMP_DTYPES = ("fp16", "bf16", "none")
 SAMPLERS = ("ddim", "ddpm", "dpm++2m")
+#: 2.14.2: what the engine trains — a diffusion U-Net, a flow-matching U-Net or a GAN.
+MODEL_TYPES = ("diffusion", "flow", "gan")
+#: Samplers per model type (a GAN needs none: one network call per image).
+SAMPLERS_BY_TYPE: dict[str, tuple[str, ...]] = {"diffusion": SAMPLERS, "flow": FLOW_SAMPLERS,
+                                                 "gan": ()}
+#: Checkpoint ``format`` per model type. Diffusion keeps the 2.10 name, so older
+#: AuraLite versions still load those; they refuse the other two instead of
+#: sampling them as a diffusion model.
+CHECKPOINT_FORMATS = {"diffusion": "auralite-image-ddpm-v2", "flow": "auralite-image-flow-v1",
+                      "gan": "auralite-image-gan-v1"}
+_LEGACY_FORMATS = ("auralite-image-ddpm-v1",)
 
 #: Version of the beta-schedule definition stored in checkpoints. 1 = the
 #: pre-2.10 linear/sigmoid ranges (1e-4 → 0.02 for every T); 2 = the same range
@@ -88,13 +122,21 @@ _MIN_FILES_FOR_THREADS = 32
 #: training continues, these come from the model, not from the new params.
 ARCH_KEYS = ("img_size", "channels", "base_channels", "channel_mults", "num_res_blocks",
              "time_emb_dim", "dropout", "attn_resolutions", "attn_heads",
-             "scale_shift_norm", "class_conditional", "num_classes", "class_names")
+             "scale_shift_norm", "class_conditional", "num_classes", "class_names",
+             "model_type", "latent_dim")
 DIFFUSION_KEYS = ("timesteps", "schedule", "prediction_type", "schedule_version")
 
 #: Values that checkpoints written before a key existed were trained with.
 _LEGACY_CONFIG: dict[str, Any] = {"schedule_version": 1, "scale_shift_norm": False,
                                   "class_conditional": False, "num_classes": 0,
-                                  "class_names": []}
+                                  "class_names": [], "model_type": "diffusion"}
+
+#: 2.14.2: ADA moves the augmentation probability from 0 to 1 within this many
+#: images (ADA's own 500k suits runs of millions of images, not CPU runs).
+ADA_SPEED_IMAGES = 100_000
+#: The GAN's validation SWD compares at most this many held-out images with as
+#: many generated ones (fixed latents, so the number is comparable across epochs).
+GAN_VAL_MAX_IMAGES = 512
 
 #: Params `train()` understands besides `ImageGenEngine.DEFAULTS`.
 _TRAIN_EXTRAS = ("continue_training", "autosave_every", "autosave_path")
@@ -195,6 +237,26 @@ def validate_image_params(params: dict) -> list[str]:
         errors.append("schedule_version must be 1 (pre-2.10 betas) or 2")
     if params.get("channels_last", None) not in (None, True, False, "auto"):
         errors.append("channels_last must be true, false or 'auto'")
+    # ---- 2.14.2: model type, flow matching, GAN ----
+    if params.get("model_type", "diffusion") not in MODEL_TYPES:
+        errors.append(f"model_type must be one of {MODEL_TYPES}, got {params.get('model_type')!r}")
+    if params.get("flow_time_sampling", "logit_normal") not in FLOW_TIME_SAMPLING:
+        errors.append(f"flow_time_sampling must be one of {FLOW_TIME_SAMPLING}")
+    if "latent_dim" in params:
+        _pos_int("latent_dim", 8, 1024)
+    if params.get("gan_loss", "rpgan") not in GAN_LOSSES:
+        errors.append(f"gan_loss must be one of {GAN_LOSSES}")
+    if params.get("gan_augment", "off") not in GAN_AUGMENTS:
+        errors.append(f"gan_augment must be one of {GAN_AUGMENTS}")
+    for name in ("gan_lr_g", "gan_lr_d"):
+        value = _number(name, 1e-3)
+        if not (0.0 < value < 1.0):
+            errors.append(f"{name} must be in (0, 1), got {value}")
+    if _number("gan_gamma", 0.5) < 0:
+        errors.append("gan_gamma must be >= 0 (0 = no R1/R2 penalty)")
+    if not (0.0 < _number("gan_ada_target", 0.6) < 1.0):
+        errors.append("gan_ada_target must be in (0, 1)")
+    _opt_int("gan_reg_every", 1, 64)
     ch_mults = params.get("channel_mults")
     if ch_mults is not None:
         if (not isinstance(ch_mults, (list, tuple)) or not ch_mults
@@ -436,8 +498,9 @@ class TinyUNet(nn.Module):
                 y: Optional[torch.Tensor] = None) -> torch.Tensor:
         t_emb = self.time_mlp(t)
         if self.class_emb is not None:
-            if y is None:
-                y = torch.full_like(t, self.num_classes)
+            if y is None:  # long labels: a flow model's t is a float tensor (2.14.2)
+                y = torch.full((x.shape[0],), self.num_classes, dtype=torch.long,
+                               device=x.device)
             t_emb = t_emb + self.class_emb(y)
         h = self.init_conv(x)
         skips = [h]
@@ -543,6 +606,9 @@ def _make_beta_schedule(kind: str, timesteps: int, version: int = SCHEDULE_VERSI
 class DDPM:
     """Diffusion constants + q_sample + weighted loss + DDIM/DDPM/DPM-Solver++ sampling."""
 
+    #: Tells the engine's processes apart (``FlowMatching.kind == "flow"``).
+    kind = "diffusion"
+
     def __init__(self, timesteps: int = 200, schedule: str = "linear",
                  prediction_type: str = "eps", min_snr_gamma: float = 0.0,
                  device: Optional[torch.device] = None,
@@ -612,6 +678,11 @@ class DDPM:
         per_sample = ((pred.float() - target.float()) ** 2).mean(dim=[1, 2, 3])
         weighted = self._loss_weight(t) * per_sample
         return weighted.mean() if reduce else weighted
+
+    def validation_timesteps(self, k: int) -> torch.Tensor:
+        """``k`` stratified timesteps for the deterministic held-out loss."""
+        T = self.timesteps
+        return ((torch.arange(k, dtype=torch.float64) + 0.5) * T / k).long().clamp(max=T - 1)
 
     def _to_x0_eps(self, x_t, ti, out):
         acp = self.alphas_cumprod[ti]
@@ -769,13 +840,16 @@ def load_image_uint8(path: str, img_size: int, channels: int = 3) -> np.ndarray:
 
 
 def load_image_folder(paths: Sequence[str], img_size: int, channels: int = 3,
-                      workers: int = 0) -> tuple[torch.Tensor, list[str]]:
+                      workers: int = 0,
+                      progress: Optional[Callable[[int, int], object]] = None
+                      ) -> tuple[torch.Tensor, list[str]]:
     """Decode ``paths`` into one ``(N, C, S, S)`` uint8 tensor.
 
     Decoding runs in a thread pool (Pillow releases the GIL while decoding and
     resizing) once there are enough files to pay for it; ``workers=0`` picks
     ``min(8, cpu_count)``. Unreadable files are skipped with a warning. Returns
-    the tensor and the paths actually loaded.
+    the tensor and the paths actually loaded. ``progress(done, total)`` is
+    called after every file (2.14.2); an exception it raises stops the work.
     """
     if workers <= 0:
         workers = min(8, os.cpu_count() or 1)
@@ -788,11 +862,26 @@ def load_image_folder(paths: Sequence[str], img_size: int, channels: int = 3,
         except Exception as e:  # corrupt / unsupported file
             return e
 
+    total = len(paths)
+    results: list = []
+    if progress is not None:
+        progress(0, total)
     if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(_one, paths))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            for r in pool.map(_one, paths):
+                results.append(r)
+                if progress is not None:
+                    progress(len(results), total)
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
     else:
-        results = [_one(p) for p in paths]
+        for p in paths:
+            results.append(_one(p))
+            if progress is not None:
+                progress(len(results), total)
     arrays, kept, bad = [], [], []
     for p, r in zip(paths, results, strict=True):
         if isinstance(r, Exception):
@@ -941,10 +1030,92 @@ def folder_class_labels(root: str, paths: Sequence[str],
 # ======================================================================
 #  Engine
 # ======================================================================
+class _TrainingStopped(Exception):
+    """A stop request while image training is being set up (2.14.2)."""
+
+    def __init__(self, stage: str):
+        super().__init__(stage)
+        self.stage = stage
+
+
+class _ImageProgress:
+    """2.14.2: progress events of image training, with the text engine's stage fields.
+
+    The setup (decoding the images, building the networks, compiling) and the
+    validation report ``stage``, ``stage_label``, ``stage_done`` /
+    ``stage_total``, ``stage_unit``, ``stage_percent``, ``stage_rate``,
+    ``stage_eta_seconds`` and a ready ``message`` (the text engine's
+    ``StageReporter``); training batches carry their epoch as the stage.
+    """
+
+    def __init__(self, callback: Optional[Callable], epochs: int, every_s: float,
+                 stop_event=None):
+        self.callback = callback
+        self.epochs = max(1, int(epochs))
+        self.every_s = max(0.0, float(every_s))
+        self.stop_event = stop_event
+        self.t0 = time.time()
+
+    def stopped(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def check(self, stage: str) -> None:
+        if self.stopped():
+            raise _TrainingStopped(stage)
+
+    def send(self, epoch: int, loss: float, val: Optional[float], info: dict) -> None:
+        if self.callback is not None:
+            info.setdefault("elapsed", time.time() - self.t0)
+            info.setdefault("is_epoch_end", False)
+            self.callback(epoch, self.epochs, loss, val, info=info)
+
+    def reporter(self, stage: str, label: str, *, phase: str = "setup", epoch: int = 0,
+                 percent: float = 0.0, loss: float = 0.0) -> Any:
+        """A ``StageReporter`` whose events reach the progress callback."""
+        from auralite.engine.tokenizer_io import StageReporter
+
+        def emit(info: dict) -> None:
+            self.send(epoch, loss, None, {"phase": phase, "percent": percent, **info})
+
+        return StageReporter(emit if self.callback is not None else None, stage, label,
+                             every_s=self.every_s)
+
+    def note(self, stage: str, label: str, *, phase: str = "setup", epoch: int = 0,
+             percent: float = 0.0, loss: float = 0.0) -> None:
+        """A stage without a count (building the networks, compiling)."""
+        self.send(epoch, loss, None, {"phase": phase, "stage": stage, "stage_label": label,
+                                      "message": label + "\u2026", "percent": percent})
+
+    @staticmethod
+    def batch_stage(epoch: int, epochs: int, seen: int, batches: int, epoch_elapsed: float
+                    ) -> dict:
+        """Stage fields of a training batch: the epoch, with its rate and time left."""
+        rate = seen / epoch_elapsed if epoch_elapsed > 0.05 and seen else None
+        return {"stage": "train", "stage_label": f"Epoch {epoch}/{epochs}",
+                "stage_step": "batches", "stage_done": seen, "stage_total": batches,
+                "stage_unit": "batches", "stage_percent": 100.0 * seen / max(1, batches),
+                "stage_rate": rate,
+                "stage_eta_seconds": (batches - seen) / rate if rate else None,
+                "stage_elapsed": epoch_elapsed}
+
+
+def _u8_to_array(img: torch.Tensor) -> np.ndarray:
+    """``(C, H, W)`` uint8 tensor → HxWxC (HxW for one channel) numpy array."""
+    arr = img.permute(1, 2, 0).numpy()
+    return arr[:, :, 0] if arr.shape[2] == 1 else arr
+
+
 class ImageGenEngine:
-    """Train a small diffusion model on a folder of images and generate new ones."""
+    """Train a small diffusion, flow-matching or GAN model on a folder of images.
+
+    ``params["model_type"]`` (2.14.2) picks the model: ``"diffusion"`` (the
+    default), ``"flow"`` or ``"gan"``. Every type trains, generates, saves and
+    loads through the same methods.
+    """
 
     DEFAULTS: dict[str, Any] = dict(
+        # 2.14.2: what to train — "diffusion", "flow" (flow matching) or "gan"
+        model_type="diffusion",
         # architecture
         img_size=32, channels=3, base_channels=32, channel_mults=None,
         num_res_blocks=1, time_emb_dim=0, dropout=0.0,
@@ -952,6 +1123,12 @@ class ImageGenEngine:
         # diffusion
         timesteps=200, schedule="linear", prediction_type="eps", min_snr_gamma=0.0,
         schedule_version=SCHEDULE_VERSION,
+        # flow matching (2.14.2)
+        flow_time_sampling="logit_normal",
+        # GAN (2.14.2): latent size, loss, the two learning rates, R1/R2 weight
+        # and interval, augmentation of the discriminator's inputs
+        latent_dim=64, gan_loss="rpgan", gan_lr_g=1e-3, gan_lr_d=1e-3, gan_gamma=0.5,
+        gan_reg_every=1, gan_augment="off", gan_ada_target=0.6,
         # optimization
         epochs=50, batch_size=16, lr=2e-4, weight_decay=0.0, grad_clip=1.0,
         accumulation_steps=1, lr_schedule="constant", warmup_steps=0,
@@ -967,17 +1144,37 @@ class ImageGenEngine:
 
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model: Optional[TinyUNet] = None
+        #: The network that generates: the U-Net (diffusion, flow) or the GAN generator.
+        self.model: Optional[TinyUNet | GanGenerator] = None
         self.ema: Optional[EMA] = None
+        #: The noise process of a diffusion model (``None`` for flow and GAN models).
         self.ddpm: Optional[DDPM] = None
+        #: 2.14.2: the process of a diffusion *or* flow model (``None`` for a GAN).
+        self.process: Optional[DDPM | FlowMatching] = None
+        #: 2.14.2: the GAN's discriminator, its optimizer and ADA's probability.
+        self.discriminator: Optional[GanDiscriminator] = None
+        self.d_optimizer: Optional[torch.optim.Optimizer] = None
+        self.augment_p = 0.0
         self.config: dict[str, Any] = {}
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scaler = None
         self.last_train_summary: dict[str, Any] = {}
         self.val_history: list[float] = []
+        #: 2.14.2: per-epoch discriminator loss of a GAN run.
+        self.d_history: list[float] = []
+        self.last_eval: dict[str, Any] = {}
         self._image_cache: Optional[tuple[tuple, torch.Tensor, list[str]]] = None
 
     # ------------------------------------------------------------------
+    @property
+    def model_type(self) -> str:
+        """``"diffusion"``, ``"flow"`` or ``"gan"`` (of the model in memory, or the defaults)."""
+        return str(self.config.get("model_type") or "diffusion")
+
+    def _set_process(self, process: Optional[DDPM | FlowMatching]) -> None:
+        self.process = process
+        self.ddpm = process if isinstance(process, DDPM) else None
+
     def _auto_channel_mults(self, img_size: int) -> tuple:
         mults = [1]
         size = img_size
@@ -1003,6 +1200,7 @@ class ImageGenEngine:
         return self.device.type == "cpu"
 
     def build_model(self, config: dict, zero_init: bool = False) -> TinyUNet:
+        """The U-Net of a diffusion or flow model (see :meth:`build_generator` for a GAN)."""
         img_size = config["img_size"]
         ch_mults = config.get("channel_mults") or self._auto_channel_mults(img_size)
         attn_res = config.get("attn_resolutions")
@@ -1030,6 +1228,44 @@ class ImageGenEngine:
         config["attn_resolutions"] = list(attn_res)
         return model
 
+    def _gan_mults(self, config: dict) -> list[int]:
+        """The GAN's effective channel multipliers (stored back into the config)."""
+        base = int(config["base_channels"])
+        widths = gan_widths(int(config["img_size"]), base, config.get("channel_mults") or None)
+        mults = [w // base for w in widths]
+        config["channel_mults"] = mults
+        return mults
+
+    def build_generator(self, config: dict) -> GanGenerator:
+        """The generator of a GAN (2.14.2)."""
+        g = GanGenerator(img_size=int(config["img_size"]), channels=int(config["channels"]),
+                         base_channels=int(config["base_channels"]),
+                         channel_mults=self._gan_mults(config),
+                         num_res_blocks=int(config["num_res_blocks"]),
+                         latent_dim=int(config.get("latent_dim") or 64),
+                         num_classes=int(config.get("num_classes") or 0)).to(self.device)
+        if self._channels_last(config):
+            g = g.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
+        return g
+
+    def build_discriminator(self, config: dict) -> GanDiscriminator:
+        """The discriminator of a GAN (2.14.2), the mirror of the generator."""
+        d = GanDiscriminator(img_size=int(config["img_size"]), channels=int(config["channels"]),
+                             base_channels=int(config["base_channels"]),
+                             channel_mults=self._gan_mults(config),
+                             num_res_blocks=int(config["num_res_blocks"]),
+                             num_classes=int(config.get("num_classes") or 0)).to(self.device)
+        if self._channels_last(config):
+            d = d.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
+        return d
+
+    def _make_process(self, cfg: dict) -> DDPM | FlowMatching:
+        """The noise process of a diffusion (DDPM) or flow-matching model."""
+        if cfg.get("model_type") == "flow":
+            return FlowMatching(str(cfg.get("flow_time_sampling") or "logit_normal"),
+                                device=self.device)
+        return self._make_ddpm(cfg)
+
     def _make_ddpm(self, cfg: dict) -> DDPM:
         return DDPM(cfg["timesteps"], cfg.get("schedule", "linear"),
                     cfg.get("prediction_type", "eps"), cfg.get("min_snr_gamma", 0.0),
@@ -1048,6 +1284,15 @@ class ImageGenEngine:
         prog = min(1.0, max(0.0, prog))
         cos = 0.5 * (1 + math.cos(math.pi * prog))  # 1 → 0
         return base * (0.1 + 0.9 * cos)  # decay to 10 % of base
+
+    def _decay_at(self, cfg, step, total_steps) -> float:
+        """The LR schedule's decay without its warmup (1 → 0.1); the GAN's R1/R2
+        weight follows it, as R3GAN lowers its gamma ten-fold over training."""
+        if cfg.get("lr_schedule", "constant") == "constant":
+            return 1.0
+        return self._lr_at({**cfg, "lr": 1.0, "warmup_steps": 0},
+                           max(0, step - int(cfg.get("warmup_steps") or 0)),
+                           max(1, total_steps - int(cfg.get("warmup_steps") or 0)))
 
     # ------------------------------------------------------------------
     def _resolve_config(self, params: dict, continuing: bool) -> dict[str, Any]:
@@ -1069,7 +1314,8 @@ class ImageGenEngine:
                             ", ".join(kept))
         return cfg
 
-    def _load_images(self, image_dir: str, cfg: dict) -> tuple[torch.Tensor, list[str]]:
+    def _load_images(self, image_dir: str, cfg: dict, progress: Optional[_ImageProgress] = None
+                     ) -> tuple[torch.Tensor, list[str]]:
         paths = scan_image_folder(image_dir)
         if not paths:
             raise ValueError(
@@ -1083,10 +1329,24 @@ class ImageGenEngine:
                 stamp.append((p, -1, -1))
         key = (os.path.abspath(image_dir), cfg["img_size"], cfg["channels"], tuple(stamp))
         if self._image_cache is not None and self._image_cache[0] == key:
+            if progress is not None:
+                progress.note("decode", f"{len(self._image_cache[2]):,} images already decoded")
             return self._image_cache[1], self._image_cache[2]
+        report: Optional[Callable[[int, int], None]] = None
+        if progress is not None:
+            stages = progress
+            reporter = stages.reporter("decode", f"Decoding {len(paths):,} images "
+                                                 f"({cfg['img_size']} px)")
+
+            def _report(done: int, total: int) -> None:
+                stages.check("decode")
+                reporter.update(done, total, step="decode", unit="images")
+
+            report = _report
+
         t0 = time.perf_counter()
         images, kept = load_image_folder(paths, cfg["img_size"], cfg["channels"],
-                                         int(cfg.get("num_workers") or 0))
+                                         int(cfg.get("num_workers") or 0), progress=report)
         logger.info("[AuraLite-Image] decoded %d images in %.2fs (%.1f MB in RAM)",
                     len(kept), time.perf_counter() - t0, images.numel() / 2**20)
         self._image_cache = (key, images, kept)
@@ -1114,117 +1374,10 @@ class ImageGenEngine:
             x = x.contiguous(memory_format=torch.channels_last)
         return x
 
-    @torch.no_grad()
-    def validation_loss(self, images_u8: torch.Tensor, net: Optional[nn.Module] = None,
-                        batch_size: int = 64, labels: Optional[torch.Tensor] = None) -> float:
-        """Deterministic held-out denoising loss (lower is better).
-
-        Every image is noised at the same ``VAL_TIMESTEPS`` stratified
-        timesteps with the same seeded noise on every call, so values are
-        comparable across epochs and runs with the same diffusion settings. It
-        uses the training loss weighting and, by default, the EMA weights —
-        the network that samples.
-        """
-        if self.model is None or self.ddpm is None:
-            raise RuntimeError("No model.")
-        if images_u8.shape[0] == 0:
-            return float("nan")
-        if net is None:
-            net = self.ema.ema_model if self.ema is not None else self.model
-        cl = self._channels_last()
-        T = self.ddpm.timesteps
-        k = VAL_TIMESTEPS
-        grid = ((torch.arange(k, dtype=torch.float64) + 0.5) * T / k).long().clamp(max=T - 1)
-        gen = torch.Generator().manual_seed(_VAL_NOISE_SEED)
-        was_training = net.training
-        net.eval()
-        per_chunk = max(1, batch_size // k)
-        total, count = 0.0, 0
-        try:
-            for start in range(0, images_u8.shape[0], per_chunk):
-                chunk = images_u8[start:start + per_chunk]
-                x0 = chunk.repeat_interleave(k, dim=0)
-                t = grid.repeat(chunk.shape[0]).to(self.device)
-                noise = torch.randn(x0.shape, generator=gen).to(self.device)
-                x0f = self._to_model_input(x0, cl)
-                if cl:
-                    noise = noise.contiguous(memory_format=torch.channels_last)
-                y = None
-                if labels is not None:
-                    y = labels[start:start + per_chunk].repeat_interleave(k).to(self.device)
-                losses = self.ddpm.p_losses(net, x0f, t=t, noise=noise, reduce=False, y=y)
-                total += float(losses.sum())
-                count += int(losses.numel())
-        finally:
-            net.train(was_training)
-        return total / max(1, count)
-
-    # ------------------------------------------------------------------
-    def train(self, image_dir: str, params: dict,
-              progress_callback: Optional[Callable] = None, stop_event=None):
-        """Train (or continue training) on the images under ``image_dir``.
-
-        Returns the per-epoch training losses; ``last_train_summary`` and
-        ``val_history`` hold the rest.
-        """
-        continuing = bool(params.get("continue_training", False)) and self.model is not None
-        cfg = self._resolve_config(params, continuing)
-        errors = validate_image_params(cfg)
-        if errors:
-            raise ValueError("\n".join(errors))
-
-        seed = int(cfg.get("seed") or 0)
-        if seed:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-        gen = torch.Generator()
-        gen.manual_seed(seed if seed else int(torch.randint(0, 2**31 - 1, (1,)).item()))
-
-        images, kept = self._load_images(image_dir, cfg)
-        labels = self._class_labels(image_dir, kept, cfg, continuing)
-        train_idx, val_idx = self._split_indices(images.shape[0],
-                                                 float(cfg.get("val_split") or 0.0))
-        train_u8, val_u8 = images[train_idx], images[val_idx]
-        train_y = labels[train_idx] if labels is not None else None
-        val_y = labels[val_idx] if labels is not None else None
-        if self.device.type == "cuda" and train_u8.numel() < 512 * 2**20:
-            train_u8 = train_u8.to(self.device)
-
-        if not continuing or self.model is None:
-            self.config = cfg
-            self.model = self.build_model(self.config, zero_init=True)
-            self.ddpm = self._make_ddpm(cfg)
-            self.ema = (EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
-                        if cfg["use_ema"] else None)
-        else:
-            self.config = cfg
-            if self.ddpm is None:
-                self.ddpm = self._make_ddpm(cfg)
-            self.ddpm.min_snr_gamma = float(cfg.get("min_snr_gamma") or 0.0)
-            if cfg["use_ema"] and self.ema is None:
-                self.ema = EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
-            elif not cfg["use_ema"]:
-                self.ema = None
-            if self.ema is not None:
-                self.ema.decay = float(cfg["ema_decay"])
-            self.model.use_gradient_checkpointing = bool(cfg.get("use_gradient_checkpointing"))
-        model: TinyUNet = self.model
-        ddpm: DDPM = self.ddpm
-        cl = self._channels_last(cfg)
-
-        # ---- AMP setup (mirrors the text engine) ----
-        amp_dtype = str(cfg.get("amp_dtype", "none")).lower()
-        if amp_dtype == "bf16":
-            use_amp, amp_t = True, torch.bfloat16
-        elif amp_dtype == "fp16":
-            use_amp, amp_t = (self.device.type == "cuda"), torch.float16
-        else:
-            use_amp, amp_t = False, None
-        amp_device = self.device.type if self.device.type in ("cuda", "cpu") else "cpu"
-        scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and amp_t is torch.float16))
-        self.scaler = scaler
-
-        n_train = int(train_u8.shape[0])
+    def _batcher(self, train_u8: torch.Tensor, train_y: Optional[torch.Tensor], cfg: dict,
+                 gen: torch.Generator, cl: bool
+                 ) -> Callable[[torch.Tensor, int], tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """``batch_at(order, i)``: batch ``i`` of a shuffled epoch, flipped and labelled."""
         bs = int(cfg["batch_size"])
         hflip = bool(cfg.get("augment_hflip", False))
         null_label = int(cfg.get("num_classes") or 0)
@@ -1246,15 +1399,160 @@ class ImageGenEngine:
                                  train_y[idx]).to(self.device)
             return xb, yb
 
+        return batch_at
+
+    @torch.no_grad()
+    def validation_loss(self, images_u8: torch.Tensor, net: Optional[nn.Module] = None,
+                        batch_size: int = 64, labels: Optional[torch.Tensor] = None,
+                        progress: Optional[Callable[[int, int], object]] = None) -> float:
+        """Deterministic held-out denoising loss (lower is better).
+
+        Every image is noised at the same ``VAL_TIMESTEPS`` stratified
+        timesteps with the same seeded noise on every call, so values are
+        comparable across epochs and runs with the same diffusion settings. It
+        uses the training loss weighting and, by default, the EMA weights —
+        the network that samples. A flow-matching model is scored the same way
+        on its velocity loss. ``progress(done, total)`` follows the images.
+        """
+        if self.model is None or self.process is None:
+            raise RuntimeError("No model." if self.model is None else
+                               "A GAN has no denoising loss; see evaluate().")
+        if images_u8.shape[0] == 0:
+            return float("nan")
+        if net is None:
+            net = self.ema.ema_model if self.ema is not None else self.model
+        cl = self._channels_last()
+        k = VAL_TIMESTEPS
+        grid = self.process.validation_timesteps(k)
+        gen = torch.Generator().manual_seed(_VAL_NOISE_SEED)
+        was_training = net.training
+        net.eval()
+        per_chunk = max(1, batch_size // k)
+        total, count = 0.0, 0
+        n_images = int(images_u8.shape[0])
+        try:
+            for start in range(0, n_images, per_chunk):
+                chunk = images_u8[start:start + per_chunk]
+                x0 = chunk.repeat_interleave(k, dim=0)
+                t = grid.repeat(chunk.shape[0]).to(self.device)
+                noise = torch.randn(x0.shape, generator=gen).to(self.device)
+                x0f = self._to_model_input(x0, cl)
+                if cl:
+                    noise = noise.contiguous(memory_format=torch.channels_last)
+                y = None
+                if labels is not None:
+                    y = labels[start:start + per_chunk].repeat_interleave(k).to(self.device)
+                losses = self.process.p_losses(net, x0f, t=t, noise=noise, reduce=False, y=y)
+                total += float(losses.sum())
+                count += int(losses.numel())
+                if progress is not None:
+                    progress(min(n_images, start + per_chunk), n_images)
+        finally:
+            net.train(was_training)
+        return total / max(1, count)
+
+    # ------------------------------------------------------------------
+    def train(self, image_dir: str, params: dict,
+              progress_callback: Optional[Callable] = None, stop_event=None):
+        """Train (or continue training) on the images under ``image_dir``.
+
+        Returns the per-epoch training losses (the generator's for a GAN);
+        ``last_train_summary`` and ``val_history`` hold the rest. A stop
+        requested while the images are being decoded returns ``[]`` with
+        ``last_train_summary["stopped_during"] == "decode"`` and leaves the
+        model in memory as it was (2.14.2).
+        """
+        continuing = bool(params.get("continue_training", False)) and self.model is not None
+        cfg = self._resolve_config(params, continuing)
+        errors = validate_image_params(cfg)
+        if errors:
+            raise ValueError("\n".join(errors))
+
+        seed = int(cfg.get("seed") or 0)
+        if seed:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        gen = torch.Generator()
+        gen.manual_seed(seed if seed else int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        stages = _ImageProgress(progress_callback, int(cfg["epochs"]),
+                                float(cfg.get("progress_every_seconds", 0.5)), stop_event)
+
+        try:
+            stages.check("decode")
+            images, kept = self._load_images(image_dir, cfg, stages)
+        except _TrainingStopped as stopped:
+            logger.info("[AuraLite-Image] stopped while %s; the model in memory is unchanged.",
+                        "decoding the images" if stopped.stage == "decode" else stopped.stage)
+            self.last_train_summary = {"epochs_run": 0, "steps": 0, "stopped_during": stopped.stage,
+                                       "model_type": cfg.get("model_type", "diffusion")}
+            return []
+        labels = self._class_labels(image_dir, kept, cfg, continuing)
+        train_idx, val_idx = self._split_indices(images.shape[0],
+                                                 float(cfg.get("val_split") or 0.0))
+        train_u8, val_u8 = images[train_idx], images[val_idx]
+        train_y = labels[train_idx] if labels is not None else None
+        val_y = labels[val_idx] if labels is not None else None
+        if self.device.type == "cuda" and train_u8.numel() < 512 * 2**20:
+            train_u8 = train_u8.to(self.device)
+
+        if cfg.get("model_type") == "gan":
+            return self._train_gan(cfg, params, continuing, train_u8, val_u8, train_y, val_y,
+                                   gen, progress_callback, stages)
+
+        stages.note("model", "Building the U-Net" if not continuing else "Preparing the model")
+        if not continuing or self.model is None or not isinstance(self.model, TinyUNet):
+            self.config = cfg
+            self.model = self.build_model(self.config, zero_init=True)
+            self._set_process(self._make_process(cfg))
+            self.ema = (EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
+                        if cfg["use_ema"] else None)
+            self.discriminator, self.d_optimizer, self.augment_p = None, None, 0.0
+        else:
+            self.config = cfg
+            if self.process is None:
+                self._set_process(self._make_process(cfg))
+            if isinstance(self.process, DDPM):
+                self.process.min_snr_gamma = float(cfg.get("min_snr_gamma") or 0.0)
+            elif isinstance(self.process, FlowMatching):
+                self.process.time_sampling = str(cfg.get("flow_time_sampling") or "logit_normal")
+            if cfg["use_ema"] and self.ema is None:
+                self.ema = EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
+            elif not cfg["use_ema"]:
+                self.ema = None
+            if self.ema is not None:
+                self.ema.decay = float(cfg["ema_decay"])
+            self.model.use_gradient_checkpointing = bool(cfg.get("use_gradient_checkpointing"))
+        model = self.model
+        process = self.process
+        assert isinstance(model, TinyUNet) and process is not None
+        cl = self._channels_last(cfg)
+
+        # ---- AMP setup (mirrors the text engine) ----
+        amp_dtype = str(cfg.get("amp_dtype", "none")).lower()
+        if amp_dtype == "bf16":
+            use_amp, amp_t = True, torch.bfloat16
+        elif amp_dtype == "fp16":
+            use_amp, amp_t = (self.device.type == "cuda"), torch.float16
+        else:
+            use_amp, amp_t = False, None
+        amp_device = self.device.type if self.device.type in ("cuda", "cpu") else "cpu"
+        scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and amp_t is torch.float16))
+        self.scaler = scaler
+
+        n_train = int(train_u8.shape[0])
+        bs = int(cfg["batch_size"])
+        batch_at = self._batcher(train_u8, train_y, cfg, gen, cl)
+
         # ---- optional torch.compile: probe with a real training step ----
         train_model: nn.Module = model
         drop_last = False
         if cfg.get("use_compile"):
+            stages.note("compile", "Compiling the model (torch.compile, can take a minute)")
             try:
                 compiled = torch.compile(model)
                 probe, probe_y = batch_at(torch.randperm(n_train, generator=gen), 0)
                 with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
-                    probe_loss = ddpm.p_losses(compiled, probe, y=probe_y)
+                    probe_loss = process.p_losses(compiled, probe, y=probe_y)
                 probe_loss.backward()
                 for p in model.parameters():
                     p.grad = None
@@ -1281,10 +1579,14 @@ class ImageGenEngine:
         steps_per_epoch = math.ceil(n_batches / accum)
         total_steps = epochs * steps_per_epoch  # optimizer steps: what _lr_at counts
         grad_clip = float(cfg.get("grad_clip") or 0.0)
-        logger.info(f"[AuraLite-Image] {n_train} train / {val_u8.shape[0]} val images, "
+        kind = cfg.get("model_type", "diffusion")
+        logger.info(f"[AuraLite-Image] {kind}: {n_train} train / {val_u8.shape[0]} val images, "
                     f"{cfg['img_size']}px, {cfg['channels']}ch | params: "
-                    f"{model.count_parameters():,} | pred={cfg['prediction_type']} "
-                    f"sched={cfg['schedule']} amp={amp_dtype} ema={cfg['use_ema']} "
+                    f"{model.count_parameters():,} | "
+                    + (f"pred={cfg['prediction_type']} sched={cfg['schedule']} "
+                       if kind == "diffusion" else
+                       f"flow t~{cfg.get('flow_time_sampling')} ")
+                    + f"amp={amp_dtype} ema={cfg['use_ema']} "
                     f"channels_last={cl} | {epochs} epochs x {steps_per_epoch} = "
                     f"{total_steps} steps | device={self.device}")
 
@@ -1292,7 +1594,7 @@ class ImageGenEngine:
         restore_best = bool(cfg.get("restore_best_weights", True))
         has_val = val_u8.shape[0] > 0
         best_val, best_epoch, bad_epochs = float("inf"), 0, 0
-        best_state: Optional[tuple[dict, Optional[dict]]] = None
+        best_state: Optional[tuple] = None
         stopped_early = False
 
         t0 = time.time()
@@ -1300,6 +1602,7 @@ class ImageGenEngine:
         done = 0
         history: list[float] = []
         self.val_history = []
+        self.d_history = []
         autosave_every = int(params.get("autosave_every", 0) or 0)
         autosave_path = params.get("autosave_path", "aura_image_autosave.pt")
         report_every = float(cfg.get("progress_every_seconds", 0.5))
@@ -1321,6 +1624,7 @@ class ImageGenEngine:
             running, seen = 0.0, 0
             pending = False
             order = torch.randperm(n_train, generator=gen)
+            epoch_t0 = time.time()
             for bi in range(n_batches):
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -1331,7 +1635,7 @@ class ImageGenEngine:
                     optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
-                    loss = ddpm.p_losses(train_model, xb, y=yb) / accum
+                    loss = process.p_losses(train_model, xb, y=yb) / accum
                 scaler.scale(loss).backward()
                 pending = True
 
@@ -1360,6 +1664,9 @@ class ImageGenEngine:
                         "percent": frac * 100.0, "elapsed": elapsed,
                         "eta_seconds": eta, "is_epoch_end": False, "epoch_loss": avg,
                         "lr": optimizer.param_groups[0]["lr"],
+                        "images_per_second": sps * bs,
+                        **_ImageProgress.batch_stage(epoch + 1, epochs, seen, n_batches,
+                                                     now - epoch_t0),
                     })
             if pending and not (stop_event is not None and stop_event.is_set()):
                 optimizer_step()  # a partial accumulation group at the epoch end
@@ -1370,7 +1677,13 @@ class ImageGenEngine:
             history.append(epoch_loss)
             val_loss: Optional[float] = None
             if has_val:
-                val_loss = self.validation_loss(val_u8, batch_size=max(bs, 32), labels=val_y)
+                percent_done = (epoch + 1) / epochs * 100.0
+                reporter = stages.reporter("val", f"Validation after epoch {epoch + 1}",
+                                           phase="val", epoch=epoch + 1,
+                                           percent=percent_done, loss=epoch_loss)
+                val_loss = self.validation_loss(
+                    val_u8, batch_size=max(bs, 32), labels=val_y,
+                    progress=lambda d, n, r=reporter: r.update(d, n, step="val", unit="images"))
                 self.val_history.append(val_loss)
                 if val_loss < best_val - 1e-6:
                     best_val, best_epoch, bad_epochs = val_loss, epoch + 1, 0
@@ -1408,6 +1721,7 @@ class ImageGenEngine:
         elapsed = time.time() - t0
         self.config = cfg
         self.last_train_summary = {
+            "model_type": kind,
             "epochs_run": len(history), "steps": done, "train_images": n_train,
             "val_images": int(val_u8.shape[0]), "seconds": round(elapsed, 2),
             "train_loss": history[-1] if history else None,
@@ -1419,6 +1733,319 @@ class ImageGenEngine:
             if elapsed > 0 and history else None,
         }
         return history
+
+    # ------------------------------------------------------------------
+    #  GAN training (2.14.2)
+    # ------------------------------------------------------------------
+    def _train_gan(self, cfg: dict, params: dict, continuing: bool, train_u8: torch.Tensor,
+                   val_u8: torch.Tensor, train_y: Optional[torch.Tensor],
+                   val_y: Optional[torch.Tensor], gen: torch.Generator,
+                   progress_callback: Optional[Callable], stages: _ImageProgress) -> list[float]:
+        """One discriminator and one generator step per batch (R3GAN recipe).
+
+        D: ``loss(D(aug(real)), D(aug(G(z))))`` + ``gamma / 2 * (R1 + R2)``
+        every ``gan_reg_every`` steps (scaled by the interval: lazy
+        regularisation). G: ``loss`` of fresh generated images against the
+        same real batch. Adam with betas (0, 0.99) for both, at ``gan_lr_d``
+        and ``gan_lr_g``, following ``lr_schedule``; gamma decays with it.
+        The EMA of G samples; the validation metric is the patch SWD of EMA
+        samples against the held-out images (lower is better).
+        """
+        stages.note("model", "Building the generator and the discriminator"
+                    if not continuing else "Preparing the GAN")
+        if not continuing or self.model is None or not isinstance(self.model, GanGenerator):
+            self.config = cfg
+            self.model = self.build_generator(cfg)
+            self.discriminator = self.build_discriminator(cfg)
+            self.ema = (EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
+                        if cfg["use_ema"] else None)
+            self.augment_p = 0.0
+        else:
+            self.config = cfg
+            if self.discriminator is None:
+                logger.warning("[AuraLite-Image] the checkpoint has no discriminator (saved "
+                               "without it): a new one is trained from scratch.")
+                self.discriminator = self.build_discriminator(cfg)
+            if cfg["use_ema"] and self.ema is None:
+                self.ema = EMA(self.model, cfg["ema_decay"], cfg.get("ema_warmup", True))
+            elif not cfg["use_ema"]:
+                self.ema = None
+            if self.ema is not None:
+                self.ema.decay = float(cfg["ema_decay"])
+        self._set_process(None)
+        g_net, d_net = self.model, self.discriminator
+        assert isinstance(g_net, GanGenerator) and d_net is not None
+        device = self.device
+        cl = self._channels_last(cfg)
+
+        ignored = [k for k in ("use_compile", "use_gradient_checkpointing") if cfg.get(k)]
+        if int(cfg.get("accumulation_steps") or 1) > 1:
+            ignored.append("accumulation_steps")
+        if float(cfg.get("weight_decay") or 0.0) > 0:
+            ignored.append("weight_decay")
+        if ignored:
+            logger.info("[AuraLite-Image] GAN training does not use: %s", ", ".join(ignored))
+
+        # bf16 autocast only: fp16 would need a GradScaler through R1/R2's double backward
+        amp_dtype = str(cfg.get("amp_dtype", "none")).lower()
+        amp_t = torch.bfloat16 if amp_dtype in ("bf16", "fp16") else None
+        if amp_t is not None and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+            amp_t = None
+        if amp_dtype == "fp16" and amp_t is not None:
+            logger.info("[AuraLite-Image] GAN training uses bf16 autocast for amp_dtype=fp16.")
+        use_amp = amp_t is not None
+        amp_device = device.type if device.type in ("cuda", "cpu") else "cpu"
+
+        lr_g, lr_d = float(cfg["gan_lr_g"]), float(cfg["gan_lr_d"])
+        opt_g = torch.optim.Adam(g_net.parameters(), lr=lr_g, betas=(0.0, 0.99), eps=1e-8)
+        opt_d = torch.optim.Adam(d_net.parameters(), lr=lr_d, betas=(0.0, 0.99), eps=1e-8)
+        self.optimizer, self.d_optimizer, self.scaler = opt_g, opt_d, None
+        augment = AdaptiveAugment(str(cfg.get("gan_augment") or "off"),
+                                  float(cfg.get("gan_ada_target") or 0.6),
+                                  p=self.augment_p if continuing else 0.0,
+                                  speed_images=ADA_SPEED_IMAGES)
+        ada = augment.mode == "ada"      # reports carry p only when ADA adapts it
+        kind = str(cfg.get("gan_loss") or "rpgan")
+        gamma0 = float(cfg.get("gan_gamma") or 0.0)
+        reg_every = max(1, int(cfg.get("gan_reg_every") or 1))
+        latent = int(cfg.get("latent_dim") or 64)
+
+        n_train = int(train_u8.shape[0])
+        bs = int(cfg["batch_size"])
+        batch_at = self._batcher(train_u8, train_y, cfg, gen, cl)
+        epochs = int(cfg["epochs"])
+        n_batches = max(1, math.ceil(n_train / bs))
+        total_steps = epochs * n_batches
+        has_val = int(val_u8.shape[0]) >= 2
+        if int(val_u8.shape[0]) == 1:
+            logger.warning("[AuraLite-Image] the GAN's validation needs at least 2 held-out "
+                           "images; validation is off.")
+        logger.info(f"[AuraLite-Image] gan: {n_train} train / {val_u8.shape[0]} val images, "
+                    f"{cfg['img_size']}px, {cfg['channels']}ch | G "
+                    f"{g_net.count_parameters():,} + D {d_net.count_parameters():,} params | "
+                    f"loss={kind} gamma={gamma0} (every {reg_every}) aug={augment.mode} "
+                    f"lr G/D={lr_g}/{lr_d} amp={'bf16' if use_amp else 'none'} "
+                    f"ema={cfg['use_ema']} | {epochs} epochs x {n_batches} = {total_steps} "
+                    f"steps | device={device}")
+
+        patience = int(cfg.get("early_stopping_patience") or 0)
+        restore_best = bool(cfg.get("restore_best_weights", True))
+        best_val, best_epoch, bad_epochs = float("inf"), 0, 0
+        best_state: Optional[tuple] = None
+        stopped_early = False
+        t0 = time.time()
+        last_report = 0.0
+        done = 0
+        history: list[float] = []
+        self.val_history = []
+        self.d_history = []
+        autosave_every = int(params.get("autosave_every", 0) or 0)
+        autosave_path = params.get("autosave_path", "aura_image_autosave.pt")
+        report_every = float(cfg.get("progress_every_seconds", 0.5))
+        g_net.train()
+        d_net.train()
+
+        def autocast():
+            return torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t)
+
+        for epoch in range(epochs):
+            if stages.stopped():
+                break
+            g_sum = d_sum = r1_sum = 0.0
+            seen = r1_seen = 0
+            order = torch.randperm(n_train, generator=gen)
+            epoch_t0 = time.time()
+            for bi in range(n_batches):
+                if stages.stopped():
+                    break
+                real, yb = batch_at(order, bi)
+                b = int(real.shape[0])
+                factor = self._lr_at({**cfg, "lr": 1.0}, done, total_steps)
+                for group in opt_g.param_groups:
+                    group["lr"] = lr_g * factor
+                for group in opt_d.param_groups:
+                    group["lr"] = lr_d * factor
+                gamma = gamma0 * self._decay_at(cfg, done, total_steps)
+
+                # ---- discriminator step ----
+                z = sample_latents(b, latent, gen, device=device)
+                with torch.no_grad(), autocast():
+                    fake = g_net(z, yb)
+                fake = fake.float()
+                if cl:
+                    fake = fake.contiguous(memory_format=torch.channels_last)
+                regularize = gamma > 0 and done % reg_every == 0
+                real_in = real.detach().requires_grad_(regularize)
+                fake_in = fake.detach().requires_grad_(regularize)
+                with autocast():
+                    d_real = d_net(augment(real_in, gen), yb).float()
+                    d_fake = d_net(augment(fake_in, gen), yb).float()
+                loss_d = discriminator_loss(kind, d_real, d_fake).mean()
+                if regularize:
+                    r1 = zero_centered_penalty(real_in, d_real)
+                    r2 = zero_centered_penalty(fake_in, d_fake)
+                    loss_d = loss_d + (gamma / 2.0) * reg_every * (r1 + r2).mean()
+                    r1_sum += float(r1.detach().mean())
+                    r1_seen += 1
+                opt_d.zero_grad(set_to_none=True)
+                loss_d.backward()
+                opt_d.step()
+                augment.observe(d_real.detach(), d_fake.detach())
+
+                # ---- generator step ----
+                d_net.requires_grad_(False)
+                z = sample_latents(b, latent, gen, device=device)
+                with autocast():
+                    fake = g_net(z, yb)
+                    d_fake_g = d_net(augment(fake, gen), yb).float()
+                    if kind == "rpgan":
+                        with torch.no_grad():
+                            d_real_g = d_net(augment(real, gen), yb).float()
+                    else:
+                        d_real_g = d_fake_g.detach()   # unused by hinge / non-saturating
+                loss_g = generator_loss(kind, d_real_g, d_fake_g).mean()
+                opt_g.zero_grad(set_to_none=True)
+                loss_g.backward()
+                opt_g.step()
+                d_net.requires_grad_(True)
+                if self.ema is not None:
+                    self.ema.update(g_net)
+                done += 1
+                g_sum += float(loss_g.detach())
+                d_sum += float(loss_d.detach())
+                seen += 1
+
+                now = time.time()
+                if progress_callback is not None and (
+                    now - last_report >= report_every or bi + 1 == n_batches
+                ):
+                    last_report = now
+                    elapsed = now - t0
+                    steps_done = epoch * n_batches + seen
+                    sps = steps_done / elapsed if elapsed > 0 else 0.0
+                    eta = (total_steps - steps_done) / sps if sps > 0 else None
+                    avg_g, avg_d = g_sum / seen, d_sum / seen
+                    progress_callback(epoch + 1, epochs, avg_g, None, info={
+                        "phase": "train",
+                        "message": f"Epoch {epoch + 1}/{epochs} · batch {seen}/{n_batches}",
+                        "batch": seen, "batches": n_batches,
+                        "percent": steps_done / max(1, total_steps) * 100.0,
+                        "elapsed": elapsed, "eta_seconds": eta, "is_epoch_end": False,
+                        "epoch_loss": avg_g, "lr": lr_g * factor,
+                        "g_loss": avg_g, "d_loss": avg_d,
+                        "r1": r1_sum / r1_seen if r1_seen else None,
+                        "gamma": gamma, "aug_p": augment.p if ada else None,
+                        "d_rt": augment.last_rt,
+                        "images_per_second": sps * bs,
+                        **_ImageProgress.batch_stage(epoch + 1, epochs, seen, n_batches,
+                                                     now - epoch_t0),
+                    })
+            self.augment_p = augment.p
+            if seen == 0:
+                break
+            g_loss, d_loss = g_sum / seen, d_sum / seen
+            history.append(g_loss)
+            self.d_history.append(d_loss)
+            val_swd: Optional[float] = None
+            if has_val:
+                reporter = stages.reporter("val", f"Validation after epoch {epoch + 1} (SWD)",
+                                           phase="val", epoch=epoch + 1,
+                                           percent=(epoch + 1) / epochs * 100.0, loss=g_loss)
+                val_swd = self._gan_validation(val_u8, val_y, reporter)
+                self.val_history.append(val_swd)
+                if val_swd < best_val - 1e-6:
+                    best_val, best_epoch, bad_epochs = val_swd, epoch + 1, 0
+                    if patience > 0 and restore_best:
+                        best_state = self._snapshot()
+                else:
+                    bad_epochs += 1
+            if autosave_every and (epoch + 1) % autosave_every == 0:
+                try:
+                    self.save_model(autosave_path)
+                except Exception as e:
+                    logger.warning(f"[AuraLite-Image] autosave failed: {e}")
+            if progress_callback is not None:
+                msg = f"Epoch {epoch + 1}/{epochs} complete — G {g_loss:.4f} · D {d_loss:.4f}"
+                if ada:
+                    msg += f" · aug p {augment.p:.2f}"
+                if val_swd is not None:
+                    msg += f" · val SWD {val_swd:.2f}"
+                progress_callback(epoch + 1, epochs, g_loss, val_swd, info={
+                    "phase": "epoch_end", "message": msg,
+                    "batch": n_batches, "batches": n_batches,
+                    "percent": (epoch + 1) / epochs * 100.0,
+                    "elapsed": time.time() - t0, "eta_seconds": None,
+                    "is_epoch_end": True, "epoch_loss": g_loss, "val_loss": val_swd,
+                    "g_loss": g_loss, "d_loss": d_loss, "aug_p": augment.p if ada else None,
+                    "val_metric": "swd",
+                })
+            if has_val and patience > 0 and bad_epochs >= patience:
+                stopped_early = True
+                logger.info("[AuraLite-Image] early stopping after epoch %d "
+                            "(best val SWD %.3f at epoch %d)", epoch + 1, best_val, best_epoch)
+                break
+
+        restored = False
+        if stopped_early and best_state is not None:
+            self._restore(best_state)
+            restored = True
+        elapsed = time.time() - t0
+        self.config = cfg
+        self.last_train_summary = {
+            "model_type": "gan",
+            "epochs_run": len(history), "steps": done, "train_images": n_train,
+            "val_images": int(val_u8.shape[0]) if has_val else 0, "seconds": round(elapsed, 2),
+            "train_loss": history[-1] if history else None,
+            "d_loss": self.d_history[-1] if self.d_history else None,
+            "val_loss": self.val_history[-1] if self.val_history else None,
+            "val_metric": "swd",
+            "best_val_loss": best_val if has_val and self.val_history else None,
+            "best_epoch": best_epoch if has_val and self.val_history else None,
+            "stopped_early": stopped_early, "restored_best": restored,
+            "augment": augment.mode, "augment_p": round(self.augment_p, 4),
+            "images_per_second": round(done * bs / elapsed, 1) if elapsed > 0 and done else None,
+        }
+        return history
+
+    def _gan_images(self, net: nn.Module, n: int, generator: Optional[torch.Generator],
+                    labels: Optional[torch.Tensor] = None, truncation: float = 0.0,
+                    progress: Optional[Callable[[int, int], object]] = None,
+                    chunk: int = 64) -> torch.Tensor:
+        """``n`` generated images as a ``(n, C, H, W)`` uint8 CPU tensor."""
+        latent = int(self.config.get("latent_dim") or 64)
+        out: list[torch.Tensor] = []
+        was_training = net.training
+        net.eval()
+        try:
+            with torch.no_grad():
+                for start in range(0, n, chunk):
+                    m = min(chunk, n - start)
+                    z = sample_latents(m, latent, generator, truncation, device=self.device)
+                    y = labels[start:start + m].to(self.device) if labels is not None else None
+                    x = net(z, y).float().clamp(-1, 1)
+                    out.append(((x + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).cpu())
+                    if progress is not None and progress(start + m, n):
+                        break
+        finally:
+            net.train(was_training)
+        return torch.cat(out).contiguous()
+
+    def _gan_validation(self, val_u8: torch.Tensor, val_y: Optional[torch.Tensor],
+                        reporter: Any = None) -> float:
+        """Patch SWD between EMA-generator samples (fixed latents) and held-out images."""
+        net = self.ema.ema_model if self.ema is not None else self.model
+        assert net is not None
+        n = min(int(val_u8.shape[0]), GAN_VAL_MAX_IMAGES)
+        labels = val_y[:n] if val_y is not None else None
+        gen = torch.Generator().manual_seed(_VAL_NOISE_SEED)
+
+        def step(done: int, total: int) -> None:
+            if reporter is not None:
+                reporter.update(done, total, step="generate", unit="images")
+
+        fakes = self._gan_images(net, n, gen, labels, progress=step)
+        return float(sliced_wasserstein_distance(val_u8[:n].cpu(), fakes,
+                                                 seed=_VAL_NOISE_SEED)["swd"])
 
     def _class_labels(self, image_dir: str, paths: list[str], cfg: dict,
                       continuing: bool) -> Optional[torch.Tensor]:
@@ -1445,18 +2072,23 @@ class ImageGenEngine:
         null = len(names)
         return torch.tensor([v if v >= 0 else null for v in labels], dtype=torch.long)
 
-    def _snapshot(self) -> tuple[dict, Optional[dict]]:
+    def _snapshot(self) -> tuple[dict, Optional[dict], Optional[dict]]:
+        """Copies of the model, EMA and (GAN) discriminator weights."""
         assert self.model is not None
         model_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
         ema_state = ({k: v.detach().clone() for k, v in self.ema.ema_model.state_dict().items()}
                      if self.ema is not None else None)
-        return model_state, ema_state
+        disc_state = ({k: v.detach().clone() for k, v in self.discriminator.state_dict().items()}
+                      if self.discriminator is not None else None)
+        return model_state, ema_state, disc_state
 
-    def _restore(self, state: tuple[dict, Optional[dict]]) -> None:
+    def _restore(self, state: tuple) -> None:
         assert self.model is not None
         self.model.load_state_dict(state[0])
         if self.ema is not None and state[1] is not None:
             self.ema.ema_model.load_state_dict(state[1])
+        if len(state) > 2 and self.discriminator is not None and state[2] is not None:
+            self.discriminator.load_state_dict(state[2])
 
     # ------------------------------------------------------------------
     @property
@@ -1485,91 +2117,173 @@ class ImageGenEngine:
                  seed: Optional[int] = None, use_ema: bool = True,
                  progress: Optional[Callable[[int, int], bool]] = None,
                  sampler: str = "ddim", class_label=None,
-                 guidance_scale: float = 1.0) -> list[np.ndarray]:
+                 guidance_scale: float = 1.0, truncation: float = 0.0) -> list[np.ndarray]:
         """Sample ``n`` images as uint8 arrays. ``steps=None`` uses all T steps.
 
         For a class-conditional model, ``class_label`` is a class name, an
         index or ``"all"`` (cycle through the classes); ``None`` samples the
         unconditional model. ``guidance_scale > 1`` applies classifier-free
         guidance (one batched call per step: twice the work).
+
+        A flow-matching model samples with ``euler`` (``ddim`` is the same),
+        ``heun`` or ``dpm++2m``; ``steps=None`` means 50. A GAN needs one
+        network call per image: ``steps``, ``eta``, ``sampler`` and
+        ``guidance_scale`` do not apply, and ``truncation > 0`` trades
+        variety for cleaner images (2.14.2).
         """
-        if self.model is None or self.ddpm is None:
+        if self.model is None:
+            raise RuntimeError("No trained model. Train or load a model first.")
+        net: nn.Module = self.ema.ema_model if (use_ema and self.ema is not None) else self.model
+        labels = self._resolve_labels(class_label, n)
+        if isinstance(self.model, GanGenerator):
+            gan_gen = torch.Generator().manual_seed(int(seed)) if seed is not None else None
+            images = self._gan_images(net, n, gan_gen, labels, float(truncation or 0.0),
+                                      progress=progress)
+            return [_u8_to_array(img) for img in images]
+        if self.process is None:
             raise RuntimeError("No trained model. Train or load a model first.")
         gen = None
         if seed is not None:
             gen = torch.Generator(device=self.device)
             gen.manual_seed(int(seed))
-        net: nn.Module = self.ema.ema_model if (use_ema and self.ema is not None) else self.model
-        labels = self._resolve_labels(class_label, n)
         if labels is not None:
             net = GuidedDenoiser(net, labels, len(self.class_names), guidance_scale)
-        imgs = self.ddpm.sample(
+        imgs = self.process.sample(
             net, n, self.config["channels"], self.config["img_size"],
             steps=steps, eta=eta, generator=gen, progress=progress, sampler=sampler,
             channels_last=self._channels_last(),
         )
         return [tensor_to_uint8(img) for img in imgs]
 
+    def evaluate(self, images, n: int = 256, seed: int = 0, real_floor: bool = True,
+                 **generate_kwargs) -> dict[str, Any]:
+        """Quality of the model in memory (2.14.2): patch SWD against real images.
+
+        ``images`` is an image folder (decoded at the model's size) or a uint8
+        ``(N, C, H, W)`` tensor. ``n`` generated images (``generate(**kwargs)``,
+        seeded) are compared with ``n`` real ones picked with ``seed``. With
+        ``real_floor`` the result also holds the SWD between two disjoint sets
+        of real images — what a perfect model would score at that size.
+        Returns ``{"swd", "levels", "images", "real_floor", "floor_images",
+        "seconds"}`` and keeps it in ``last_eval``.
+        """
+        if self.model is None:
+            raise RuntimeError("No trained model. Train or load a model first.")
+        t0 = time.perf_counter()
+        if isinstance(images, (str, os.PathLike)):
+            real_u8, _ = self._load_images(str(images), self.config)
+        else:
+            real_u8 = images
+        total = int(real_u8.shape[0])
+        n = max(2, min(int(n), total))
+        if total < 2:
+            raise ValueError("evaluate() needs at least 2 real images")
+        perm = torch.randperm(total, generator=torch.Generator().manual_seed(int(seed)))
+        real = real_u8[perm[:n]].cpu()
+        fakes = self.generate(n=n, seed=seed, **generate_kwargs)
+        result: dict[str, Any] = dict(sliced_wasserstein_distance(real, fakes, seed=seed))
+        result["real_floor"], result["floor_images"] = None, 0
+        if real_floor:
+            m = n if total >= 2 * n else total // 2
+            if m >= 2:
+                a, b = real_u8[perm[:m]].cpu(), real_u8[perm[m:2 * m]].cpu()
+                result["real_floor"] = sliced_wasserstein_distance(a, b, seed=seed)["swd"]
+                result["floor_images"] = m
+        result["seconds"] = round(time.perf_counter() - t0, 2)
+        self.last_eval = result
+        return result
+
     # ------------------------------------------------------------------
-    def save_model(self, path: str):
+    def save_model(self, path: str, include_discriminator: bool = True):
         """Save an image-generator checkpoint.
 
         `*.safetensors` → pickle-free weights + JSON metadata (safe to share);
-        anything else → the classic `.pt` container.
+        anything else → the classic `.pt` container. A GAN checkpoint also
+        holds the discriminator (to continue training) unless
+        ``include_discriminator=False`` (half the size; generation only).
         """
         if self.model is None:
             raise RuntimeError("Nothing to save — no model in memory.")
+        model_type = self.model_type if self.model_type in CHECKPOINT_FORMATS else "diffusion"
+        fmt = CHECKPOINT_FORMATS[model_type]
         model_state = {k: v.contiguous() for k, v in self.model.state_dict().items()}
         ema_state = ({k: v.contiguous() for k, v in self.ema.ema_model.state_dict().items()}
                      if self.ema is not None else None)
         ema_updates = self.ema.num_updates if self.ema is not None else 0
+        disc_state = None
+        if model_type == "gan" and include_discriminator and self.discriminator is not None:
+            disc_state = {k: v.contiguous() for k, v in self.discriminator.state_dict().items()}
         if str(path).lower().endswith(".safetensors"):
             from auralite.engine.safe_io import save_safetensors_checkpoint
             tensors = {f"model.{k}": v for k, v in model_state.items()}
-            metadata: dict[str, Any] = {"format": "auralite-image-ddpm-v2", "config": self.config}
+            metadata: dict[str, Any] = {"format": fmt, "config": self.config}
             if ema_state is not None:
                 tensors.update({f"ema.{k}": v for k, v in ema_state.items()})
                 metadata["has_ema"] = True
                 metadata["ema_updates"] = ema_updates
+            if disc_state is not None:
+                tensors.update({f"disc.{k}": v for k, v in disc_state.items()})
+                metadata["has_disc"] = True
+            if model_type == "gan":
+                metadata["augment_p"] = float(self.augment_p)
             return save_safetensors_checkpoint(
                 path, tensors, metadata, meta_key="auralite-image")
-        torch.save({
-            "format": "auralite-image-ddpm-v2",
+        payload: dict[str, Any] = {
+            "format": fmt,
             "config": self.config,
             "model_state": model_state,
             "ema_state": ema_state,
             "ema_updates": ema_updates,
-        }, path)
+        }
+        if model_type == "gan":
+            payload["disc_state"] = disc_state
+            payload["augment_p"] = float(self.augment_p)
+        torch.save(payload, path)
 
     def load_model(self, path: str, allow_unsafe: bool = False):
         if str(path).lower().endswith(".safetensors"):
             from auralite.engine.safe_io import load_safetensors_checkpoint
             raw = load_safetensors_checkpoint(path, meta_key="auralite-image")
-            model_state = {
-                k[len("model."):]: v for k, v in raw["model_state"].items()
-                if k.startswith("model.")
-            }
+
+            def part(prefix: str) -> dict:
+                return {k[len(prefix):]: v for k, v in raw["model_state"].items()
+                        if k.startswith(prefix)}
+
             ckpt = {
                 "format": raw.get("format", "auralite-image-ddpm-v2"),
                 "config": raw.get("config", {}),
-                "model_state": model_state,
-                "ema_state": ({
-                    k[len("ema."):]: v for k, v in raw["model_state"].items()
-                    if k.startswith("ema.")
-                } if raw.get("has_ema") else None),
+                "model_state": part("model."),
+                "ema_state": part("ema.") if raw.get("has_ema") else None,
                 "ema_updates": raw.get("ema_updates"),
+                "disc_state": part("disc.") if raw.get("has_disc") else None,
+                "augment_p": raw.get("augment_p"),
             }
         else:
             from auralite.engine.safe_io import safe_torch_load
             ckpt = safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
-        if ckpt.get("format") not in ("auralite-image-ddpm-v1", "auralite-image-ddpm-v2"):
+        fmt = ckpt.get("format") if isinstance(ckpt, dict) else None
+        types = {v: k for k, v in CHECKPOINT_FORMATS.items()}
+        if fmt not in types and fmt not in _LEGACY_FORMATS:
             raise ValueError("Not an AuraLite image-generator checkpoint.")
         cfg: dict[str, Any] = dict(self.DEFAULTS)
         cfg.update(_LEGACY_CONFIG)  # keys absent from older checkpoints
         cfg.update(ckpt["config"])
+        cfg["model_type"] = types.get(fmt, "diffusion")  # the format decides
         self.config = cfg
-        self.model = self.build_model(self.config)
-        self.model.load_state_dict(ckpt["model_state"])
+        self.discriminator, self.d_optimizer = None, None
+        if cfg["model_type"] == "gan":
+            self.model = self.build_generator(self.config)
+            self.model.load_state_dict(ckpt["model_state"])
+            if ckpt.get("disc_state"):
+                self.discriminator = self.build_discriminator(self.config)
+                self.discriminator.load_state_dict(ckpt["disc_state"])
+            self.augment_p = float(ckpt.get("augment_p") or 0.0)
+            self._set_process(None)
+        else:
+            self.model = self.build_model(self.config)
+            self.model.load_state_dict(ckpt["model_state"])
+            self.augment_p = 0.0
+            self._set_process(self._make_process(cfg))
         self.model.eval()
         self.ema = None
         if ckpt.get("ema_state"):
@@ -1578,11 +2292,20 @@ class ImageGenEngine:
             self.ema.ema_model.load_state_dict(ckpt["ema_state"])
             # older checkpoints did not count updates: treat them as warmed up
             self.ema.num_updates = int(ckpt.get("ema_updates") or 10**9)
-        self.ddpm = self._make_ddpm(cfg)
         return self.config
 
     def count_parameters(self) -> int:
+        """Parameters of the network that generates (the U-Net or the GAN generator)."""
         return self.model.count_parameters() if self.model is not None else 0
+
+    def parameter_summary(self) -> str:
+        """``"1,234,567"``, or ``"G 1,234,567 + D 1,111,111"`` for a GAN (2.14.2)."""
+        if self.model is None:
+            return "—"
+        if self.discriminator is not None:
+            return (f"G {self.model.count_parameters():,} + "
+                    f"D {self.discriminator.count_parameters():,}")
+        return f"{self.model.count_parameters():,}"
 
 
 # ======================================================================
@@ -1590,18 +2313,21 @@ class ImageGenEngine:
 # ======================================================================
 IMAGE_PRESETS = {
     "Tiny (CPU-friendly)": dict(
+        model_type="diffusion",
         img_size=16, base_channels=32, num_res_blocks=1, attn_heads=0, timesteps=200,
         schedule="linear", prediction_type="eps", min_snr_gamma=0.0,
         epochs=60, batch_size=32, lr=2e-3, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.995, lr_schedule="constant",
     ),
     "Small (default)": dict(
+        model_type="diffusion",
         img_size=32, base_channels=48, num_res_blocks=2, attn_heads=0, timesteps=400,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
         epochs=80, batch_size=32, lr=6e-4, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.999, lr_schedule="warmup_cosine", warmup_steps=200,
     ),
     "Medium (GPU recommended)": dict(
+        model_type="diffusion",
         img_size=48, base_channels=64, num_res_blocks=2, attn_heads=0, timesteps=600,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
         epochs=120, batch_size=32, lr=4e-4, dropout=0.1, amp_dtype="bf16",
@@ -1609,10 +2335,44 @@ IMAGE_PRESETS = {
         use_gradient_checkpointing=True,
     ),
     "Large (powerful GPU)": dict(
+        model_type="diffusion",
         img_size=64, base_channels=96, num_res_blocks=2, attn_heads=0, timesteps=1000,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
         epochs=200, batch_size=16, lr=2e-4, dropout=0.1, amp_dtype="bf16",
         use_ema=True, ema_decay=0.9999, lr_schedule="warmup_cosine", warmup_steps=1000,
         use_gradient_checkpointing=True,
     ),
+    # 2.14.2: flow matching on the same U-Nets
+    "Flow Tiny (CPU-friendly)": dict(
+        model_type="flow", flow_time_sampling="logit_normal",
+        img_size=16, base_channels=32, num_res_blocks=1, attn_heads=0,
+        epochs=60, batch_size=32, lr=2e-3, dropout=0.0, amp_dtype="none",
+        use_ema=True, ema_decay=0.995, lr_schedule="constant",
+    ),
+    "Flow Small": dict(
+        model_type="flow", flow_time_sampling="logit_normal",
+        img_size=32, base_channels=48, num_res_blocks=2, attn_heads=0,
+        epochs=80, batch_size=32, lr=6e-4, dropout=0.0, amp_dtype="none",
+        use_ema=True, ema_decay=0.999, lr_schedule="warmup_cosine", warmup_steps=200,
+    ),
+    # 2.14.2: the GAN (R3GAN-style); its learning rates are gan_lr_g / gan_lr_d
+    "GAN Tiny (CPU-friendly)": dict(
+        model_type="gan", img_size=16, base_channels=32, num_res_blocks=1, latent_dim=64,
+        gan_loss="rpgan", gan_lr_g=1e-3, gan_lr_d=1e-3, gan_gamma=0.5, gan_reg_every=1,
+        gan_augment="off", gan_ada_target=0.6,
+        epochs=60, batch_size=32, amp_dtype="none", use_ema=True, ema_decay=0.999,
+        lr_schedule="constant",
+    ),
+    "GAN Small": dict(
+        model_type="gan", img_size=32, base_channels=32, num_res_blocks=2, latent_dim=64,
+        gan_loss="rpgan", gan_lr_g=5e-4, gan_lr_d=5e-4, gan_gamma=0.5, gan_reg_every=1,
+        gan_augment="off", gan_ada_target=0.6,
+        epochs=100, batch_size=32, amp_dtype="none", use_ema=True, ema_decay=0.999,
+        lr_schedule="constant",
+    ),
 }
+
+
+def preset_slug(name: str) -> str:
+    """The command-line name of a preset: ``"GAN Tiny (CPU-friendly)"`` → ``"gan-tiny"``."""
+    return "-".join(name.split("(")[0].lower().split())

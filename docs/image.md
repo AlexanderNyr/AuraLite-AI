@@ -1,10 +1,13 @@
-# Image generator: what changed in 2.10 and how it was measured
+# Image generator: what changed in 2.10 and 2.14.2, and how it was measured
 
-This page covers the from-scratch diffusion model behind the GUI *Image* tab,
-`ImageGenEngine` and the new `auralite image-train` / `auralite image-generate`
-commands. Every number was measured on this repository's code on a 2-vCPU VM
-(one physical core with two hyper-threads, torch 2.14.1 CPU). The commands to
-reproduce them are in § 9.
+This page covers the from-scratch image generator behind the GUI *Image* tab,
+`ImageGenEngine` and the `auralite image-train` / `image-generate` /
+`image-eval` commands. § 1–9 are the 2.10 work on the diffusion model (and the
+`image-train` / `image-generate` commands, new then); § 10–15 are 2.14.2: flow
+matching and a GAN as further model types, a quality score without pretrained
+networks, and the progress stages. Every number was measured on this
+repository's code on a 2-vCPU VM (one physical core with two hyper-threads,
+torch 2.14.1 CPU). The commands to reproduce them are in § 9.
 
 Quality is measured on MNIST at 16 px, a data set small enough to train on this
 machine:
@@ -326,3 +329,293 @@ The MNIST quality runs used the 5,000-image subset described at the top
 (seed 0 for the subset, seed 1 for training). The classifier was a 3-conv CNN
 trained for 3 epochs on the 60,000 MNIST training images at 16 px. FID used
 1,000 samples drawn with seeds 0, 250, 500 and 750, 250 images each.
+
+2.14.2 (§ 10–14): the same subset and sampling seeds with a newly trained
+classifier of the same design; the training seed is 1 unless a table names
+others. The time per training step and per sampled image of each model type:
+
+    python benchmarks/image_bench.py types --size 16 --files 96 --repeats 3
+
+# 2.14.2: three model types, a quality score, detailed progress
+
+2.14.2 adds two ways to train an image generator next to the diffusion model
+of § 1–9, a way to measure a model without pretrained networks, and progress
+for every stage of a run. The measurements below were made with a new MNIST
+classifier (98.6 % test accuracy, the same three-convolution design as § 9),
+so their FID values are not comparable with the 2.10 tables above. On this
+classifier 1,000 real training images score **14.1** (the floor at this sample
+size). Every run trained on the same 5,000 images at 16 px for 10 epochs
+(1,570 steps at batch 32); 1,000 samples (seeds 0, 250, 500, 750) were scored.
+
+## 10. Model types
+
+`model_type` (GUI: *Model Type*; CLI: `image-train --type`) picks what is
+trained. All three types read the same folders (sub-folders as classes),
+validate, stop early, continue training, autosave and save `.pt` or
+`.safetensors` the same way.
+
+| | `diffusion` (default) | `flow` | `gan` |
+|---|---|---|---|
+| network | self-attention U-Net | the same U-Net | ResNet generator + discriminator |
+| training objective | DDPM noise prediction (ε / x0 / v), Min-SNR | rectified flow: velocity on a straight noise→image path | relativistic GAN loss with R1 + R2 |
+| sampling | 10–50 network calls (DPM-Solver++, DDIM, DDPM) | 10–50 calls (DPM-Solver++, Euler, Heun) | **one call per image** |
+| validation | held-out denoising loss | held-out velocity loss | patch SWD of samples vs. held-out images (§ 13) |
+| class guidance | classifier-free | classifier-free | a class label per image (projection discriminator) |
+| presets | *Tiny*, *Small*, *Medium*, *Large* | *Flow Tiny*, *Flow Small* | *GAN Tiny*, *GAN Small* |
+| checkpoint `format` | `auralite-image-ddpm-v2` | `auralite-image-flow-v1` | `auralite-image-gan-v1` |
+
+Results on MNIST-16 at the same budget (*Tiny* presets, 1,570 steps; lower
+FID is better):
+
+| model | classifier-FID | sampling 1,000 images | training (1,570 steps) |
+|---|---|---|---|
+| diffusion, DPM-Solver++ 20 steps | 187.5 | 27.7 s | 251 s |
+| **flow matching, DPM-Solver++ 20 steps** | **74.4** | 27.3 s | 253 s |
+| GAN, the defaults (mean of seeds 1–3: 195, 131, 141) | 155.5 | **0.2 s** | 271–282 s |
+
+Flow matching gave the best images of the three at this budget: a 2.5 times
+lower FID than diffusion with the same network, the same number of steps and
+the same sampling cost. The GAN came second and samples about 130 times
+faster than both. In the samples the difference is plain: flow matching draws
+clean digits, the GAN recognisable but softer ones, and the diffusion model
+at this budget many broken strokes.
+
+The cost of a training step and of a sampled image (`image_bench.py types`,
+3 channels, 16 px, batch 32, 2 threads):
+
+| model | parameters | ms per training step | ms per sampled image |
+|---|---|---|---|
+| diffusion (*Tiny*) | 715 k | 164 | 29.2 (DPM-Solver++, 20 steps) |
+| flow matching (*Flow Tiny*) | 715 k | 167 | 28.2 (DPM-Solver++, 20 steps) |
+| GAN (*GAN Tiny*), R1 + R2 every step | G 172 k + D 164 k | 200 | 0.2–0.5 |
+| GAN, R1 + R2 every 4 steps | G 172 k + D 164 k | 101 | 0.2 |
+
+## 11. Flow matching (`model_type="flow"`)
+
+`auralite/image_flow.py` trains the U-Net with **rectified flow** (Liu et al.
+2022; Lipman et al. 2022), the objective of Stable Diffusion 3 and FLUX:
+
+* the training example is `x_t = (1 - t) * x0 + t * noise` on the straight path
+  from the image (t = 0) to pure noise (t = 1);
+* the network predicts the velocity `noise - x0` (plain MSE, no weighting);
+* `t` is drawn from a **logit-normal** distribution (`flow_time_sampling`,
+  Esser et al. 2024), which puts more training on the middle of the path;
+  `uniform` is the alternative;
+* sampling integrates `dx/dt = v(x, t)` from t = 1 to 0. **DPM-Solver++(2M)**
+  applies because the path is a Gaussian diffusion with `alpha = 1 - t`,
+  `sigma = t`; **Euler** (what DDIM is on this path, so `ddim` is accepted as
+  its name) and **Heun** (second order, two calls per step) are the
+  alternatives. A diffusion-only sampler (`ddpm`) is refused with a message.
+
+**Exact-velocity test.** Data N(0, 0.3²) with the exact velocity field: the
+ODE maps N(0, 1) onto the data, so the error of the sample std is the
+solver's own error (4,000 samples; the noise itself is 0.7 % below 1):
+
+| sample std error | 4 steps | 8 | 10 | 20 | 50 |
+|---|---|---|---|---|---|
+| Euler (1 call per step) | -41.3 % | -22.3 % | -18.3 % | -9.9 % | -4.6 % |
+| Heun (2 × steps − 1 calls) | -29.8 % | -8.4 % | -5.6 % | -2.0 % | -1.1 % |
+| DPM-Solver++(2M) (1 call per step) | -38.6 % | -11.8 % | -6.6 % | **-0.2 %** | -0.3 % |
+
+**Trained model** (MNIST-16, *Flow Tiny* settings, 1,570 steps):
+
+| sampler | network calls | classifier-FID |
+|---|---|---|
+| Euler, 20 steps | 20 | 89.1 |
+| Heun, 10 steps | 19 | 75.0 |
+| DPM-Solver++(2M), 20 steps | 20 | **74.4** |
+
+DPM-Solver++ is the default in the GUI and the CLI for both diffusion and flow
+models. The validation loss of a flow model is the velocity loss at 8 fixed
+times with fixed noise, so it is comparable across epochs like the diffusion
+one.
+
+## 12. GAN (`model_type="gan"`)
+
+`auralite/image_gan.py` follows **R3GAN** (Huang et al., NeurIPS 2024, "The GAN
+is dead; long live the GAN! A Modern GAN Baseline"): a loss that makes GAN
+training well-behaved, so none of the classic tricks are needed.
+
+* **Loss.** Relativistic pairing (RpGAN): the discriminator scores a generated
+  image *relative to* a real one, `softplus(D(fake) - D(real))`, which removes
+  the mode-dropping minima of the classic loss. `gan_loss` also offers `hinge`
+  (SAGAN, BigGAN) and `nonsaturating` (the original GAN loss).
+* **R1 + R2.** Zero-centred gradient penalties on real (R1) and generated (R2)
+  images, `gamma / 2 * ||grad D||²` (`gan_gamma`). They are what makes the
+  relativistic loss converge. They need a second backward pass, so they run
+  every `gan_reg_every` steps with the weight scaled by the interval (lazy
+  regularisation, StyleGAN2). With a cosine LR schedule `gamma` decays with
+  it to 10 %, as R3GAN lowers its gamma over training.
+* **Networks.** A symmetric ResNet generator and discriminator without
+  normalisation layers: every block is a 1x1 → grouped 3x3 (16 channels per
+  group) → 1x1 inverted bottleneck, resolutions change in separate transition
+  layers with bilinear resampling, and **fix-up initialisation** (the last
+  convolution of each block starts at zero, the other two are scaled by
+  `L^-0.25`) replaces the normalisation. The generator starts from a learned
+  4x4 basis (3x3 for 24/48/96 px) modulated by the latent; the discriminator
+  ends with a depthwise 4x4 convolution and a linear layer. Width per
+  resolution: `base_channels` doubling up to 4x; `channel_mults` and
+  `num_res_blocks` apply as for the U-Net.
+* **Optimiser.** Adam with betas (0, 0.99) for both networks, at `gan_lr_g` and
+  `gan_lr_d` (two time scales are possible), following `lr_schedule`.
+* **Augmentation** (`gan_augment`, off by default). DiffAugment (Zhao et al.
+  2020): brightness, saturation, contrast, translation by up to 1/8 and cutout
+  of half the size, applied to real *and* generated images before the
+  discriminator and differentiable, so the generator learns through it and
+  does not reproduce it. `ada` gives each operation ADA's **adaptive
+  probability** (Karras et al. 2020): every 4 steps `r_t`, the mean sign of
+  `D(real) - D(fake)` (how consistently the discriminator ranks a training
+  image above a generated one), is compared with `gan_ada_target` (0.6);
+  above it the probability rises, below it falls, by up to 1 per 100,000
+  images. `diffaug` keeps it at 1. Augmentation exists against a
+  discriminator that memorises a small data set over a long run (rising
+  validation SWD); at the budgets measured here it did not pay off, even
+  with 500 images (below), so it is off by default.
+* **EMA generator and truncation.** Samples come from an EMA of the
+  generator's weights (with the 2.10 warmup). `generate(truncation=1.5)`
+  (GUI: *Truncation*; CLI: `--truncation`) resamples latent values beyond
+  ±1.5: cleaner, less varied images (BigGAN's truncation trick).
+* **Classes.** The label embedding is concatenated to the latent in the
+  generator, and the discriminator projects its features onto a class
+  embedding (projection discriminator). `class_dropout` trains a "no class"
+  label too, which is what `class_label=None` samples.
+* **Validation.** There is no likelihood to hold out, so each epoch the EMA
+  generator draws images from fixed latents and the patch SWD (§ 13) against
+  the held-out images is the validation value (`val_metric: "swd"` in the
+  summary), used by early stopping and best-weights restore.
+
+The GAN does not use `lr`, `weight_decay`, `grad_clip`, `accumulation_steps`,
+`use_compile` or gradient checkpointing; a log line names the ones that were
+set. `amp_dtype="fp16"` runs bf16 autocast (a gradient scaler does not fit the
+double backward of R1/R2). A checkpoint holds the generator, its EMA and the
+discriminator (to continue training) plus ADA's probability;
+`save_model(path, include_discriminator=False)` writes half the size for
+generation only, and continuing such a file trains a new discriminator.
+
+**Finding the defaults** (MNIST-16, 1,570 steps, base 32: G 172 k + D 164 k
+parameters; classifier-FID of the EMA generator and of the raw weights; one
+change per row):
+
+| change (from lr 1e-3, γ 0.05, R1 + R2 every step, ADA) | FID, EMA generator | raw weights |
+|---|---|---|
+| learning rate 2e-4 (R3GAN's value, for batch 512) | 394 | — |
+| learning rate 1e-3 | 212 | 472 |
+| learning rate 2e-3 | 478 (diverged) | 1012 |
+| γ 0.01 | 208 | 284 |
+| **γ 0.5** | **147** | 459 |
+| γ 1 | 269 | 397 |
+| γ 0.5 with a cosine LR schedule | 250 | 373 |
+| R1 + R2 every 4 steps (lazy) | 201 | 243 |
+| augmentation `off` | 205 | 202 |
+| augmentation `diffaug` (always on) | 474 | 442 |
+| `base_channels` 64 (G 536 k + D 520 k) | 216 | 250 |
+
+GAN runs this short vary a lot with the seed, so the candidates were run
+with seeds 1–3:
+
+| configuration | seeds 1, 2, 3 | mean |
+|---|---|---|
+| γ 0.05, R1 + R2 every 4 steps, ADA | 201, 229, 240 | 223 |
+| γ 0.5, every step, ADA | 147, 153, 265 | 189 |
+| **γ 0.5, every step, no augmentation** (the defaults) | 195, 131, 141 | **156** |
+
+With 500 images (a subset of the 5,000, 100 epochs: the same 1,600
+steps) the GAN without augmentation scored 138 and with ADA 186; ADA's
+probability had risen to 0.22. At these budgets the discriminator does not
+get to memorise even 500 images, and the augmentation only makes its task
+harder.
+
+The defaults are therefore **learning rate 1e-3 for both networks, γ 0.5,
+R1 + R2 every step, no augmentation, a constant LR, EMA**.
+`gan_reg_every=4` trains twice as fast per step (101 against 200 ms in the
+table of § 10) for a somewhat worse result. Sampling from the EMA generator
+(the default; *EMA weights* in the Generate row) is the safer choice at a
+learning rate this high: it scored better than the raw weights in 15 of the
+23 runs that measured both, often by a factor of two (147 against 459,
+212 against 472); where the raw weights won, they won by 2–38 %.
+
+## 13. Quality without pretrained networks: patch SWD
+
+FID needs an Inception network trained on ImageNet: weights AuraLite does not
+ship and cannot download in an offline training run. `image_metrics.py`
+implements the **multi-scale sliced Wasserstein distance** of ProGAN (Karras
+et al. 2018), which needs nothing:
+
+* every image becomes a Laplacian pyramid down to 8 px (16 px → levels 16 and
+  8): the finest levels hold edges and texture, the coarsest the layout;
+* from each level, 128 random 7x7 patches per image become descriptors
+  (the same positions in both sets), normalised with the statistics of the
+  **real** patches — ProGAN normalises each set on its own, which hides a
+  colour or brightness shift;
+* the distance is the average 1-D Wasserstein distance over 4 x 128 random
+  directions, times 1000, per level and averaged.
+
+Patch positions and directions are seeded, so the same two sets always give
+the same number. Two sets of *real* images score above zero, so
+`ImageGenEngine.evaluate(folder, n=256)` also reports that floor, from two
+disjoint sets of real images:
+
+    auralite image-eval --model gen.pt --images photos/ -n 256 [--json]
+    # GUI: Generate → 📏 Measure Quality (against the selected folder)
+
+What it can and cannot tell (MNIST-16, 1,000 images per set; real training
+vs. real test images score **52.9**):
+
+| 1,000 images | classifier-FID | SWD |
+|---|---|---|
+| real training digits | 14.1 | 52.9 |
+| flow matching, Euler 20 steps | 89.1 | 56.0 |
+| flow matching, DPM-Solver++ 20 steps | 74.4 | 61.6 |
+| diffusion, DPM-Solver++ 20 steps | 187.5 | 75.3 |
+| GAN, γ 0.05 (EMA generator) | 211.7 | 73.3 |
+| GAN, γ 0.5 (EMA generator) | 147.3 | 80.9 |
+| GAN, γ 0.05 (raw weights) | 472.4 | 209.5 |
+| GAN, learning rate 2e-3 (diverged) | 478.3 | 220.9 |
+
+Over all 51 results of these runs (every GAN setting, raw and EMA, and the
+U-Net models), the rank correlation between SWD and the classifier-FID is
+0.69; among the 37 with an FID below 300 it is 0.53.
+
+SWD separates a bad model from a usable one — it fell from 210 to 73 as the
+FID fell from 472 to 212 — but near the floor its sampling noise is larger
+than the difference between good models. Compare models on the same images
+with the same `n`, read the floor next to the score, and look at the samples.
+
+## 14. Progress: every stage on one bar
+
+`train()` of the image engine now reports the stages before training like the
+text engine (2.14.1): decoding the images (done/total, images per second,
+time left), building the networks and compiling, then every batch with the
+epoch as its stage, and the validation (held-out images, or the images
+generated for the GAN's SWD). In the GUI one progress bar shows the stage
+before the first step — a stage without a count (building, compiling)
+animates the bar — and the whole run from then on, with the stage's
+done/total, speed and time left on the line under it. This holds for the
+*Image* tab and the training tab, where 2.14.1 drew a second bar for the
+stages. `auralite image-train` prints the same stages (one line updated in
+place on a terminal) and the GAN's G and D losses per batch, with ADA's
+augmentation probability when `gan_augment` is `ada`.
+
+Stop while the images are decoded ends at once: `train()` returns `[]`, the
+summary says `stopped_during: "decode"`, and the model in memory is the one
+it was. `auralite image-train` now stops on Ctrl+C too: after the current
+batch, saving what was trained (during the decoding nothing is saved and
+the exit code is 130); a second Ctrl+C aborts.
+
+## 15. Compatibility (2.14.2)
+
+* Every 2.9–2.14.1 image checkpoint loads and samples as before; a missing
+  `model_type` means diffusion, and diffusion checkpoints keep the 2.10 format
+  name, so 2.14.1 still loads the diffusion models 2.14.2 writes.
+* Flow and GAN checkpoints have their own format names: older versions refuse
+  them ("Not an AuraLite image-generator checkpoint") instead of sampling them
+  as a diffusion model.
+* `model_type` and `latent_dim` belong to the architecture: *continue training*
+  keeps the type of the model in memory whatever the new settings say (the log
+  and the GUI's status line say so).
+* `ImageGenEngine.ddpm` is the DDPM of a diffusion model and `None` for the
+  other types; `process` holds the DDPM or the flow. `build_model` still
+  builds the U-Net; `build_generator` / `build_discriminator` build the GAN.
+* Presets carry `model_type`; the CLI accepts their short names (`tiny`,
+  `flow-small`, `gan-tiny`, ...) and `--type gan --preset tiny` picks
+  *GAN Tiny*.

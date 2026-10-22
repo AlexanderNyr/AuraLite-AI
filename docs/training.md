@@ -817,9 +817,12 @@ stage and how far it is (`stage`, `stage_label`, `stage_step`, `stage_done`,
 | `val` | validation batches | Epoch 3/10 — validation · 12 / 50 batches (24%) |
 
 The corpus is tokenized in chunks that give exactly the ids of `encode`, in
-RAM and memory-mapped. The GUI shows the stage on a second bar under the
-main one (which keeps the whole run's percentage); the CLI updates one line
-per stage on a terminal and writes a line every 5 s into a log file.
+RAM and memory-mapped. The GUI has one progress bar (2.14.2; 2.14.1 drew a
+second one for the stages): before the first training step it shows the
+current stage — a busy animation for a stage without a count (building the
+model, compiling) — and from the first step on the whole run, with the
+stage's line (done/total, speed, time left) under it. The CLI updates one
+line per stage on a terminal and writes a line every 5 s into a log file.
 4-argument callbacks are still called once per epoch. Stop (the GUI's Stop,
 the CLI's Ctrl+C) before the first training step ends the run at once
 instead of finishing it: `train()` puts back the model, the tokenizer and
@@ -838,8 +841,8 @@ commands and progress lines, and a two-process cluster run with the main
 computer's tokenizer. `tests/test_hf_tokenizer_json_real.py` compares
 encoding and decoding with the library for nine tokenizer families and the
 split behaviours (the CI `integrations` job runs it), and
-`tests/test_gui_tokenizer_v2141.py` the GUI's tokenizer row, stage bar and
-Stop.
+`tests/test_gui_tokenizer_v2141.py` the GUI's tokenizer row, the stages on
+the one progress bar and Stop.
 
 ## 14. Reproduce
 

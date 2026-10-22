@@ -12,7 +12,7 @@ built or uploaded from a laptop.
 
    ```bash
    python scripts/check_version_consistency.py          # all strings agree?
-   python scripts/check_version_consistency.py v2.14.1   # ...and match the tag you will push?
+   python scripts/check_version_consistency.py v2.14.2   # ...and match the tag you will push?
    ```
 
 2. **Green CI on the commit you will tag**, including the `package` job: it
@@ -45,14 +45,14 @@ built or uploaded from a laptop.
    ```
 
    A real release can also be started by hand for an existing tag:
-   `gh workflow run release.yml -f tag=v2.14.1 -f dry_run=false` — the jobs then
+   `gh workflow run release.yml -f tag=v2.14.2 -f dry_run=false` — the jobs then
    check out that tag, not the branch the button was pressed on.
 
 4. **Tag and push.**
 
    ```bash
-   git tag v2.14.1
-   git push origin v2.14.1
+   git tag v2.14.2
+   git push origin v2.14.2
    ```
 
 ## What the workflow does
@@ -96,7 +96,7 @@ The next pushed tag publishes. When this page was written (2026-10-12) the name
 
 - A failed job can be re-run from the Actions page; the tag stays.
 - A bad tag can be removed before anything was published:
-  `git push --delete origin v2.14.1 && git tag -d v2.14.1`.
+  `git push --delete origin v2.14.2 && git tag -d v2.14.2`.
 - PyPI never accepts the same file name twice. If a broken version reached PyPI,
   *yank* it on pypi.org and release the next patch version — do not try to
   re-upload the same number.
