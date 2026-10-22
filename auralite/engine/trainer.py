@@ -54,6 +54,7 @@ from auralite.engine.recipe import (
 )
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler
 from auralite.engine.tokenizers import BPETokenizer, CharTokenizer, tokenizer_from_dict
+from auralite.engine import tokenizer_io as _tok_io
 from auralite.engine.train_control import TrainControl
 
 import logging
@@ -61,6 +62,21 @@ import logging
 logger = logging.getLogger("auralite")
 
 __all__ = ["TrainerMixin"]
+
+
+class _SetupStopped(Exception):
+    """Stop or finish pressed before the first training step (2.14.1)."""
+
+    def __init__(self, stage: str):
+        super().__init__(stage)
+        self.stage = stage
+
+
+#: Engine attributes a run changes before its first step; a run stopped then
+#: puts them back, so the model in memory stays usable (2.14.1).
+_SETUP_STATE = ("tokenizer", "vocab_size", "model", "optimizer", "optimizer_name", "scheduler",
+                "scaler", "params_used", "backend", "gguf_path", "hf_path",
+                "default_chat_template", "last_val_loss", "last_val_bpb", "_ddp_model")
 
 
 def _remove_file_quietly(path: str) -> None:
@@ -101,15 +117,20 @@ class TrainerMixin:
 
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
-    def _evaluate(self, loader, criterion, max_batches: int | None = None) -> float | None:
+    def _evaluate(self, loader, criterion, max_batches: int | None = None,
+                  on_batch: Callable[[int, int], None] | None = None) -> float | None:
         """Mean per-token cross-entropy on `loader`, or None if it is empty.
 
         Batches are weighted by their token count (2.8 averaged batch means, so a
-        short last batch counted as much as a full one).
+        short last batch counted as much as a full one). ``on_batch(done,
+        total)`` follows the batches (2.14.1, the progress bar).
         """
         self.model.eval()
         total, count = 0.0, 0
         try:
+            n_batches = len(loader) if hasattr(loader, "__len__") else 0
+            if max_batches is not None and n_batches:
+                n_batches = min(n_batches, max_batches)
             for i, (xb, yb) in enumerate(loader):
                 if max_batches is not None and i >= max_batches:
                     break
@@ -119,6 +140,8 @@ class TrainerMixin:
                 loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
                 total += loss.item() * yb.numel()
                 count += yb.numel()
+                if on_batch is not None:
+                    on_batch(i + 1, max(n_batches, i + 1))
         finally:
             self.model.train()
         cluster = getattr(self, "_cluster", None)
@@ -171,7 +194,8 @@ class TrainerMixin:
             progress_callback(epoch, total_epochs, train_loss, val_loss)
 
     def _iter_token_chunks(self, text: str, chunk_chars: int = 2_000_000,
-                           overlap_chars: int = 256):
+                           overlap_chars: int = 256,
+                           on_progress: Callable[[int], None] | None = None):
         """Yield token ids in chunks — the mmap corpus path never holds them all.
 
         Each chunk is encoded with a small overlap before its start; the tokens
@@ -179,6 +203,7 @@ class TrainerMixin:
         duplicate text. For the char tokenizer this is *exact* (a char is a
         token); for BPE a few boundary merges can differ from encoding the whole
         text at once, which is the documented trade-off of streaming corpora.
+        ``on_progress(characters done)`` follows the chunks (2.14.1).
         """
         if not text:
             return
@@ -191,6 +216,8 @@ class TrainerMixin:
             if start > 0 and left != start:
                 prefix_ids = self.encode(text[left:start])
                 ids = ids[len(prefix_ids):]
+            if on_progress is not None:
+                on_progress(min(len(text), start + step))
             yield ids
 
     def _apply_auto_dropout(self, passes: float, *, bound: bool) -> float:
@@ -214,14 +241,21 @@ class TrainerMixin:
         return chosen
 
     def train(self, training_text: str, params: dict,
-              progress_callback=None, stop_event=None, finish_event=None):
+              progress_callback=None, stop_event=None, finish_event=None, tokenizer=None):
         """Train (or continue training) the model.
 
         `stop_event` (a ``threading.Event``) stops at the next batch;
         `finish_event` (2.12) ends the run well instead: the learning rate
         decays for ``cooldown_ratio`` x the steps taken so far, then the run
         ends with ``stop_reason="finished"``. The GUI's first Stop and the
-        CLI's first Ctrl+C finish, the second one stops.
+        CLI's first Ctrl+C finish, the second one stops. Either one before the
+        first training step (2.14.1: while the tokenizer trains or the corpus
+        is tokenized) ends the run at once and puts the engine back as it
+        was: the summary then has ``stopped_during`` (the stage) and
+        ``epochs_completed`` 0.
+
+        `tokenizer` (2.14.1): train a new model with this tokenizer instead
+        of building one (see also the ``tokenizer_path`` parameter).
 
         progress_callback(epoch, total_epochs, train_loss, val_loss_or_None, info=None)
 
@@ -232,6 +266,10 @@ class TrainerMixin:
         info keys: phase (setup|train|val|epoch_end|stopped), message, batch,
         batches, global_step, total_steps, percent, epoch_percent, lr,
         tokens_per_sec, batches_per_sec, elapsed, eta_seconds, is_epoch_end.
+        2.14.1, the stage of the work, in setup, train and val events:
+        stage (tokenizer|tokenize|model|data|compile|train|val), stage_label,
+        stage_step, stage_done, stage_total, stage_unit, stage_percent,
+        stage_rate (units per second), stage_eta_seconds, stage_elapsed.
 
         Throttle knobs in params:
           progress_every_batches  : emit at least every N batches (default ~1%)
@@ -247,6 +285,12 @@ class TrainerMixin:
         params (beyond architecture/optimizer):
           tokenizer        : "bpe" (default since 2.12) or "char"
           bpe_vocab_size   : target BPE vocab (default 512)
+          tokenizer_path   : train with the tokenizer in this file instead
+                             (2.14.1): an AuraLite tokenizer file
+                             (`auralite tokenizer train`), a Hugging Face
+                             tokenizer.json (BPE), GPT-2 vocab.json +
+                             merges.txt, or a checkpoint; `tokenizer` and
+                             `bpe_vocab_size` are then not used
           val_split        : fraction of text held out for validation (default 0.1)
           use_compile      : try torch.compile for the training loop (default False)
           autosave_every   : autosave checkpoint every N epochs, 0 = off
@@ -298,7 +342,9 @@ class TrainerMixin:
         was fitted on), train_tokens, val_tokens, dropout and
         dropout_planned_passes (2.14: the dropout used, and for "auto" how
         many times the plan reads the training text), cluster_size (2.14: the
-        computers that trained), seconds.
+        computers that trained), seconds, tokenizer_source (2.14.1:
+        "trained", "file", "given", "main computer" or "continued") and
+        tokenizer (a description), stopped_during (2.14.1, see above).
           use_alibi        : enable ALiBi attention bias (default False)
           lora_rank        : enable LoRA with given rank (default 0 = disabled)
         """
@@ -307,6 +353,8 @@ class TrainerMixin:
         _compute.release_compute_pool()
         session = None
         distributed_before = (self.is_distributed, self.world_size, self.local_rank)
+        state = {name: getattr(self, name, None) for name in _SETUP_STATE}
+        started = time.time()
         try:
             with _compute.run_inline():
                 cluster = _cluster.cluster_params(params)
@@ -314,10 +362,29 @@ class TrainerMixin:
                     # 2.14: wait for the workers, then hand them the run.
                     session = self._host_cluster(cluster, params, progress_callback,
                                                  stop_event)
-                    session.send_job(training_text, params)
+                    job = dict(params)
+                    if tokenizer is not None and not job.get("tokenizer_path"):
+                        # The workers get the tokenizer itself later; the key
+                        # only makes them cut the validation text alike.
+                        job["tokenizer_path"] = "(the main computer's tokenizer)"
+                    session.send_job(training_text, job)
                     self._cluster = session
                 return self._train_impl(training_text, params, progress_callback,
-                                        stop_event, finish_event)
+                                        stop_event, finish_event, tokenizer=tokenizer)
+        except _SetupStopped as stopped:
+            for name, value in state.items():
+                setattr(self, name, value)
+            logger.info(f"[AuraLite] Stopped before the first training step "
+                        f"({stopped.stage}); the model in memory is unchanged.")
+            self.last_train_summary = {
+                "epochs_completed": 0, "optimizer_steps": 0, "tokens": 0,
+                "train_loss": None, "val_loss": None, "best_val_loss": None,
+                "val_bpb": None, "best_val_bpb": None, "best_epoch": None,
+                "restored_best": False, "stop_reason": "stopped",
+                "stopped_during": stopped.stage, "cooldown_steps": 0,
+                "cluster_size": 1, "seconds": time.time() - started,
+            }
+            return dict(self.last_train_summary)
         finally:
             if session is not None:
                 self._cluster = None
@@ -329,6 +396,50 @@ class TrainerMixin:
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
             self._release_corpus_tempfile()
             _compute.release_caller_pool()
+
+    # ---- Only the tokenizer (2.14.1) -----------------------------------
+    def train_tokenizer(self, text: str, vocab_size: int | None = None, *, kind: str = "bpe",
+                        pretokenizer: str = "gpt", val_split: float | None = None,
+                        progress_callback: Callable[[dict], None] | None = None,
+                        stop_event: Any = None, path: str | None = None,
+                        progress_every_seconds: float = 0.5) -> Any:
+        """Train only a tokenizer for `text` and return it (2.14.1).
+
+        The engine, its model and its tokenizer stay as they are: train a
+        model with the result through ``train(..., tokenizer=tok)`` or, once
+        saved (`path`, or :meth:`save_tokenizer`), ``params["tokenizer_path"]``.
+        `vocab_size` defaults to the recipe's 512 and `val_split` to its 0.1,
+        so the validation text of a later ``train()`` on the same text stays
+        unseen. ``progress_callback(info)`` gets the stage events of
+        ``train()`` (``info["message"]``, ``info["stage_percent"]``, ...), at
+        most every `progress_every_seconds`; `stop_event` ends the training
+        with the merges learned so far. How it went:
+        ``engine.last_tokenizer_info``.
+        """
+        tok, info = _tok_io.train_tokenizer(
+            text, kind=kind, vocab_size=int(vocab_size or DEFAULT_RECIPE["bpe_vocab_size"]),
+            pretokenizer=pretokenizer,
+            val_split=DEFAULT_RECIPE["val_split"] if val_split is None else float(val_split),
+            progress=progress_callback,
+            should_stop=stop_event.is_set if stop_event is not None else None,
+            every_s=progress_every_seconds)
+        self.last_tokenizer_info = info
+        if path:
+            _tok_io.save_tokenizer(tok, path, training=info)
+        return tok
+
+    def save_tokenizer(self, path: str, tokenizer: Any = None,
+                       training: dict | None = None) -> str:
+        """Save `tokenizer` (default: the model's) as an AuraLite tokenizer file (2.14.1)."""
+        tok = tokenizer if tokenizer is not None else self.tokenizer
+        if tok is None:
+            raise ValueError("No tokenizer — train or load a model first!")
+        return _tok_io.save_tokenizer(tok, path, training=training)
+
+    @staticmethod
+    def load_tokenizer(path: str) -> Any:
+        """The tokenizer in a file, folder or checkpoint (2.14.1; the engine is not changed)."""
+        return _tok_io.load_tokenizer(path)
 
     def _host_cluster(self, cluster: dict, params: dict, progress_callback: Any,
                       stop_event: Any) -> Any:
@@ -383,7 +494,8 @@ class TrainerMixin:
         logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
 
     def _train_impl(self, training_text: str, params: dict,
-                    progress_callback=None, stop_event=None, finish_event=None):
+                    progress_callback=None, stop_event=None, finish_event=None,
+                    tokenizer=None):
         """Body of :meth:`train`, split out so its temp files are released on every exit."""
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
@@ -580,20 +692,39 @@ class TrainerMixin:
         progress_every_seconds = float(params.get("progress_every_seconds", 0.5) or 0.5)
         train_t0 = time.time()
 
-        def _setup_progress(message: str, frac: float = 0.0):
+        def _setup_progress(message: str, frac: float = 0.0, stage: dict | None = None):
             """Setup-phase updates (tokenizer / encode) before epoch 1."""
-            self._invoke_progress(
-                progress_callback, 0, epochs, 0.0, None,
-                info={
-                    "phase": "setup",
-                    "message": message,
-                    "percent": max(0.0, min(2.0, float(frac) * 2.0)),  # keep setup <2%
-                    "elapsed": time.time() - train_t0,
-                    "is_epoch_end": False,
-                    "batch": 0,
-                    "batches": 0,
-                },
-            )
+            info = {
+                "phase": "setup",
+                "message": message,
+                "percent": max(0.0, min(2.0, float(frac) * 2.0)),  # keep setup <2%
+                "elapsed": time.time() - train_t0,
+                "is_epoch_end": False,
+                "batch": 0,
+                "batches": 0,
+            }
+            if stage:
+                info.update(stage)
+                info["message"] = message
+            self._invoke_progress(progress_callback, 0, epochs, 0.0, None, info=info)
+
+        def setup_stage(stage: str, label: str, low: float, high: float) -> Any:
+            """2.14.1: a setup stage with done/total, rate and ETA (StageReporter)."""
+            def emit(info: dict) -> None:
+                share = float(info.get("stage_percent") or 0.0) / 100.0
+                _setup_progress(info["message"], low + (high - low) * share, stage=info)
+            return _tok_io.StageReporter(emit if progress_callback is not None else None,
+                                         stage, label, every_s=progress_every_seconds)
+
+        def stop_requested() -> bool:
+            """Stop or finish pressed (the caller's events, not a cluster's copies)."""
+            return bool((user_stop_event is not None and user_stop_event.is_set())
+                        or (user_finish_event is not None and user_finish_event.is_set()))
+
+        def check_stop(stage: str) -> None:
+            """2.14.1: before the first step a stop ends the run at once."""
+            if stop_requested():
+                raise _SetupStopped(stage)
 
         _setup_progress("Preparing: validating parameters…", 0.02)
 
@@ -601,42 +732,95 @@ class TrainerMixin:
         # 2.13: a new BPE never sees the validation text. Fitted on all of it,
         # it learned merges for words found only in the held-out tail, and the
         # validation loss came out up to 9 % too low (docs/training.md § 10).
+        # 2.14.1: a tokenizer from a file (or given) is not fitted here, but
+        # the text is cut at the same place, so its validation is comparable.
+        tokenizer_path = params.get("tokenizer_path") or None
+        tokenizer_source = "continued" if resuming else "trained"
+        if resuming and (tokenizer is not None or tokenizer_path):
+            logger.warning("[AuraLite] WARNING: continued training keeps the model's tokenizer; "
+                           "the given tokenizer is not used")
         fit_chars = len(training_text)
-        if not resuming and tok_kind == "bpe" and val_split > 0:
+        if not resuming and (tok_kind == "bpe" or tokenizer_path or tokenizer is not None) \
+                and val_split > 0:
             fit_chars = validation_split_point(training_text, val_split)
         if not resuming and cluster is not None and not cluster.is_main:
-            _setup_progress("Receiving the tokenizer from the main computer…", 0.08)
+            _setup_progress("Receiving the tokenizer from the main computer…", 0.08,
+                            stage={"stage": "tokenizer", "stage_label": "Receiving the tokenizer"})
             self.tokenizer = tokenizer_from_dict(cluster.broadcast_json(None))
             self.vocab_size = self.tokenizer.vocab_size
+            tokenizer_source = "main computer"
         elif not resuming:
-            if tok_kind == "bpe":
-                _setup_progress(
-                    f"Training BPE tokenizer (vocab={bpe_vocab})… "
-                    "on large corpora this may take a few minutes",
-                    0.08,
-                )
+            new_tokenizer: Any
+            if tokenizer is not None or tokenizer_path:
+                tokenizer_source = "given" if tokenizer is not None else "file"
+                shown = "the given tokenizer" if tokenizer is not None else \
+                    os.path.basename(str(tokenizer_path))
+                _setup_progress(f"Loading the tokenizer ({shown})…", 0.08,
+                                stage={"stage": "tokenizer", "stage_label": "Loading the tokenizer"})
+                file_info: dict = {}
+                if tokenizer is not None:
+                    new_tokenizer = tokenizer
+                else:
+                    new_tokenizer, file_info = _tok_io.read_tokenizer_file(str(tokenizer_path))
+                if not callable(getattr(new_tokenizer, "to_dict", None)):
+                    raise ValueError("the tokenizer must be an AuraLite or plugged-in BPE "
+                                     "tokenizer (to_dict/encode/decode)")
+                logger.info(f"[AuraLite] Tokenizer from {shown}: "
+                            f"{_tok_io.describe_tokenizer(new_tokenizer)}")
+                seen = (file_info.get("training") or {})
+                if (seen.get("text_sha256") == _tok_io.text_sha256(training_text)
+                        and int(seen.get("fit_chars") or 0) > fit_chars):
+                    logger.warning("[AuraLite] WARNING: this tokenizer was fitted on the "
+                                   "validation text too: the validation loss can come out "
+                                   "too low (train it with the same val_split, "
+                                   "docs/training.md § 13)")
+            elif tok_kind == "bpe":
                 # 2.8: GPT-style pre-tokenization by default; "ws" = 2.7 behaviour
-                self.tokenizer = BPETokenizer(
+                new_tokenizer = BPETokenizer(
                     pretokenizer=str(params.get("bpe_pretokenizer", "gpt")))
+                reporter = setup_stage("tokenizer", f"Training the BPE tokenizer "
+                                                    f"(vocab {bpe_vocab:,})", 0.08, 0.25)
+
+                def on_step(step: str, done: int, total: int) -> None:
+                    words, unit = _tok_io.BPE_STEPS.get(step, (step, ""))
+                    reporter.update(done, total, step=step, words=words, unit=unit)
+
+                reporter.update(0, 0, step="sample", words="sampling the text")
                 # IMPROVED: stratified sampling instead of prefix
-                self.tokenizer.train(training_text[:fit_chars], vocab_size=bpe_vocab,
-                                     extra_chars=training_text[fit_chars:])
+                new_tokenizer.train(training_text[:fit_chars], vocab_size=bpe_vocab,
+                                    extra_chars=training_text[fit_chars:],
+                                    progress=on_step, should_stop=stop_requested)
             else:
-                _setup_progress("Training char tokenizer…", 0.08)
-                self.tokenizer = CharTokenizer()
-                self.tokenizer.train(training_text)
+                _setup_progress("Training char tokenizer…", 0.08,
+                                stage={"stage": "tokenizer", "stage_label": "Character tokenizer"})
+                new_tokenizer = CharTokenizer()
+                new_tokenizer.train(training_text)
+            check_stop("tokenizer")
+            self.tokenizer = new_tokenizer
             if cluster is not None:          # the workers use exactly this one
                 cluster.broadcast_json(self.tokenizer.to_dict())
             self.vocab_size = self.tokenizer.vocab_size
+            if tokenizer_source != "trained" or tok_kind == "bpe":
+                missing, occurrences = _tok_io.coverage_report(self.tokenizer, training_text)
+                if missing:
+                    shown_chars = ", ".join(repr(c) for c in missing)
+                    logger.warning(f"[AuraLite] WARNING: the tokenizer does not know "
+                                   f"{occurrences:,} characters of the text (most often "
+                                   f"{shown_chars}); they are encoded as its unknown token "
+                                   f"and cannot be generated")
             _setup_progress(
-                f"Tokenizer ready (vocab={self.vocab_size})", 0.25,
+                f"Tokenizer ready: {_tok_io.describe_tokenizer(self.tokenizer)}", 0.25,
+                stage={"stage": "tokenizer", "stage_label": "Tokenizer ready",
+                       "stage_percent": 100.0},
             )
         else:
             _setup_progress("Continued training — tokenizer already in memory", 0.15)
 
         # ---- Model ----------------------------------------------------
+        check_stop("model")
         if not resuming:
-            _setup_progress("Building model…", 0.30)
+            _setup_progress("Building model…", 0.30,
+                            stage={"stage": "model", "stage_label": "Building the model"})
             self.backend = "torch"
             self.gguf_path = None
             self.hf_path = None
@@ -798,7 +982,19 @@ class TrainerMixin:
         # RAM. Measured cost of the RAM path: ~16 MiB per 1 MiB of text, i.e.
         # a 500 MiB corpus needs ~8 GiB peak; memmap+uint32 cuts that by ~4x
         # and never materialises the token list.
-        _setup_progress("Tokenizing corpus (encode)…", 0.45)
+        _setup_progress("Tokenizing corpus (encode)…", 0.45,
+                        stage={"stage": "tokenize", "stage_label": "Tokenizing the corpus",
+                               "stage_done": 0, "stage_total": len(training_text),
+                               "stage_unit": "chars", "stage_percent": 0.0})
+        tokenizing = setup_stage("tokenize", "Tokenizing the corpus", 0.45, 0.55)
+
+        def encoded_upto(offset: int) -> Callable[[int], None]:
+            def report(done: int) -> None:
+                tokenizing.update(offset + done, len(training_text), step="encode",
+                                  unit="chars")
+                check_stop("tokenize")
+            return report
+
         cache_mode = str(params.get("corpus_cache")
                          or os.environ.get("AURALITE_CORPUS_CACHE", "")).strip().lower()
         use_mmap = cache_mode in ("1", "true", "yes", "on", "mmap", "memmap")
@@ -817,10 +1013,12 @@ class TrainerMixin:
             fit_count = [0]
 
             def _chunks():
-                for ids in self._iter_token_chunks(training_text[:fit_chars]):
+                for ids in self._iter_token_chunks(training_text[:fit_chars],
+                                                   on_progress=encoded_upto(0)):
                     fit_count[0] += len(ids)
                     yield ids
-                yield from self._iter_token_chunks(training_text[fit_chars:])
+                yield from self._iter_token_chunks(training_text[fit_chars:],
+                                                   on_progress=encoded_upto(fit_chars))
             total_tokens = write_tokens_memmap(corpus_file, _chunks(), dtype="uint32")
             fit_tokens = fit_count[0]
             size_mib = corpus_file.stat().st_size / (1024 * 1024)
@@ -828,18 +1026,26 @@ class TrainerMixin:
                         f"({size_mib:.2f} MiB uint32 memmap: {corpus_file}).")
             self._corpus_cache_path = str(corpus_file)
         else:
-            ids = list(self.encode(training_text[:fit_chars]))
+            # 2.14.1: in chunks, for the progress bar (the same ids as encode)
+            ids = _tok_io.encode_with_progress(self.tokenizer, training_text[:fit_chars],
+                                               report=encoded_upto(0))
             fit_tokens = len(ids)
             if fit_chars < len(training_text):
-                ids += list(self.encode(training_text[fit_chars:]))
+                ids += _tok_io.encode_with_progress(self.tokenizer, training_text[fit_chars:],
+                                                    report=encoded_upto(fit_chars))
             encoded = torch.tensor(ids, dtype=torch.long)
             encoded_bytes = encoded.numel() * encoded.element_size()
             logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
                         f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
         token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
+        per_token = len(training_text) / max(1, token_count)
         _setup_progress(
-            f"Corpus tokenized: {token_count:,} tokens", 0.55,
+            f"Corpus tokenized: {token_count:,} tokens ({per_token:.2f} characters per token)",
+            0.55, stage={"stage": "tokenize", "stage_label": "Corpus tokenized",
+                         "stage_done": len(training_text), "stage_total": len(training_text),
+                         "stage_unit": "chars", "stage_percent": 100.0},
         )
+        check_stop("tokenize")
 
         # ---- Train / validation split -------------------------------------
         # Goal: both train and val slices must produce at least one full
@@ -953,6 +1159,9 @@ class TrainerMixin:
                 logger.warning(f"[AuraLite] WARNING: val dataset is empty after windowing "
                                f"(val slice has {total_tokens - split_at} tokens, need > "
                                f"{seq_length}). Validation DISABLED.")
+        if val_loader is not None:
+            _setup_progress("Preparing the validation windows…", 0.70,
+                            stage={"stage": "data", "stage_label": "Preparing the data"})
         val_bytes_per_token = self._bytes_per_token(val_loader) if val_loader is not None else None
 
         # Scheduler steps = optimizer steps. 2.7 counted *batches*, so with
@@ -1010,6 +1219,9 @@ class TrainerMixin:
         train_model = self.model
         if use_compile:
             compiled = None
+            _setup_progress("Compiling the model with torch.compile (the first step takes a "
+                            "while)…", 0.80, stage={"stage": "compile",
+                                                    "stage_label": "Compiling the model"})
             try:
                 compile_t0 = time.time()
                 compiled = torch.compile(self.model)
@@ -1069,10 +1281,13 @@ class TrainerMixin:
         tokens_per_batch = batch_size * seq_length
         report_rank_ok = (not ddp_active or dist.get_rank() == 0)
 
+        check_stop("setup")
         _setup_progress(
             f"Training start: {epochs} epochs × {n_loader_batches} batches "
             f"(~{epochs * n_loader_batches} steps)",
-            0.95,
+            0.95, stage={"stage": "train", "stage_label": f"Epoch 1/{epochs}",
+                         "stage_done": 0, "stage_total": n_loader_batches,
+                         "stage_unit": "batches", "stage_percent": 0.0},
         )
         if report_rank_ok:
             self._invoke_progress(
@@ -1252,6 +1467,18 @@ class TrainerMixin:
                                 "eta_seconds": eta,
                                 "is_epoch_end": False,
                                 "epoch_loss": avg_loss,
+                                # 2.14.1: the stage bar follows the epoch
+                                "stage": "train",
+                                "stage_label": f"Epoch {epoch + 1}/{epochs}",
+                                "stage_step": "batches",
+                                "stage_done": seen_batches,
+                                "stage_total": n_loader_batches,
+                                "stage_unit": "batches",
+                                "stage_percent": epoch_frac * 100.0,
+                                "stage_rate": sps,
+                                "stage_eta_seconds": ((n_loader_batches - seen_batches) / sps
+                                                      if sps > 0 else None),
+                                "stage_elapsed": epoch_elapsed,
                             },
                         )
 
@@ -1317,7 +1544,34 @@ class TrainerMixin:
                         },
                     )
                 val_t0 = time.time()
-                val_loss = self._evaluate(val_loader, criterion)
+                val_hook: Callable[[int, int], None] | None = None
+                if report_rank_ok and progress_callback is not None:
+                    # 2.14.1: validation batches on the stage bar
+                    val_info = {"batch": n_loader_batches, "batches": n_loader_batches,
+                                "global_step": completed_batches_total,
+                                "total_steps": total_opt_steps,
+                                "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0 - 0.01,
+                                "epoch_percent": 100.0, "is_epoch_end": False}
+                    val_epoch, val_loss_so_far = epoch + 1, running_loss / max(1, seen_batches)
+
+                    def emit_val(stage_info: dict, val_epoch: int = val_epoch,
+                                 val_loss_so_far: float = val_loss_so_far,
+                                 val_info: dict = val_info) -> None:
+                        self._invoke_progress(
+                            progress_callback, val_epoch, epochs, val_loss_so_far, None,
+                            info={**val_info, **stage_info, "phase": "val",
+                                  "elapsed": time.time() - train_t0,
+                                  "lr": self.scheduler.get_lr() if self.scheduler else lr})
+
+                    validating = _tok_io.StageReporter(
+                        emit_val, "val", f"Epoch {val_epoch}/{epochs} — validation",
+                        every_s=progress_every_seconds)
+
+                    def on_val_batch(done: int, total: int,
+                                     validating: Any = validating) -> None:
+                        validating.update(done, total, step="batches", unit="batches")
+                    val_hook = on_val_batch
+                val_loss = self._evaluate(val_loader, criterion, on_batch=val_hook)
                 val_seconds = time.time() - val_t0
                 if cluster is not None:
                     val_seconds = cluster.broadcast_floats([val_seconds])[0]
@@ -1429,6 +1683,8 @@ class TrainerMixin:
             "cooldown_steps": (ctl.run_steps - ctl.finish_started_at
                                if ctl.finish_started_at is not None else 0),
             "tokenizer_fit_chars": fit_chars,
+            "tokenizer_source": tokenizer_source,
+            "tokenizer": _tok_io.describe_tokenizer(self.tokenizer),
             "train_tokens": n_train_tokens,
             "val_tokens": total_tokens - split_at,
             "dropout": float(dropout),

@@ -42,6 +42,10 @@ DECOMPOSED = {
                "validate_params"],
     "trainer": ["TrainerMixin"],
     "generation": ["GenerationMixin"],
+    # 2.14.1: plugged-in BPE tokenizers and tokenizer files
+    "hf_bpe": ["HFBPETokenizer", "TokenizerFormatError"],
+    "tokenizer_io": ["describe_tokenizer", "load_tokenizer", "read_tokenizer_file",
+                     "save_tokenizer", "train_tokenizer"],
 }
 
 #: Public surface of `model_engine/_legacy.py` at `base/upstream-main` (13d9f47) —

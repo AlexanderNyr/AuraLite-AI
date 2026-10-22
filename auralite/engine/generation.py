@@ -21,6 +21,7 @@ from auralite.engine.batching import DecodeBatch, batchable_model, max_batch_row
 from auralite.engine.decode_slots import DecodeSlot, _unwrap
 from auralite.engine.gguf_proxy import is_gguf_like
 from auralite.engine.sampling import SamplingParams
+from auralite.engine import tokenizer_io as _tok_io
 
 #: ``on_token(token_id, logits)``: see :meth:`GenerationMixin.generate` (2.14).
 TokenCallback = Callable[[int, torch.Tensor], None]
@@ -36,6 +37,18 @@ def __getattr__(name: str) -> Any:
         return importlib.import_module("auralite.engine").AuraLiteEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
+class _TokenByToken:
+    """Streaming text of AuraLite's own tokenizers: ``decode([id])`` per id."""
+
+    def __init__(self, decode: Callable[[list[int]], str]):
+        self._decode = decode
+
+    def step(self, token_id: int) -> str:
+        return self._decode([token_id])
+
+    def flush(self) -> str:
+        return ""
 
 class _DraftSession:
     """A draft model with a persistent KV cache, for speculative decoding (2.8).
@@ -591,7 +604,24 @@ class GenerationMixin:
             repetition_penalty=repetition_penalty, min_p=min_p,
             presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
             on_token=on_token)
-        return start_str + self.decode(result_ids[len(ids):])
+        return start_str + self._decode_after(ids, result_ids[len(ids):])
+
+    # ---- Text of generated ids (2.14.1) --------------------------------
+    def _decode_after(self, prompt_ids, new_ids) -> str:
+        """The text `new_ids` add after `prompt_ids`.
+
+        ``decode(new_ids)`` for AuraLite's tokenizers; a plugged-in BPE
+        decodes with the last prompt tokens (tokenizer_io.decode_continuation).
+        """
+        if getattr(self.tokenizer, "context_sensitive_decode", False):
+            return _tok_io.decode_continuation(self.tokenizer, prompt_ids, new_ids)
+        return self.decode(new_ids)
+
+    def _stream_decoder(self, prompt_ids) -> Any:
+        """``step(id) -> text`` / ``flush()`` for streaming (tokenizer_io.StreamDecoder)."""
+        if getattr(self.tokenizer, "context_sensitive_decode", False):
+            return _tok_io.StreamDecoder(self.tokenizer, prompt_ids)
+        return _TokenByToken(self.decode)
 
     def _require_native_for_token_callback(self) -> None:
         if self.model is not None and (self.is_gguf_model() or self.is_hf_model()):
@@ -799,8 +829,12 @@ class GenerationMixin:
         ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
+        stream = self._stream_decoder(ids)
         for nxt in self._iter_token_ids(ids, length, sp, on_token=on_token):
-            yield self.decode([nxt])
+            yield stream.step(nxt)
+        rest = stream.flush()
+        if rest:
+            yield rest
 
     def _generate_batch_group(self, batch_ids: list[list[int]], length: int = 50,
                               temperature: float = 0.8,

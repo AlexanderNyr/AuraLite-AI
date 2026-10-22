@@ -64,6 +64,23 @@ Notes that save time later:
   stdout, `--quiet` silences them, `AURALITE_LOG_LEVEL=WARNING` keeps them out
   of scripts.
 
+### Your own tokenizer (2.14.1)
+
+```bash
+auralite tokenizer train --text corpus.txt --vocab-size 4096 --out tok.json
+auralite train --text corpus.txt --tokenizer tok.json --model model.pt
+auralite train --text corpus.txt --tokenizer tokenizer.json --model model.pt  # Hugging Face BPE
+```
+
+Training only the tokenizer once and reusing it saves that step in every run;
+with the same text and `val_split` the run is the one `auralite train` would
+do without the file. `--tokenizer` also takes a Hugging Face `tokenizer.json`
+(BPE: GPT-2, Llama, Mistral, Qwen style), GPT-2 `vocab.json` + `merges.txt` or
+a checkpoint. In the GUI: *Train tokenizer only*, *Load tokenizer…* and the
+choice *Own file* in the training tab. The progress lines (and the GUI's
+second bar) show every stage: tokenizer, tokenizing, epoch, validation.
+Details: [training.md](training.md) § 13.
+
 ### Train on several computers (2.14)
 
 ```bash

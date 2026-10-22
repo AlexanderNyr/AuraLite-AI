@@ -39,7 +39,8 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "n_layers", "num_experts", "optimizer", "progress_every_batches",
     "progress_every_seconds", "restore_best_weights", "resume_training_state",
     "rope_scaling", "sample_stride", "seed", "seq_length", "sliding_window",
-    "tie_word_embeddings", "time_budget_s", "tokenizer", "use_alibi", "use_compile", "use_ddp",
+    "tie_word_embeddings", "time_budget_s", "tokenizer", "tokenizer_path", "use_alibi",
+    "use_compile", "use_ddp",
     "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
     "val_max_tokens", "val_split", "weight_decay", "wsd_decay", "wsd_min_lr_ratio",
     "wsd_stable_ratio",
@@ -139,7 +140,8 @@ def validate_params(params: dict) -> list[str]:
                              or wait <= 0):
         errors.append(f"cluster_timeout_s must be a positive number of seconds, got {wait!r}")
     for key, value in (("cluster_host", params.get("cluster_host")),
-                       ("cluster_token", params.get("cluster_token"))):
+                       ("cluster_token", params.get("cluster_token")),
+                       ("tokenizer_path", params.get("tokenizer_path"))):
         if value is not None and not isinstance(value, str):
             errors.append(f"{key} must be a string, got {value!r}")
     ns_steps = params.get("muon_ns_steps")

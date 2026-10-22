@@ -3,9 +3,35 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
-from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, estimate_n_params, filedialog, messagebox, os, parse_dropout, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
+from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, describe_tokenizer, estimate_n_params, filedialog, messagebox, os, parse_dropout, read_tokenizer_file, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
 
 R = DEFAULT_RECIPE      # 2.12: one recipe for the GUI, the CLI and train()
+
+#: 2.14.1: tokenizer kinds the "Save the model's tokenizer" button can write.
+_SAVEABLE_TOKENIZERS = ("bpe", "char", "hf_bpe")
+_NO_TOKENIZER_FILE = "Own tokenizer: none — BPE is trained with the model"
+
+
+def _stage_text(info: dict) -> str:
+    """2.14.1: the line under the stage bar (tokenizer, tokenizing, epoch, validation)."""
+    if info.get("phase") != "train" and info.get("message"):
+        return str(info["message"])
+    parts = [str(info.get("stage_label") or info.get("stage") or "")]
+    try:
+        done, total = int(info.get("stage_done") or 0), int(info.get("stage_total") or 0)
+        unit = str(info.get("stage_unit") or "")
+        if total:
+            parts.append(f"{done:,}/{total:,} {unit} ({100.0 * done / total:.0f}%)")
+        rate = info.get("stage_rate")
+        if rate:
+            parts.append(f"{float(rate):,.1f} {unit}/s")
+        eta = info.get("stage_eta_seconds")
+        if eta is not None and done < total:
+            parts.append(f"~{_fmt_duration(float(eta))} left")
+    except (TypeError, ValueError):
+        pass
+    return " · ".join(p for p in parts if p)
+
 
 class TrainTabMixin:
     def _build_training_tab(self):
@@ -95,6 +121,9 @@ class TrainTabMixin:
                         variable=self.tok_var).pack(side=tk.LEFT, padx=4)
         ttk.Radiobutton(row1, text="Char-level", value="char",
                         variable=self.tok_var).pack(side=tk.LEFT, padx=4)
+        # 2.14.1: a tokenizer file (your own, or one trained with the button below)
+        ttk.Radiobutton(row1, text="Own file", value="file",
+                        variable=self.tok_var).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(row1, text="BPE Vocab:").pack(side=tk.LEFT, padx=(16, 4))
         self.bpe_vocab_var = tk.StringVar(value=str(R["bpe_vocab_size"]))
@@ -122,6 +151,23 @@ class TrainTabMixin:
                   width=5).pack(side=tk.LEFT, padx=2)
         ttk.Label(row1, text="(min, 0=off)", style="Sub.TLabel").pack(
             side=tk.LEFT, padx=2)
+
+        # 2.14.1: plug in your own tokenizer, or train only the tokenizer
+        row_tok = ttk.Frame(tok_frame)
+        row_tok.pack(fill=tk.X, pady=2)
+        self.tokenizer_path_var = tk.StringVar(value="")
+        self._tokenizer_vocab = 0
+        self.tok_load_btn = ttk.Button(row_tok, text="📂 Load tokenizer…",
+                                       command=self.load_tokenizer_file)
+        self.tok_load_btn.pack(side=tk.LEFT, padx=4)
+        self.tok_train_btn = ttk.Button(row_tok, text="🔤 Train tokenizer only",
+                                        command=self.train_tokenizer_only)
+        self.tok_train_btn.pack(side=tk.LEFT, padx=4)
+        self.tok_save_btn = ttk.Button(row_tok, text="💾 Save model's tokenizer…",
+                                       command=self.save_tokenizer_file)
+        self.tok_save_btn.pack(side=tk.LEFT, padx=4)
+        self.tokenizer_label = ttk.Label(row_tok, text=_NO_TOKENIZER_FILE, style="Sub.TLabel")
+        self.tokenizer_label.pack(side=tk.LEFT, padx=8)
 
         # NEW: GQA, Accumulation, ALiBi, LoRA
         row1b = ttk.Frame(tok_frame)
@@ -300,6 +346,17 @@ class TrainTabMixin:
             run_frame, textvariable=self.progress_detail_var, style="Sub.TLabel")
         self.progress_detail_label.pack(fill=tk.X, pady=(0, 2), anchor=tk.W)
 
+        # 2.14.1: the current stage — tokenizer training, tokenizing the corpus,
+        # the epoch, the validation — with done/total, speed and time left.
+        self.stage_var = tk.DoubleVar()
+        self.stage_bar = ttk.Progressbar(run_frame, variable=self.stage_var, maximum=100)
+        self.stage_bar.pack(fill=tk.X, pady=(2, 0))
+        self.stage_detail_var = tk.StringVar(value="")
+        self.stage_detail_label = ttk.Label(
+            run_frame, textvariable=self.stage_detail_var, style="Sub.TLabel")
+        self.stage_detail_label.pack(fill=tk.X, pady=(0, 2), anchor=tk.W)
+        self._train_phase = ""
+
         self.status_label = ttk.Label(run_frame,
                                       text="Status: Waiting for file…")
         self.status_label.pack(pady=(0, 2), anchor=tk.W)
@@ -396,7 +453,10 @@ class TrainTabMixin:
             return
 
         n_chars = len(text_sample)
-        if tok_kind == "bpe":
+        if tok_kind == "file" and getattr(self, "_tokenizer_vocab", 0):
+            vocab = int(self._tokenizer_vocab)                 # 2.14.1: the loaded file's
+            n_tokens = max(seq_length + 2, int(n_chars / 3.0))
+        elif tok_kind in ("bpe", "file"):
             vocab = min(bpe_vocab, max(2, len(set(text_sample))))
             n_tokens = max(seq_length + 2, int(n_chars / 3.0))   # rough BPE estimate
         else:
@@ -527,6 +587,9 @@ class TrainTabMixin:
             info = {}
         phase = str(info.get("phase") or ("epoch_end" if info.get("is_epoch_end") else "train"))
         is_epoch_end = bool(info.get("is_epoch_end")) or phase == "epoch_end"
+        if getattr(self, "_train_phase", ""):
+            self._train_phase = phase          # 2.14.1: Stop acts at once before training
+        self._apply_stage(info)
 
         # Prefer engine-provided overall percent (includes intra-epoch fraction).
         if "percent" in info and info["percent"] is not None:
@@ -695,7 +758,33 @@ class TrainTabMixin:
                 self._update_loss_plot()
 
 
+    def _apply_stage(self, info) -> None:
+        """2.14.1: the stage bar and its line, from the stage fields of `info`."""
+        if not isinstance(info, dict) or not info.get("stage"):
+            return
+        try:
+            percent = info.get("stage_percent")
+            if percent is None:
+                done = float(info.get("stage_done") or 0)
+                total = float(info.get("stage_total") or 0)
+                percent = 100.0 * done / total if total else None
+            if percent is not None:
+                self.stage_var.set(max(0.0, min(100.0, float(percent))))
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.stage_detail_var.set(_stage_text(info))
+        except Exception:
+            pass
+
     def stop_training(self):
+        # 2.14.1: before the first training step (tokenizer, tokenizing) and
+        # while only the tokenizer trains there is nothing to cool down.
+        if getattr(self, "_train_phase", "") in ("setup", "cluster", "tokenizer"):
+            self.finish_event.set()
+            self.stop_event.set()
+            self.status_label.config(text="Status: Stopping… 🛑")
+            return
         # 2.12: the first press finishes the run with a short learning-rate
         # decay (a run that ends at the peak LR is measurably worse); the
         # second press stops at once.
@@ -714,6 +803,21 @@ class TrainTabMixin:
         if not self.selected_file_path:
             return
 
+        # 2.14.1: "Own file" trains with the loaded / trained tokenizer file
+        tokenizer_path = ""
+        if self.tok_var.get() == "file":
+            tokenizer_path = str(self.tokenizer_path_var.get() or "").strip()
+            if not tokenizer_path:
+                messagebox.showinfo(
+                    "No tokenizer file",
+                    "«Own file» is selected: load a tokenizer (📂 Load tokenizer…) or "
+                    "train one (🔤 Train tokenizer only) first.")
+                return
+            if not os.path.exists(tokenizer_path):
+                messagebox.showerror("Tokenizer file",
+                                     f"The tokenizer file is missing:\n{tokenizer_path}")
+                return
+
         try:
             params = {
                 "lr":          float(self.params["lr"].get()),
@@ -726,7 +830,7 @@ class TrainTabMixin:
                 "batch_size":  int(self.params["batch_size"].get()),
                 "dropout":     parse_dropout(self.params["dropout"].get()),
                 "grad_clip":   float(self.params["grad_clip"].get()),
-                "tokenizer":       self.tok_var.get(),
+                "tokenizer":       "bpe" if tokenizer_path else self.tok_var.get(),
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
                 "val_split":       float(self.val_split_var.get()),
                 "early_stopping_patience": int(self.early_stop_var.get() or 0),
@@ -763,6 +867,8 @@ class TrainTabMixin:
             messagebox.showerror("Params Error",
                                  "Please enter valid numbers in all fields!")
             return
+        if tokenizer_path:
+            params["tokenizer_path"] = tokenizer_path
 
         # NEW: Validate parameters before training
         errors = validate_params(params)
@@ -820,9 +926,13 @@ class TrainTabMixin:
         self._progress_ui_pending = None
         try:
             self.progress_detail_var.set("Preparing for training…")
+            self.stage_var.set(0)
+            self.stage_detail_var.set("")
         except Exception:
             pass
+        self._train_phase = "setup"
         self.status_label.config(text="Status: Starting… ⏳")
+        self._set_tokenizer_buttons(tk.DISABLED)
         self.train_btn.config(state=tk.DISABLED)
         self.file_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)
@@ -852,7 +962,14 @@ class TrainTabMixin:
                 total_time = (time.time() - self.train_start_time
                               if self.train_start_time else 0.0)
                 total_str = _fmt_duration(total_time)
-                if summary.get("stop_reason") == "early_stopping":
+                if summary.get("stopped_during"):
+                    # 2.14.1: stopped while the tokenizer trained / the corpus was
+                    # tokenized: train() put the engine back as it was.
+                    msg = (f"Status: Stopped before training began "
+                           f"({summary['stopped_during']}) — the model in memory is "
+                           f"unchanged 🛑  |  Total: {total_str}")
+                    print(f"[AuraLite] Training stopped before it began ({total_str}).")
+                elif summary.get("stop_reason") == "early_stopping":
                     kept = ("restored" if summary.get("restored_best")
                             else "of the last epoch kept")
                     msg = (f"Status: Stopped early after epoch "
@@ -903,10 +1020,143 @@ class TrainTabMixin:
 
 
     def _reset_train_buttons(self):
+        self._train_phase = ""
         self.train_btn.config(state=tk.NORMAL)
         self.file_btn.config(state=tk.NORMAL)
         self.load_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED, text="🛑 Stop")
+        self._set_tokenizer_buttons(tk.NORMAL)
+
+    # ---- Own tokenizer / training only the tokenizer (2.14.1) -------------
+    def _set_tokenizer_buttons(self, state) -> None:
+        for name in ("tok_load_btn", "tok_train_btn", "tok_save_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.config(state=state)
+
+    def _use_tokenizer_file(self, path: str, tokenizer) -> None:
+        """Select "Own file" with this tokenizer for the next training."""
+        self.tokenizer_path_var.set(path)
+        self.tok_var.set("file")
+        self._tokenizer_vocab = int(getattr(tokenizer, "vocab_size", 0) or 0)
+        self.tokenizer_label.config(
+            text=f"Own tokenizer: {os.path.basename(path)} — {describe_tokenizer(tokenizer)}")
+
+    def load_tokenizer_file(self):
+        """Plug in a tokenizer: AuraLite file, tokenizer.json, vocab.json, checkpoint."""
+        path = filedialog.askopenfilename(
+            title="Load a tokenizer",
+            filetypes=[("Tokenizers (JSON)", "*.json"),
+                       ("AuraLite checkpoints", "*.pt *.safetensors"),
+                       ("GPT-2 merges.txt", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            tokenizer, info = read_tokenizer_file(path)
+        except Exception as e:
+            messagebox.showerror("Tokenizer Error", f"Could not load the tokenizer:\n{e}")
+            return
+        self._use_tokenizer_file(path, tokenizer)
+        self.status_label.config(
+            text=f"Status: Tokenizer loaded ✅ ({describe_tokenizer(tokenizer)}; "
+                 f"read as {info.get('format')}) — the next training uses it")
+
+    def save_tokenizer_file(self):
+        """Save the tokenizer of the model in memory (to train other models with it)."""
+        tokenizer = self.engine.tokenizer
+        if tokenizer is None or getattr(tokenizer, "kind", None) not in _SAVEABLE_TOKENIZERS:
+            messagebox.showinfo("No tokenizer",
+                                "Train or load a native AuraLite model first — its tokenizer "
+                                "is what gets saved.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save the model's tokenizer", defaultextension=".json",
+            initialfile="tokenizer.json",
+            filetypes=[("Tokenizer (JSON)", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.engine.save_tokenizer(path)
+        except Exception as e:
+            messagebox.showerror("Tokenizer Error", f"Could not save the tokenizer:\n{e}")
+            return
+        self.status_label.config(text=f"Status: Tokenizer saved ✅ ({os.path.basename(path)}: "
+                                      f"{describe_tokenizer(tokenizer)})")
+
+    def train_tokenizer_only(self):
+        """Train only the tokenizer on the selected text, save it and select it."""
+        if not self.selected_file_path:
+            messagebox.showinfo("No file", "Select a training .txt file first "
+                                           "(📂 Select .txt File).")
+            return
+        kind = "char" if self.tok_var.get() == "char" else "bpe"
+        try:
+            vocab = int(self.bpe_vocab_var.get())
+            val_split = float(self.val_split_var.get())
+        except ValueError:
+            messagebox.showerror("Params Error", "BPE Vocab and Val Split must be numbers.")
+            return
+        stem = os.path.splitext(os.path.basename(self.selected_file_path))[0]
+        size = f"{vocab}" if kind == "bpe" else ""
+        path = filedialog.asksaveasfilename(
+            title="Save the tokenizer as", defaultextension=".json",
+            initialfile=f"{stem}_{kind}{size}_tokenizer.json",
+            filetypes=[("Tokenizer (JSON)", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(self.selected_file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            messagebox.showerror("File Error", f"Could not read file:\n{e}")
+            return
+        self.stop_event.clear()
+        self.finish_event.clear()
+        self._train_phase = "tokenizer"
+        self.stage_var.set(0)
+        self.stage_detail_var.set("Training the tokenizer…")
+        self.status_label.config(text="Status: Training the tokenizer… ⏳ (Stop keeps the "
+                                      "merges learned so far)")
+        self._set_tokenizer_buttons(tk.DISABLED)
+        self.train_btn.config(state=tk.DISABLED)
+        self.file_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        started = time.time()
+
+        def progress(info):
+            self.root.after(0, self._apply_stage, dict(info))
+
+        def run():
+            try:
+                tokenizer = self.engine.train_tokenizer(
+                    text, vocab, kind=kind, val_split=val_split, progress_callback=progress,
+                    stop_event=self.stop_event, path=path)
+                info = dict(getattr(self.engine, "last_tokenizer_info", None) or {})
+                self.root.after(0, self._tokenizer_trained, path, tokenizer, info,
+                                time.time() - started)
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Tokenizer Error", f"Could not train the tokenizer:\n{err}"))
+            finally:
+                self.root.after(0, self._reset_train_buttons)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _tokenizer_trained(self, path: str, tokenizer, info: dict, seconds: float) -> None:
+        self._use_tokenizer_file(path, tokenizer)
+        details = [describe_tokenizer(tokenizer)]
+        if info.get("chars_per_token"):
+            details.append(f"{float(info['chars_per_token']):.2f} chars/token")
+        if info.get("stopped"):
+            details.append("stopped early with the merges learned so far")
+        elif info.get("exhausted"):
+            details.append("the text had no more pairs to merge")
+        self.stage_var.set(100.0)
+        self.status_label.config(
+            text=f"Status: Tokenizer trained and saved ✅ ({os.path.basename(path)}: "
+                 f"{'; '.join(details)})  |  {_fmt_duration(seconds)} — the next training "
+                 f"uses it")
 
 
     def _append_loss_line(self, line):

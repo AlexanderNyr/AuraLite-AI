@@ -20,7 +20,7 @@ from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
 from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, sys, threading, tk, ttk)
+from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, read_tokenizer_file, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -60,7 +60,8 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.last_prompt = ""
         self._tab_names = list(self._TAB_NAMES)
 
-        self.root.title("AuraLite AI v2.6.5 — Modern Transformer Edition")
+        from auralite import __version__     # 2.14.1: the one version source
+        self.root.title(f"AuraLite AI v{__version__} — Modern Transformer Edition")
         # Default 800x600, clamped to the physical screen so the window (and its
         # content) never exceeds what the monitor can show. The scrollable tabs
         # handle the rest, so nothing is clipped on 1280x720 / 1280x800 / 1280x1024.
@@ -493,7 +494,10 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 "batch_size": int(self.params["batch_size"].get()),
                 "dropout": parse_dropout(self.params["dropout"].get()),
                 "grad_clip": float(self.params["grad_clip"].get()),
-                "tokenizer": self.tok_var.get(),
+                # 2.14.1: "Own file" is saved as its path (train() reads it)
+                "tokenizer": "bpe" if self.tok_var.get() == "file" else self.tok_var.get(),
+                "tokenizer_path": (self.tokenizer_path_var.get()
+                                   if self.tok_var.get() == "file" else ""),
                 "bpe_vocab_size": int(self.bpe_vocab_var.get()),
                 "val_split": float(self.val_split_var.get()),
                 "early_stopping_patience": int(self.early_stop_var.get() or 0),
@@ -543,6 +547,15 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                     self.params[key].set(str(config[key]))
             if "tokenizer" in config:
                 self.tok_var.set(config["tokenizer"])
+            if config.get("tokenizer_path"):
+                path = str(config["tokenizer_path"])
+                try:
+                    self._use_tokenizer_file(path, read_tokenizer_file(path)[0])
+                except Exception as e:      # moved or damaged: keep the path, say so
+                    self.tokenizer_path_var.set(path)
+                    self.tok_var.set("file")
+                    self.tokenizer_label.config(text=f"Own tokenizer: {path} (cannot be read: "
+                                                     f"{e})")
             if "bpe_vocab_size" in config:
                 self.bpe_vocab_var.set(str(config["bpe_vocab_size"]))
             if "val_split" in config:

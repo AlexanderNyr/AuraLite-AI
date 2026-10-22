@@ -3,13 +3,15 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 13. Since 2.12 the three entry points share one
+to reproduce them are in § 14. Since 2.12 the three entry points share one
 default recipe (§ 8), and a run that is stopped or has a time limit ends with
 a learning-rate decay (§ 9). Since 2.13 a new BPE tokenizer never sees the
 validation text (§ 10); validation numbers measured before 2.13 are
 optimistic by up to 9 %. Since 2.14 dropout is chosen from the plan and Muon
 runs 3 Newton-Schulz iterations (§ 11), and several computers can train one
-model together (§ 12).
+model together (§ 12). Since 2.14.1 a model can be trained with your own BPE
+tokenizer, the tokenizer can be trained on its own, and the progress shows
+every stage (§ 13).
 
 ## 1. An epoch is one pass over the text
 
@@ -712,7 +714,134 @@ addresses play the computers), a note for one it does not need, and the main
 computer's store on the default address, which connects to itself over the
 loopback because Windows refuses connections to 0.0.0.0.
 
-## 13. Reproduce
+## 13. Your own tokenizer, training only the tokenizer, progress (2.14.1)
+
+**Train only the tokenizer, then models with it.** The BPE tokenizer of a
+run is trained in a step of its own:
+
+```bash
+auralite tokenizer train --text corpus.txt --vocab-size 4096 --out tok.json
+auralite train --text corpus.txt --model model.pt --tokenizer tok.json
+auralite tokenizer info tok.json --text sample.txt     # size, how it was made, a sample
+auralite tokenizer encode tok.json "Hello world"       # ids and tokens of a text
+```
+
+From Python: `tok, info = auralite.engine.train_tokenizer(text, vocab_size=4096)`,
+`save_tokenizer(tok, "tok.json", training=info)`, then
+`engine.train(text, {"tokenizer_path": "tok.json", ...})` or
+`engine.train(text, params, tokenizer=tok)`; the engine has
+`engine.train_tokenizer(...)`, `engine.save_tokenizer(path)` (the model's
+tokenizer) and `AuraLiteEngine.load_tokenizer(path)`. In the GUI the
+*Tokenizer & Options* box has *🔤 Train tokenizer only* (it asks where to save,
+uses the *BPE Vocab* and *Val Split* fields and selects the result),
+*📂 Load tokenizer…*, *💾 Save model's tokenizer…* and the choice *Own file*.
+
+The tokenizer is the one `train()` would build: `--val-split` (default 0.1,
+the training default) leaves the validation tail of the text out, so a model
+trained later on the same text with the same `val_split` is validated on text
+the tokenizer never saw (§ 10). A run with such a file is the run without it,
+bit for bit (`tests/test_tokenizers_v2141.py`). The file records the text's
+size and fingerprint, the characters it was fitted on, its merges, the time
+and the characters per token (measured on up to 1 M characters); a run on the
+same text warns when the tokenizer was fitted on the validation text too.
+Stop (Ctrl+C, the GUI's Stop) ends the training with the merges learned so
+far. On the 1.1 MB tinyshakespeare a 2,048 or an 8,192 token BPE takes
+1.3–1.4 s (it learns from a sample of at most 2 M characters); tokenizing a
+20 MB corpus with it takes 2.9 s.
+
+**Your own tokenizer.** `tokenizer_path` (CLI `--tokenizer`, GUI *Own file*)
+also reads tokenizers made elsewhere, without the `tokenizers` package:
+
+| file | read as |
+|---|---|
+| a file of `auralite tokenizer train` / `save_tokenizer` / *Save model's tokenizer* | AuraLite tokenizer (`"format": "auralite-tokenizer"`) |
+| `tokenizer.json` of Hugging Face with a BPE model (GPT-2, RoBERTa, Llama, Mistral, Qwen style, or trained with the `tokenizers` library) | `hf_bpe` tokenizer, encoded and decoded as the library does |
+| GPT-2 `vocab.json` + `merges.txt` (either one; the other next to it, also as `NAME-vocab.json` / `NAME-merges.txt`) | the same, byte-level |
+| an AuraLite checkpoint (`.pt`, `.safetensors`) | the tokenizer the model was trained with |
+| a folder | its `tokenizer.json` or `vocab.json` |
+
+`auralite tokenizer convert SOURCE --out tok.json` saves any of them as an
+AuraLite file. A SentencePiece `.model` is not read; Hugging Face converts it
+once (`AutoTokenizer.from_pretrained(folder).save_pretrained(folder)` writes
+`tokenizer.json`).
+
+`auralite/engine/hf_bpe.py` reproduces the parts BPE files use: added tokens
+(`lstrip`, `rstrip`, `single_word`, `normalized`), the normalizers NFC, NFD,
+NFKC, NFKD, Lowercase, Strip, StripAccents, Replace, Prepend, Nmt,
+BertNormalizer, ByteLevel and Sequence, the pre-tokenizers ByteLevel,
+Metaspace, Split (string or regex, every behaviour, `invert`), Whitespace,
+WhitespaceSplit, BertPreTokenizer, Punctuation, Digits, CharDelimiterSplit and
+Sequence, the BPE model (byte fallback, unknown token fused or not, subword
+prefix and suffix, `ignore_merges`) and the decoders ByteLevel, Metaspace,
+BPEDecoder, ByteFallback, Fuse, Strip, Replace, WordPiece and Sequence. The
+regular expressions of the files are Oniguruma's: `\p{L}` and the other
+general categories become ranges, `\s` and `\w` keep their Unicode meaning
+(Python's `\s` also matches U+001C–U+001F). Anything else (WordPiece or
+Unigram models, SentencePiece's "Precompiled" normalizer, script classes such
+as `\p{Han}`) is refused with its name instead of being approximated. Two
+choices differ from `tokenizers.Tokenizer` on purpose: `encode` adds no
+special tokens (no post-processor) and `decode` keeps them, so a generated
+`</s>` reaches the stop strings.
+
+Measured against tokenizers 0.23: the real GPT-2, Qwen2.5, TinyLlama (Llama-2
+style), SmolLM2 and Phi-2 files encode and decode tinyshakespeare and random
+multilingual text with no difference; the nine tokenizer families of
+`tests/test_hf_tokenizer_json_real.py` match tokenizers 0.20 too (the version
+the minimum transformers of the `hf` extra brings). Encoding 311 k characters takes
+0.26–0.37 s against the library's 0.17 s for the byte-level files and 0.14 s
+against 0.16 s for TinyLlama's (its file has no pre-tokenizer; AuraLite cuts
+the text where no merge can join two characters, which gives the same tokens).
+
+| what | own file | trained in the run |
+|---|---|---|
+| vocabulary, model size | the file's (GPT-2: 50,257 tokens, the embedding and the output head then hold most of a small model) | `bpe_vocab_size` |
+| validation text | the last `val_split`, cut as for a trained BPE | the same |
+| characters the tokenizer does not know | a warning names the most frequent; they become its unknown token | none |
+| checkpoint | holds the tokenizer (the whole `tokenizer.json` for a Hugging Face file) | holds the tokenizer |
+| generation | exact: a byte-level tokenizer splits characters into several tokens, streaming holds them back until the character is complete; a Metaspace tokenizer keeps the space before the first generated word | token by token |
+| `continue_training` | keeps the model's tokenizer (a warning) | keeps it |
+| cluster | the workers get the tokenizer from the main computer; they never read the file | the same |
+
+**Progress of every stage.** The progress events of `train()` name the
+stage and how far it is (`stage`, `stage_label`, `stage_step`, `stage_done`,
+`stage_total`, `stage_unit`, `stage_percent`, `stage_rate`,
+`stage_eta_seconds`, `stage_elapsed`), at most every
+`progress_every_seconds`:
+
+| stage | done / total | example |
+|---|---|---|
+| `tokenizer` | words counted, words scanned for pairs, merges learned | Training the BPE tokenizer (vocab 4,096) · learning merges: 1,520 / 4,032 (38%) · 760 merges/s · ~3 s left |
+| `tokenize` | characters | Tokenizing the corpus · 2.1 M / 5.4 M chars (39%) · 1.1 M chars/s · ~3 s left |
+| `model`, `data`, `compile` | (a message) | Compiling the model with torch.compile (the first step takes a while)… |
+| `train` | batches of the epoch | Epoch 3/10 · 120/400 batches (30%) · 12.3 batches/s · ~23s left |
+| `val` | validation batches | Epoch 3/10 — validation · 12 / 50 batches (24%) |
+
+The corpus is tokenized in chunks that give exactly the ids of `encode`, in
+RAM and memory-mapped. The GUI shows the stage on a second bar under the
+main one (which keeps the whole run's percentage); the CLI updates one line
+per stage on a terminal and writes a line every 5 s into a log file.
+4-argument callbacks are still called once per epoch. Stop (the GUI's Stop,
+the CLI's Ctrl+C) before the first training step ends the run at once
+instead of finishing it: `train()` puts back the model, the tokenizer and
+the optimizer it had and returns `stopped_during` (`"tokenizer"`,
+`"tokenize"`, ...) with `epochs_completed` 0; the CLI saves nothing.
+
+**Tests.** `tests/test_tokenizers_v2141.py` pins the ids four hand-written
+`tokenizer.json` files give in the library (byte level, Llama-2 style with
+byte fallback, Whitespace with a word suffix, Metaspace with added tokens),
+the split behaviours, the regex translation, refused components, the exact
+safe cuts and heap merge, the file formats and their errors, a run with a
+file that equals the run without it, the warnings, `continue_training`, a
+model that trains and streams with a byte-level tokenizer, the stream
+decoder, the stage events of a run, a stop before the first step, the CLI
+commands and progress lines, and a two-process cluster run with the main
+computer's tokenizer. `tests/test_hf_tokenizer_json_real.py` compares
+encoding and decoding with the library for nine tokenizer families and the
+split behaviours (the CI `integrations` job runs it), and
+`tests/test_gui_tokenizer_v2141.py` the GUI's tokenizer row, stage bar and
+Stop.
+
+## 14. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader

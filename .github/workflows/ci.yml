@@ -259,7 +259,7 @@ jobs:
       - name: Real Hugging Face and llama.cpp suites
         run: |
           pytest tests/test_hf_real.py tests/test_gguf_real.py tests/test_hf_integration.py \
-            -q -rs --tb=short
+            tests/test_hf_tokenizer_json_real.py -q -rs --tb=short
 
   package:
     # The artifact users actually install. Every other job uses an editable

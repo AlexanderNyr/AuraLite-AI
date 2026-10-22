@@ -21,6 +21,8 @@ from auralite.engine.recipe import DEFAULT_RECIPE, parse_dropout
 # 2.14: training on several computers (the training tab's Cluster row).
 from auralite.engine.cluster import lan_address as cluster_lan_address
 from auralite.engine.cluster import run_worker as run_cluster_worker
+# 2.14.1: your own tokenizer / training only the tokenizer (the training tab).
+from auralite.engine.tokenizer_io import describe_tokenizer, read_tokenizer_file
 from auralite.web_tools import build_web_context
 # Agent framework (optional)
 try:

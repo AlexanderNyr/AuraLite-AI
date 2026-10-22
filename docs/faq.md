@@ -249,3 +249,16 @@ ports), and check with `Test-NetConnection MAIN_ADDRESS -Port 29500` from the
 worker. A line `failed to connect to [NAME]:29500 (system error: 10049, ...)`
 is harmless (torch tries IPv6 first). The steps and commands are in
 [training.md](training.md) § 12, *If a worker cannot connect*.
+
+## 13. Can I use my own tokenizer, or train only the tokenizer?
+
+Yes, since 2.14.1. `auralite tokenizer train --text corpus.txt --vocab-size
+4096 --out tok.json` trains only the BPE tokenizer (GUI: *Train tokenizer
+only*); `auralite train ... --tokenizer tok.json` (GUI: *Own file*;
+`"tokenizer_path"` in `train()`) trains models with it. `--tokenizer` also
+reads a Hugging Face `tokenizer.json` with a BPE model, GPT-2 `vocab.json` +
+`merges.txt` and checkpoints, without the `tokenizers` package. WordPiece and
+Unigram tokenizers (BERT, T5) are refused, and so is a SentencePiece `.model`
+(convert it to `tokenizer.json` once). A big vocabulary makes a big model:
+GPT-2's 50,257 tokens are most of the parameters of a small AuraLite model.
+See [training.md](training.md) § 13.

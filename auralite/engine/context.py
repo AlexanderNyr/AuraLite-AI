@@ -156,7 +156,15 @@ class ContextWindowMixin:
         if tok is None or not self.vocab_size:
             return None
         try:
-            lengths = [len(tok.decode([i]).encode("utf-8")) for i in range(int(self.vocab_size))]
+            exact: Any = getattr(tok, "token_byte_lengths", None)
+            if exact is not None:
+                # 2.14.1: a byte-level BPE has tokens that are part of a
+                # character; decoding them alone would count U+FFFD.
+                lengths = list(exact())[:int(self.vocab_size)]
+                lengths += [0] * (int(self.vocab_size) - len(lengths))
+            else:
+                lengths = [len(tok.decode([i]).encode("utf-8"))
+                           for i in range(int(self.vocab_size))]
         except Exception:
             return None
         return torch.tensor(lengths, dtype=torch.float64)

@@ -1,3 +1,153 @@
+# 📦 v2.14.1 — your own BPE tokenizer, training only the tokenizer, progress for every stage
+
+Tokenizers: a model can be trained with your own BPE tokenizer: a file of the
+new `auralite tokenizer train`, a Hugging Face `tokenizer.json` (GPT-2,
+RoBERTa, Llama, Mistral and Qwen style files, or one trained with the
+`tokenizers` library), GPT-2 `vocab.json` + `merges.txt`, or the tokenizer of
+a checkpoint. AuraLite reads them without the `tokenizers` package and
+encodes and decodes exactly as it does. Training only the tokenizer is a
+command, a GUI button and an engine method. Progress: training the
+tokenizer, tokenizing the corpus, compiling, the epoch and the validation
+report done/total, speed and time left, on a second bar in the GUI and on
+progress lines in the CLI. Details:
+[docs/training.md § 13](docs/training.md#13-your-own-tokenizer-training-only-the-tokenizer-progress-2141).
+
+**Defaults that changed**
+
+| setting | 2.14.1 | 2.14.0 |
+|---|---|---|
+| Stop or finish (the GUI's Stop, the CLI's Ctrl+C) before the first training step | ends the run at once; the engine keeps the model, tokenizer and optimizer it had; the summary says `stopped_during` | the setup ran to its end, then the run stopped (or finished after a cooldown of no steps) with an untrained model, which the CLI saved |
+| the GUI's first Stop before the first step | stops at once | "finishing" (a learning-rate cooldown of a run that has not begun) |
+
+Without a tokenizer file a run computes what 2.14.0 computed: the progress
+reports do not change the merges of the BPE (tested bit for bit against
+2.14.0) nor the ids of the corpus.
+
+**Your own tokenizer** (`auralite/engine/hf_bpe.py`, `auralite/engine/tokenizer_io.py`)
+
+- `auralite train --tokenizer FILE`, `"tokenizer_path"` in `train()`, GUI:
+  *Own file* in *Tokenizer & Options* with *📂 Load tokenizer…*; from Python
+  also `engine.train(text, params, tokenizer=tok)`. The model gets the
+  tokenizer's vocabulary; `tokenizer` and `bpe_vocab_size` are not used.
+- Read without the `tokenizers` package: AuraLite tokenizer files, Hugging
+  Face `tokenizer.json` with a BPE model, GPT-2 `vocab.json` + `merges.txt`
+  (either file, the other next to it), a folder holding one of those, and
+  AuraLite checkpoints (`.pt`, `.safetensors`). `hf_bpe.py` reproduces added
+  tokens (`lstrip`, `rstrip`, `single_word`, `normalized`), the normalizers,
+  pre-tokenizers (ByteLevel, Metaspace, Split with every behaviour, Whitespace,
+  Digits, Punctuation, ...), the BPE model (byte fallback, fused unknown
+  token, subword prefix and suffix, `ignore_merges`) and the decoders BPE
+  files use; Oniguruma's `\p{L}`-style classes become explicit ranges and
+  `\s`/`\w` keep their Unicode meaning. Components BPE files do not use
+  (WordPiece and Unigram models, SentencePiece's "Precompiled" normalizer, script
+  classes) are refused by name, never approximated; a SentencePiece `.model`
+  gets the one-line conversion to `tokenizer.json` in its error. `encode`
+  adds no special tokens and `decode` keeps them (a generated `</s>` reaches
+  the stop strings).
+- Exact: the real GPT-2, Qwen2.5, TinyLlama (Llama-2 style), SmolLM2 and
+  Phi-2 files encode and decode tinyshakespeare and random multilingual text
+  like tokenizers 0.23, with no difference; nine tokenizer families trained by
+  the library also match tokenizers 0.20. Encoding 311 k characters takes
+  0.26–0.37 s against the library's 0.17 s for the byte-level files, 0.14 s
+  against 0.16 s for TinyLlama's (a file without pre-tokenizer: the text is
+  cut where no merge can join two characters, which gives the same tokens,
+  and the pieces are cached).
+- Generation is exact for these tokenizers: a byte-level one splits a
+  character into several tokens, so streaming holds the bytes back until the
+  character is complete; a Metaspace one drops the first space of a decoded
+  sequence, so a continuation is decoded with the last prompt tokens.
+  Bits per byte count the bytes of every token instead of the U+FFFD a lone
+  byte decodes to. The checkpoint holds the tokenizer (for a Hugging Face file
+  the whole `tokenizer.json`), so loading, generating, serving and exporting
+  work as with AuraLite's own tokenizers.
+- The validation text is cut where a trained BPE cuts it, so runs with and
+  without a file compare. A warning names the most frequent characters of the
+  text the tokenizer does not know (they become its unknown token), and a
+  tokenizer whose file says it was fitted on the validation text of this very
+  text. `continue_training` keeps the model's tokenizer (a warning says the
+  file is not used). On a cluster the workers get the tokenizer from the main
+  computer and never read the file.
+
+**Training only the tokenizer**
+
+- `auralite tokenizer train --text corpus.txt --vocab-size 4096 --out
+  tok.json` (`--kind char`, `--pretokenizer ws`, `--val-split`), and
+  `auralite tokenizer info FILE [--text F]`, `encode FILE TEXT`, `convert
+  SOURCE --out FILE`. GUI: *🔤 Train tokenizer only* (asks where to save, uses
+  the *BPE Vocab* and *Val Split* fields, selects the result for the next
+  training) and *💾 Save model's tokenizer…*. Python:
+  `train_tokenizer(text, vocab_size=...)` returns `(tokenizer, info)`;
+  `save_tokenizer`, `load_tokenizer`, `read_tokenizer_file`;
+  `engine.train_tokenizer(...)`, `engine.save_tokenizer(path)`,
+  `AuraLiteEngine.load_tokenizer(path)`, all in `auralite.engine`.
+- The tokenizer is the one `train()` builds: `val_split` (default 0.1, the
+  training default) leaves the validation tail out, so a run on the same text
+  with the file is the run without it, bit for bit. The file records the
+  text's size and fingerprint, the characters it was fitted on, the merges,
+  the time and the characters per token (measured on up to 1 M characters).
+- Stop (Ctrl+C, the GUI's Stop) keeps the merges learned so far.
+
+**Progress of every stage**
+
+- The progress events of `train()` carry the stage: `stage` (`tokenizer`,
+  `tokenize`, `model`, `data`, `compile`, `train`, `val`), `stage_label`,
+  `stage_step`, `stage_done`, `stage_total`, `stage_unit`, `stage_percent`,
+  `stage_rate`, `stage_eta_seconds`, `stage_elapsed`, and a ready message, at
+  most every `progress_every_seconds` (`tokenizer_io.StageReporter`).
+  Tokenizer training reports counting words, counting pairs and learning merges
+  (merges/s, time left); tokenizing the corpus reports characters in chunks
+  that give exactly the ids of `encode` (in RAM and memory-mapped); the epoch
+  reports its batches and the validation its batches.
+- GUI: a second bar under the main one follows the stage, with a line such
+  as "Training the BPE tokenizer (vocab 4,096) · learning merges: 1,520 /
+  4,032 (38%) · 760 merges/s · ~3 s left"; the main bar keeps the run's
+  percentage.
+- CLI: one line per stage, updated in place on a terminal, a line every 5 s
+  in a log file. 4-argument callbacks are still called once per epoch.
+
+**Version 2.14.1 everywhere**
+
+- `pyproject.toml`, `auralite.__version__` (read by the engine, the server,
+  the CLI and the cluster check), the README badge and the examples of
+  docs/releasing.md. The GUI window title read "v2.6.5" since 2.6.5; it now
+  shows the package version, and `scripts/check_version_consistency.py` checks
+  the title and the badge as well.
+
+**Tests**
+
+- `tests/test_tokenizers_v2141.py` (44 tests): the ids four hand-written
+  `tokenizer.json` files give in the library (byte level, Llama-2 style with
+  byte fallback, Whitespace with a word suffix, Metaspace with added tokens),
+  normalized and `single_word` added tokens and Unicode whitespace (pinned the
+  same way), round trips and byte counts, unknown characters, the exact safe
+  cuts and heap merge, the split behaviours, the regex translation, refused
+  components,
+  BPE progress and stop against the merges of a plain run, `iter_encode`,
+  every file format and its errors, a checkpoint's tokenizer, a run with a
+  file that equals the run without it, a file that cuts the validation text
+  like a trained BPE, the warnings, `continue_training`, a model that trains,
+  saves, reloads and streams with a byte-level tokenizer, the engine's
+  streaming of whole characters (plain and chat), the stream decoder, the
+  stage events of a run, a stop before the first step (the engine as before),
+  the reporter's throttle and format, the parameter, the CLI commands and
+  progress lines, the marker a cluster job carries for a tokenizer object (the
+  workers cut the validation text from the parameters) and a two-process
+  cluster run with the main computer's tokenizer. 21 mutations of the new
+  code (the whitespace set, the Metaspace decoder, the safe cuts, the stream
+  decoder, the stop and restore, the job marker, the stage bar, ...) each
+  fail at least one of these tests.
+  `tests/test_hf_tokenizer_json_real.py` (19 tests, needs `tokenizers`; the CI
+  `integrations` job runs it): encode and decode against the library for nine
+  tokenizer families and the split behaviours. `tests/test_gui_tokenizer_v2141.py`
+  (10 tests): training only the tokenizer, loading and saving, the own file in
+  `start_training`, a real run with a tokenizer trained before, the stage bar,
+  Stop before the first step, the configuration round trip, the window title.
+  The layout test covers the two new modules.
+- 1,656 passed / 18 skipped on Python 3.13 and 3.11 in `.[test]`-only
+  environments (2.14.0: 1,600 / 17; the new skip is the module that needs
+  `tokenizers`). `tests/test_hf_tokenizer_json_real.py` passed with
+  tokenizers 0.23.3 and 0.20.3. The CI `integrations` job runs it as well.
+
 # 📦 v2.14.0 — training on several computers, concurrent generations share a forward pass, `n` and `logprobs` on the server, dropout "auto"
 
 Training: two or more computers of a local network (Windows and Linux mixed)

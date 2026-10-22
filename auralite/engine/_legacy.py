@@ -85,6 +85,11 @@ from auralite.engine.safe_io import (  # noqa: E402,F401
 from auralite.engine.tokenizers import (  # noqa: E402,F401
     UNK_TOKEN, BPETokenizer, CharTokenizer, tokenizer_from_dict,
 )
+# 2.14.1: plugged-in BPE tokenizers, tokenizer files, training only the tokenizer
+from auralite.engine.hf_bpe import HFBPETokenizer, TokenizerFormatError  # noqa: E402,F401
+from auralite.engine.tokenizer_io import (  # noqa: E402,F401
+    describe_tokenizer, load_tokenizer, read_tokenizer_file, save_tokenizer, train_tokenizer,
+)
 from auralite.engine.layers import (  # noqa: E402,F401
     _FLEX_COMPILED, Attention, FeedForward, HeadwiseRMSNorm, RMSNorm, Top2MoE,
     TransformerBlock, _flex_attention_available, _flex_block_mask,
@@ -615,7 +620,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             # Return only the newly generated part (token-based slice),
             # cut at the first stop marker (incl. multi-token ones).
             generated_ids = result_ids[len(ids):]
-            text = self.decode(generated_ids)
+            text = self._decode_after(ids, generated_ids)
             return self._truncate_at_stop(text, stop_strs).strip()
 
     def generate_chat_streaming(
@@ -806,18 +811,23 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                                    presence_penalty, frequency_penalty)
         hit_stop = False
         tokens = self._iter_token_ids(ids, max_new_tokens, sp, on_token=on_token)
+        stream = self._stream_decoder(ids)     # 2.14.1: exact for plugged-in BPE too
         try:
             for nxt in tokens:
                 if nxt in stop_ids:
                     hit_stop = True
                     break
-                out, hit_stop = _consume(self.decode([nxt]))
+                out, hit_stop = _consume(stream.step(nxt))
                 if out:
                     yield out
                 if hit_stop:
                     break
         finally:
             tokens.close()      # frees the KV cache now, not at garbage collection
+        if not hit_stop:
+            out, hit_stop = _consume(stream.flush())
+            if out:
+                yield out
         if not hit_stop and text_buffer:
             yield text_buffer
 

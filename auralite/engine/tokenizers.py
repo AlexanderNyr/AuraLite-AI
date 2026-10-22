@@ -2,12 +2,23 @@
 
 Extracted verbatim from `auralite/engine/_legacy.py` (v2.6.5); `_legacy` re-exports
 every name below, so `auralite.engine.<name>` keeps working.
+
+2.14.1: `BPETokenizer.train` reports its progress and can be stopped,
+`iter_encode` encodes in chunks (for progress bars) with exactly the ids of
+`encode`, and `tokenizer_from_dict` also restores Hugging Face BPE tokenizers
+(`hf_bpe.py`). Tokenizer files: `tokenizer_io.py`.
 """
 from __future__ import annotations
 
 import re
 from collections import Counter
 import logging
+from typing import Callable, Iterator
+
+from auralite.engine.hf_bpe import HFBPETokenizer
+
+#: ``progress(step, done, total)`` of `BPETokenizer.train` (2.14.1).
+TrainProgress = Callable[[str, int, int], None]
 
 logger = logging.getLogger("auralite")
 
@@ -50,6 +61,18 @@ class CharTokenizer:
     def encode(self, s: str) -> list[int]:
         fb = self.token_to_id.get(" ", 0)
         return [self.token_to_id.get(c, fb) for c in s]
+
+    def iter_encode(self, s: str, chunk_chars: int = 1_000_000) -> Iterator[tuple[list[int], int]]:
+        """``(ids, characters done)`` in chunks; joined they are ``encode(s)`` (2.14.1)."""
+        step = max(1, int(chunk_chars))
+        for start in range(0, len(s), step):
+            yield self.encode(s[start:start + step]), min(len(s), start + step)
+        if not s:
+            yield [], 0
+
+    def uncovered_chars(self, chars) -> set[str]:
+        """Characters this tokenizer does not know (they become spaces) (2.14.1)."""
+        return set(chars) - set(self.token_to_id)
 
     def decode(self, ids) -> str:
         return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else "?"
@@ -104,6 +127,8 @@ class BPETokenizer:
         self._ranks: dict[tuple[int, int], tuple[int, int]] = {}
         self._cache: dict[str, list[int]] = {}
         self._unk_id: int = 0
+        #: How the last `train` ended (2.14.1): merges learned/wanted, stopped, exhausted.
+        self.train_stats: dict = {}
 
     @property
     def vocab_size(self) -> int:
@@ -121,13 +146,24 @@ class BPETokenizer:
         self._cache = {}
 
     # ---- training ----------------------------------------------------
-    def train(self, text: str, vocab_size: int = 512, extra_chars: str = ""):
+    def train(self, text: str, vocab_size: int = 512, extra_chars: str = "",
+              progress: TrainProgress | None = None,
+              should_stop: Callable[[], bool] | None = None):
         """Learn merges from `text`; `extra_chars` only join the base alphabet.
 
         `train()` (2.13) passes the held-out validation text as `extra_chars`:
         its characters stay encodable (and can be generated), but no merge is
         learned from it.
+
+        2.14.1: ``progress(step, done, total)`` follows the steps ``"count"``
+        (pieces counted), ``"pairs"`` (pieces scanned for pairs) and
+        ``"merge"`` (merges learned of those wanted); call it as often as you
+        like, the merges do not change. When ``should_stop()`` returns True
+        the training ends after the current merge: the tokenizer is complete,
+        with the merges learned so far. ``train_stats`` tells how it ended.
         """
+        report = progress or (lambda _step, _done, _total: None)
+        stop = should_stop or (lambda: False)
         # IMPROVED: stratified sampling for large files
         # Instead of just taking the prefix, sample chunks spread across the text
         sample = self._stratified_sample(text, max_chars=2_000_000, n_chunks=100)
@@ -143,13 +179,25 @@ class BPETokenizer:
             self.token_to_id[self.unk_token] = len(self.vocab) - 1
 
         self._unk_id = self.token_to_id.get(self.unk_token, 0)
+        wanted = max(0, int(vocab_size) - len(self.vocab))
+        self.train_stats = {"base_vocab": len(self.vocab), "merges": 0,
+                            "merges_wanted": wanted, "stopped": False, "exhausted": False}
 
         if vocab_size <= len(self.vocab):
             self._build_ranks()
             return
 
-        # word-frequency corpus: distinct pieces with counts
-        piece_counts = Counter(self._split_pieces(sample))
+        # word-frequency corpus: distinct pieces with counts. Counted in slices
+        # for the progress report; Counter.update keeps the order of first
+        # occurrence, so the tie-breaks of the merges stay those of 2.13.
+        pieces = self._split_pieces(sample)
+        piece_counts: Counter = Counter()
+        step = 200_000
+        for start in range(0, len(pieces), step):
+            report("count", start, len(pieces))
+            piece_counts.update(pieces[start:start + step])
+        report("count", len(pieces), len(pieces))
+        del pieces
         corpus: list[list[int]] = []
         piece_cnts: list[int] = []
         for piece, cnt in piece_counts.items():
@@ -174,6 +222,8 @@ class BPETokenizer:
         pair_totals: Counter = Counter()
         pair_pos: dict[tuple[int, int], dict[int, int]] = {}  # pair -> {piece: first_pos}
         for pidx, ids in enumerate(corpus):
+            if pidx % 20_000 == 0:
+                report("pairs", pidx, len(corpus))
             if len(ids) < 2:
                 continue
             cnt = piece_cnts[pidx]
@@ -199,7 +249,12 @@ class BPETokenizer:
             if pair_totals.get(pair, 0) > 0:
                 heapq.heappush(heap, (-pair_totals[pair], _first_key(pair), pair))
 
+        report("pairs", len(corpus), len(corpus))
+        report("merge", 0, wanted)
         while len(self.vocab) < vocab_size:
+            if stop():
+                self.train_stats["stopped"] = True
+                break
             # Pop stale heap entries until the top is current.
             a = b = best_cnt = None
             while heap:
@@ -211,6 +266,7 @@ class BPETokenizer:
                     break
                 heapq.heappop(heap)
             if best_cnt is None or best_cnt < 2:
+                self.train_stats["exhausted"] = True
                 break
 
             new_id = len(self.vocab)
@@ -257,7 +313,12 @@ class BPETokenizer:
                     touched.add(new_pair)
             for pair in touched:
                 _refresh(pair)
+            report("merge", len(self.merges), wanted)
 
+        self.train_stats["merges"] = len(self.merges)
+        if self.train_stats["exhausted"]:
+            # nothing left to merge: the step is complete with fewer merges
+            report("merge", len(self.merges), len(self.merges))
         self._build_ranks()
 
     @staticmethod
@@ -314,6 +375,23 @@ class BPETokenizer:
             out.extend(self._encode_piece(piece))
         return out
 
+    def iter_encode(self, s: str, chunk_pieces: int = 50_000) -> Iterator[tuple[list[int], int]]:
+        """``(ids, characters done)`` in chunks; joined they are ``encode(s)`` (2.14.1)."""
+        out: list[int] = []
+        done = 0
+        step = max(1, int(chunk_pieces))
+        for count, piece in enumerate(self._split_pieces(s), 1):
+            out.extend(self._encode_piece(piece))
+            done += len(piece)
+            if count % step == 0:
+                yield out, done
+                out = []
+        yield out, done
+
+    def uncovered_chars(self, chars) -> set[str]:
+        """Characters this tokenizer does not know (they become ``unk_token``) (2.14.1)."""
+        return set(chars) - set(self.token_to_id)
+
     def decode(self, ids) -> str:
         return "".join(self.vocab[int(i)] if 0 <= int(i) < len(self.vocab) else self.unk_token
                        for i in ids)
@@ -344,7 +422,9 @@ class BPETokenizer:
 def tokenizer_from_dict(d: dict):
     if d.get("kind") == "bpe":
         return BPETokenizer.from_dict(d)
+    if d.get("kind") == HFBPETokenizer.kind:          # 2.14.1: a plugged-in HF tokenizer
+        return HFBPETokenizer.from_dict(d)
     return CharTokenizer.from_dict(d)
 
 
-__all__ = ["UNK_TOKEN", "CharTokenizer", "BPETokenizer", "tokenizer_from_dict"]
+__all__ = ["UNK_TOKEN", "CharTokenizer", "BPETokenizer", "HFBPETokenizer", "tokenizer_from_dict"]

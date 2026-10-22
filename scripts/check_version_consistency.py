@@ -56,6 +56,18 @@ def _engine_version(root: pathlib.Path = REPO_ROOT) -> str:
         root, "auralite/engine/__init__.py", r'^__version__\s*=\s*"([^"]+)"')
 
 
+def _gui_version(root: pathlib.Path = REPO_ROOT) -> str:
+    """2.14.1: the window title read 'v2.6.5' for eight releases."""
+    return _imports_the_package_version(
+        root, "auralite/gui/app.py", r'title\(\s*"AuraLite AI v(\d+\.\d+\.\d+)')
+
+
+def _readme_badge_version(root: pathlib.Path = REPO_ROOT) -> str | None:
+    source = (root / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"badge/version-(\d+\.\d+\.\d+)-", source)
+    return match.group(1) if match else None
+
+
 def _changelog_version(root: pathlib.Path = REPO_ROOT) -> str | None:
     source = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     match = re.search(r"^#\s*.*?v?(\d+\.\d+\.\d+)", source, re.M)
@@ -73,7 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         "auralite/__init__.py": _module_version(),
         "auralite/engine/__init__.py (imported)": _engine_version(),
         "auralite/server/openai_server.py (imported)": _server_version(),
+        "auralite/gui/app.py (imported)": _gui_version(),
     }
+    badge = _readme_badge_version()
+    if badge:
+        versions["README.md (badge)"] = badge
     changelog = _changelog_version()
     if changelog:
         versions["CHANGELOG.md (top entry)"] = changelog

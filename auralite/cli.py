@@ -8,6 +8,16 @@
     auralite export    --model out.pt [--format pt2|onnx|torchscript] [--out PATH]
     auralite image-train    --images DIR [--preset small] [--params p.json] --model img.pt
     auralite image-generate --model img.pt [-n 16] [--steps 20] [--out grid.png]
+    auralite tokenizer train   --text corpus.txt --vocab-size 4096 --out tok.json
+    auralite tokenizer info    tok.json [--text sample.txt]
+    auralite tokenizer encode  tok.json "some text"
+    auralite tokenizer convert tokenizer.json --out tok.json
+
+2.14.1: `auralite train --tokenizer FILE` trains with your own tokenizer: a file
+of `auralite tokenizer train`, a Hugging Face tokenizer.json (BPE), GPT-2
+vocab.json + merges.txt, or a checkpoint (its tokenizer). Progress lines name
+every stage (tokenizer, tokenizing, epochs, validation) with done/total, the
+speed and the time left.
 
 `--mmap` (or `--corpus-cache PATH`) streams the corpus into a uint32 memory map
 instead of an in-RAM int64 tensor — the same tokens, ~4x less memory and no
@@ -143,44 +153,132 @@ def _configure_logging(args: argparse.Namespace) -> None:
         logging.basicConfig(level=level, format="%(message)s")
 
 
+class _ProgressPrinter:
+    """Progress lines of `auralite train` and `auralite tokenizer train`.
+
+    2.14.1: the stages of the setup (tokenizer training, tokenizing the
+    corpus, ...) and the validation print their done/total, speed and time
+    left: on a terminal as one line updated in place, otherwise (a log file)
+    at most every few seconds. Each stage ends with a full line.
+    """
+
+    def __init__(self, stream=None, interval: float | None = None):
+        self.stream = stream
+        self.interactive = self._isatty()
+        self.interval = interval if interval is not None else (0.25 if self.interactive else 5.0)
+        self.key: tuple | None = None
+        self.last = 0.0
+        self.width = 0
+        self.last_setup = ""
+
+    def _out(self):
+        return self.stream if self.stream is not None else sys.stdout
+
+    def _isatty(self) -> bool:
+        try:
+            return bool(self._out().isatty())
+        except (AttributeError, ValueError):
+            return False
+
+    def _line(self, text: str, final: bool) -> None:
+        out = self._out()
+        if self.interactive and not final:
+            out.write("\r" + text.ljust(self.width))
+            self.width = max(self.width, len(text))
+        else:
+            if self.width:
+                out.write("\r" + text.ljust(self.width) + "\n")
+            else:
+                out.write(text + "\n")
+            self.width = 0
+        out.flush()
+
+    def _end_inline(self) -> None:
+        if self.width:
+            self._out().write("\n")
+            self._out().flush()
+            self.width = 0
+
+    def stage(self, info: dict, prefix: str | None = None) -> None:
+        """A stage event (`StageReporter` info): throttled, in place on a terminal."""
+        message = str(info.get("message") or info.get("stage_label") or "")
+        name = prefix or str(info.get("stage") or "setup")
+        key = (name, info.get("stage_label"), info.get("stage_step"))
+        try:
+            done, total = float(info.get("stage_done") or 0), float(info.get("stage_total") or 0)
+        except (TypeError, ValueError):
+            done, total = 0.0, 0.0
+        finished = total > 0 and done >= total
+        now = time.monotonic()
+        if key != self.key:
+            self._end_inline()
+            self.key, self.last = key, now
+            self._line(f"  {name} | {message}", final=not self.interactive or finished)
+            return
+        if not finished and now - self.last < self.interval:
+            return
+        self.last = now
+        self._line(f"  {name} | {message}", final=finished or not self.interactive)
+
+    def __call__(self, epoch: int, total: int, train_loss: float, val_loss: float | None,
+                 info: dict | None = None) -> None:
+        info = info or {}
+        phase = info.get("phase", "train")
+        if phase in ("setup", "cluster"):
+            if info.get("stage_total") or info.get("stage_step"):
+                self.stage(info)
+                return
+            msg = info.get("message") or "setup"
+            if msg != self.last_setup:
+                self._end_inline()
+                self.key = None
+                self.last_setup = msg
+                self._line(f"  setup | {msg}", final=True)
+            return
+        if phase == "val":
+            if info.get("stage_total"):
+                self.stage(info, prefix=f"epoch {epoch}/{total}")
+            else:
+                self._end_inline()
+                self._line(f"  epoch {epoch}/{total} | validating…", final=True)
+            return
+        self._end_inline()
+        self.key = None
+        # Live batch lines (same epoch)
+        if phase == "train" and not info.get("is_epoch_end"):
+            batch = info.get("batch")
+            batches = info.get("batches")
+            pct = info.get("percent")
+            eta = info.get("eta_seconds")
+            tps = info.get("tokens_per_sec")
+            parts = [f"  epoch {epoch}/{total}"]
+            if batch is not None and batches is not None:
+                parts.append(f"batch {batch}/{batches}")
+            if train_loss:
+                parts.append(f"loss={train_loss:.4f}")
+            if tps:
+                parts.append(f"{float(tps):.0f} tok/s")
+            if pct is not None:
+                parts.append(f"{float(pct):.1f}%")
+            if eta is not None:
+                m, sec = divmod(int(max(0, float(eta))), 60)
+                h, m = divmod(m, 60)
+                parts.append(f"ETA {h}h{m:02d}m{sec:02d}s" if h else f"ETA {m}m{sec:02d}s")
+            self._line(" | ".join(parts), final=True)
+            return
+        if phase == "stopped":
+            self._line(f"  {info.get('message') or 'stopped'}", final=True)
+            return
+        val = f" | val={val_loss:.4f}" if val_loss is not None else ""
+        if val and info.get("val_bpb") is not None:
+            val += f" ({float(info['val_bpb']):.4f} bits/byte)"
+        self._line(f"  epoch {epoch}/{total} done | loss={train_loss:.4f}{val}", final=True)
+
+
 def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
               info: dict | None = None) -> None:
-    info = info or {}
-    phase = info.get("phase", "train")
-    # Quiet setup spam — one line is enough
-    if phase == "setup":
-        msg = info.get("message") or "setup"
-        print(f"  setup | {msg}", flush=True)
-        return
-    # Live batch lines (same epoch) — overwrite-friendly single line
-    if phase == "train" and not info.get("is_epoch_end"):
-        batch = info.get("batch")
-        batches = info.get("batches")
-        pct = info.get("percent")
-        eta = info.get("eta_seconds")
-        tps = info.get("tokens_per_sec")
-        parts = [f"  epoch {epoch}/{total}"]
-        if batch is not None and batches is not None:
-            parts.append(f"batch {batch}/{batches}")
-        if train_loss:
-            parts.append(f"loss={train_loss:.4f}")
-        if tps:
-            parts.append(f"{float(tps):.0f} tok/s")
-        if pct is not None:
-            parts.append(f"{float(pct):.1f}%")
-        if eta is not None:
-            m, s = divmod(int(max(0, float(eta))), 60)
-            h, m = divmod(m, 60)
-            parts.append(f"ETA {h}h{m:02d}m{s:02d}s" if h else f"ETA {m}m{s:02d}s")
-        print(" | ".join(parts), flush=True)
-        return
-    if phase == "val":
-        print(f"  epoch {epoch}/{total} | validating…", flush=True)
-        return
-    val = f" | val={val_loss:.4f}" if val_loss is not None else ""
-    if val and info.get("val_bpb") is not None:
-        val += f" ({float(info['val_bpb']):.4f} bits/byte)"
-    print(f"  epoch {epoch}/{total} done | loss={train_loss:.4f}{val}", flush=True)
+    """One-off progress line (kept for callers of 2.14.0; the CLI uses _ProgressPrinter)."""
+    _ProgressPrinter(interval=0.0)(epoch, total, train_loss, val_loss, info)
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -199,6 +297,13 @@ def cmd_train(args: argparse.Namespace) -> int:
         params["corpus_cache"] = "mmap"
     if getattr(args, "corpus_cache", None):
         params["corpus_cache_path"] = os.path.abspath(args.corpus_cache)
+    if getattr(args, "tokenizer", None):
+        # 2.14.1: train with your own tokenizer (auralite tokenizer train, a
+        # Hugging Face tokenizer.json, GPT-2 vocab.json + merges.txt, a checkpoint)
+        if not os.path.exists(args.tokenizer):
+            print(f"error: tokenizer file not found: {args.tokenizer}", file=sys.stderr)
+            return 2
+        params["tokenizer_path"] = os.path.abspath(args.tokenizer)
     # v2.6.5: validate the merged params against the typed config so typos in
     # --params (e.g. "epoch" instead of "epochs") fail loudly instead of being
     # silently ignored by train().
@@ -240,13 +345,22 @@ def cmd_train(args: argparse.Namespace) -> int:
             params["cluster_timeout_s"] = float(args.cluster_timeout)
     finish_event, stop_event = threading.Event(), threading.Event()
     previous = _graceful_sigint(finish_event, stop_event)
+    from auralite.engine.hf_bpe import TokenizerFormatError
     try:
-        engine.train(text, params,
-                     progress_callback=None if getattr(args, "quiet", False) else _progress,
-                     stop_event=stop_event, finish_event=finish_event)
+        summary = engine.train(
+            text, params,
+            progress_callback=None if getattr(args, "quiet", False) else _ProgressPrinter(),
+            stop_event=stop_event, finish_event=finish_event)
+    except (TokenizerFormatError, FileNotFoundError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
     finally:
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
+    if isinstance(summary, dict) and summary.get("stopped_during"):
+        # 2.14.1: stopped before the first step — there is no new model
+        print(f"stopped before training began ({summary['stopped_during']}); nothing was saved")
+        return 130
     engine.save_model(args.model)
     line = f"saved: {args.model}"
     summary = engine.last_train_summary or {}
@@ -650,7 +764,14 @@ def cmd_info(args: argparse.Namespace) -> int:
               f"generate/chat/serve --full-context lifts it)")
     tok = ckpt.get("tokenizer") or {}
     if tok:
-        print(f"tokenizer: {tok.get('kind', '?')} (vocab={len(tok.get('vocab', []))})")
+        try:                                # 2.14.1: plugged-in tokenizers have no "vocab" list
+            from auralite.engine.tokenizer_io import describe_tokenizer
+            from auralite.engine.tokenizers import tokenizer_from_dict
+            built = tokenizer_from_dict(tok)
+            print(f"tokenizer: {tok.get('kind', '?')} (vocab={built.vocab_size})")
+            print(f"tokenizer_detail: {describe_tokenizer(built)}")
+        except Exception:                   # noqa: BLE001 - a damaged dict still prints
+            print(f"tokenizer: {tok.get('kind', '?')} (vocab={len(tok.get('vocab', []))})")
     params = ckpt.get("params_used") or {}
     if params:
         print("params_used:")
@@ -665,6 +786,139 @@ def cmd_info(args: argparse.Namespace) -> int:
         return _bench(args.model, int(args.bench),
                       modes=bool(getattr(args, "bench_modes", False)),
                       compile_bench=bool(getattr(args, "bench_compile", False)))
+    return 0
+
+
+# ----------------------------------------------------------------------
+#  auralite tokenizer ... (2.14.1)
+# ----------------------------------------------------------------------
+def _read_text(path: str) -> str | None:
+    if not os.path.exists(path):
+        print(f"error: text file not found: {path}", file=sys.stderr)
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if not text:
+        print(f"error: the text file is empty: {path}", file=sys.stderr)
+        return None
+    return text
+
+
+def cmd_tokenizer_train(args: argparse.Namespace) -> int:
+    """Train only a tokenizer and save it (`auralite train --tokenizer` uses it)."""
+    from auralite.engine.tokenizer_io import describe_tokenizer, save_tokenizer, train_tokenizer
+    text = _read_text(args.text)
+    if text is None:
+        return 2
+    printer = None if getattr(args, "quiet", False) else _ProgressPrinter()
+    stop = threading.Event()
+
+    def handler(signum, frame):
+        if stop.is_set():
+            raise KeyboardInterrupt
+        stop.set()
+        print("\n^C: stopping — the merges learned so far are kept (Ctrl+C again to abort)",
+              file=sys.stderr, flush=True)
+
+    try:
+        previous = signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):            # not the main thread
+        previous = None
+    try:
+        tokenizer, info = train_tokenizer(
+            text, kind=args.kind, vocab_size=args.vocab_size, pretokenizer=args.pretokenizer,
+            val_split=args.val_split, progress=printer.stage if printer else None,
+            should_stop=stop.is_set, source=os.path.basename(args.text))
+    except ValueError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    save_tokenizer(tokenizer, args.out, training=info)
+    line = f"saved: {args.out} | {describe_tokenizer(tokenizer)}"
+    if info.get("chars_per_token"):
+        line += f" | {info['chars_per_token']:.2f} characters per token"
+    print(line)
+    if args.kind == "bpe" and info["fit_chars"] < info["text_chars"]:
+        print(f"fitted on the first {info['fit_chars']:,} of {info['text_chars']:,} characters: "
+              f"the last {info['val_split']:g} is the validation text of `auralite train` "
+              f"with the same val_split")
+    if info.get("stopped"):
+        print(f"stopped early: {info['merges']:,} of {info['requested_vocab_size']:,} tokens' "
+              f"merges learned")
+    elif info.get("exhausted"):
+        print(f"no pair occurs twice any more: {info['vocab_size']:,} tokens instead of "
+              f"{info['requested_vocab_size']:,}")
+    return 0
+
+
+def _tokenizer_or_error(path: str):
+    from auralite.engine.hf_bpe import TokenizerFormatError
+    from auralite.engine.tokenizer_io import read_tokenizer_file
+    try:
+        return read_tokenizer_file(path)
+    except (TokenizerFormatError, FileNotFoundError, OSError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return None
+
+
+def _token_piece(tokenizer, token_id: int) -> str:
+    text_of = getattr(tokenizer, "token_text", None)
+    piece = text_of(token_id) if callable(text_of) else tokenizer.decode([token_id])
+    return repr(piece)[1:-1]
+
+
+def cmd_tokenizer_info(args: argparse.Namespace) -> int:
+    from auralite.engine.tokenizer_io import describe_tokenizer
+    loaded = _tokenizer_or_error(args.file)
+    if loaded is None:
+        return 2
+    tokenizer, info = loaded
+    print(f"file: {info.get('path', args.file)}")
+    print(f"format: {info.get('format')}")
+    print(f"tokenizer: {describe_tokenizer(tokenizer)}")
+    print(f"kind: {tokenizer.kind}")
+    print(f"vocab_size: {tokenizer.vocab_size}")
+    special = getattr(tokenizer, "special_tokens", None)
+    if special:
+        print(f"special_tokens: {', '.join(special[:12])}" + (" ..." if len(special) > 12 else ""))
+    for key, value in sorted((info.get("training") or {}).items()):
+        if key != "text_sha256":
+            print(f"training.{key}: {value}")
+    if getattr(args, "text", None):
+        text = _read_text(args.text)
+        if text is None:
+            return 2
+        ids = tokenizer.encode(text)
+        print(f"sample: {len(text):,} characters -> {len(ids):,} tokens "
+              f"({len(text) / max(1, len(ids)):.2f} characters per token)")
+        print("first tokens: " + " | ".join(_token_piece(tokenizer, i) for i in ids[:24]))
+    return 0
+
+
+def cmd_tokenizer_encode(args: argparse.Namespace) -> int:
+    loaded = _tokenizer_or_error(args.file)
+    if loaded is None:
+        return 2
+    tokenizer = loaded[0]
+    ids = tokenizer.encode(args.text)
+    print(" ".join(str(i) for i in ids))
+    print(" | ".join(_token_piece(tokenizer, i) for i in ids))
+    back = tokenizer.decode(ids)
+    print(f"{len(ids)} tokens, {len(args.text) / max(1, len(ids)):.2f} characters per token, "
+          + ("decodes back exactly" if back == args.text else f"decodes back as {back!r}"))
+    return 0
+
+
+def cmd_tokenizer_convert(args: argparse.Namespace) -> int:
+    from auralite.engine.tokenizer_io import describe_tokenizer, save_tokenizer
+    loaded = _tokenizer_or_error(args.source)
+    if loaded is None:
+        return 2
+    tokenizer, info = loaded
+    save_tokenizer(tokenizer, args.out, training=info.get("training") or None)
+    print(f"saved: {args.out} | {describe_tokenizer(tokenizer)} (read as {info.get('format')})")
     return 0
 
 
@@ -688,6 +942,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "temporary file is deleted when training ends")
     p.add_argument("--corpus-cache", metavar="PATH",
                    help="where to keep the tokenised corpus (implies --mmap)")
+    p.add_argument("--tokenizer", metavar="FILE",
+                   help="train with this tokenizer instead of a new one: a file of "
+                        "`auralite tokenizer train`, a Hugging Face tokenizer.json (BPE), "
+                        "GPT-2 vocab.json (+ merges.txt) or a checkpoint")
     p.add_argument("--resume", metavar="CHECKPOINT",
                    help="continue training this checkpoint (a longer seq_length in "
                         "--params extends its context)")
@@ -716,6 +974,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=_parse_duration, default=600.0, metavar="DURATION",
                    help="network timeout of a run (default 10m)")
     p.set_defaults(func=cmd_cluster_worker)
+
+    # 2.14.1: train / inspect / convert tokenizers on their own
+    p = sub.add_parser("tokenizer", help="train only a tokenizer, inspect or convert one")
+    tok_sub = p.add_subparsers(dest="tokenizer_command", required=True)
+    q = tok_sub.add_parser("train", help="train only a BPE (or character) tokenizer and save it")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("--text", required=True, help="training text file (UTF-8)")
+    q.add_argument("--out", default="tokenizer.json", help="output file (default tokenizer.json)")
+    q.add_argument("--vocab-size", type=int, default=512, metavar="N",
+                   help="tokens to learn (default 512, as `auralite train`)")
+    q.add_argument("--kind", choices=["bpe", "char"], default="bpe",
+                   help="bpe (default) or char (one token per character)")
+    q.add_argument("--pretokenizer", choices=["gpt", "ws"], default="gpt",
+                   help="where merges may happen: gpt (default) or ws (2.7, whitespace only)")
+    q.add_argument("--val-split", type=float, default=0.1, metavar="F",
+                   help="leave the last F of the text out, as training does for validation "
+                        "(default 0.1; 0 = fit on all of it)")
+    q.set_defaults(func=cmd_tokenizer_train)
+    q = tok_sub.add_parser("info", help="describe a tokenizer file")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("file", help="tokenizer file, tokenizer.json, vocab.json or checkpoint")
+    q.add_argument("--text", metavar="FILE", help="also encode this text file as a sample")
+    q.set_defaults(func=cmd_tokenizer_info)
+    q = tok_sub.add_parser("encode", help="show the tokens of a text")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("file", help="tokenizer file, tokenizer.json, vocab.json or checkpoint")
+    q.add_argument("text", help="the text to encode")
+    q.set_defaults(func=cmd_tokenizer_encode)
+    q = tok_sub.add_parser("convert", help="save any supported tokenizer as an AuraLite "
+                                           "tokenizer file")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("source", help="tokenizer.json, vocab.json, merges.txt, a folder or a checkpoint")
+    q.add_argument("--out", required=True, help="output file")
+    q.set_defaults(func=cmd_tokenizer_convert)
 
     p = sub.add_parser("generate", help="generate text from a checkpoint")
     _add_common_flags(p, suppress_defaults=True)
