@@ -3,7 +3,7 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 14. Since 2.12 the three entry points share one
+to reproduce them are in § 16. Since 2.12 the three entry points share one
 default recipe (§ 8), and a run that is stopped or has a time limit ends with
 a learning-rate decay (§ 9). Since 2.13 a new BPE tokenizer never sees the
 validation text (§ 10); validation numbers measured before 2.13 are
@@ -11,7 +11,9 @@ optimistic by up to 9 %. Since 2.14 dropout is chosen from the plan and Muon
 runs 3 Newton-Schulz iterations (§ 11), and several computers can train one
 model together (§ 12). Since 2.14.1 a model can be trained with your own BPE
 tokenizer, the tokenizer can be trained on its own, and the progress shows
-every stage (§ 13).
+every stage (§ 13). Since 2.15 a run reads several files and folders, validated
+on whole held-out documents (§ 14), and dialogs fine-tune a chat model that
+answers in its chat template and stops by itself (§ 15).
 
 ## 1. An epoch is one pass over the text
 
@@ -844,7 +846,168 @@ split behaviours (the CI `integrations` job runs it), and
 `tests/test_gui_tokenizer_v2141.py` the GUI's tokenizer row, the stages on
 the one progress bar and Stop.
 
-## 14. Reproduce
+## 14. Several files and folders (2.15)
+
+`auralite train --text` takes any number of files, folders and globs; the GUI
+has *📁 Select Folder* next to *📂 Select File*; from Python,
+`auralite.engine.load_training_data(paths)` reads them and `engine.train()`
+takes the result:
+
+```bash
+auralite train --text books/ --model model.pt               # every .txt/.md/.jsonl file inside
+auralite train --text "notes/**/*.md" intro.txt --model model.pt   # globs work in every shell
+auralite tokenizer train --text books/ --vocab-size 4096 --out tok.json
+```
+
+```python
+from auralite.engine import AuraLiteEngine, load_training_data
+corpus = load_training_data(["books/", "intro.txt"])     # a TextCorpus
+AuraLiteEngine().train(corpus, {"epochs": 3})
+```
+
+* A folder contributes its `.txt`, `.text`, `.md`, `.markdown`, `.rst` and
+  `.jsonl` files, recursively and in name order; hidden files and folders are
+  skipped, and so are files that are not UTF-8 (the run says which). A file
+  given by name can have any extension.
+* A `.jsonl` file has one JSON record per line, a `.json` file an array:
+  `{"text": ...}` records (or plain strings) are one document each. Dialog
+  records fine-tune a chat model instead (§ 15); a run cannot mix the two.
+* Each file is a document; documents are joined with a blank line, so one
+  never runs into the next mid-sentence.
+* Validation holds out **whole documents**: picked at random with a fixed
+  seed until they hold `val_split` of the text (a document longer than twice
+  that share is passed over). The model is trained on the other documents,
+  and a new BPE tokenizer is fitted on them only (§ 10). When no set of
+  documents comes within half of the share (a few documents of very
+  different sizes), validation is the end of the text, as for one file.
+* The text a corpus trains on is the training documents followed by the
+  validation documents, and `val_start_char` (a `train()` parameter) is where
+  the validation documents start: `train(corpus, params)` is
+  `train(text, {**params, "val_start_char": start})` with `text, start =
+  corpus.layout(val_split)`, bit for bit; a cluster's workers get the same
+  cut. **One file trains exactly as in 2.14.2**: its text is used as it reads
+  (`tests/test_chat_sft_v215.py` checks the weights).
+* `auralite tokenizer train` and the GUI's *Train tokenizer only* cut a corpus
+  the same way, so a tokenizer trained on its own never sees the validation
+  documents either.
+
+The summary of a corpus run has `documents` and `val_documents`.
+
+## 15. Chat fine-tuning on dialogs (2.15)
+
+A `.jsonl` file of dialogs fine-tunes a chat model: the model in memory (or
+`--resume`) or a new one.
+
+```bash
+auralite train --text chats.jsonl --resume base.pt --model chat.pt    # fine-tune a model
+auralite train --text chats.jsonl --resume base.pt --lora 8 --model chat.pt   # with LoRA
+auralite chat --model chat.pt          # the template comes from the checkpoint
+```
+
+```python
+from auralite.engine import AuraLiteEngine, load_training_data
+engine = AuraLiteEngine()
+engine.load_model("base.pt")
+engine.train(load_training_data("chats.jsonl"), {"continue_training": True})
+engine.generate_chat([{"role": "user", "content": "Hello!"}])
+```
+
+In the GUI: select the `.jsonl` file (the line under the buttons says it holds
+dialogs), choose the *Chat template (dialogs)*, check *Continue training
+current model* to fine-tune the model in memory, and start. The Chat tab then
+uses the model's template.
+
+**Records.** One dialog per line, in any of these formats (`.json`: an array
+of them):
+
+| format | record |
+|---|---|
+| OpenAI | `{"messages": [{"role": "system" \| "user" \| "assistant", "content": "..."}, ...]}` |
+| ShareGPT | `{"conversations": [{"from": "human" \| "gpt" \| "system", "value": "..."}, ...], "system": "..."}` |
+| Alpaca | `{"instruction": "...", "input": "...", "output": "..."}` |
+| prompt / completion | `{"prompt": "...", "completion": "..."}` (or `"response"`), `{"question": "...", "answer": "..."}` |
+
+Tool and function messages are skipped; records without an assistant reply
+are skipped and counted (the run names the first one).
+
+**What is trained.** Each dialog is written with the chat template exactly as
+`generate_chat` writes a prompt (ChatML by default; `--template`, the GUI's
+combo box or `chat_template` choose `gemma` or `phi`), so the model learns the
+text it will be prompted with. The loss learns only the assistant's replies
+and the marker that ends each of them (`<|im_end|>` in ChatML): not the
+system and user turns, not the markers that open a reply (the prompt already
+has them). `dialog_loss="all"` learns every token instead. Dialogs are packed
+one after another into the training windows; a window without any reply
+token adds nothing to the loss. Validation holds out `val_split` of the
+dialogs, whole, picked with a fixed seed, and measures the loss on their
+replies (`val_bpb`: bits per byte of the replies).
+
+**Special tokens.** The template's markers become special tokens: one id
+each, found before the rest of the text is encoded, saved with the tokenizer
+(`special_tokens` in its dict; 2.14.2 reads such a tokenizer and treats the
+markers as text). A model that has learned the end marker stops by itself:
+`generate_chat`, `auralite chat` and the server end the reply at that token.
+Every tokenizer class takes special tokens (`add_special_tokens`), the
+plugged-in Hugging Face ones too. A continued model gets rows for the new
+tokens in its embedding and output layer, initialised to the mean of the
+others (its predictions stay as they were until training moves them), and
+characters of the dialogs its tokenizer has never seen get tokens the same
+way (digits after a corpus without any, say; AuraLite's own tokenizers —
+byte-level ones know every character already); the run lists them.
+
+**Fine-tuning.** A dialog run starts a fresh optimizer and learning-rate
+schedule. `lora_rank` (CLI `--lora`, GUI *LoRA rank*) trains LoRA adapters on
+the feed-forward layers of the continued model (2.14.2 applied `lora_rank`
+to new models only); on dialogs the token embedding and the output layer
+train too, since the markers are new tokens. Dialogs train on one computer.
+The summary has `dialogs`: the dialogs trained on and held out, the template,
+what the loss learned, the reply tokens, the tokens added and the records
+skipped. The templates `simple`, `llama2` and `mistral` cannot be used: the
+first has no end marker, the other two write no `</s>` after the replies in
+the history of a prompt, so the model would learn one text and be prompted
+with another.
+
+**Measured** (`benchmarks/chat_bench.py`, § 16): 3,000 synthetic dialogs
+(arithmetic, capitals, animal sounds, counting, opposites, greetings, a
+two-turn name recall; 2,700 to train on, 300 held out), a 0.8 M-parameter
+model (d_model 128, 4 layers, 128-token windows, the default recipe with
+early stopping, seed 3), and 300 other dialogs to answer, greedy, at most 48
+new tokens. *Stopped* counts the replies that ended with the end marker
+before the limit, *exact* those equal to the expected reply; *reply bits per
+byte* is the loss of each dialog's last reply and its end marker given the
+dialog before it, per UTF-8 byte (comparable across tokenizers).
+
+| run | stopped by itself | exact reply | reply bits per byte |
+|---|---|---|---|
+| 2.14.2: the same dialogs trained as plain ChatML text (`<\|im_end\|>` is 5 tokens) | 0 / 300: every reply ran to the 48-token limit, then was cut | 62 % | 0.058 |
+| new model on the dialogs (default: loss on the replies) | 300 / 300, after 8.6 tokens on average | 70 % | 0.056 |
+| new model, `dialog_loss="all"` | 300 / 300 | 69 % | 0.057 |
+| text model fine-tuned on the dialogs (base: 8 epochs on 300 k characters of tinyshakespeare) | 300 / 300 | 76 % | 0.033 |
+| the same, `dialog_loss="all"` | 300 / 300 | 76 % | 0.034 |
+| the same, LoRA rank 8 (`lr` 1e-3; still improving after the 40 epochs) | 300 / 300 | 57 % | 0.083 |
+
+Every 2.15 run stopped by itself, in every variant and seed. Fine-tuning a
+text model gave far better replies than training a new one on the dialogs.
+The base model's tokenizer had never seen a digit: before 2.15 added such
+characters as tokens, the fine-tuned model answered the arithmetic with `�`
+and 54 % of its replies were exact.
+
+Learning only the replies did not lower their loss on these dialogs. Over
+five runs of the new model (seeds 3–5, with early stopping and with a fixed
+690 steps) the replies came out at 0.056–0.062 bits per byte (mean 0.057)
+with the default, 0.050–0.059 (mean 0.054) learning every token, and
+0.046–0.058 for 2.14.2 on the text (two seeds); 70–75 % of the replies were
+exact against 66–74 % and 62–72 %. On the fine-tuned model, seed 4 gave
+0.039 learning the replies and 0.031 learning every token (the same 1,200
+steps). The replies here are short (about nine tokens) next to the system
+and user turns, the case where Shi et al. (2024) found a loss over the
+prompts to help. The default stays the usual one — the model learns to
+answer, not to write the user's turns, and the validation loss is the loss
+of the replies — and `dialog_loss="all"` is worth a try for short replies.
+LoRA trains far fewer weights and needs more steps or a higher `lr` than
+full fine-tuning.
+
+## 16. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -884,6 +1047,26 @@ python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --seeds 0,
 python benchmarks/recipe_bench.py defaults --text tinyshakespeare.txt --chars 100000 \
     --variants recipe,muon_ns3
 ```
+
+The 2.15 runs (§ 15):
+
+```bash
+python benchmarks/chat_bench.py data chats.jsonl --n 3000 --seed 1
+python benchmarks/chat_bench.py data eval.jsonl --n 300 --seed 99
+python benchmarks/chat_bench.py train --data chats.jsonl --out scratch.pt
+python benchmarks/chat_bench.py train --data chats.jsonl --out scratch_all.pt --loss all
+python benchmarks/chat_bench.py text chats.jsonl chats.txt        # the 2.14.2 row:
+python benchmarks/chat_bench.py train --data chats.txt --out plain.pt   # plain text
+auralite train --text shakespeare_300k.txt --params base.json --model base.pt
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --out base_chat.pt
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --lora 8 --out lora.pt
+python benchmarks/chat_bench.py eval --model scratch.pt --data eval.jsonl
+```
+
+(`base.json`: the model of `PARAMS` in the script with `"epochs": 8`; the
+first 300,000 characters of tinyshakespeare. `--seed 4` / `5` and
+`"epochs": 30, "early_stopping_patience": 0` in `PARAMS` for the other seeds
+and the fixed 690 steps; one text file trains in 2.15 exactly as in 2.14.2.)
 
 (`muon_ns3` sets what is now the default; for the 5-iteration rows pass
 `"muon_ns_steps": 5`.) The § 7 runs used `engine.train` with the parameters in the

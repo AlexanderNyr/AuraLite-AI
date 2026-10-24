@@ -45,7 +45,12 @@ DECOMPOSED = {
     # 2.14.1: plugged-in BPE tokenizers and tokenizer files
     "hf_bpe": ["HFBPETokenizer", "TokenizerFormatError"],
     "tokenizer_io": ["describe_tokenizer", "load_tokenizer", "read_tokenizer_file",
-                     "save_tokenizer", "train_tokenizer"],
+                     "save_tokenizer", "train_tokenizer", "with_characters",
+                     "with_special_tokens"],
+    # 2.15: training data from files and folders; dialogs for chat fine-tuning
+    "corpus": ["DataFormatError", "TextCorpus", "collect_files", "data_kind",
+               "load_training_data"],
+    "dialogs": ["DialogSet"],
 }
 
 #: Public surface of `model_engine/_legacy.py` at `base/upstream-main` (13d9f47) —

@@ -32,7 +32,7 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "autosave_path", "batch_size", "bpe_pretokenizer", "bpe_vocab_size",
     "chat_template", "cluster_host", "cluster_port", "cluster_timeout_s", "cluster_token",
     "cluster_workers", "continue_training", "cooldown_ratio", "corpus_cache",
-    "corpus_cache_path", "d_ff", "d_model", "dropout", "early_stopping_cooldown",
+    "corpus_cache_path", "d_ff", "d_model", "dialog_loss", "dropout", "early_stopping_cooldown",
     "early_stopping_patience", "epochs", "grad_clip",
     "kv_cache_dtype", "lora_rank", "lr", "lr_schedule", "max_steps",
     "muon_adjust_lr", "muon_lr", "muon_momentum", "muon_ns_steps", "n_heads", "n_kv_heads",
@@ -42,7 +42,8 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "tie_word_embeddings", "time_budget_s", "tokenizer", "tokenizer_path", "use_alibi",
     "use_compile", "use_ddp",
     "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
-    "val_max_tokens", "val_split", "weight_decay", "wsd_decay", "wsd_min_lr_ratio",
+    "val_max_tokens", "val_split", "val_start_char", "weight_decay", "wsd_decay",
+    "wsd_min_lr_ratio",
     "wsd_stable_ratio",
 })
 

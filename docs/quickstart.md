@@ -64,6 +64,26 @@ Notes that save time later:
   stdout, `--quiet` silences them, `AURALITE_LOG_LEVEL=WARNING` keeps them out
   of scripts.
 
+### Folders of documents and a chat model (2.15)
+
+```bash
+auralite train --text books/ "notes/*.md" --model model.pt       # files, folders, globs
+auralite train --text chats.jsonl --resume model.pt --model chat.pt
+auralite chat --model chat.pt
+```
+
+Each file is a document; documents are joined with a blank line and whole
+documents are held out for validation (one file trains exactly as before).
+A `.jsonl` file of dialogs — one `{"messages": [{"role": "user", "content":
+"..."}, {"role": "assistant", "content": "..."}]}` per line, or ShareGPT,
+Alpaca, prompt/completion records — fine-tunes the model into a chat model:
+it learns only the replies, in the chat template `auralite chat` and the
+server prompt with (ChatML; `--template gemma|phi`), and to end them with the
+template's end marker, so it stops by itself. `--lora 8` fine-tunes with
+adapters. In the GUI: *📁 Select Folder*, or select the `.jsonl` file and check
+*Continue training current model*. Details: [training.md](training.md)
+§ 14–15.
+
 ### Your own tokenizer (2.14.1)
 
 ```bash

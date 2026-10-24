@@ -25,6 +25,7 @@ classes are translated into explicit ranges for the standard ``re`` module.
 """
 from __future__ import annotations
 
+import copy
 import functools
 import heapq
 import re
@@ -1097,6 +1098,41 @@ class HFBPETokenizer:
             if not ids or (self._unk_id is not None and self._unk_id in ids):
                 missing.add(char)
         return missing
+
+    # ---- special tokens (2.15) -------------------------------------------
+    def add_special_tokens(self, tokens) -> list[int]:
+        """Make each of `tokens` one special added token; returns their ids.
+
+        A token the file already has keeps its id (and becomes special); a
+        new one gets the next free id, as ``tokenizer.add_special_tokens``
+        of the library does. The tokenizer is rebuilt from the changed file.
+        """
+        data = copy.deepcopy(self.data)
+        added = [t for t in data.get("added_tokens") or [] if isinstance(t, dict)]
+        by_content = {str(t.get("content", "")): t for t in added}
+        next_id = self._vocab_size
+        ids = []
+        for token in tokens:
+            token = str(token)
+            if not token:
+                raise ValueError("a special token cannot be empty")
+            entry = by_content.get(token)
+            if entry is None:
+                token_id = self.token_to_id.get(token)
+                if token_id is None:
+                    token_id, next_id = next_id, next_id + 1
+                entry = {"id": int(token_id), "content": token, "single_word": False,
+                         "lstrip": False, "rstrip": False, "normalized": False,
+                         "special": True}
+                added.append(entry)
+                by_content[token] = entry
+            else:
+                entry["special"] = True
+                entry["normalized"] = False
+            ids.append(int(entry["id"]))
+        data["added_tokens"] = added
+        self.__init__(data, self.source)
+        return ids
 
     # ---- (de)serialization -----------------------------------------------
     def to_dict(self) -> dict:

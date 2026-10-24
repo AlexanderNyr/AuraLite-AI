@@ -182,7 +182,8 @@ class ContextWindowMixin:
             return None
         total_bytes, count = 0.0, 0
         for _, yb in loader:
-            ids = yb.reshape(-1).to("cpu", torch.long).clamp(0, len(table) - 1)
+            ids = yb.reshape(-1).to("cpu", torch.long)
+            ids = ids[ids >= 0].clamp(0, len(table) - 1)    # 2.15: learned targets only
             total_bytes += float(table[ids].sum())
             count += int(ids.numel())
         return total_bytes / count if count and total_bytes > 0 else None

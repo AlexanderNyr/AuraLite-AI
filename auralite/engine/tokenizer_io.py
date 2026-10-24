@@ -31,7 +31,7 @@ from auralite.engine.tokenizers import BPETokenizer, CharTokenizer, tokenizer_fr
 __all__ = ["FORMAT", "StageReporter", "StreamDecoder", "TokenizerFormatError",
            "coverage_report", "decode_continuation", "describe_tokenizer",
            "encode_with_progress", "load_tokenizer", "read_tokenizer_file", "save_tokenizer",
-           "text_sha256", "train_tokenizer"]
+           "text_sha256", "train_tokenizer", "with_characters", "with_special_tokens"]
 
 #: ``"format"`` of AuraLite tokenizer files.
 FORMAT = "auralite-tokenizer"
@@ -230,6 +230,43 @@ def describe_tokenizer(tokenizer: Any) -> str:
     return f"{kind}, {size}"
 
 
+def with_special_tokens(tokenizer: Any, tokens) -> tuple[Any, int]:
+    """A copy of `tokenizer` in which every one of `tokens` is one special token (2.15).
+
+    Returns ``(tokenizer, number of new ids)``; the tokenizer itself is
+    returned when it already has them all. The copy keeps every other id, so
+    a model only needs rows for the new ids at the end of its vocabulary.
+    """
+    tokens = [str(t) for t in tokens]
+    have = set(getattr(tokenizer, "special_tokens", None) or ())
+    if all(t in have for t in tokens):
+        return tokenizer, 0
+    if not callable(getattr(tokenizer, "add_special_tokens", None)):
+        raise ValueError(f"{describe_tokenizer(tokenizer)} cannot hold special tokens")
+    before = int(tokenizer.vocab_size)
+    copy = tokenizer_from_dict(tokenizer.to_dict())
+    copy.add_special_tokens(tokens)
+    return copy, max(0, int(copy.vocab_size) - before)
+
+
+def with_characters(tokenizer: Any, text: str) -> tuple[Any, list[str]]:
+    """A copy of `tokenizer` that also knows every character of `text` (2.15).
+
+    Returns ``(tokenizer, the characters added)``; the tokenizer itself when
+    it knows them all, or cannot take new ones (a plugged-in Hugging Face
+    tokenizer: byte-level ones know every character anyway).
+    """
+    check = getattr(tokenizer, "uncovered_chars", None)
+    if check is None or not text or not callable(getattr(tokenizer, "add_characters", None)):
+        return tokenizer, []
+    missing = sorted(c for c in check(set(text)) if len(c) == 1)
+    if not missing:
+        return tokenizer, []
+    copy = tokenizer_from_dict(tokenizer.to_dict())
+    copy.add_characters(missing)
+    return copy, missing
+
+
 def coverage_report(tokenizer: Any, text: str, limit: int = 8) -> tuple[list[str], int]:
     """``(most frequent unknown characters, their occurrences)`` of `text`."""
     check = getattr(tokenizer, "uncovered_chars", None)
@@ -374,7 +411,7 @@ def train_tokenizer(text: str, *, kind: str = "bpe", vocab_size: int = 512,
                     progress: Callable[[dict], None] | None = None,
                     should_stop: Callable[[], bool] | None = None,
                     every_s: float = 0.5, measure_chars: int = 1_000_000,
-                    source: str = "") -> tuple[Any, dict]:
+                    source: str = "", fit_chars: int | None = None) -> tuple[Any, dict]:
     """Train only a tokenizer: ``(tokenizer, info)`` (2.14.1).
 
     The same tokenizer ``train()`` would build for this text: with
@@ -386,6 +423,8 @@ def train_tokenizer(text: str, *, kind: str = "bpe", vocab_size: int = 512,
     the merges learned so far (``info["stopped"]``). Afterwards up to
     `measure_chars` characters are encoded to report characters per token.
     `info` is what :func:`save_tokenizer` stores as ``"training"``.
+    `fit_chars` (2.15) is where the validation text starts instead (the
+    ``val_start_char`` of a corpus with held-out documents).
     """
     if kind not in ("bpe", "char"):
         raise ValueError(f"kind must be 'bpe' or 'char', got {kind!r}")
@@ -396,7 +435,11 @@ def train_tokenizer(text: str, *, kind: str = "bpe", vocab_size: int = 512,
         raise ValueError(f"vocab_size must be >= 2, got {vocab_size}")
     started = time.monotonic()
     split = float(val_split or 0.0)
-    fit_chars = validation_split_point(text, split) if kind == "bpe" and split > 0 else len(text)
+    if kind == "bpe" and split > 0 and fit_chars is not None and 0 < int(fit_chars) < len(text):
+        fit_chars = int(fit_chars)
+    else:
+        fit_chars = validation_split_point(text, split) if kind == "bpe" and split > 0 \
+            else len(text)
     label = "Training the BPE tokenizer" if kind == "bpe" else "Building the character tokenizer"
     reporter = StageReporter(progress, "tokenizer", label, every_s=every_s)
     tokenizer: Any

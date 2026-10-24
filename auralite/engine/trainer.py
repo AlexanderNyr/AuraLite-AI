@@ -4,6 +4,11 @@
 with their helpers (validation passes, progress callbacks, the corpus cache
 and AMP scaler steps). The code moved unchanged; the methods are reached
 through ``AuraLiteEngine`` as before.
+
+2.15: ``train`` also takes a :class:`~auralite.engine.corpus.TextCorpus`
+(several documents, validated on whole held-out documents) and a
+:class:`~auralite.engine.dialogs.DialogSet` (chat fine-tuning: the loss
+learns the assistant's replies only).
 """
 from __future__ import annotations
 
@@ -20,17 +25,22 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from auralite.engine import cluster as _cluster
 from auralite.engine import compute_thread as _compute
+from auralite.engine import dialogs as _dialogs
+from auralite.engine.corpus import TextCorpus
 from auralite.engine.dataset import (
+    IGNORE_INDEX,
     CharDataset,
     WindowBatches,
     spread_indices,
     validation_split_point,
 )
+from auralite.engine.dialogs import DialogSet
 from auralite.engine.model import ModernTransformer, estimate_n_params
 from auralite.engine.optimizers import (
     Muon,
@@ -79,6 +89,29 @@ _SETUP_STATE = ("tokenizer", "vocab_size", "model", "optimizer", "optimizer_name
                 "default_chat_template", "last_val_loss", "last_val_bpb", "_ddp_model")
 
 
+class _ReplyLoss(nn.Module):
+    """Cross-entropy over the learned targets only (2.15, dialogs).
+
+    The mean over the targets that are not ``IGNORE_INDEX``, like
+    ``nn.CrossEntropyLoss``, but 0 (with a gradient of zeros) for a batch
+    without any, where ``nn.CrossEntropyLoss`` returns NaN: a window can lie
+    entirely inside a long user turn.
+    """
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        learned = (targets != IGNORE_INDEX).sum()
+        total = F.cross_entropy(logits, targets, ignore_index=IGNORE_INDEX, reduction="sum")
+        return total / learned.clamp(min=1)
+
+
+def _undo_resize(model: Any, embedding: nn.Module, head: nn.Module) -> None:
+    """Put back the embedding and head a `resize_token_embeddings` replaced (2.15)."""
+    model.embedding = embedding
+    model.head = head
+    if getattr(model, "tie_word_embeddings", False):
+        model.head.weight = embedding.weight
+
+
 def _remove_file_quietly(path: str) -> None:
     """atexit fallback for `AuraLiteEngine._release_corpus_tempfile`."""
     try:
@@ -123,7 +156,8 @@ class TrainerMixin:
 
         Batches are weighted by their token count (2.8 averaged batch means, so a
         short last batch counted as much as a full one). ``on_batch(done,
-        total)`` follows the batches (2.14.1, the progress bar).
+        total)`` follows the batches (2.14.1, the progress bar). 2.15: only
+        targets that are not ``IGNORE_INDEX`` count (dialogs: the replies).
         """
         self.model.eval()
         total, count = 0.0, 0
@@ -138,8 +172,10 @@ class TrainerMixin:
                 yb = yb.to(self.device, non_blocking=True)
                 out = self.model(xb)
                 loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
-                total += loss.item() * yb.numel()
-                count += yb.numel()
+                # 2.15: dialogs learn only some targets; plain text learns all
+                learned = int((yb != IGNORE_INDEX).sum())
+                total += loss.item() * learned
+                count += learned
                 if on_batch is not None:
                     on_batch(i + 1, max(n_batches, i + 1))
         finally:
@@ -240,9 +276,22 @@ class TrainerMixin:
                     f"{passes:.1f} times; dropout above {AUTO_DROPOUT_MAX_PASSES})")
         return chosen
 
-    def train(self, training_text: str, params: dict,
+    def train(self, training_text: str | TextCorpus | DialogSet, params: dict,
               progress_callback=None, stop_event=None, finish_event=None, tokenizer=None):
         """Train (or continue training) the model.
+
+        `training_text` (2.15): a text, a :class:`TextCorpus` of several
+        documents or a :class:`DialogSet` of chat dialogs, as
+        ``auralite.engine.load_training_data(paths)`` reads them from files,
+        folders and globs. A corpus is validated on whole documents held out
+        at random (``val_split`` of the text) and trained on the others,
+        joined with blank lines. Dialogs fine-tune a chat model: each is
+        written with the ``chat_template`` (default "chatml", or the
+        continued model's own), whose markers become special tokens (a
+        continued model gets rows for them), and the loss learns only the
+        assistant's replies and the marker that ends them, so the model
+        answers in the template and stops by itself; ``val_split`` of the
+        dialogs are held out.
 
         `stop_event` (a ``threading.Event``) stops at the next batch;
         `finish_event` (2.12) ends the run well instead: the learning rate
@@ -346,7 +395,21 @@ class TrainerMixin:
         "trained", "file", "given", "main computer" or "continued") and
         tokenizer (a description), stopped_during (2.14.1, see above).
           use_alibi        : enable ALiBi attention bias (default False)
-          lora_rank        : enable LoRA with given rank (default 0 = disabled)
+          lora_rank        : enable LoRA with given rank (default 0 = disabled);
+                             2.15: also for a continued model (fine-tuning
+                             with adapters). On dialogs the token embedding
+                             and the output head train too (the template's
+                             markers are new tokens)
+          val_start_char   : 2.15, validation starts at this character of the
+                             text (a TextCorpus sets it to its first held-out
+                             document); default: the last val_split of it
+          dialog_loss      : 2.15, dialogs only: "assistant" (default, the
+                             replies) or "all" (every token, as plain text)
+
+        2.15: dialogs add ``dialogs`` to the summary (train, val, template,
+        loss, learned_tokens, added_tokens, skipped records), a TextCorpus
+        ``documents`` and ``val_documents``. A dialog run starts a fresh
+        optimizer and learning-rate schedule and runs on one computer.
         """
         # 2.13: training stays on this thread; an idle OpenMP team of the
         # compute thread would only slow it down (compute_thread.py).
@@ -355,7 +418,12 @@ class TrainerMixin:
         distributed_before = (self.is_distributed, self.world_size, self.local_rank)
         state = {name: getattr(self, name, None) for name in _SETUP_STATE}
         started = time.time()
+        # 2.15: changes to the model in memory that a stop before the first
+        # step takes back (new token rows, LoRA adapters), newest last
+        self._setup_undo: list[Callable[[], Any]] = []
         try:
+            training_text, params, corpus_info = self._resolve_training_data(training_text,
+                                                                             params)
             with _compute.run_inline():
                 cluster = _cluster.cluster_params(params)
                 if cluster["workers"] > 0 and getattr(self, "_cluster", None) is None:
@@ -367,11 +435,14 @@ class TrainerMixin:
                         # The workers get the tokenizer itself later; the key
                         # only makes them cut the validation text alike.
                         job["tokenizer_path"] = "(the main computer's tokenizer)"
-                    session.send_job(training_text, job)
+                    session.send_job(str(training_text), job)
                     self._cluster = session
                 return self._train_impl(training_text, params, progress_callback,
-                                        stop_event, finish_event, tokenizer=tokenizer)
+                                        stop_event, finish_event, tokenizer=tokenizer,
+                                        corpus_info=corpus_info)
         except _SetupStopped as stopped:
+            for undo in reversed(self._setup_undo):
+                undo()
             for name, value in state.items():
                 setattr(self, name, value)
             logger.info(f"[AuraLite] Stopped before the first training step "
@@ -395,10 +466,45 @@ class TrainerMixin:
             # Success, Ctrl+C/stop_event and exceptions alike: never leave the
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
             self._release_corpus_tempfile()
+            self._setup_undo = []
             _compute.release_caller_pool()
 
+    def _resolve_training_data(self, data: Any, params: dict
+                               ) -> tuple[str | DialogSet, dict, dict]:
+        """``(text or dialogs, params, corpus info)`` for `train` (2.15).
+
+        A :class:`TextCorpus` becomes its training text; when it holds whole
+        documents out for validation, ``val_start_char`` in the returned
+        params says where they start (a cluster's workers get it too).
+        """
+        if isinstance(data, DialogSet):
+            if int(params.get("cluster_workers") or 0) > 0 \
+                    or getattr(self, "_cluster", None) is not None:
+                raise ValueError("chat fine-tuning on dialogs runs on one computer: "
+                                 "train without cluster_workers")
+            return data, params, {}
+        if isinstance(data, TextCorpus):
+            val_split = float(params.get("val_split", DEFAULT_RECIPE["val_split"]) or 0.0)
+            held = data.validation_documents(val_split)
+            text, start = data.layout(val_split)
+            info = {"documents": len(data), "val_documents": len(held) if start is not None else 0}
+            if start is not None:
+                params = {**params, "val_start_char": start}
+                logger.info(f"[AuraLite] Corpus: {len(data):,} documents; {len(held):,} of them "
+                            f"({(len(text) - start) / max(1, len(text)):.1%} of the text) are "
+                            f"held out whole for validation")
+            elif len(data) > 1:
+                logger.info(f"[AuraLite] Corpus: {len(data):,} documents; validation is the "
+                            f"end of the text (no document split fits val_split={val_split:g})")
+            return text, params, info
+        if not isinstance(data, str):
+            raise TypeError(f"train() takes a text, a TextCorpus or a DialogSet, not "
+                            f"{type(data).__name__}")
+        return data, params, {}
+
     # ---- Only the tokenizer (2.14.1) -----------------------------------
-    def train_tokenizer(self, text: str, vocab_size: int | None = None, *, kind: str = "bpe",
+    def train_tokenizer(self, text: str | TextCorpus, vocab_size: int | None = None, *,
+                        kind: str = "bpe",
                         pretokenizer: str = "gpt", val_split: float | None = None,
                         progress_callback: Callable[[dict], None] | None = None,
                         stop_event: Any = None, path: str | None = None,
@@ -414,15 +520,20 @@ class TrainerMixin:
         ``train()`` (``info["message"]``, ``info["stage_percent"]``, ...), at
         most every `progress_every_seconds`; `stop_event` ends the training
         with the merges learned so far. How it went:
-        ``engine.last_tokenizer_info``.
+        ``engine.last_tokenizer_info``. 2.15: `text` can be a
+        :class:`TextCorpus`; the tokenizer is then fitted on the documents
+        ``train()`` trains on, not on those it holds out.
         """
+        split = DEFAULT_RECIPE["val_split"] if val_split is None else float(val_split)
+        fit_chars = None
+        if isinstance(text, TextCorpus):
+            text, fit_chars = text.layout(split)
         tok, info = _tok_io.train_tokenizer(
             text, kind=kind, vocab_size=int(vocab_size or DEFAULT_RECIPE["bpe_vocab_size"]),
-            pretokenizer=pretokenizer,
-            val_split=DEFAULT_RECIPE["val_split"] if val_split is None else float(val_split),
+            pretokenizer=pretokenizer, val_split=split,
             progress=progress_callback,
             should_stop=stop_event.is_set if stop_event is not None else None,
-            every_s=progress_every_seconds)
+            every_s=progress_every_seconds, fit_chars=fit_chars)
         self.last_tokenizer_info = info
         if path:
             _tok_io.save_tokenizer(tok, path, training=info)
@@ -493,10 +604,16 @@ class TrainerMixin:
             self._corpus_cache_path = None
         logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
 
-    def _train_impl(self, training_text: str, params: dict,
+    def _train_impl(self, training_text: str | DialogSet, params: dict,
                     progress_callback=None, stop_event=None, finish_event=None,
-                    tokenizer=None):
+                    tokenizer=None, corpus_info: dict | None = None):
         """Body of :meth:`train`, split out so its temp files are released on every exit."""
+        # 2.15: dialogs (chat fine-tuning) instead of a text
+        dialogs: DialogSet | None = None
+        if isinstance(training_text, DialogSet):
+            dialogs, training_text = training_text, ""
+        if not isinstance(getattr(self, "_setup_undo", None), list):
+            self._setup_undo = []          # called without train()
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
             raise ValueError(
@@ -679,6 +796,24 @@ class TrainerMixin:
                     scaler_state_to_restore = None
             elif self._resume_scaler_state is not None:
                 scaler_state_to_restore = self._resume_scaler_state
+        # 2.15: dialogs — the chat template (the continued model's own unless
+        # one is given), what the loss learns, and a fresh optimizer: the run
+        # is a new task, and new template tokens change the vocabulary.
+        template = ""
+        dialog_loss = str(params.get("dialog_loss", "assistant")).strip().lower()
+        if dialogs is not None:
+            own = self.default_chat_template
+            template = _dialogs.check_template(
+                chat_template or (own if resuming and own in _dialogs.SFT_TEMPLATES else "chatml"))
+            self.default_chat_template = template
+            if dialog_loss not in _dialogs.DIALOG_LOSSES:
+                raise ValueError(f"dialog_loss must be one of "
+                                 f"{', '.join(_dialogs.DIALOG_LOSSES)}, got {dialog_loss!r}")
+            if optimizer_state_to_restore is not None or scheduler_state_to_restore is not None:
+                logger.info("[AuraLite] Dialogs: a fresh optimizer and learning-rate schedule "
+                            "(the continued model's are not restored)")
+            optimizer_state_to_restore = scheduler_state_to_restore = None
+            scaler_state_to_restore = None
         if "optimizer" not in params and optimizer_state_to_restore is not None:
             # 2.12: the default optimizer changed from AdamW to Muon. A model
             # continued with default params keeps the optimizer whose state is
@@ -739,8 +874,38 @@ class TrainerMixin:
         if resuming and (tokenizer is not None or tokenizer_path):
             logger.warning("[AuraLite] WARNING: continued training keeps the model's tokenizer; "
                            "the given tokenizer is not used")
+        # 2.15: dialogs are held out whole; a new tokenizer is fitted on the
+        # text of the training dialogs (without the template's markers, which
+        # become special tokens below)
+        train_dialogs: list[list[dict]] = []
+        val_dialogs: list[list[dict]] = []
+        dialog_fit_chars = 0
+        if dialogs is not None:
+            train_index, val_index = dialogs.split(val_split)
+            train_dialogs = [dialogs.dialogs[i] for i in train_index]
+            val_dialogs = [dialogs.dialogs[i] for i in val_index]
+            training_text = "\n".join(_dialogs.dialog_plain_text(d, template)
+                                      for d in train_dialogs)
+            dialog_fit_chars = len(training_text)
+            if val_dialogs:
+                training_text += "\n" + "\n".join(_dialogs.dialog_plain_text(d, template)
+                                                  for d in val_dialogs)
+            logger.info(f"[AuraLite] Dialogs: {len(train_dialogs):,} to train on, "
+                        f"{len(val_dialogs):,} held out for validation; {template} template, "
+                        f"the loss learns "
+                        f"{'the replies' if dialog_loss == 'assistant' else 'every token'}")
+            if dialogs.skipped:
+                logger.warning(f"[AuraLite] WARNING: {dialogs.skipped:,} records were not "
+                               f"dialogs with a reply and are skipped (the first: "
+                               f"{dialogs.first_skipped})")
+        val_start = params.get("val_start_char")
         fit_chars = len(training_text)
-        if not resuming and (tok_kind == "bpe" or tokenizer_path or tokenizer is not None) \
+        if dialogs is not None:
+            fit_chars = dialog_fit_chars
+        elif val_start is not None and val_split > 0 and 0 < int(val_start) < len(training_text):
+            # 2.15: validation starts at the first held-out document (TextCorpus)
+            fit_chars = int(val_start)
+        elif not resuming and (tok_kind == "bpe" or tokenizer_path or tokenizer is not None) \
                 and val_split > 0:
             fit_chars = validation_split_point(training_text, val_split)
         if not resuming and cluster is not None and not cluster.is_main:
@@ -815,6 +980,34 @@ class TrainerMixin:
             )
         else:
             _setup_progress("Continued training — tokenizer already in memory", 0.15)
+            if dialogs is None:
+                # 2.15: continued training warns about unknown characters too
+                missing, occurrences = _tok_io.coverage_report(self.tokenizer, training_text)
+                if missing:
+                    logger.warning(f"[AuraLite] WARNING: the model's tokenizer does not know "
+                                   f"{occurrences:,} characters of the text (most often "
+                                   f"{', '.join(repr(c) for c in missing)}); they are encoded "
+                                   f"as its unknown token")
+        added_tokens = 0
+        if dialogs is not None:
+            # 2.15: the template's markers are one token each, and characters
+            # of the dialogs the tokenizer lacks (a continued model's, from
+            # another corpus) get tokens too. On a copy of the tokenizer, so
+            # a stop before the first step leaves it as it was.
+            markers = _dialogs.template_special_tokens(template)
+            self.tokenizer, added_tokens = _tok_io.with_special_tokens(self.tokenizer, markers)
+            if added_tokens:
+                logger.info(f"[AuraLite] Special tokens of the {template} template: "
+                            f"{', '.join(markers)} ({added_tokens} new)")
+            self.tokenizer, new_chars = _tok_io.with_characters(self.tokenizer, training_text)
+            if new_chars:
+                added_tokens += len(new_chars)
+                shown = ", ".join(repr(c) for c in new_chars[:12])
+                logger.info(f"[AuraLite] Characters of the dialogs the tokenizer did not know, "
+                            f"added as tokens: {len(new_chars)} ({shown}"
+                            f"{', ...' if len(new_chars) > 12 else ''})")
+            rows = int(self.vocab_size or 0) if resuming else 0
+            self.vocab_size = max(rows, int(self.tokenizer.vocab_size))
 
         # ---- Model ----------------------------------------------------
         check_stop("model")
@@ -883,6 +1076,37 @@ class TrainerMixin:
                     logger.info(f"[AuraLite] Tokens per optimizer step: {old_tokens:,} → "
                                 f"{new_tokens:,}. batch_size={keep} keeps them (and the "
                                 f"steps per epoch) as before; docs/training.md, section 7.")
+            # 2.15: rows for the new special tokens of a chat template, and
+            # LoRA adapters on the continued model (fine-tuning with adapters;
+            # 2.14 applied lora_rank to new models only)
+            grown: Any = native
+            rows = int(getattr(getattr(grown, "embedding", None), "num_embeddings", 0) or 0)
+            if rows and int(self.vocab_size) > rows and hasattr(grown, "resize_token_embeddings"):
+                old_modules = (grown.embedding, grown.head)
+                grown.resize_token_embeddings(int(self.vocab_size))
+                self._setup_undo.append(
+                    lambda m=grown, e=old_modules[0], h=old_modules[1]: _undo_resize(m, e, h))
+                optimizer_state_to_restore = scheduler_state_to_restore = None
+                logger.info(f"[AuraLite] Vocabulary {rows:,} → {self.vocab_size:,} tokens: the "
+                            f"new ones start as the mean of the others")
+            if int(lora_rank or 0) > 0 and not getattr(grown, "lora_adapters", None) \
+                    and hasattr(grown, "enable_lora"):
+                grown.enable_lora(rank=int(lora_rank))
+                self._setup_undo.append(grown.disable_lora)
+                optimizer_state_to_restore = scheduler_state_to_restore = None
+                logger.info(f"[AuraLite] LoRA rank {int(lora_rank)} on the continued model "
+                            f"(a fresh optimizer)")
+        native_model: Any = getattr(self.model, "module", self.model)
+        if dialogs is not None and getattr(native_model, "lora_adapters", None):
+            # The template's markers may be new tokens: with LoRA the token
+            # embedding and the output head must still learn them.
+            flags = [(p, p.requires_grad) for p in (native_model.embedding.weight,
+                                                    native_model.head.weight)]
+            for p, _ in flags:
+                p.requires_grad_(True)
+            self._setup_undo.append(lambda flags=flags: [p.requires_grad_(f) for p, f in flags])
+            logger.info("[AuraLite] LoRA on dialogs: the token embedding and the output head "
+                        "train too")
 
         self._ddp_model = None
 
@@ -947,7 +1171,8 @@ class TrainerMixin:
                 logger.info("[AuraLite] Restored optimizer state.")
             except Exception as e:
                 logger.warning(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
-        criterion = nn.CrossEntropyLoss()
+        # 2.15: dialogs learn the replies only (0 for a window without any)
+        criterion: nn.Module = _ReplyLoss() if dialogs is not None else nn.CrossEntropyLoss()
 
         # Mixed precision. History: fp16 autocast + GradScaler on CUDA only.
         # v2.6.2 adds `amp_dtype`:
@@ -1000,7 +1225,37 @@ class TrainerMixin:
         use_mmap = cache_mode in ("1", "true", "yes", "on", "mmap", "memmap")
         corpus_file = None
         encoded = None
-        if use_mmap:
+        dialog_targets: torch.Tensor | None = None
+        learned_tokens = 0
+        if dialogs is not None:
+            # 2.15: each dialog with its targets (the replies), the training
+            # dialogs first; held in RAM (dialog sets are small)
+            if use_mmap:
+                logger.info("[AuraLite] Dialogs are tokenized in memory (corpus_cache "
+                            "applies to texts)")
+                use_mmap = False
+            ids, targets = [], []
+            fit_tokens = 0
+            every = max(1, len(dialogs) // 200)
+            for number, dialog in enumerate(train_dialogs + val_dialogs, 1):
+                dialog_ids, dialog_targets_list = _dialogs.encode_dialog(
+                    self.tokenizer, dialog, template, dialog_loss)
+                ids += dialog_ids
+                targets += dialog_targets_list
+                if number == len(train_dialogs):
+                    fit_tokens = len(ids)
+                    learned_tokens = sum(1 for t in targets if t != IGNORE_INDEX)
+                if number % every == 0 or number == len(dialogs):
+                    tokenizing.update(number, len(dialogs), step="encode", unit="dialogs")
+                    check_stop("tokenize")
+            if learned_tokens == 0:
+                raise ValueError("the training dialogs have no reply tokens to learn")
+            encoded = torch.tensor(ids, dtype=torch.long)
+            dialog_targets = torch.tensor(targets, dtype=torch.long)
+            logger.info(f"[AuraLite] Tokenized {len(dialogs):,} dialogs into {len(ids):,} tokens; "
+                        f"the loss learns {learned_tokens:,} of the "
+                        f"{fit_tokens:,} training tokens")
+        elif use_mmap:
             from auralite.engine.dataset import write_tokens_memmap
             cache_path = params.get("corpus_cache_path")
             if cache_path:
@@ -1040,6 +1295,8 @@ class TrainerMixin:
         token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
         per_token = len(training_text) / max(1, token_count)
         _setup_progress(
+            f"Dialogs tokenized: {token_count:,} tokens, {learned_tokens:,} of them to learn"
+            if dialogs is not None else
             f"Corpus tokenized: {token_count:,} tokens ({per_token:.2f} characters per token)",
             0.55, stage={"stage": "tokenize", "stage_label": "Corpus tokenized",
                          "stage_done": len(training_text), "stage_total": len(training_text),
@@ -1065,7 +1322,8 @@ class TrainerMixin:
         split_at = total_tokens
         n_train_tokens = total_tokens
 
-        if val_split > 0:
+        # 2.15: dialogs validate on held-out dialogs only (none: no validation)
+        if val_split > 0 and (dialogs is None or val_dialogs):
             if total_tokens < min_train_tokens + min_val_tokens:
                 logger.warning(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
                                f"encoding, need at least {min_train_tokens + min_val_tokens} "
@@ -1090,6 +1348,15 @@ class TrainerMixin:
                 logger.info(f"[AuraLite] Split: {n_train_tokens} train tokens, "
                             f"{val_tokens} val tokens, seq_length={seq_length}")
 
+        train_targets = val_targets = None
+        if dialog_targets is not None:        # 2.15: the targets follow the same cut
+            train_targets = dialog_targets[:split_at]
+            val_targets = dialog_targets[split_at:] if val_data is not None else None
+            if val_data is not None and split_at != fit_tokens:
+                logger.warning(f"[AuraLite] WARNING: the held-out dialogs have fewer than "
+                               f"{min_val_tokens} tokens (seq_length + 1): validation also "
+                               f"reads the end of the training dialogs; hold out more "
+                               f"dialogs (val_split)")
         net = cast(nn.Module, self.model)      # the module being trained (typed)
         if use_mmap:
             from auralite.engine.dataset import PagedDataset
@@ -1098,7 +1365,8 @@ class TrainerMixin:
                                    stride=sample_stride)
         else:
             assert train_data is not None
-            dataset = CharDataset(train_data, seq_length, stride=sample_stride)
+            dataset = CharDataset(train_data, seq_length, stride=sample_stride,
+                                  targets=train_targets)
         if len(dataset) == 0:
             raise ValueError(
                 "Training text is too short for the chosen Context Window (seq_length)."
@@ -1136,7 +1404,7 @@ class TrainerMixin:
                                    limit=total_tokens - split_at, stride=seq_length)
                       if split_at < total_tokens else None)
         else:
-            val_ds = (CharDataset(val_data, seq_length, stride=seq_length)
+            val_ds = (CharDataset(val_data, seq_length, stride=seq_length, targets=val_targets)
                       if val_data is not None else None)
         if val_ds is not None:
             if len(val_ds) > 0:
@@ -1692,4 +1960,12 @@ class TrainerMixin:
             "cluster_size": cluster.world_size if cluster is not None else 1,
             "seconds": elapsed,
         }
+        if corpus_info:                    # 2.15: a TextCorpus
+            self.last_train_summary.update(corpus_info)
+        if dialogs is not None:            # 2.15: chat fine-tuning
+            self.last_train_summary["dialogs"] = {
+                "train": len(train_dialogs), "val": len(val_dialogs), "template": template,
+                "loss": dialog_loss, "learned_tokens": learned_tokens,
+                "added_tokens": added_tokens, "skipped": dialogs.skipped,
+            }
         return dict(self.last_train_summary)

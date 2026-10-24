@@ -1,6 +1,8 @@
 """AuraLite command line interface.
 
     auralite train     --text corpus.txt --params params.json --model out.pt
+    auralite train     --text books/ notes/*.md --model out.pt      (2.15: folders, globs)
+    auralite train     --text chats.jsonl --resume base.pt --model chat.pt   (2.15: dialogs)
     auralite generate  --model out.pt --prompt "Hello" --length 40
     auralite chat      --model out.pt [--template chatml] [--system "..."]
     auralite serve     --model out.pt [--host 0.0.0.0] [--port 8000]
@@ -36,6 +38,12 @@ decay and saves the model; a second Ctrl+C stops at once (and still saves).
 2.14.2: `auralite image-train --type flow|gan` trains a flow-matching or a GAN
 image generator instead of the diffusion model; `auralite image-eval` measures
 an image generator (patch SWD against a folder of real images).
+
+2.15: `auralite train --text` takes several files, folders and globs (the
+documents are joined with blank lines and validated on whole held-out
+documents); a `.jsonl` file of dialogs fine-tunes a chat model instead
+(`--template`, `--lora`): it learns to answer in the chat template and to stop
+at the end of its reply.
 """
 from __future__ import annotations
 
@@ -318,14 +326,32 @@ def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
     _ProgressPrinter(interval=0.0)(epoch, total, train_loss, val_loss, info)
 
 
+def _describe_data(data) -> str:
+    """One line about what `auralite train` read (2.15)."""
+    from auralite.engine import DialogSet
+    if isinstance(data, DialogSet):
+        line = f"{len(data):,} dialogs from {', '.join(os.path.basename(p) for p in data.sources)}"
+        if data.skipped:
+            line += f" ({data.skipped:,} records skipped, the first: {data.first_skipped})"
+        return line
+    chars = sum(len(doc) for doc in data.documents)
+    line = f"{chars:,} characters" if len(data) == 1 else \
+        f"{len(data):,} documents, {chars:,} characters"
+    if data.skipped:
+        line += f" ({len(data.skipped)} files skipped: not UTF-8)"
+    return line
+
+
 def cmd_train(args: argparse.Namespace) -> int:
-    from auralite.engine import AuraLiteEngine
-    text_path = args.text
-    if not os.path.exists(text_path):
-        print(f"error: text file not found: {text_path}", file=sys.stderr)
+    from auralite.engine import AuraLiteEngine, DataFormatError, DialogSet, load_training_data
+    # 2.15: files, folders and globs; text documents or dialogs
+    try:
+        data = load_training_data(args.text)
+    except (FileNotFoundError, DataFormatError) as err:
+        print(f"error: {err}", file=sys.stderr)
         return 2
-    with open(text_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    if not getattr(args, "quiet", False):
+        print(f"data: {_describe_data(data)}")
     params = dict(DEFAULT_TRAIN_PARAMS)
     if args.params:
         with open(args.params, "r", encoding="utf-8") as f:
@@ -334,6 +360,21 @@ def cmd_train(args: argparse.Namespace) -> int:
         params["corpus_cache"] = "mmap"
     if getattr(args, "corpus_cache", None):
         params["corpus_cache_path"] = os.path.abspath(args.corpus_cache)
+    if getattr(args, "template", None):
+        params["chat_template"] = args.template
+    if getattr(args, "lora", None):
+        params["lora_rank"] = int(args.lora)
+    if isinstance(data, DialogSet) and getattr(args, "cluster_workers", None):
+        print("error: chat fine-tuning on dialogs runs on one computer "
+              "(drop --cluster-workers)", file=sys.stderr)
+        return 2
+    if isinstance(data, DialogSet) and params.get("chat_template"):
+        from auralite.engine.dialogs import check_template
+        try:
+            check_template(params["chat_template"])
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     if getattr(args, "tokenizer", None):
         # 2.14.1: train with your own tokenizer (auralite tokenizer train, a
         # Hugging Face tokenizer.json, GPT-2 vocab.json + merges.txt, a checkpoint)
@@ -385,7 +426,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     from auralite.engine.hf_bpe import TokenizerFormatError
     try:
         summary = engine.train(
-            text, params,
+            data, params,
             progress_callback=None if getattr(args, "quiet", False) else _ProgressPrinter(),
             stop_event=stop_event, finish_event=finish_event)
     except (TokenizerFormatError, FileNotFoundError) as err:
@@ -405,6 +446,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         line += f" | val loss {summary['val_loss']:.4f}"
         if summary.get("val_bpb") is not None:
             line += f" ({summary['val_bpb']:.4f} bits/byte)"
+    if summary.get("dialogs"):
+        line += f" | chat template {summary['dialogs']['template']}"
     reason = str(summary.get("stop_reason") or "")
     if reason:
         line += " | " + {"early_stopping": "stopped early (best epoch kept)",
@@ -883,6 +926,8 @@ def cmd_info(args: argparse.Namespace) -> int:
             built = tokenizer_from_dict(tok)
             print(f"tokenizer: {tok.get('kind', '?')} (vocab={built.vocab_size})")
             print(f"tokenizer_detail: {describe_tokenizer(built)}")
+            if getattr(built, "special_tokens", None):      # 2.15: a chat model's markers
+                print(f"special_tokens: {', '.join(built.special_tokens)}")
         except Exception:                   # noqa: BLE001 - a damaged dict still prints
             print(f"tokenizer: {tok.get('kind', '?')} (vocab={len(tok.get('vocab', []))})")
     params = ckpt.get("params_used") or {}
@@ -919,9 +964,21 @@ def _read_text(path: str) -> str | None:
 
 def cmd_tokenizer_train(args: argparse.Namespace) -> int:
     """Train only a tokenizer and save it (`auralite train --tokenizer` uses it)."""
+    from auralite.engine import DataFormatError, DialogSet, load_training_data
     from auralite.engine.tokenizer_io import describe_tokenizer, save_tokenizer, train_tokenizer
-    text = _read_text(args.text)
-    if text is None:
+    # 2.15: files, folders and globs, cut like `auralite train` cuts them
+    try:
+        data = load_training_data(args.text)
+    except (FileNotFoundError, DataFormatError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if isinstance(data, DialogSet):
+        print("error: train the tokenizer on text; `auralite train` on dialogs adds the chat "
+              "template's tokens to the model's tokenizer", file=sys.stderr)
+        return 2
+    text, fit_chars = data.layout(float(args.val_split or 0.0))
+    if not text:
+        print("error: the training text is empty", file=sys.stderr)
         return 2
     printer = None if getattr(args, "quiet", False) else _ProgressPrinter()
     stop = threading.Event()
@@ -941,7 +998,8 @@ def cmd_tokenizer_train(args: argparse.Namespace) -> int:
         tokenizer, info = train_tokenizer(
             text, kind=args.kind, vocab_size=args.vocab_size, pretokenizer=args.pretokenizer,
             val_split=args.val_split, progress=printer.stage if printer else None,
-            should_stop=stop.is_set, source=os.path.basename(args.text))
+            should_stop=stop.is_set, source=", ".join(os.path.basename(p) for p in args.text),
+            fit_chars=fit_chars)
     except ValueError as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
@@ -953,7 +1011,11 @@ def cmd_tokenizer_train(args: argparse.Namespace) -> int:
     if info.get("chars_per_token"):
         line += f" | {info['chars_per_token']:.2f} characters per token"
     print(line)
-    if args.kind == "bpe" and info["fit_chars"] < info["text_chars"]:
+    if args.kind == "bpe" and fit_chars is not None:
+        print(f"fitted on the training documents ({info['fit_chars']:,} of "
+              f"{info['text_chars']:,} characters): the held-out documents are the "
+              f"validation text of `auralite train` with the same val_split")
+    elif args.kind == "bpe" and info["fit_chars"] < info["text_chars"]:
         print(f"fitted on the first {info['fit_chars']:,} of {info['text_chars']:,} characters: "
               f"the last {info['val_split']:g} is the validation text of `auralite train` "
               f"with the same val_split")
@@ -1044,9 +1106,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("train", help="train a model from a text file")
+    p = sub.add_parser("train", help="train a model on text files, or fine-tune one on dialogs")
     _add_common_flags(p, suppress_defaults=True)
-    p.add_argument("--text", required=True, help="training text file (UTF-8)")
+    p.add_argument("--text", "--data", dest="text", nargs="+", required=True, metavar="PATH",
+                   help="training data (UTF-8): text files, folders (their .txt/.md/.jsonl "
+                        "files), globs; .jsonl/.json files of {\"text\": ...} records, or of "
+                        "dialogs ({\"messages\": [...]}, ShareGPT, Alpaca, prompt/completion) "
+                        "to fine-tune a chat model")
+    p.add_argument("--template", metavar="NAME",
+                   help="dialogs: the chat template (chatml, gemma or phi; default: the "
+                        "continued model's, else chatml)")
+    p.add_argument("--lora", type=int, metavar="RANK",
+                   help="train LoRA adapters of this rank instead of every weight (with "
+                        "--resume: fine-tune a model with adapters)")
     p.add_argument("--params", help="JSON file with training params")
     p.add_argument("--model", default="model.pt", help="output checkpoint")
     p.add_argument("--mmap", action="store_true",
@@ -1093,7 +1165,8 @@ def build_parser() -> argparse.ArgumentParser:
     tok_sub = p.add_subparsers(dest="tokenizer_command", required=True)
     q = tok_sub.add_parser("train", help="train only a BPE (or character) tokenizer and save it")
     _add_common_flags(q, suppress_defaults=True)
-    q.add_argument("--text", required=True, help="training text file (UTF-8)")
+    q.add_argument("--text", nargs="+", required=True, metavar="PATH",
+                   help="training text (UTF-8): files, folders, globs, as for `auralite train`")
     q.add_argument("--out", default="tokenizer.json", help="output file (default tokenizer.json)")
     q.add_argument("--vocab-size", type=int, default=512, metavar="N",
                    help="tokens to learn (default 512, as `auralite train`)")

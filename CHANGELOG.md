@@ -1,3 +1,106 @@
+# 📦 v2.15.0 — chat fine-tuning on dialogs, training on folders of documents
+
+Chat: a `.jsonl` file of dialogs fine-tunes a model into a **chat model**. The
+dialogs are written with the chat template exactly as `generate_chat`
+prompts, the loss learns **only the assistant's replies** and the marker that
+ends them, and the template's markers become **special tokens**, so the model
+answers in the template and **stops by itself** at `<|im_end|>`. A continued
+model grows rows for the new tokens, `--lora` fine-tunes it with adapters.
+Data: `auralite train --text` takes **several files, folders and globs**;
+each file is a document, documents are joined with a blank line, and
+validation holds out **whole documents**. One text file trains bit for bit as
+in 2.14.2. Details: [docs/training.md § 14–15](docs/training.md#14-several-files-and-folders-215).
+
+**Defaults that changed**
+
+| setting | 2.15.0 | 2.14.2 |
+|---|---|---|
+| `auralite train --text` | one or more files, folders, globs; `.jsonl`/`.json` files are read as records (text or dialogs) | one file, read as text |
+| `lora_rank` with `continue_training` | LoRA adapters on the continued model (a fresh optimizer) | ignored: applied to new models only |
+| continued training on text with characters its tokenizer lacks | a warning naming them | silent (they became the unknown token) |
+| GUI training tab | *📂 Select File* (text, Markdown, `.jsonl`, `.json`) and *📁 Select Folder*; *Chat template (dialogs)* | *📂 Select .txt File* |
+| GUI Chat tab after loading or training a native model | the model's chat template | the last choice (ChatML) |
+| `auralite tokenizer train --text` | files, folders, globs, cut as `auralite train` cuts them | one file |
+
+**Chat fine-tuning** (`auralite/engine/dialogs.py`)
+
+- Records: OpenAI `{"messages": [...]}` (content parts too), ShareGPT
+  `{"conversations": [{"from", "value"}], "system"}`, Alpaca
+  `{"instruction", "input", "output"}`, `{"prompt", "completion"|"response"}`,
+  `{"question", "answer"}`; tool messages are skipped, records without a reply
+  skipped and counted.
+- Templates: ChatML (default, or the continued model's), Gemma, Phi
+  (`chat_template`, CLI `--template`, GUI *Chat template (dialogs)*); the
+  checkpoint records it and `generate_chat`, `auralite chat` and the server
+  use it. `simple`, `llama2` and `mistral` are refused: no end marker, or a
+  history written differently from the training text.
+- What is learned: `render_segments` / `encode_dialog` mark each reply and its
+  end marker; targets elsewhere are `IGNORE_INDEX` (-100) and a window
+  without a reply adds nothing. `dialog_loss="all"` learns every token.
+- Validation: `val_split` of the dialogs, whole, picked with a fixed seed; the
+  loss and `val_bpb` are those of their replies.
+- A dialog run starts a fresh optimizer and schedule and runs on one
+  computer. The summary has `dialogs` (train, val, template, loss,
+  learned_tokens, added_tokens, skipped).
+
+**Special tokens and new rows**
+
+- `add_special_tokens(tokens)` on `CharTokenizer`, `BPETokenizer` and the
+  plugged-in `HFBPETokenizer`: one id each, matched leftmost-longest before
+  the rest of the text is encoded, saved under `special_tokens` (2.14.2 reads
+  the file and treats the markers as text). `with_special_tokens(tok, tokens)`
+  returns a copy. Without special tokens encoding is unchanged.
+- `add_characters` / `with_characters`: characters of the dialogs a continued
+  model's tokenizer has never seen get tokens (the run lists them).
+- `ModernTransformer.resize_token_embeddings(n)`: new rows in the embedding and
+  the output layer, initialised to the mean of the others (the outputs for
+  the old tokens do not change); tying and `requires_grad` are kept.
+- `lora_rank` now applies to a continued model; on dialogs the token
+  embedding and the output layer train with the adapters.
+- A stop before the first step puts the model back: new rows, LoRA adapters
+  and the tokenizer are undone.
+
+**Folders of documents** (`auralite/engine/corpus.py`)
+
+- `load_training_data(paths)` → `TextCorpus` or `DialogSet`; folders add
+  their `.txt`, `.text`, `.md`, `.markdown`, `.rst` and `.jsonl` files,
+  recursively, in name order (hidden ones and files that are not UTF-8 are
+  skipped); globs are expanded by AuraLite, so they work in every shell.
+- `TextCorpus.layout(val_split)`: the training documents, then the held-out
+  ones (drawn with a fixed seed until they hold `val_split` of the text),
+  and `val_start_char`, a new `train()` parameter: where validation starts.
+  A new BPE is fitted on the training documents only. When no set of
+  documents fits, validation is the end of the text, as for one file.
+- `engine.train(corpus)` equals `engine.train(text, {"val_start_char": start})`
+  bit for bit, and one file equals its text (checked on the weights).
+
+**Measured** (`benchmarks/chat_bench.py`, docs/training.md § 15)
+
+- 3,000 synthetic dialogs (benchmarks/chat_bench.py), a 0.8 M-parameter
+  model, 300 other dialogs answered greedily with at most 48 new tokens:
+  every 2.15 run **stopped by itself in 300 of 300 replies** (a new model
+  after 8.6 tokens on average; 70 % exact replies), a fine-tuned
+  tinyshakespeare model too (76 % exact); 2.14.2 trained on the same dialogs
+  as plain ChatML text stopped in none (62 % exact after cutting at
+  `<|im_end|>`, which is 5 tokens there).
+- Learning only the replies (the default) did not lower their loss on these
+  short replies: over five runs of the new model 0.057 bits per byte against
+  0.054 learning every token (`dialog_loss="all"`) and 0.052 for 2.14.2 on
+  the text (two seeds), with 70–75 % exact replies against 66–74 % and
+  62–72 %; a loss over the prompts is known to help when replies are short.
+  Fine-tuning a text model gave far better replies (0.033) than a new model.
+- Without the characters added to the fine-tuned model's tokenizer (it had
+  never seen a digit) the arithmetic came out as `�` and 54 % of the replies
+  were exact.
+
+**Tests**: `tests/test_chat_sft_v215.py` (special tokens for the three
+tokenizer classes, new rows, targets, record formats, templates against
+`apply_chat_template`, files/folders/globs, corpus layout, one file = its
+text and corpus = its layout bit for bit, training from scratch and from a
+text model with and without LoRA, the undo on stop, CLI, the benchmark),
+`tests/test_gui_data_v215.py` (folder and dialog selection, training a
+folder, fine-tuning in the chosen template, the Chat tab following it).
+
 # 📦 v2.14.2 — GAN and flow-matching image training, a quality score, one progress bar
 
 Images: the image generator trains three model types — the diffusion model

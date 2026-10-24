@@ -23,6 +23,9 @@ from auralite.engine.cluster import lan_address as cluster_lan_address
 from auralite.engine.cluster import run_worker as run_cluster_worker
 # 2.14.1: your own tokenizer / training only the tokenizer (the training tab).
 from auralite.engine.tokenizer_io import describe_tokenizer, read_tokenizer_file
+# 2.15: folders of documents and dialogs for chat fine-tuning (the training tab).
+from auralite.engine.corpus import data_kind, load_training_data
+from auralite.engine.dialogs import SFT_TEMPLATES, DialogSet, dialog_plain_text
 from auralite.web_tools import build_web_context
 # Agent framework (optional)
 try:

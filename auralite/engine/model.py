@@ -231,6 +231,41 @@ class ModernTransformer(nn.Module):
         self.head.weight = self.embedding.weight
         self.tie_word_embeddings = True
 
+    def resize_token_embeddings(self, vocab_size: int) -> int:
+        """Grow the vocabulary to `vocab_size` tokens; returns how many were added (2.15).
+
+        New tokens (the special tokens of a chat template, say) get the mean
+        of the existing rows, in the token embedding and in the output head:
+        the model then gives them an average logit instead of a random one,
+        which keeps its predictions unchanged until training teaches them
+        (Hewitt, 2021). Existing rows, the tying of the head to the embedding
+        and the ``requires_grad`` flags stay as they were. A vocabulary never
+        shrinks.
+        """
+        old = int(self.embedding.num_embeddings)
+        new = int(vocab_size)
+        if new <= old:
+            return 0
+        weight = self.embedding.weight
+        embedding = nn.Embedding(new, self.d_model).to(device=weight.device, dtype=weight.dtype)
+        with torch.no_grad():
+            embedding.weight[:old] = weight
+            embedding.weight[old:] = weight.mean(dim=0)
+        embedding.weight.requires_grad_(weight.requires_grad)
+        self.embedding = embedding
+        if self.tie_word_embeddings:
+            self.head.weight = self.embedding.weight
+        else:
+            head_weight = self.head.weight
+            head = nn.Linear(self.d_model, new, bias=False).to(device=head_weight.device,
+                                                               dtype=head_weight.dtype)
+            with torch.no_grad():
+                head.weight[:old] = head_weight
+                head.weight[old:] = head_weight.mean(dim=0)
+            head.weight.requires_grad_(head_weight.requires_grad)
+            self.head = head
+        return new - old
+
     def untie_weights(self):
         """Clone the LM head for research runs that need untied embeddings."""
         new_head = nn.Linear(self.d_model, self.embedding.num_embeddings, bias=False).to(self.embedding.weight.device)

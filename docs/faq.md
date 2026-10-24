@@ -288,3 +288,21 @@ To compare models on your own images, use the same folder and number of
 images: `auralite image-eval --model m.pt --images photos/` (or *📏 Measure
 Quality*) prints the patch SWD next to the score of two sets of real images.
 See [image.md](image.md) § 10–13.
+
+## 15. How do I turn my model into a chat model?
+
+Since 2.15: fine-tune it on dialogs. Put one dialog per line in a `.jsonl`
+file — `{"messages": [{"role": "user", "content": "..."}, {"role":
+"assistant", "content": "..."}]}`, or ShareGPT, Alpaca or prompt/completion
+records — and run `auralite train --text chats.jsonl --resume model.pt
+--model chat.pt` (GUI: select the file, check *Continue training current
+model*). The model learns only the replies, in the chat template that
+`auralite chat`, the GUI's Chat tab and the server prompt with (ChatML by
+default), and learns to end them with the template's end marker, so it stops
+by itself instead of running on into the next turn. A model that has only
+read plain text knows neither: it writes on until the token limit. A few
+hundred dialogs teach the format; what the replies say comes from the
+dialogs and from what the model learned before. `--lora 8` trains
+adapters instead of every weight (converges more slowly on small models).
+Several files or a folder of plain text are one `--text` too. See
+[training.md](training.md) § 14–15.

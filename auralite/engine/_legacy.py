@@ -89,6 +89,7 @@ from auralite.engine.tokenizers import (  # noqa: E402,F401
 from auralite.engine.hf_bpe import HFBPETokenizer, TokenizerFormatError  # noqa: E402,F401
 from auralite.engine.tokenizer_io import (  # noqa: E402,F401
     describe_tokenizer, load_tokenizer, read_tokenizer_file, save_tokenizer, train_tokenizer,
+    with_characters, with_special_tokens,
 )
 from auralite.engine.layers import (  # noqa: E402,F401
     _FLEX_COMPILED, Attention, FeedForward, HeadwiseRMSNorm, RMSNorm, Top2MoE,
@@ -101,6 +102,11 @@ from auralite.engine.model import (  # noqa: E402,F401
 from auralite.engine.dataset import (  # noqa: E402,F401
     CharDataset, WindowBatches, spread_indices, validation_split_point,
 )
+# 2.15: training data from files, folders and globs; dialogs for chat fine-tuning
+from auralite.engine.corpus import (  # noqa: E402,F401
+    DataFormatError, TextCorpus, collect_files, data_kind, load_training_data,
+)
+from auralite.engine.dialogs import DialogSet  # noqa: E402,F401
 from auralite.engine.context import ContextWindowMixin  # noqa: E402
 from auralite.engine.decode_slots import DecodeSlot, DecodeSlotsMixin  # noqa: E402
 from auralite.engine.inference_bench import InferenceBenchMixin  # noqa: E402

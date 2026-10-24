@@ -4,6 +4,7 @@ Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
 from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, describe_tokenizer, estimate_n_params, filedialog, messagebox, os, parse_dropout, read_tokenizer_file, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
+from ..common import SFT_TEMPLATES, DialogSet, data_kind, dialog_plain_text, load_training_data
 
 R = DEFAULT_RECIPE      # 2.12: one recipe for the GUI, the CLI and train()
 
@@ -307,9 +308,13 @@ class TrainTabMixin:
         top_row = ttk.Frame(run_frame)
         top_row.pack(fill=tk.X, pady=2)
 
-        self.file_btn = ttk.Button(top_row, text="📂 Select .txt File",
+        self.file_btn = ttk.Button(top_row, text="📂 Select File",
                                    command=self.select_file)
         self.file_btn.pack(side=tk.LEFT, padx=4)
+        # 2.15: a folder of documents (its .txt / .md / .jsonl files)
+        self.folder_btn = ttk.Button(top_row, text="📁 Select Folder",
+                                     command=self.select_folder)
+        self.folder_btn.pack(side=tk.LEFT, padx=4)
 
         self.train_btn = ttk.Button(top_row, text="🚀 Start Training",
                                     command=self.start_training,
@@ -330,9 +335,17 @@ class TrainTabMixin:
                                        command=self.load_config)
         self.load_cfg_btn.pack(side=tk.LEFT, padx=4)
 
-        self.file_label = ttk.Label(run_frame, text="No file selected",
+        data_row = ttk.Frame(run_frame)
+        data_row.pack(fill=tk.X, pady=2)
+        self.file_label = ttk.Label(data_row, text="No file selected",
                                     foreground="gray")
-        self.file_label.pack(pady=2, anchor=tk.W)
+        self.file_label.pack(side=tk.LEFT, anchor=tk.W)
+        # 2.15: a .jsonl of dialogs fine-tunes a chat model in this template
+        self.dialog_template_var = tk.StringVar(value="chatml")
+        ttk.Combobox(data_row, textvariable=self.dialog_template_var,
+                     values=list(SFT_TEMPLATES), state="readonly",
+                     width=8).pack(side=tk.RIGHT, padx=4)
+        ttk.Label(data_row, text="Chat template (dialogs):").pack(side=tk.RIGHT, padx=4)
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(run_frame,
@@ -439,9 +452,7 @@ class TrainTabMixin:
         # for char-level we count unique chars; for BPE the trained vocab
         # caps at bpe_vocab; raw token count ≈ chars / 3 (typical English).
         try:
-            with open(self.selected_file_path, "r", encoding="utf-8",
-                      errors="ignore") as f:
-                text_sample = f.read()
+            text_sample = self._selected_text()       # 2.15: files, folders, dialogs
         except Exception as e:
             messagebox.showerror("File Error", f"Could not read file:\n{e}")
             return
@@ -496,16 +507,40 @@ class TrainTabMixin:
     def select_file(self):
         file_path = filedialog.askopenfilename(
             title="Select Training File",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            filetypes=[("Text or dialogs", "*.txt *.md *.jsonl *.json"), ("Text files", "*.txt"),
+                       ("Dialogs (JSONL)", "*.jsonl"), ("All files", "*.*")],
         )
         if file_path:
-            self.selected_file_path = file_path
-            self.file_label.config(
-                text=f"Selected: {os.path.basename(file_path)}",
-                foreground="black",
-            )
-            self.train_btn.config(state=tk.NORMAL)
-            self.status_label.config(text="Status: Ready to train")
+            self._select_data(file_path)
+
+    def select_folder(self):
+        """2.15: train on every text file of a folder (one document each)."""
+        folder = filedialog.askdirectory(title="Select a Folder of Training Files")
+        if folder:
+            self._select_data(folder)
+
+    def _select_data(self, path: str) -> None:
+        self.selected_file_path = path
+        name = os.path.basename(os.path.normpath(path)) or path
+        kind = data_kind([path])
+        if os.path.isdir(path):
+            text = f"Selected folder: {name}"
+        else:
+            text = f"Selected: {name}"
+        if kind == "dialogs":
+            text += " — dialogs: fine-tunes a chat model (check «Continue training» to " \
+                    "fine-tune the model in memory)"
+        self.file_label.config(text=text, foreground="black")
+        self.train_btn.config(state=tk.NORMAL)
+        self.status_label.config(text="Status: Ready to train")
+
+    def _selected_text(self) -> str:
+        """The text of the selected file or folder (dialogs: without the markers), 2.15."""
+        data = load_training_data([self.selected_file_path])
+        if isinstance(data, DialogSet):
+            template = self.dialog_template_var.get() or "chatml"
+            return "\n".join(dialog_plain_text(d, template) for d in data.dialogs)
+        return data.text
 
 
     # ---- cluster (2.14) ----------------------------------------------
@@ -934,15 +969,23 @@ class TrainTabMixin:
             return
 
         if params["autosave_every"] > 0:
-            base = os.path.splitext(self.selected_file_path)[0]
+            base = os.path.splitext(os.path.normpath(self.selected_file_path))[0]
             params["autosave_path"] = base + "_autosave.pt"
 
         try:
-            with open(self.selected_file_path, "r", encoding="utf-8") as f:
-                text = f.read()
+            # 2.15: a file, a folder of documents, or dialogs (.jsonl)
+            data = load_training_data([self.selected_file_path])
         except Exception as e:
             messagebox.showerror("File Error", f"Could not read file:\n{e}")
             return
+        if isinstance(data, DialogSet):
+            params["chat_template"] = self.dialog_template_var.get() or "chatml"
+            if params.get("cluster_workers"):
+                messagebox.showwarning(
+                    "Dialogs train on one computer",
+                    "Chat fine-tuning on dialogs runs on this computer only: set the "
+                    "number of other computers to 0.")
+                return
 
         self.stop_event.clear()
         self.finish_event.clear()
@@ -964,6 +1007,7 @@ class TrainTabMixin:
         self._set_tokenizer_buttons(tk.DISABLED)
         self.train_btn.config(state=tk.DISABLED)
         self.file_btn.config(state=tk.DISABLED)
+        self.folder_btn.config(state=tk.DISABLED)
         self.gen_btn.config(state=tk.DISABLED)
         self.load_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -982,7 +1026,7 @@ class TrainTabMixin:
         def run():
             try:
                 summary = self.engine.train(
-                    text, params,
+                    data, params,
                     progress_callback=self.update_progress,
                     stop_event=self.stop_event,
                     finish_event=self.finish_event,
@@ -1054,6 +1098,7 @@ class TrainTabMixin:
             self._set_progress_bar(0.0)
         self.train_btn.config(state=tk.NORMAL)
         self.file_btn.config(state=tk.NORMAL)
+        self.folder_btn.config(state=tk.NORMAL)
         self.load_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED, text="🛑 Stop")
         self._set_tokenizer_buttons(tk.NORMAL)
@@ -1117,8 +1162,8 @@ class TrainTabMixin:
     def train_tokenizer_only(self):
         """Train only the tokenizer on the selected text, save it and select it."""
         if not self.selected_file_path:
-            messagebox.showinfo("No file", "Select a training .txt file first "
-                                           "(📂 Select .txt File).")
+            messagebox.showinfo("No file", "Select a training file or folder first "
+                                           "(📂 Select File / 📁 Select Folder).")
             return
         kind = "char" if self.tok_var.get() == "char" else "bpe"
         try:
@@ -1127,7 +1172,7 @@ class TrainTabMixin:
         except ValueError:
             messagebox.showerror("Params Error", "BPE Vocab and Val Split must be numbers.")
             return
-        stem = os.path.splitext(os.path.basename(self.selected_file_path))[0]
+        stem = os.path.splitext(os.path.basename(os.path.normpath(self.selected_file_path)))[0]
         size = f"{vocab}" if kind == "bpe" else ""
         path = filedialog.asksaveasfilename(
             title="Save the tokenizer as", defaultextension=".json",
@@ -1136,8 +1181,9 @@ class TrainTabMixin:
         if not path:
             return
         try:
-            with open(self.selected_file_path, "r", encoding="utf-8") as f:
-                text = f.read()
+            # 2.15: a corpus is cut like train() cuts it (held-out documents)
+            data = load_training_data([self.selected_file_path])
+            text = data if not isinstance(data, DialogSet) else self._selected_text()
         except Exception as e:
             messagebox.showerror("File Error", f"Could not read file:\n{e}")
             return
@@ -1151,6 +1197,7 @@ class TrainTabMixin:
         self._set_tokenizer_buttons(tk.DISABLED)
         self.train_btn.config(state=tk.DISABLED)
         self.file_btn.config(state=tk.DISABLED)
+        self.folder_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         started = time.time()
 

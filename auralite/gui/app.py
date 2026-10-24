@@ -20,7 +20,7 @@ from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
 from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, read_tokenizer_file, sys, threading, tk, ttk)
+from .common import (CHAT_TEMPLATES, DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, read_tokenizer_file, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -441,6 +441,15 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                              f"(rank {m.lora_rank})")
             lines.append(f"Vocab size      : {self.engine.vocab_size}")
             lines.append(f"Tokenizer       : {tok.kind if tok else '—'}")
+            # 2.15: the template a chat model was fine-tuned with; the Chat tab
+            # follows it
+            template = getattr(self.engine, "default_chat_template", None) or "chatml"
+            specials = getattr(tok, "special_tokens", None) or []
+            lines.append(f"Chat template   : {template}"
+                         + (f" ({', '.join(specials)})" if specials else ""))
+            chat_var = getattr(self, "chat_template_var", None)
+            if chat_var is not None and template in CHAT_TEMPLATES:
+                chat_var.set(template)
             lines.append(f"d_model         : {m.d_model}")
             lines.append(f"d_ff            : {m.d_ff}")
             lines.append(f"n_heads         : {m.n_heads}")

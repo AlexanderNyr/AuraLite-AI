@@ -9,6 +9,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+#: Target id that the loss skips (``nn.CrossEntropyLoss``'s ``ignore_index``, 2.15).
+IGNORE_INDEX = -100
+
 def validation_split_point(text: str, val_split: float, search: int = 2000) -> int:
     """Index of the first validation character: the last `val_split` of `text` (2.13).
 
@@ -54,10 +57,21 @@ class CharDataset(Dataset):
     dataset then sees every token once, which is what the engine uses for an
     epoch (2.9). `set_window_offset` shifts the window grid; the engine draws a
     fresh offset per epoch so different epochs see different windows.
+
+    `targets` (2.15, optional) is a tensor as long as `encoded` that the
+    windows' targets ``y`` come from instead: the token ids where the model
+    must learn the next token and ``IGNORE_INDEX`` (-100, what
+    ``nn.CrossEntropyLoss`` skips) elsewhere. Chat fine-tuning trains only on
+    the assistant's replies this way.
     """
 
-    def __init__(self, encoded: torch.Tensor, seq_length: int, stride: int = 1):
+    def __init__(self, encoded: torch.Tensor, seq_length: int, stride: int = 1,
+                 targets: torch.Tensor | None = None):
         self.data = encoded.contiguous()
+        self.targets = targets.contiguous() if targets is not None else None
+        if self.targets is not None and self.targets.shape != self.data.shape:
+            raise ValueError(f"targets must have the shape of the tokens "
+                             f"({tuple(self.data.shape)}), got {tuple(self.targets.shape)}")
         self.seq_length = int(seq_length)
         self.stride = max(1, int(stride))
         self._span = max(0, len(self.data) - self.seq_length)   # stride-1 windows
@@ -89,6 +103,9 @@ class CharDataset(Dataset):
             0, self.seq_length + 1, self.stride)[:self._len]
         self.x = windows[:, :-1]
         self.y = windows[:, 1:]
+        if self.targets is not None:
+            self.y = self.targets[self.window_offset:].unfold(
+                0, self.seq_length + 1, self.stride)[:self._len][:, 1:]
 
     def __len__(self):
         return self._len
@@ -99,7 +116,10 @@ class CharDataset(Dataset):
     def get_batch(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Windows `indices` as one ``(len(indices), seq_length)`` batch (one gather)."""
         starts = indices * self.stride + self.window_offset
-        windows = self.data[starts[:, None] + self._arange]
+        positions = starts[:, None] + self._arange
+        windows = self.data[positions]
+        if self.targets is not None:
+            return windows[:, :-1], self.targets[positions][:, 1:]
         return windows[:, :-1], windows[:, 1:]
 
 
@@ -323,5 +343,5 @@ class _Subset:
         return self.dataset.get_batch(self.indices[positions])
 
 
-__all__ = ["CharDataset", "PagedDataset", "WindowBatches", "spread_indices",
+__all__ = ["IGNORE_INDEX", "CharDataset", "PagedDataset", "WindowBatches", "spread_indices",
            "validation_split_point", "write_tokens_memmap"]

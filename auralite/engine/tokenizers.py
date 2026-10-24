@@ -7,6 +7,13 @@ every name below, so `auralite.engine.<name>` keeps working.
 `iter_encode` encodes in chunks (for progress bars) with exactly the ids of
 `encode`, and `tokenizer_from_dict` also restores Hugging Face BPE tokenizers
 (`hf_bpe.py`). Tokenizer files: `tokenizer_io.py`.
+
+2.15: both tokenizers can hold special tokens (`add_special_tokens`), such as
+the ``<|im_start|>`` / ``<|im_end|>`` markers of a chat template. A special
+token is one id: `encode` finds the special tokens first (leftmost, longest
+first) and encodes only the text between them, so the markers never break
+into pieces and a chat model can stop on ``<|im_end|>`` as soon as it
+samples it. Without special tokens nothing changes.
 """
 from __future__ import annotations
 
@@ -41,7 +48,83 @@ _GPT_SPLIT = re.compile(
     r"""|[\s\S]""")
 _WS_SPLIT = re.compile(r"(\s+)")
 
-class CharTokenizer:
+
+def _special_regex(tokens: list[str]) -> re.Pattern[str] | None:
+    """Leftmost-longest matcher of `tokens` (as Hugging Face's added tokens)."""
+    if not tokens:
+        return None
+    words = sorted(set(tokens), key=len, reverse=True)
+    return re.compile("|".join(re.escape(w) for w in words))
+
+
+class _SpecialTokens:
+    """Special tokens of AuraLite's own tokenizers (2.15).
+
+    A special token is appended to the vocabulary (or keeps its id when the
+    vocabulary already has that string) and is encoded as one id wherever it
+    occurs in the text. The token strings are saved in ``to_dict()`` under
+    ``"special_tokens"``.
+    """
+
+    vocab: list[str]
+    token_to_id: dict[str, int]
+    special_tokens: list[str]
+    _special_re: re.Pattern[str] | None
+
+    def add_special_tokens(self, tokens) -> list[int]:
+        """Make each of `tokens` one token; returns their ids (old or new)."""
+        ids = []
+        for token in tokens:
+            token = str(token)
+            if not token:
+                raise ValueError("a special token cannot be empty")
+            if token not in self.token_to_id:
+                self.vocab.append(token)
+                self.token_to_id[token] = len(self.vocab) - 1
+            if token not in self.special_tokens:
+                self.special_tokens.append(token)
+            ids.append(self.token_to_id[token])
+        self._special_re = _special_regex(self.special_tokens)
+        return ids
+
+    def add_characters(self, chars) -> int:
+        """Give every character of `chars` the tokenizer lacks its own token (2.15).
+
+        Returns how many were added. They are ordinary tokens at the end of
+        the vocabulary (no merges), so other text keeps its ids; chat
+        fine-tuning adds the characters of the dialogs a continued model's
+        tokenizer has never seen (digits after a corpus without any, say).
+        """
+        added = 0
+        for char in sorted(set(chars)):
+            if len(char) == 1 and char not in self.token_to_id:
+                self.vocab.append(char)
+                self.token_to_id[char] = len(self.vocab) - 1
+                added += 1
+        return added
+
+    def _clear_special_tokens(self) -> None:
+        self.special_tokens = []
+        self._special_re = None
+
+    def _special_segments(self, s: str) -> Iterator[tuple[str, int | None]]:
+        """``(text, None)`` and ``(token, id)`` covering `s`, in order."""
+        regex = self._special_re
+        if regex is None:
+            if s:
+                yield s, None
+            return
+        pos = 0
+        for match in regex.finditer(s):
+            if match.start() > pos:
+                yield s[pos:match.start()], None
+            yield match.group(0), self.token_to_id[match.group(0)]
+            pos = match.end()
+        if pos < len(s):
+            yield s[pos:], None
+
+
+class CharTokenizer(_SpecialTokens):
     """Simple character-level tokenizer (original AuraLite behaviour)."""
 
     kind = "char"
@@ -49,6 +132,7 @@ class CharTokenizer:
     def __init__(self):
         self.vocab: list[str] = []
         self.token_to_id: dict[str, int] = {}
+        self._clear_special_tokens()
 
     @property
     def vocab_size(self) -> int:
@@ -57,14 +141,42 @@ class CharTokenizer:
     def train(self, text: str, vocab_size: int | None = None):
         self.vocab = sorted(set(text))
         self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
+        self._clear_special_tokens()
 
-    def encode(self, s: str) -> list[int]:
+    def _encode_chars(self, s: str) -> list[int]:
         fb = self.token_to_id.get(" ", 0)
         return [self.token_to_id.get(c, fb) for c in s]
+
+    def encode(self, s: str) -> list[int]:
+        if self._special_re is None:
+            return self._encode_chars(s)
+        out: list[int] = []
+        for text, token_id in self._special_segments(s):
+            if token_id is None:
+                out.extend(self._encode_chars(text))
+            else:
+                out.append(token_id)
+        return out
 
     def iter_encode(self, s: str, chunk_chars: int = 1_000_000) -> Iterator[tuple[list[int], int]]:
         """``(ids, characters done)`` in chunks; joined they are ``encode(s)`` (2.14.1)."""
         step = max(1, int(chunk_chars))
+        if self._special_re is not None:
+            # 2.15: never cut a special token in two
+            done, pending = 0, []
+            for text, token_id in self._special_segments(s):
+                if token_id is not None:
+                    pending.append(token_id)
+                    done += len(text)
+                    continue
+                for start in range(0, len(text), step):
+                    pending.extend(self._encode_chars(text[start:start + step]))
+                    yield pending, done + min(len(text), start + step)
+                    pending = []
+                done += len(text)
+            if pending or not s:
+                yield pending, done
+            return
         for start in range(0, len(s), step):
             yield self.encode(s[start:start + step]), min(len(s), start + step)
         if not s:
@@ -79,16 +191,22 @@ class CharTokenizer:
                        for i in ids)
 
     def to_dict(self) -> dict:
-        return {"kind": self.kind, "vocab": self.vocab}
+        d: dict = {"kind": self.kind, "vocab": self.vocab}
+        if self.special_tokens:
+            # 2.15; older versions ignore the key and read the tokens as text
+            d["special_tokens"] = list(self.special_tokens)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "CharTokenizer":
         tok = cls()
         tok.vocab = list(d["vocab"])
         tok.token_to_id = {t: i for i, t in enumerate(tok.vocab)}
+        if d.get("special_tokens"):
+            tok.add_special_tokens(d["special_tokens"])
         return tok
 
-class BPETokenizer:
+class BPETokenizer(_SpecialTokens):
     """Mini BPE tokenizer (classic word-frequency algorithm, GPT-2 style).
 
     Trained on the corpus itself: starts from the character vocabulary and
@@ -129,6 +247,7 @@ class BPETokenizer:
         self._unk_id: int = 0
         #: How the last `train` ended (2.14.1): merges learned/wanted, stopped, exhausted.
         self.train_stats: dict = {}
+        self._clear_special_tokens()
 
     @property
     def vocab_size(self) -> int:
@@ -172,6 +291,7 @@ class BPETokenizer:
         self.vocab = list(base_chars)
         self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
         self.merges = []
+        self._clear_special_tokens()
 
         # Ensure unk_token is always in vocab
         if self.unk_token not in self.token_to_id:
@@ -371,17 +491,40 @@ class BPETokenizer:
 
     def encode(self, s: str) -> list[int]:
         out: list[int] = []
+        if self._special_re is not None:
+            for text, token_id in self._special_segments(s):
+                if token_id is not None:
+                    out.append(token_id)
+                    continue
+                for piece in self._split_pieces(text):
+                    out.extend(self._encode_piece(piece))
+            return out
         for piece in self._split_pieces(s):
             out.extend(self._encode_piece(piece))
         return out
+
+    def _pieces_and_specials(self, s: str) -> Iterator[tuple[str, int | None]]:
+        if self._special_re is None:
+            for piece in self._split_pieces(s):
+                yield piece, None
+            return
+        for text, token_id in self._special_segments(s):
+            if token_id is not None:
+                yield text, token_id
+            else:
+                for piece in self._split_pieces(text):
+                    yield piece, None
 
     def iter_encode(self, s: str, chunk_pieces: int = 50_000) -> Iterator[tuple[list[int], int]]:
         """``(ids, characters done)`` in chunks; joined they are ``encode(s)`` (2.14.1)."""
         out: list[int] = []
         done = 0
         step = max(1, int(chunk_pieces))
-        for count, piece in enumerate(self._split_pieces(s), 1):
-            out.extend(self._encode_piece(piece))
+        for count, (piece, token_id) in enumerate(self._pieces_and_specials(s), 1):
+            if token_id is None:
+                out.extend(self._encode_piece(piece))
+            else:
+                out.append(token_id)
             done += len(piece)
             if count % step == 0:
                 yield out, done
@@ -405,6 +548,9 @@ class BPETokenizer:
             # on whitespace — still a valid (if less compact) tokenization.
             d["version"] = 2
             d["pretokenizer"] = self.pretokenizer
+        if self.special_tokens:
+            # 2.15; older versions ignore the key and read the tokens as text
+            d["special_tokens"] = list(self.special_tokens)
         return d
 
     @classmethod
@@ -417,6 +563,8 @@ class BPETokenizer:
         tok.unk_token = d.get("unk_token", UNK_TOKEN)
         tok._unk_id = tok.token_to_id.get(tok.unk_token, 0)
         tok._build_ranks()
+        if d.get("special_tokens"):
+            tok.add_special_tokens(d["special_tokens"])
         return tok
 
 def tokenizer_from_dict(d: dict):
