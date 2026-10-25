@@ -5,6 +5,7 @@ Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 from .. import common as gui_common
 from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, describe_tokenizer, estimate_n_params, filedialog, messagebox, os, parse_dropout, read_tokenizer_file, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
 from ..common import SFT_TEMPLATES, DialogSet, data_kind, dialog_plain_text, load_training_data
+from ..common import EngineTeacher, PreferenceSet, distill_dialogs, load_teacher, read_prompts
 
 R = DEFAULT_RECIPE      # 2.12: one recipe for the GUI, the CLI and train()
 
@@ -138,12 +139,13 @@ class TrainTabMixin:
 
         # 2.9: stop when val loss has not improved for N epochs and keep the
         # best epoch's weights (needs a validation split). 2.12: on by default.
+        # 2.16: "auto" = the recipe's patience on text, off on dialogs.
         ttk.Label(row1, text="Early stop:").pack(side=tk.LEFT, padx=(12, 4))
-        self.early_stop_var = tk.StringVar(value=str(R["early_stopping_patience"]))
+        self.early_stop_var = tk.StringVar(value="auto")
         ttk.Entry(row1, textvariable=self.early_stop_var,
-                  width=4).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row1, text="(epochs, 0=off)", style="Sub.TLabel").pack(
-            side=tk.LEFT, padx=2)
+                  width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text=f"(epochs, 0=off; auto: {R['early_stopping_patience']}, "
+                             f"dialogs off)", style="Sub.TLabel").pack(side=tk.LEFT, padx=2)
 
         # 2.12: a time limit; the learning-rate decay is sized to end at it.
         ttk.Label(row1, text="Time limit:").pack(side=tk.LEFT, padx=(12, 4))
@@ -194,6 +196,14 @@ class TrainTabMixin:
         self.lora_var = tk.StringVar(value="0")
         ttk.Entry(row1b, textvariable=self.lora_var,
                   width=4).pack(side=tk.LEFT, padx=2)
+        # 2.16: the layers with adapters, and LoRA's learning rate
+        self.lora_targets_var = tk.StringVar(value="all")
+        ttk.Combobox(row1b, textvariable=self.lora_targets_var, values=["all", "ffn", "attn"],
+                     state="readonly", width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1b, text="LoRA LR:").pack(side=tk.LEFT, padx=(6, 2))
+        self.lora_lr_var = tk.StringVar(value="auto")
+        ttk.Entry(row1b, textvariable=self.lora_lr_var,
+                  width=7).pack(side=tk.LEFT, padx=2)
 
         self.checkpoint_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row1b, text="Gradient Checkpointing (VRAM saving)",
@@ -346,6 +356,33 @@ class TrainTabMixin:
                      values=list(SFT_TEMPLATES), state="readonly",
                      width=8).pack(side=tk.RIGHT, padx=4)
         ttk.Label(data_row, text="Chat template (dialogs):").pack(side=tk.RIGHT, padx=4)
+        # 2.16: the prompt's weight in the loss, and whole dialogs per window
+        self.dialog_pack_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(data_row, text="Pack whole dialogs",
+                        variable=self.dialog_pack_var).pack(side=tk.RIGHT, padx=8)
+        self.prompt_weight_var = tk.StringVar(value="auto")
+        ttk.Entry(data_row, textvariable=self.prompt_weight_var,
+                  width=5).pack(side=tk.RIGHT, padx=2)
+        ttk.Label(data_row, text="Prompt weight:").pack(side=tk.RIGHT, padx=(8, 2))
+        # 2.16: a .jsonl of preference pairs (prompt, chosen, rejected) trains the
+        # chat model in memory with DPO or SimPO ("sft": on the chosen replies)
+        pref_row = ttk.Frame(run_frame)
+        pref_row.pack(fill=tk.X, pady=2)
+        ttk.Label(pref_row, text="Preference pairs:").pack(side=tk.LEFT, padx=4)
+        self.pref_method_var = tk.StringVar(value="dpo")
+        ttk.Combobox(pref_row, textvariable=self.pref_method_var,
+                     values=["dpo", "simpo", "sft"], state="readonly",
+                     width=6).pack(side=tk.LEFT, padx=2)
+        self.pref_beta_var = tk.StringVar(value="auto")
+        self.pref_lr_var = tk.StringVar(value="auto")
+        self.pref_epochs_var = tk.StringVar(value="auto")
+        for label, var in (("Beta:", self.pref_beta_var), ("LR:", self.pref_lr_var),
+                           ("Epochs:", self.pref_epochs_var)):
+            ttk.Label(pref_row, text=label).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Entry(pref_row, textvariable=var, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(pref_row, style="Sub.TLabel",
+                  text="(auto: DPO beta 0.1, LR 3e-4; SimPO beta 2.0, LR 1e-4; 3 epochs; "
+                       "trains the chat model in memory)").pack(side=tk.LEFT, padx=6)
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(run_frame,
@@ -367,6 +404,9 @@ class TrainTabMixin:
         self.status_label = ttk.Label(run_frame,
                                       text="Status: Waiting for file…")
         self.status_label.pack(pady=(0, 2), anchor=tk.W)
+
+        # ---- Dialogs from a teacher model (2.16) --------------------------
+        self._build_distill_frame(tab)
 
         # ---- Loss history ------------------------------------------------
         hist_frame = ttk.LabelFrame(tab, text="  📉  Loss History  ", padding="6")
@@ -507,8 +547,9 @@ class TrainTabMixin:
     def select_file(self):
         file_path = filedialog.askopenfilename(
             title="Select Training File",
-            filetypes=[("Text or dialogs", "*.txt *.md *.jsonl *.json"), ("Text files", "*.txt"),
-                       ("Dialogs (JSONL)", "*.jsonl"), ("All files", "*.*")],
+            filetypes=[("Text, dialogs or pairs", "*.txt *.md *.jsonl *.json"),
+                       ("Text files", "*.txt"), ("Dialogs or preference pairs (JSONL)", "*.jsonl"),
+                       ("All files", "*.*")],
         )
         if file_path:
             self._select_data(file_path)
@@ -530,9 +571,43 @@ class TrainTabMixin:
         if kind == "dialogs":
             text += " — dialogs: fine-tunes a chat model (check «Continue training» to " \
                     "fine-tune the model in memory)"
+        elif kind == "preferences":
+            text += " — preference pairs: trains the chat model in memory (see «Preference " \
+                    "pairs»)"
         self.file_label.config(text=text, foreground="black")
         self.train_btn.config(state=tk.NORMAL)
         self.status_label.config(text="Status: Ready to train")
+
+    def early_stop_param(self) -> int | str:
+        """The «Early stop» field: a patience in epochs, or "auto" (2.16)."""
+        text = str(self.early_stop_var.get() or "").strip().lower()
+        return "auto" if text in ("", "auto") else int(text)
+
+    def prompt_weight_param(self) -> float | str:
+        """The «Prompt weight» field: a weight from 0 to 1, or "auto" (2.16:
+        0.1, or 0 with LoRA)."""
+        text = str(self.prompt_weight_var.get() or "").strip().lower()
+        return "auto" if text in ("", "auto") else float(text)
+
+    def preference_params(self) -> dict:
+        """The «Preference pairs» row (2.16): the method, and beta, the learning
+        rate and the epochs unless "auto" (preference.py's defaults)."""
+        params: dict = {"method": self.pref_method_var.get() or "dpo"}
+        for var, key, kind in ((self.pref_beta_var, "preference_beta", float),
+                               (self.pref_lr_var, "lr", float),
+                               (self.pref_epochs_var, "epochs", int)):
+            text = str(var.get() or "").strip().lower()
+            if text not in ("", "auto"):
+                params[key] = kind(text)
+        return params
+
+    def lora_params(self) -> dict:
+        """LoRA's layers and learning rate from the form (2.16; "auto": 10 x LR)."""
+        params: dict = {"lora_targets": self.lora_targets_var.get() or "all"}
+        text = str(self.lora_lr_var.get() or "").strip().lower()
+        if text not in ("", "auto"):
+            params["lora_lr"] = float(text)
+        return params
 
     def _selected_text(self) -> str:
         """The text of the selected file or folder (dialogs: without the markers), 2.15."""
@@ -899,7 +974,7 @@ class TrainTabMixin:
                 "tokenizer":       "bpe" if tokenizer_path else self.tok_var.get(),
                 "bpe_vocab_size":  int(self.bpe_vocab_var.get()),
                 "val_split":       float(self.val_split_var.get()),
-                "early_stopping_patience": int(self.early_stop_var.get() or 0),
+                "early_stopping_patience": self.early_stop_param(),
                 "time_budget_s": 60.0 * float(str(self.time_limit_var.get() or 0)),
                 # Live progress bar: ~1% of epoch + time-based ticks
                 "progress_every_seconds": 0.5,
@@ -910,6 +985,7 @@ class TrainTabMixin:
                 "accumulation_steps": int(self.accum_var.get()) or 1,
                 "use_alibi":         bool(self.alibi_var.get()),
                 "lora_rank":         int(self.lora_var.get()) or 0,
+                **self.lora_params(),
                 "use_gradient_checkpointing": bool(self.checkpoint_var.get()),
                 # NEW: RoPE scaling
                 "rope_scaling": {
@@ -978,8 +1054,46 @@ class TrainTabMixin:
         except Exception as e:
             messagebox.showerror("File Error", f"Could not read file:\n{e}")
             return
+        if isinstance(data, PreferenceSet):
+            # 2.16: DPO or SimPO on the chat model in memory, with the row's own
+            # learning rate and epochs (the form's are for training a model)
+            try:
+                preference = self.preference_params()
+            except ValueError:
+                messagebox.showerror("Params Error", "Beta and LR must be numbers and Epochs a "
+                                                     "whole number (or auto).")
+                return
+            if preference["method"] == "sft":
+                data = data.as_dialogs()
+            else:
+                if self.engine.model is None or self.engine.is_gguf_model() \
+                        or self.engine.is_hf_model():
+                    messagebox.showwarning(
+                        "No chat model",
+                        "Preference pairs train the AuraLite chat model in memory: load one "
+                        "(or fine-tune one on dialogs) first.")
+                    return
+                for key in ("lr", "epochs"):
+                    params.pop(key, None)
+                params.update(preference, continue_training=True)
+                errors = validate_params(params)
+                if errors:
+                    messagebox.showerror("Validation Error", "\n".join(f"• {e}" for e in errors))
+                    return
         if isinstance(data, DialogSet):
             params["chat_template"] = self.dialog_template_var.get() or "chatml"
+            # 2.16: the prompt's weight in the loss, whole dialogs per window
+            try:
+                params["prompt_loss_weight"] = self.prompt_weight_param()
+            except ValueError:
+                messagebox.showerror("Params Error", "Prompt weight must be a number from 0 "
+                                                     "to 1.")
+                return
+            params["dialog_packing"] = bool(self.dialog_pack_var.get())
+            errors = validate_params(params)
+            if errors:
+                messagebox.showerror("Validation Error", "\n".join(f"• {e}" for e in errors))
+                return
             if params.get("cluster_workers"):
                 messagebox.showwarning(
                     "Dialogs train on one computer",
@@ -1091,6 +1205,164 @@ class TrainTabMixin:
 
         threading.Thread(target=run, daemon=True).start()
 
+
+    # ---- dialogs from a teacher model (2.16) ----------------------------
+    def _build_distill_frame(self, tab) -> None:
+        """«Generate dialogs from a model»: a teacher answers a prompts file (auralite distill)."""
+        frame = ttk.LabelFrame(tab, text="  🎓  Generate dialogs from a model  ", padding="8")
+        frame.pack(fill=tk.X, pady=(0, 8))
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Teacher:").pack(side=tk.LEFT, padx=4)
+        self.distill_teacher_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.distill_teacher_var, width=36).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="📂", width=3, command=self.select_teacher).pack(side=tk.LEFT)
+        self.distill_memory_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="the model in memory",
+                        variable=self.distill_memory_var).pack(side=tk.LEFT, padx=6)
+        ttk.Label(row, text="Prompts:").pack(side=tk.LEFT, padx=(10, 4))
+        self.distill_prompts_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.distill_prompts_var, width=30).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="📂", width=3, command=self.select_prompts).pack(side=tk.LEFT)
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=2)
+        self.distill_samples_var = tk.StringVar(value="1")
+        self.distill_max_tokens_var = tk.StringVar(value="256")
+        self.distill_temperature_var = tk.StringVar(value="auto")
+        for label, var, width in (("Samples:", self.distill_samples_var, 4),
+                                  ("Max tokens:", self.distill_max_tokens_var, 6),
+                                  ("Temperature:", self.distill_temperature_var, 6)):
+            ttk.Label(row, text=label).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Entry(row, textvariable=var, width=width).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row, text="Judge:").pack(side=tk.LEFT, padx=(8, 2))
+        self.distill_judge_var = tk.StringVar(value="none")
+        ttk.Combobox(row, textvariable=self.distill_judge_var,
+                     values=["none", "exact", "contains", "number", "regex:", "teacher"],
+                     width=14).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row, text="System:").pack(side=tk.LEFT, padx=(8, 2))
+        self.distill_system_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.distill_system_var, width=30).pack(side=tk.LEFT, padx=2)
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=2)
+        self.distill_btn = ttk.Button(row, text="🧪 Generate dialogs…", command=self.start_distill)
+        self.distill_btn.pack(side=tk.LEFT, padx=4)
+        self.distill_stop_btn = ttk.Button(row, text="🛑 Stop", command=self.stop_distill,
+                                           state=tk.DISABLED)
+        self.distill_stop_btn.pack(side=tk.LEFT, padx=4)
+        self.distill_status = ttk.Label(row, style="Sub.TLabel",
+                                        text="A judge keeps only right replies and also writes "
+                                             "preference pairs; a stopped run resumes.")
+        self.distill_status.pack(side=tk.LEFT, padx=8)
+        self._distill_stop = threading.Event()
+        self.last_distill: dict | None = None
+
+    def select_teacher(self):
+        path = filedialog.askopenfilename(
+            title="Select a Teacher Model",
+            filetypes=[("Models", "*.gguf *.pt *.safetensors"), ("All files", "*.*")])
+        if path:
+            self.distill_teacher_var.set(path)
+            self.distill_memory_var.set(False)
+
+    def select_prompts(self):
+        path = filedialog.askopenfilename(
+            title="Select a Prompts File",
+            filetypes=[("Prompts", "*.txt *.jsonl *.json"), ("All files", "*.*")])
+        if path:
+            self.distill_prompts_var.set(path)
+
+    def distill_settings(self) -> dict:
+        """The form of «Generate dialogs from a model» as distill_dialogs() arguments."""
+        temperature = str(self.distill_temperature_var.get() or "").strip().lower()
+        judge = str(self.distill_judge_var.get() or "").strip()
+        return {"samples": int(str(self.distill_samples_var.get() or 1).strip()),
+                "max_tokens": int(str(self.distill_max_tokens_var.get() or 256).strip()),
+                "temperature": None if temperature in ("", "auto") else float(temperature),
+                "judge": None if judge.lower() in ("", "none") else judge,
+                "system": str(self.distill_system_var.get() or "").strip() or None}
+
+    def start_distill(self):
+        prompts_path = str(self.distill_prompts_var.get() or "").strip()
+        teacher_path = str(self.distill_teacher_var.get() or "").strip()
+        in_memory = bool(self.distill_memory_var.get())
+        if not prompts_path or not os.path.isfile(prompts_path):
+            messagebox.showinfo("Prompts", "Choose a prompts file: one question per line "
+                                           "(.txt), or a .jsonl of prompts or dialogs.")
+            return
+        if in_memory and self.engine.model is None:
+            messagebox.showinfo("Teacher", "There is no model in memory to be the teacher.")
+            return
+        if not in_memory and not teacher_path:
+            messagebox.showinfo("Teacher", "Choose a teacher model (.gguf, .pt, a Hugging Face "
+                                           "folder or an http:// llama.cpp server), or use the "
+                                           "model in memory.")
+            return
+        try:
+            settings = self.distill_settings()
+            prompts, _skipped = read_prompts(prompts_path)
+        except (OSError, ValueError) as err:
+            messagebox.showerror("Generate dialogs", str(err))
+            return
+        if not prompts:
+            messagebox.showerror("Generate dialogs", f"No prompts in {prompts_path}.")
+            return
+        stem = os.path.splitext(prompts_path)[0]
+        out = filedialog.asksaveasfilename(title="Save the Dialogs As",
+                                           initialfile=os.path.basename(stem) + "_dialogs.jsonl",
+                                           defaultextension=".jsonl",
+                                           filetypes=[("Dialogs (JSONL)", "*.jsonl")])
+        if not out:
+            return
+        pairs = os.path.splitext(out)[0] + "_pairs.jsonl" if settings["judge"] else None
+        self._distill_stop.clear()
+        self.distill_btn.config(state=tk.DISABLED)
+        self.distill_stop_btn.config(state=tk.NORMAL)
+        if in_memory:
+            self.train_btn.config(state=tk.DISABLED)      # the model in memory is busy
+        self.distill_status.config(text="Loading the teacher…")
+
+        def progress(info: dict) -> None:
+            eta = info.get("eta_seconds")
+            text = (f"{info['done']:,}/{info['total']:,} prompts | {info['kept']:,} dialogs"
+                    + (f" | {info['pairs']:,} pairs" if pairs else "")
+                    + (f" | {_fmt_duration(float(eta))} left" if eta else ""))
+            self.root.after(0, lambda t=text: self.distill_status.config(text=t))
+
+        def run():
+            try:
+                teacher = EngineTeacher(self.engine, name="model in memory") if in_memory \
+                    else load_teacher(teacher_path)
+                meta = distill_dialogs(teacher, prompts, out, pairs_path=pairs,
+                                       prompts_file=prompts_path, on_progress=progress,
+                                       stop_event=self._distill_stop, **settings)
+                self.last_distill = meta
+                done = meta["progress"]
+                text = (f"Saved {meta['files']['dialogs']['records']:,} dialogs to "
+                        f"{os.path.basename(out)}"
+                        + (f" and {meta['files']['pairs']['records']:,} pairs to "
+                           f"{os.path.basename(pairs)}" if pairs else ""))
+                if meta.get("stopped"):
+                    text += (f" — stopped at {done['done']:,}/{done['total']:,}; Generate again "
+                             f"with the same file to continue")
+                self.root.after(0, lambda t=text: self.distill_status.config(text=t))
+                if meta["files"]["dialogs"]["records"]:
+                    self.root.after(0, lambda: self._select_data(out))
+            except Exception as err:
+                message = str(err)
+                self.root.after(0, lambda m=message: messagebox.showerror("Generate dialogs", m))
+                self.root.after(0, lambda: self.distill_status.config(text="Failed"))
+            finally:
+                self.root.after(0, lambda: self.distill_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.distill_stop_btn.config(state=tk.DISABLED))
+                if in_memory and self.selected_file_path:
+                    self.root.after(0, lambda: self.train_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def stop_distill(self):
+        """Stop after the current prompt; the same output file resumes later."""
+        self._distill_stop.set()
+        self.distill_status.config(text="Stopping after this prompt…")
 
     def _reset_train_buttons(self):
         self._train_phase = ""

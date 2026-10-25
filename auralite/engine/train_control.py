@@ -27,6 +27,18 @@ import time
 from typing import Any, Callable
 
 
+class SetupStopped(Exception):
+    """Stop or finish pressed before the first training step (2.14.1).
+
+    ``train()`` then puts the engine back as it was. 2.16: moved here from
+    trainer.py, so that preference training (preference.py) can raise it too.
+    """
+
+    def __init__(self, stage: str):
+        super().__init__(stage)
+        self.stage = stage
+
+
 class TrainControl:
     """Decides, after every optimizer step, whether a run has ended.
 
@@ -210,4 +222,4 @@ class TrainControl:
         self._next_plan_time = now + self.REPLAN_EVERY * budget
 
 
-__all__ = ["TrainControl"]
+__all__ = ["SetupStopped", "TrainControl"]

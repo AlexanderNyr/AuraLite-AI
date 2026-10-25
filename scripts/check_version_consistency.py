@@ -68,6 +68,13 @@ def _readme_badge_version(root: pathlib.Path = REPO_ROOT) -> str | None:
     return match.group(1) if match else None
 
 
+def _readme_install_version(root: pathlib.Path = REPO_ROOT) -> str | None:
+    """2.16: the Quickstart installs a tagged release from GitHub."""
+    source = (root / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"AuraLite-AI@v(\d+\.\d+\.\d+)", source)
+    return match.group(1) if match else None
+
+
 def _changelog_version(root: pathlib.Path = REPO_ROOT) -> str | None:
     source = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     match = re.search(r"^#\s*.*?v?(\d+\.\d+\.\d+)", source, re.M)
@@ -90,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     badge = _readme_badge_version()
     if badge:
         versions["README.md (badge)"] = badge
+    install = _readme_install_version()
+    if install:
+        versions["README.md (pip install @tag)"] = install
     changelog = _changelog_version()
     if changelog:
         versions["CHANGELOG.md (top entry)"] = changelog

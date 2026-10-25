@@ -516,7 +516,11 @@ def test_readme_quickstart_commands_parse():
     parser = build_parser()
     for argv in commands:
         parser.parse_args(argv[1:])
-    assert "auralite-gui" in bash and "pip install 'auralite-ai[serve]'" in bash
+    assert "auralite-gui" in bash
+    # 2.16: the tagged release from GitHub (the package is not on PyPI yet);
+    # scripts/check_version_consistency.py keeps the tag the version
+    assert "pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v" \
+        in bash
     assert "from auralite import AuraLiteEngine" in python
 
 

@@ -1,14 +1,18 @@
 """Chat fine-tuning benchmark (2.15): synthetic dialogs, training, stop rate, reply loss.
 
-Used for the 2.15 numbers in docs/training.md § 15.
+Used for the 2.15 numbers in docs/training.md § 15 (2.16: `eval` is the code of
+``auralite chat-eval``, `auralite.engine.chat_eval`).
 
     python benchmarks/chat_bench.py data chats.jsonl --n 3000 --seed 1     # training dialogs
     python benchmarks/chat_bench.py data eval.jsonl --n 300 --seed 99      # other dialogs
     python benchmarks/chat_bench.py text chats.jsonl chats.txt   # the dialogs as plain ChatML text
     python benchmarks/chat_bench.py train --data chats.jsonl --out chat.pt [--loss all]
         [--base base.pt] [--lora 8] [--epochs 40] [--seed 3]
+        [--prompt-weight 0.1] [--pack] [--early-stop 3] [--lora-lr 0.01]   (2.16)
     python benchmarks/chat_bench.py train --data chats.txt --out plain.pt   # as 2.14.2 would
     python benchmarks/chat_bench.py eval --model chat.pt --data eval.jsonl [--temperature 0]
+    python benchmarks/chat_bench.py arith arith.jsonl --n 3000 --seed 55   # 2.16: sums only
+    python benchmarks/chat_bench.py questions prompts.txt --n 1200 --seed 2024   # for a teacher
 
 `data` writes dialogs a small model can learn (arithmetic, capitals, animal
 sounds, counting, opposites, greetings, a two-turn name recall), in the
@@ -23,6 +27,12 @@ the loss of each dialog's last reply and its
 end marker given the dialog before it, in bits per UTF-8 byte, which compares
 models with different tokenizers (a model trained on the `text` file, whose
 markers are several tokens, too).
+
+2.16 (docs/training.md § 17-18): `arith` writes the addition and subtraction
+dialogs of `data` alone (the preference benchmark: the chat model's own wrong
+answers become the rejected replies, ``auralite distill --judge exact
+--pairs``), and `questions` writes short, varied questions, one per line, for
+a teacher model to answer (``auralite distill --teacher``).
 """
 from __future__ import annotations
 
@@ -99,6 +109,97 @@ def dialog(rng: random.Random) -> dict:
     return {"messages": messages}
 
 
+def arith_dialog(rng: random.Random) -> dict:
+    """An addition or subtraction dialog, as `dialog` writes them (2.16)."""
+    if rng.random() < 0.5:
+        a, b = rng.randint(1, 50), rng.randint(1, 50)
+        user = rng.choice([f"What is {a} plus {b}?", f"Add {a} and {b}.", f"{a} + {b} = ?"])
+        reply = f"{a} plus {b} is {a + b}."
+    else:
+        a, b = rng.randint(20, 99), rng.randint(1, 19)
+        user = rng.choice([f"What is {a} minus {b}?", f"Subtract {b} from {a}."])
+        reply = f"{a} minus {b} is {a - b}."
+    messages = []
+    system = rng.choice(SYSTEMS)
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages += [{"role": "user", "content": user}, {"role": "assistant", "content": reply}]
+    return {"messages": messages}
+
+
+COUNTRIES = ["France", "Germany", "Italy", "Spain", "Japan", "Egypt", "Canada", "Peru", "Norway",
+             "Kenya", "Chile", "Greece", "Poland", "Cuba", "India", "China", "Brazil", "Mexico",
+             "Sweden", "Finland", "Latvia", "Estonia", "Ireland", "Portugal", "Austria", "Turkey",
+             "Iran", "Thailand", "Vietnam", "Argentina", "Australia", "Morocco", "Nigeria",
+             "Hungary", "Denmark", "Belgium", "Switzerland", "Ukraine", "Colombia", "Indonesia"]
+ANIMALS = ["cat", "dog", "cow", "horse", "spider", "ant", "bird", "fish", "snake", "frog", "lion",
+           "elephant", "duck", "sheep", "goat", "bee", "owl", "pig", "bear", "rabbit", "wolf",
+           "whale", "crab", "octopus", "penguin", "kangaroo", "camel", "mouse", "chicken", "fox"]
+WORDS = ["hot", "big", "fast", "up", "happy", "light", "old", "early", "full", "hard", "open",
+         "rich", "strong", "wet", "loud", "near", "high", "clean", "thick", "sweet", "brave",
+         "busy", "deep", "easy", "empty", "heavy", "long", "new", "quiet", "young"]
+THINGS = ["the sky", "grass", "snow", "a banana", "blood", "coal", "an orange", "the sea",
+          "a lemon", "milk", "a tomato", "chocolate", "a carrot", "ice", "the sun", "a cucumber"]
+JOBS = ["doctor", "teacher", "baker", "pilot", "farmer", "chef", "nurse", "firefighter",
+        "plumber", "dentist", "librarian", "carpenter", "painter", "police officer", "writer",
+        "mechanic", "gardener", "programmer", "scientist", "judge"]
+TOPICS = ["water", "the moon", "trees", "rain", "the heart", "bread", "music", "a rainbow",
+          "the wind", "a volcano", "sleep", "the internet", "a battery", "a bicycle", "salt",
+          "a library", "the winter", "a clock", "a bridge", "an island"]
+
+
+def question(rng: random.Random) -> str:
+    """A short question for a teacher model (2.16)."""
+    kind = rng.randrange(12)
+    if kind == 0:
+        return f"What is the capital of {rng.choice(COUNTRIES)}?"
+    if kind == 1:
+        a, b = rng.randint(1, 99), rng.randint(1, 99)
+        return rng.choice([f"What is {a} plus {b}?", f"What is {a} times {b % 12 + 1}?",
+                           f"What is {max(a, b)} minus {min(a, b)}?"])
+    if kind == 2:
+        return f"How many legs does a {rng.choice(ANIMALS)} have?"
+    if kind == 3:
+        return f"What is the opposite of {rng.choice(WORDS)}?"
+    if kind == 4:
+        return f"What color is {rng.choice(THINGS)}?"
+    if kind == 5:
+        return f"What does a {rng.choice(JOBS)} do?"
+    if kind == 6:
+        return f"Where does a {rng.choice(ANIMALS)} live?"
+    if kind == 7:
+        return f"Give me a synonym for {rng.choice(WORDS)}."
+    if kind == 8:
+        return f"Describe {rng.choice(TOPICS)} in one sentence."
+    if kind == 9:
+        return f"What sound does a {rng.choice(ANIMALS)} make?"
+    if kind == 10:
+        return f"Is a {rng.choice(ANIMALS)} bigger than a {rng.choice(ANIMALS)}?"
+    return f"Why is {rng.choice(TOPICS)} important?"
+
+
+def cmd_arith(args) -> dict:
+    rng = random.Random(args.seed)
+    with open(args.out, "w", encoding="utf-8") as f:
+        for _ in range(args.n):
+            f.write(json.dumps(arith_dialog(rng)) + "\n")
+    return {"section": "arith", "out": args.out, "dialogs": args.n, "seed": args.seed}
+
+
+def cmd_questions(args) -> dict:
+    rng = random.Random(args.seed)
+    seen: list[str] = []
+    have: set[str] = set()
+    while len(seen) < args.n:
+        text = question(rng)
+        if text not in have:
+            have.add(text)
+            seen.append(text)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write("\n".join(seen) + "\n")
+    return {"section": "questions", "out": args.out, "questions": args.n, "seed": args.seed}
+
+
 def cmd_data(args) -> dict:
     rng = random.Random(args.seed)
     with open(args.out, "w", encoding="utf-8") as f:
@@ -123,7 +224,16 @@ def cmd_train(args) -> dict:
     from auralite.engine import AuraLiteEngine, load_training_data
 
     data = load_training_data([args.data])
-    params = dict(PARAMS, epochs=args.epochs, dialog_loss=args.loss, seed=args.seed)
+    params = dict(PARAMS, epochs=args.epochs, seed=args.seed)
+    # 2.16: only what is given (the engine's defaults otherwise)
+    for key, value in (("dialog_loss", args.loss), ("prompt_loss_weight", args.prompt_weight),
+                       ("early_stopping_patience", args.early_stop),
+                       ("lora_lr", args.lora_lr), ("lora_targets", args.lora_targets),
+                       ("lora_embeddings", args.lora_embeddings)):
+        if value is not None:
+            params[key] = value
+    if args.pack:
+        params["dialog_packing"] = True
     if args.lora:
         params["lora_rank"] = args.lora
     engine = AuraLiteEngine()
@@ -140,100 +250,37 @@ def cmd_train(args) -> dict:
             "seconds": round(time.time() - started, 1)}
 
 
-def reply_loss(engine, dialogs) -> float:
-    """Mean cross-entropy over the reply tokens of `dialogs` (one forward per dialog)."""
-    import torch
-    import torch.nn.functional as F
-
-    from auralite.engine.dataset import IGNORE_INDEX
-    from auralite.engine.dialogs import encode_dialog
-
-    total, count = 0.0, 0
-    engine.model.eval()
-    with torch.no_grad():
-        for messages in dialogs:
-            ids, targets = encode_dialog(engine.tokenizer, messages,
-                                         engine.default_chat_template)
-            logits = engine.model(torch.tensor([ids[:-1]]))
-            y = torch.tensor([targets[1:]])
-            total += float(F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1),
-                                           ignore_index=IGNORE_INDEX, reduction="sum"))
-            count += int((y != IGNORE_INDEX).sum())
-    return total / max(1, count)
+def reply_loss(engine, dialogs):
+    """Mean cross-entropy over the reply tokens of `dialogs` (2.16: ``chat_eval``)."""
+    from auralite.engine.chat_eval import reply_loss as measure
+    return measure(engine, dialogs)
 
 
-def reply_bits_per_byte(engine, dialogs) -> float:
-    """Bits per byte of each dialog's last reply and end marker, given the dialog before it.
-
-    The text continues with a newline, as in training; the tokens up to the
-    one that completes the end marker count (a BPE without special tokens can
-    join the marker with that newline).
-    """
-    import math
-
-    import torch
-    import torch.nn.functional as F
-
-    from auralite.chat_interface import ChatMessage, apply_chat_template, get_stop_tokens
-
-    template = engine.default_chat_template
-    end = get_stop_tokens(template)[0]
-    nats, total_bytes = 0.0, 0
-    engine.model.eval()
-    for messages in dialogs:
-        prompt = apply_chat_template([ChatMessage.from_dict(m) for m in messages[:-1]],
-                                     template_name=template, add_generation_prompt=True)
-        reply = messages[-1]["content"] + end
-        prompt_ids = engine.encode(prompt)
-        ids = engine.encode(prompt + reply + "\n")
-        k = len(prompt_ids)
-        while k < len(ids) and len(engine.decode(ids[len(prompt_ids):k])) < len(reply):
-            k += 1
-        with torch.no_grad():
-            logits = engine.model(torch.tensor([ids[:k - 1]]))[0]
-        start = len(prompt_ids) - 1
-        nats += float(F.cross_entropy(logits[start:], torch.tensor(ids[1:k])[start:],
-                                      reduction="sum"))
-        total_bytes += len(engine.decode(ids[len(prompt_ids):k]).encode("utf-8"))
-    return nats / max(1, total_bytes) / math.log(2.0)
+def reply_bits_per_byte(engine, dialogs):
+    """Bits per byte of each dialog's last reply and end marker (2.16: ``chat_eval``)."""
+    from auralite.engine.chat_eval import reply_bits_per_byte as measure
+    return measure(engine, dialogs)
 
 
 def cmd_eval(args) -> dict:
-    from auralite.chat_interface import get_stop_tokens
+    """2.16: the code of ``auralite chat-eval`` (`auralite.engine.chat_eval`)."""
     from auralite.engine import AuraLiteEngine, load_training_data
+    from auralite.engine.chat_eval import evaluate_chat
 
     engine = AuraLiteEngine()
     engine.load_model(args.model)
     dialogs = load_training_data([args.data]).dialogs[:args.n]
-    from auralite.engine.dialogs import SFT_TEMPLATES, template_special_tokens
-
-    template = engine.default_chat_template
-    stop_ids = engine._stop_token_ids(get_stop_tokens(template))
-    markers = template_special_tokens(template) if template in SFT_TEMPLATES else []
-    greedy = args.temperature <= 0
-    stopped = clean = exact = new_tokens = 0
-    seen: list[int] = []
-
-    def record(token: int, _logits) -> None:
-        seen.append(token)
-
-    for messages in dialogs:
-        seen.clear()
-        reply = engine.generate_chat(messages[:-1], max_new_tokens=args.max_new_tokens,
-                                     temperature=args.temperature, top_k=1 if greedy else 40,
-                                     repetition_penalty=1.0, on_token=record)
-        stopped += bool(seen) and seen[-1] in stop_ids
-        new_tokens += len(seen)
-        clean += not any(m in reply for m in markers)
-        exact += reply.strip() == messages[-1]["content"].strip()
-    n = max(1, len(dialogs))
-    return {"section": "eval", "model": args.model, "template": template, "dialogs": len(dialogs),
-            "temperature": args.temperature, "stop_rate": stopped / n, "clean_rate": clean / n,
-            "exact": exact / n, "mean_new_tokens": round(new_tokens / n, 2),
+    result = evaluate_chat(engine, dialogs, max_new_tokens=args.max_new_tokens,
+                           temperature=args.temperature, samples=0)
+    loss, bpb = result["reply_loss"], result["reply_bpb"]
+    return {"section": "eval", "model": args.model, "template": result["template"],
+            "dialogs": result["dialogs"], "temperature": args.temperature,
+            "stop_rate": result["stop_rate"], "clean_rate": result["clean_rate"],
+            "exact": result["exact"], "mean_new_tokens": result["mean_new_tokens"],
             # per token only where the markers are tokens (a plain-text model: None)
-            "reply_loss": round(reply_loss(engine, dialogs), 4) if stop_ids else None,
-            "reply_bpb": round(reply_bits_per_byte(engine, dialogs), 4),
-            "single_token_stops": sorted(stop_ids)}
+            "reply_loss": round(loss, 4) if loss is not None else None,
+            "reply_bpb": round(bpb, 4) if bpb is not None else None,
+            "single_token_stops": result["single_token_stops"]}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,6 +291,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--n", type=int, default=3000)
     p.add_argument("--seed", type=int, default=1)
     p.set_defaults(func=cmd_data)
+    p = sub.add_parser("arith", help="2.16: addition and subtraction dialogs only (JSONL)")
+    p.add_argument("out")
+    p.add_argument("--n", type=int, default=3000)
+    p.add_argument("--seed", type=int, default=55)
+    p.set_defaults(func=cmd_arith)
+    p = sub.add_parser("questions", help="2.16: short questions for a teacher, one per line")
+    p.add_argument("out")
+    p.add_argument("--n", type=int, default=1200)
+    p.add_argument("--seed", type=int, default=2024)
+    p.set_defaults(func=cmd_questions)
     p = sub.add_parser("text", help="write dialogs as plain ChatML text (a 2.14.2-style corpus)")
     p.add_argument("data")
     p.add_argument("out")
@@ -251,9 +308,16 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("train", help="train (or fine-tune --base) a chat model on dialogs")
     p.add_argument("--data", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--loss", choices=["assistant", "all"], default="assistant")
+    p.add_argument("--loss", choices=["assistant", "all"], default=None)
+    p.add_argument("--prompt-weight", type=float, default=None, help="2.16")
+    p.add_argument("--pack", action="store_true", help="2.16: pack whole dialogs")
+    p.add_argument("--early-stop", type=int, default=None,
+                   help="early_stopping_patience (2.15 used 3; 2.16: off on dialogs)")
     p.add_argument("--base", help="fine-tune this checkpoint instead of a new model")
     p.add_argument("--lora", type=int, default=0)
+    p.add_argument("--lora-lr", type=float, default=None, help="2.16 (default 10 x lr)")
+    p.add_argument("--lora-targets", choices=["all", "ffn", "attn"], default=None, help="2.16")
+    p.add_argument("--lora-embeddings", choices=["all", "new"], default=None, help="2.16")
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--seed", type=int, default=PARAMS["seed"])
     p.set_defaults(func=cmd_train)

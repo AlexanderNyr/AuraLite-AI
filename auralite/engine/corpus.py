@@ -13,7 +13,9 @@ file and folder buttons are given:
   of records: plain-text records (``{"text": ...}`` or a string) are one
   document each, dialog records (``{"messages": [...]}`` and the other
   formats of :mod:`auralite.engine.dialogs`) make a :class:`DialogSet` for
-  chat fine-tuning.
+  chat fine-tuning, and (2.16) preference pairs (``{"prompt", "chosen",
+  "rejected"}`` and the other formats of :mod:`auralite.engine.preference`)
+  a :class:`~auralite.engine.preference.PreferenceSet` for DPO or SimPO.
 
 Documents are joined with a blank line (:data:`DOCUMENT_SEPARATOR`), so one
 never runs into the next mid-sentence; a single document is used exactly as
@@ -37,6 +39,7 @@ from auralite.engine.dialogs import (
     dialog_from_record,
     text_from_record,
 )
+from auralite.engine.preference import PreferenceSet, is_preference_record, pair_from_record
 
 __all__ = ["DOCUMENT_SEPARATOR", "DataFormatError", "FOLDER_SUFFIXES", "TextCorpus",
            "collect_files", "data_kind", "load_training_data"]
@@ -206,6 +209,8 @@ def _has_reply(dialog: list[dict]) -> bool:
 
 
 def _record_kind(location: str, record: Any) -> str:
+    if is_preference_record(record):               # 2.16: before dialogs ("messages" + pairs)
+        return "preferences"
     if dialog_from_record(record) is not None:
         return "dialogs"
     if text_from_record(record) is not None:
@@ -216,12 +221,14 @@ def _record_kind(location: str, record: Any) -> str:
         f"(\"text\"); rename the file to .txt to train on it as plain text")
 
 
-def load_training_data(paths: Any, *,
-                       separator: str = DOCUMENT_SEPARATOR) -> TextCorpus | DialogSet:
-    """Read `paths` (files, folders, globs) as a :class:`TextCorpus` or a :class:`DialogSet`.
+def load_training_data(paths: Any, *, separator: str = DOCUMENT_SEPARATOR
+                       ) -> TextCorpus | DialogSet | PreferenceSet:
+    """Read `paths` (files, folders, globs) as a :class:`TextCorpus`, a
+    :class:`DialogSet` or (2.16) a :class:`~auralite.engine.preference.PreferenceSet`.
 
     All files must hold the same kind of data: plain text and dialogs train
-    differently (pretrain on the text first, then fine-tune on the dialogs).
+    differently (pretrain on the text first, then fine-tune on the dialogs,
+    then train on preference pairs).
     Files of a folder that are not UTF-8 are skipped (`TextCorpus.skipped`);
     a file given by name must be readable.
     """
@@ -232,6 +239,7 @@ def load_training_data(paths: Any, *,
     names: list[str] = []
     skipped: list[str] = []
     dialogs: list[list[dict]] = []
+    pairs: list = []
     sources: list[str] = []
     bad_records = 0
     first_bad = ""
@@ -242,7 +250,14 @@ def load_training_data(paths: Any, *,
             kind = ""
             for location, record in _records(path):
                 kind = kind or _record_kind(location, record)
-                if kind == "dialogs":
+                if kind == "preferences":
+                    pair = pair_from_record(record)
+                    if pair is None:
+                        bad_records += 1
+                        first_bad = first_bad or location
+                        continue
+                    pairs.append(pair)
+                elif kind == "dialogs":
                     dialog = dialog_from_record(record)
                     if dialog is None or not _has_reply(dialog):
                         bad_records += 1
@@ -259,7 +274,7 @@ def load_training_data(paths: Any, *,
                     names.append(location)
             if kind:
                 kinds.setdefault(kind, path.name)
-                if kind == "dialogs":
+                if kind in ("dialogs", "preferences"):
                     sources.append(str(path))
             continue
         try:
@@ -275,9 +290,19 @@ def load_training_data(paths: Any, *,
             documents.append(text)
             names.append(str(path))
     if len(kinds) > 1:
+        if "preferences" in kinds:
+            mixed = ", ".join(f"{kind} ({name})" for kind, name in kinds.items())
+            raise DataFormatError(f"the data mixes {mixed}: preference pairs train on their "
+                                  f"own, after the model was fine-tuned on dialogs")
         raise DataFormatError(f"the data mixes plain text ({kinds['text']}) with dialogs "
                               f"({kinds['dialogs']}): train on the text first, then "
                               f"fine-tune the model on the dialogs")
+    if "preferences" in kinds:
+        if not pairs:
+            raise DataFormatError(f"no usable preference pair (a prompt with a chosen and a "
+                                  f"rejected reply that differ) in {', '.join(sources)}")
+        return PreferenceSet(pairs, sources=sources, skipped=bad_records,
+                             first_skipped=first_bad)
     if "dialogs" in kinds:
         if not dialogs:
             raise DataFormatError(f"no dialog with an assistant reply in "
@@ -295,7 +320,8 @@ def load_training_data(paths: Any, *,
 
 
 def data_kind(paths: Any) -> str:
-    """``"dialogs"`` or ``"text"``: what :func:`load_training_data` makes of `paths`.
+    """``"dialogs"``, ``"preferences"`` (2.16) or ``"text"``: what
+    :func:`load_training_data` makes of `paths`.
 
     A quick look for the GUI: only the first record of each ``.jsonl`` /
     ``.json`` file is read. ``""`` when the paths cannot be read
@@ -306,8 +332,9 @@ def data_kind(paths: Any) -> str:
             if path.suffix.lower() not in _RECORD_SUFFIXES:
                 continue
             for location, record in _records(path):
-                if _record_kind(location, record) == "dialogs":
-                    return "dialogs"
+                kind = _record_kind(location, record)
+                if kind in ("dialogs", "preferences"):
+                    return kind
                 break
     except (OSError, ValueError):
         return ""

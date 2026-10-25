@@ -112,6 +112,16 @@ from auralite.engine.decode_slots import DecodeSlot, DecodeSlotsMixin  # noqa: E
 from auralite.engine.inference_bench import InferenceBenchMixin  # noqa: E402
 from auralite.engine.generation import GenerationMixin, _DraftSession  # noqa: E402,F401
 from auralite.engine.trainer import TrainerMixin, _remove_file_quietly  # noqa: E402,F401
+from auralite.engine.adapters import LoRAMixin, base_fingerprint  # noqa: E402,F401
+from auralite.engine.chat_eval import ChatEvalMixin, evaluate_chat  # noqa: E402,F401
+# 2.16: preference training (DPO, SimPO) and dialogs from a teacher model
+from auralite.engine.preference import (  # noqa: E402,F401
+    PreferencePair, PreferenceSet, PreferenceTrainerMixin, evaluate_preferences,
+)
+from auralite.engine.distill import (  # noqa: E402,F401
+    CallableTeacher, DistillPrompt, EngineTeacher, TeacherReply, distill_dialogs, load_teacher,
+    read_prompts,
+)
 from auralite.engine import sampling as _sampling  # noqa: E402
 from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
@@ -379,7 +389,8 @@ _SDPA_GQA_SUPPORTED: bool | None = None
 
 
 class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
-                     InferenceBenchMixin, DecodeSlotsMixin):
+                     InferenceBenchMixin, DecodeSlotsMixin, LoRAMixin, ChatEvalMixin,
+                     PreferenceTrainerMixin):
     """Modern training & inference engine for AuraLite AI v2.1.
 
     IMPROVED (v2.1+):
@@ -1642,6 +1653,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "format": "auralite",
             "checkpoint_version": 3,
         }
+        # 2.16: where the adapters sit and their scale (2.15 files: FFN)
+        checkpoint.update(self._lora_config_entry())
         # Atomic write: save next to the target and os.replace() it in place, so
         # an interrupted save (Ctrl+C, out of disk) can never leave a truncated,
         # unloadable checkpoint at `path`.
@@ -1688,7 +1701,14 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "chat_template": self.default_chat_template,
             "format": "auralite",
             "checkpoint_version": 3,
+            # 2.16: where LoRA adapters sit and their scale
+            **self._lora_config_entry(),
         }
+
+    def _lora_config_entry(self) -> dict:
+        """``{"lora_config": ...}`` for a model with LoRA adapters, else ``{}`` (2.16)."""
+        config = getattr(self.model, "lora_config", None)
+        return {"lora_config": dict(config)} if config else {}
 
     def _save_model_safetensors(self, path: str):
         """Pickle-free export: tensors + JSON metadata, no optimizer/RNG state.
@@ -1806,7 +1826,15 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         # layer.ffn.lora and therefore live inside model_state).
         lora_rank = checkpoint.get("lora_rank", 0)
         if lora_rank > 0:
-            self.model.enable_lora(rank=lora_rank)
+            # 2.16: the adapters' places and scale (a 2.15 file has FFN adapters)
+            lora_config = checkpoint.get("lora_config") or {}
+            model = self.model
+            model.enable_lora(rank=lora_rank, target_modules=lora_config.get("targets"),
+                              alpha=lora_config.get("alpha"),
+                              rslora=bool(lora_config.get("rslora", False)))
+            if model.lora_config is not None:
+                model.lora_config.update({key: lora_config[key] for key in
+                                          ("base_vocab", "embedding_rows") if key in lora_config})
 
         # Backward compatibility: drop RoPE cos/sin buffers from the checkpoint.
         # They are non-persistent since v2.6.1 (derived data, rebuilt on demand),

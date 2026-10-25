@@ -296,13 +296,37 @@ file — `{"messages": [{"role": "user", "content": "..."}, {"role":
 "assistant", "content": "..."}]}`, or ShareGPT, Alpaca or prompt/completion
 records — and run `auralite train --text chats.jsonl --resume model.pt
 --model chat.pt` (GUI: select the file, check *Continue training current
-model*). The model learns only the replies, in the chat template that
-`auralite chat`, the GUI's Chat tab and the server prompt with (ChatML by
-default), and learns to end them with the template's end marker, so it stops
-by itself instead of running on into the next turn. A model that has only
+model*). The model learns the replies (and, with a small weight, the
+prompt: `--prompt-weight`, 0.1 by default since 2.16), in the chat template
+that `auralite chat`, the GUI's Chat tab and the server prompt with (ChatML
+by default), and learns to end them with the template's end marker, so it
+stops by itself instead of running on into the next turn. A model that has only
 read plain text knows neither: it writes on until the token limit. A few
 hundred dialogs teach the format; what the replies say comes from the
 dialogs and from what the model learned before. `--lora 8` trains
-adapters instead of every weight (converges more slowly on small models).
-Several files or a folder of plain text are one `--text` too. See
-[training.md](training.md) § 14–15.
+adapters instead of every weight (2.16: on every linear layer, at ten times
+the learning rate; `--save-adapter` writes them to a small file of their
+own, `auralite lora merge` folds them into the weights). `auralite
+chat-eval --model chat.pt --data held_out.jsonl` measures how well the
+model answers. Several files or a folder of plain text are one `--text`
+too. See [training.md](training.md) § 14–16.
+
+## 16. I have no dialogs. Can a bigger model write them? And what are DPO and SimPO?
+
+Since 2.16: `auralite distill --teacher model.gguf --prompts questions.txt
+--out chats.jsonl` has a teacher — a GGUF file, a llama.cpp server, a Hugging
+Face model or an AuraLite checkpoint — answer your questions (one per line)
+and writes its replies as dialogs for `auralite train --data` (GUI: Training
+tab, *Generate dialogs from a model*). Stopped runs resume with the same
+command. The metadata next to the file records the teacher's license if the
+model file names it (`--license` otherwise): check it, since some licenses
+forbid training other models on the outputs. With `--judge` (an exact,
+contained or numeric reference answer, a regex, or the teacher itself) only
+right replies are kept, and `--pairs` also writes **preference pairs**: a
+prompt with a chosen and a rejected reply. Such pairs train a chat model to
+prefer the chosen replies: `auralite train --data pairs.jsonl --resume
+chat.pt --method dpo` (or `simpo`; GUI: the *Preference pairs* row). DPO
+keeps the model close to where it started; SimPO needs no reference model.
+Run the chat model itself as the teacher with `--judge exact` and its own
+wrong answers become the rejected replies. See [training.md](training.md)
+§ 17–18.

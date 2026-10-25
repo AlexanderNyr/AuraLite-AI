@@ -337,11 +337,17 @@ class GGUFModelProxy:
                                min_p: float = 0.0, stream: bool = False,
                                stop: list[str] | None = None,
                                presence_penalty: float = 0.0,
-                               frequency_penalty: float = 0.0):
-        """Use llama.cpp chat formatting for instruction/chat GGUF models."""
+                               frequency_penalty: float = 0.0,
+                               seed: int | None = None):
+        """Use llama.cpp chat formatting for instruction/chat GGUF models.
+
+        `seed` (2.16): the sampling seed of this call (``auralite distill``).
+        """
         kwargs: dict[str, Any] = _penalty_kwargs(presence_penalty, frequency_penalty)
         if stop:
             kwargs["stop"] = list(stop)
+        if seed is not None:
+            kwargs["seed"] = int(seed)
         return self._generate_locked(lambda: self.llama.create_chat_completion(
             messages=messages,
             max_tokens=max(0, int(max_tokens)),
@@ -469,7 +475,8 @@ class LlamaServerProxy:
                                min_p: float = 0.0, stream: bool = False,
                                stop: list[str] | None = None,
                                presence_penalty: float = 0.0,
-                               frequency_penalty: float = 0.0):
+                               frequency_penalty: float = 0.0,
+                               seed: int | None = None):
         payload = {
             **_penalty_kwargs(presence_penalty, frequency_penalty),
             "messages": messages,
@@ -483,6 +490,8 @@ class LlamaServerProxy:
         }
         if stop:
             payload["stop"] = list(stop)
+        if seed is not None:
+            payload["seed"] = int(seed)
         return self._generate(payload, stream=stream, chat=True)
 
     def _generate(self, payload: dict, *, stream: bool, chat: bool):
@@ -494,17 +503,24 @@ class LlamaServerProxy:
         if stream:
             return self._stream_generation(payload, chat=chat)
         data = self._request("POST", "/v1/chat/completions" if chat else "/completion", payload)
+        choice = (data.get("choices") or [{}])[0]
         if chat:
-            text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            text = (choice.get("message") or {}).get("content", "")
         else:
-            text = data.get("content") or (data.get("choices") or [{}])[0].get("text", "")
+            text = data.get("content") or choice.get("text", "")
+        # 2.16: the OpenAI-style answer of /v1/chat/completions carries its own
+        # finish_reason ("length" when cut at the token limit) and usage
+        usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or data.get("tokens_evaluated", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens")
+                                or data.get("tokens_predicted", 0) or 0)
         return {
             "choices": [{"text": text, "index": 0,
-                         "finish_reason": data.get("stop_type") or "stop",
+                         "finish_reason": choice.get("finish_reason") or data.get("stop_type")
+                         or "stop",
                          "message": {"role": "assistant", "content": text}}],
-            "usage": {"prompt_tokens": data.get("tokens_evaluated", 0),
-                      "completion_tokens": data.get("tokens_predicted", 0),
-                      "total_tokens": data.get("tokens_evaluated", 0) + data.get("tokens_predicted", 0)},
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens + completion_tokens},
             "model": self._props.get("model_path", "gguf-server"),
         }
 

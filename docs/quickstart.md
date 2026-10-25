@@ -70,6 +70,7 @@ Notes that save time later:
 auralite train --text books/ "notes/*.md" --model model.pt       # files, folders, globs
 auralite train --text chats.jsonl --resume model.pt --model chat.pt
 auralite chat --model chat.pt
+auralite chat-eval --model chat.pt --data held_out.jsonl          # 2.16: how well it answers
 ```
 
 Each file is a document; documents are joined with a blank line and whole
@@ -77,12 +78,34 @@ documents are held out for validation (one file trains exactly as before).
 A `.jsonl` file of dialogs — one `{"messages": [{"role": "user", "content":
 "..."}, {"role": "assistant", "content": "..."}]}` per line, or ShareGPT,
 Alpaca, prompt/completion records — fine-tunes the model into a chat model:
-it learns only the replies, in the chat template `auralite chat` and the
-server prompt with (ChatML; `--template gemma|phi`), and to end them with the
-template's end marker, so it stops by itself. `--lora 8` fine-tunes with
-adapters. In the GUI: *📁 Select Folder*, or select the `.jsonl` file and check
-*Continue training current model*. Details: [training.md](training.md)
-§ 14–15.
+it learns the replies (and the prompt with a small weight, 2.16), in the chat
+template `auralite chat` and the server prompt with (ChatML; `--template
+gemma|phi`), and to end them with the template's end marker, so it stops by
+itself. `--lora 8` fine-tunes with adapters (`--save-adapter adapter.pt`
+writes them to a file of their own). In the GUI: *📁 Select Folder*, or select
+the `.jsonl` file and check *Continue training current model*. Details:
+[training.md](training.md) § 14–16.
+
+### Dialogs from a teacher, DPO and SimPO (2.16)
+
+```bash
+auralite distill --teacher teacher.gguf --prompts questions.txt --out chats.jsonl \
+    --max-tokens 64                                          # Ctrl+C, then again: it resumes
+auralite train --data chats.jsonl --resume model.pt --model chat.pt
+auralite distill --teacher chat.pt --prompts questions.jsonl --out right.jsonl \
+    --judge exact --pairs pairs.jsonl                        # its own wrong answers
+auralite train --data pairs.jsonl --resume chat.pt --method dpo --model dpo.pt
+auralite chat-eval --model dpo.pt --data held_out.jsonl
+```
+
+A teacher (a GGUF file through llama-cpp-python, a llama.cpp server, a Hugging
+Face model or an AuraLite checkpoint) answers a file of questions; its replies
+become dialogs. The metadata next to the file records the progress (the same
+command continues an interrupted run) and the teacher's license. A judge keeps
+the right replies and makes preference pairs, which train a chat model with
+DPO (`--method dpo`, the default for pairs) or SimPO (`--method simpo`). In
+the GUI: Training tab, *Generate dialogs from a model* and the *Preference
+pairs* row. Details: [training.md](training.md) § 17–18.
 
 ### Your own tokenizer (2.14.1)
 

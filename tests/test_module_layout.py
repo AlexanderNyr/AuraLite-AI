@@ -51,6 +51,14 @@ DECOMPOSED = {
     "corpus": ["DataFormatError", "TextCorpus", "collect_files", "data_kind",
                "load_training_data"],
     "dialogs": ["DialogSet"],
+    # 2.16: LoRA adapter files and merging; chat models measured on dialogs
+    "adapters": ["LoRAMixin", "base_fingerprint"],
+    "chat_eval": ["ChatEvalMixin", "evaluate_chat"],
+    # 2.16: preference training (DPO, SimPO); dialogs from a teacher model
+    "preference": ["PreferencePair", "PreferenceSet", "PreferenceTrainerMixin",
+                   "evaluate_preferences"],
+    "distill": ["CallableTeacher", "EngineTeacher", "distill_dialogs", "load_teacher",
+                "read_prompts"],
 }
 
 #: Public surface of `model_engine/_legacy.py` at `base/upstream-main` (13d9f47) —

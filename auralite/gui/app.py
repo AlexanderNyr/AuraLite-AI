@@ -509,7 +509,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                                    if self.tok_var.get() == "file" else ""),
                 "bpe_vocab_size": int(self.bpe_vocab_var.get()),
                 "val_split": float(self.val_split_var.get()),
-                "early_stopping_patience": int(self.early_stop_var.get() or 0),
+                "early_stopping_patience": self.early_stop_param(),
                 "time_budget_s": 60.0 * float(str(self.time_limit_var.get() or 0)),
                 "use_compile": bool(self.compile_var.get()),
                 "continue_training": bool(self.continue_var.get()),
@@ -518,6 +518,10 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 "accumulation_steps": int(self.accum_var.get()) or 1,
                 "use_alibi": bool(self.alibi_var.get()),
                 "lora_rank": int(self.lora_var.get()) or 0,
+                **self.lora_params(),
+                # 2.16: dialogs
+                "prompt_loss_weight": self.prompt_weight_param(),
+                "dialog_packing": bool(self.dialog_pack_var.get()),
                 "use_gradient_checkpointing": bool(self.checkpoint_var.get()),
                 "use_ddp": bool(self.ddp_var.get()),
                 "rope_scaling": {
@@ -579,6 +583,14 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
                 self.accum_var.set(str(config["accumulation_steps"]))
             if "lora_rank" in config:
                 self.lora_var.set(str(config["lora_rank"]))
+            # 2.16
+            if "lora_targets" in config:
+                self.lora_targets_var.set(str(config["lora_targets"]))
+            self.lora_lr_var.set(str(config.get("lora_lr", "auto")))
+            if "prompt_loss_weight" in config:
+                self.prompt_weight_var.set(str(config["prompt_loss_weight"]))
+            if "dialog_packing" in config:
+                self.dialog_pack_var.set(bool(config["dialog_packing"]))
             if "use_compile" in config:
                 self.compile_var.set(config["use_compile"])
             if "use_alibi" in config:

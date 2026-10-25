@@ -3,7 +3,7 @@
 This page covers the native training loop (`AuraLiteEngine.train`, the GUI
 *Train* tab and `auralite train`). Every number below was measured on this
 repository's code on a 2-thread CPU (Xeon, AVX-512, torch 2.14.1). The commands
-to reproduce them are in § 16. Since 2.12 the three entry points share one
+to reproduce them are in § 19. Since 2.12 the three entry points share one
 default recipe (§ 8), and a run that is stopped or has a time limit ends with
 a learning-rate decay (§ 9). Since 2.13 a new BPE tokenizer never sees the
 validation text (§ 10); validation numbers measured before 2.13 are
@@ -13,7 +13,12 @@ model together (§ 12). Since 2.14.1 a model can be trained with your own BPE
 tokenizer, the tokenizer can be trained on its own, and the progress shows
 every stage (§ 13). Since 2.15 a run reads several files and folders, validated
 on whole held-out documents (§ 14), and dialogs fine-tune a chat model that
-answers in its chat template and stops by itself (§ 15).
+answers in its chat template and stops by itself (§ 15). Since 2.16 dialog
+runs train for every epoch asked for, can weigh the prompt, LoRA adapts every
+linear layer and saves to a file of its own, and `auralite chat-eval`
+measures a chat model (§ 16); a teacher model writes dialogs to fine-tune on
+(`auralite distill`, § 17), and preference pairs train a chat model with DPO
+or SimPO (§ 18).
 
 ## 1. An epoch is one pass over the text
 
@@ -958,8 +963,9 @@ byte-level ones know every character already); the run lists them.
 **Fine-tuning.** A dialog run starts a fresh optimizer and learning-rate
 schedule. `lora_rank` (CLI `--lora`, GUI *LoRA rank*) trains LoRA adapters on
 the feed-forward layers of the continued model (2.14.2 applied `lora_rank`
-to new models only); on dialogs the token embedding and the output layer
-train too, since the markers are new tokens. Dialogs train on one computer.
+to new models only; 2.16: on every linear layer, at 10 × `lr`, § 16); on
+dialogs the token embedding and the output layer train too, since the
+markers are new tokens. Dialogs train on one computer.
 The summary has `dialogs`: the dialogs trained on and held out, the template,
 what the loss learned, the reply tokens, the tokens added and the records
 skipped. The templates `simple`, `llama2` and `mistral` cannot be used: the
@@ -967,7 +973,7 @@ first has no end marker, the other two write no `</s>` after the replies in
 the history of a prompt, so the model would learn one text and be prompted
 with another.
 
-**Measured** (`benchmarks/chat_bench.py`, § 16): 3,000 synthetic dialogs
+**Measured** (`benchmarks/chat_bench.py`, § 19): 3,000 synthetic dialogs
 (arithmetic, capitals, animal sounds, counting, opposites, greetings, a
 two-turn name recall; 2,700 to train on, 300 held out), a 0.8 M-parameter
 model (d_model 128, 4 layers, 128-token windows, the default recipe with
@@ -1007,7 +1013,322 @@ of the replies — and `dialog_loss="all"` is worth a try for short replies.
 LoRA trains far fewer weights and needs more steps or a higher `lr` than
 full fine-tuning.
 
-## 16. Reproduce
+## 16. Chat fine-tuning 2: the prompt's weight, LoRA everywhere, chat-eval (2.16)
+
+```bash
+auralite train --text chats.jsonl --resume base.pt --model chat.pt          # the 2.16 defaults
+auralite train --text chats.jsonl --resume base.pt --lora 8 --model chat_lora.pt \
+    --save-adapter chat_adapter.pt                                          # LoRA + its own file
+auralite chat-eval --model chat.pt --data held_out.jsonl                    # how well it answers
+auralite lora merge --model chat_lora.pt --out chat_merged.pt               # a plain model again
+auralite lora apply --base base.pt --adapter chat_adapter.pt --out chat2.pt [--merge]
+```
+
+```python
+engine.train(load_training_data("chats.jsonl"), {"continue_training": True, "lora_rank": 8})
+engine.save_adapter("chat_adapter.pt")              # or engine.merge_lora()
+engine.evaluate_chat("held_out.jsonl", limit=300)   # stop_rate, exact, reply_loss, reply_bpb
+```
+
+**What changed on the benchmark of § 15** (the text model fine-tuned on the
+2,700 dialogs for 40 epochs; 300 other dialogs answered greedily; *exact*:
+the reply is the expected one; *reply loss*: nats per token over the
+replies of the 300 dialogs, the loss training minimises; every run stopped by
+itself in 300 of 300 replies):
+
+| run | seeds | exact replies | reply loss |
+|---|---|---|---|
+| 2.15 default: early stopping (patience 3), the replies only | 3, 4 | 75.7 %, 64.0 % (stopped at epochs 32 and 19) | 0.046, 0.063 |
+| no early stopping, the replies only (`prompt_loss_weight=0`) | 3–5 | 82.2 % (78.0–86.3) | 0.034 (0.025–0.045) |
+| **2.16 default**: no early stopping, prompt weight 0.1 | 3–5 | **86.4 %** (84.3–88.3) | **0.021** (0.018–0.026) |
+| prompt weight 0.01 / 0.5 / 1 (1 = `dialog_loss="all"`) | 3 | 85.0 % / 83.7 % / 78.7 % | 0.027 / 0.032 / 0.041 |
+| packed dialogs, the replies only: windows fixed / packed again every epoch | 3 | 76.0 % / 78.0 % | 0.074 / 0.067 |
+| LoRA rank 8, 2.15 default (feed-forward layers, `lr` 1e-3) | 3 | 57.0 % | 0.115 |
+| **LoRA, 2.16 default**: every layer, `lora_lr` 1e-2, the replies only | 3–5 | **73.4 %** (71.7–75.7) | **0.059** (0.055–0.063) |
+| LoRA as the default, prompt weight 0.1 | 3–5 | 70.2 % (68.7–71.3) | 0.062 (0.059–0.066) |
+| LoRA, `lora_lr` 3e-2 (with prompt weight 0.1; at 1e-2: 71.3 %, 0.061) | 3 | 55.3 % | 0.095 |
+| LoRA, only the rows of new tokens (`lora_embeddings="new"`), the replies only | 3 | 52.0 % | 0.368 |
+
+**Early stopping is off on dialogs.** A dialog run trains for every epoch
+asked for unless `early_stopping_patience` is given (text keeps the recipe's
+3; `"auto"` picks the default, and the GUI's *Early stop* field now says
+`auto`). In 2.15 the patience of 3 ended dialog runs while their replies were
+still improving — seed 4 after 19 of 40 epochs; without it the same seeds
+gave 6.6 and 14 more exact replies in a hundred. Pass a patience to get the
+2.15 behaviour (and the best epoch's weights).
+
+**The prompt's weight.** `prompt_loss_weight` (CLI `--prompt-weight`, GUI
+*Prompt weight*) learns the prompt tokens — the system and user turns and the
+markers that open a reply — with a weight between 0 (the replies only, 2.15's
+`dialog_loss="assistant"`) and 1 (every token, `dialog_loss="all"`); the
+replies weigh 1 and the loss is the weighted mean. The default (`"auto"`) is
+0.1 when every weight trains — on every seed it beat the replies alone, by 4
+points of exact replies on average, with a 37 % lower reply loss — and 0 for a
+LoRA run, where 0.1 cost 3 points on average (worse on every seed; the few
+adapter weights are perhaps better spent on the replies alone). On seed 3 the
+weights 0, 0.01, 0.1, 0.5 and 1 gave 82.3, 85.0, 88.3, 83.7 and 78.7 % exact
+replies: learning every token, as `dialog_loss="all"` does, was the worst.
+This matches Huerta-Enochian & Ko (EMNLP 2024): small weights help short
+replies, and the weight does not matter for long ones (not measured here; the
+replies of this benchmark are about nine tokens). `dialog_loss` still works
+and is the same as weight 0 or 1 (both at once must agree). Validation now
+measures the replies whatever the weight (2.15 validated `dialog_loss="all"`
+on every token), so runs with different weights compare.
+
+**Accumulated batches.** With `accumulation_steps` above 1, a dialog step
+averages the loss over every token it learns, in whichever batch they are:
+the gradient of 4 batches of 8 is that of one batch of 32 (to 1e-6 in the
+tests), where 2.15 averaged the batches' means and over-weighted batches with
+few reply tokens (Hugging Face fixed the same in transformers 4.46). Text, and
+dialogs with one batch per step, train bit for bit as before.
+
+**Packing (opt-in).** `dialog_packing=True` (CLI `--pack-dialogs`, GUI *Pack
+whole dialogs*) best-fits whole dialogs into the windows, so that no reply is
+learned without its question; a dialog longer than a window is split where a
+user turn starts (a turn longer than the window is cut, and counted), and the
+windows are packed again every epoch with other dialogs side by side. It
+stays off: the 2.15 stream — the dialogs one after another, cut into windows
+at a fresh offset every epoch — gave clearly better replies here (82.3 %
+against 76–78 % exact, seed 3), most likely because every epoch shows each
+dialog in another window, at another place, where packed windows repeat. It
+may suit long multi-turn dialogs better; measure with `chat-eval`.
+
+**LoRA 2.** The adapters sit on every linear layer of the blocks — the
+attention's `W_q`, `W_k`, `W_v`, `W_o` as well as the feed-forward `gate`,
+`up`, `down` (`lora_targets`: `all`, `ffn` as 2.15, `attn`; CLI
+`--lora-targets`, GUI combo box) — and learn at `lora_lr` (default 10 × `lr`,
+AdamW; CLI `--lora-lr`, GUI *LoRA LR*), as "LoRA Without Regret" (Thinking
+Machines, 2025) recommends: the best LoRA learning rate is about ten times the
+full fine-tuning one, and adapters belong on the MLP layers as well as the
+attention. Together they took LoRA from 57 % to 73 % exact replies (three
+seeds; full fine-tuning: 86 %); 1e-2 also beat 3e-2 here (55 %), as it beat
+3e-3 for feed-forward adapters in 2.15 (65 % against 61 %). `lora_alpha`
+(default the rank) and `lora_rslora` (scale `alpha/sqrt(rank)`) set the
+adapters' scale. On dialogs the token embedding and the output layer train
+with the adapters, every row (`lora_embeddings="all"`, as 2.15); `"new"`
+trains only the rows of the new tokens, which leaves the base model exactly as
+it was and makes the adapter file small, but the replies were far worse (52 %
+exact on seed 3): the small model needs its output layer to adapt.
+
+`merge_lora()` (CLI `auralite lora merge`, GUI *Merge LoRA*) folds the
+adapters into the weights: a plain model, as fast as one without adapters,
+whose logits differ by at most 2e-5 here; it exports to `.pt2` like any model.
+`save_adapter(path)` (CLI `--save-adapter`, `auralite lora save`, GUI *Save
+LoRA adapter…*) writes only what the run trained — the adapters, the rows of
+the embedding and output layer it trained, the tokenizer and the chat template
+— with a fingerprint (sha256) of the base weights. `load_adapter(path)` (CLI
+`auralite lora apply`, GUI *Load LoRA adapter…*) puts it back on the base
+model it was trained on, logit for logit; another model is refused unless
+`check_base=False`. For the 0.8 M-parameter model of the benchmark the file is
+0.85 MB with every embedding row trained (25 % of its 3.4 MB of weights) and
+0.32 MB with only the new rows (9 %); the merged model exported to `.pt2`
+gives the same logits. Checkpoints record where their adapters sit
+(`lora_config`, shown by `auralite info`); 2.15 files load with feed-forward
+adapters, as they were trained.
+
+**chat-eval.** `auralite chat-eval --model chat.pt --data held_out.jsonl`
+(GUI: Evaluation tab, *Evaluate on dialogs…*, without lm-eval;
+`engine.evaluate_chat`) has the model answer the last user turn of each
+dialog, greedily (`--temperature`), and reports how often it stopped by
+itself, how often the reply was exactly the dialog's, how often it was free
+of template markers, the reply loss in nats per token and in bits per byte
+(comparable across tokenizers), the new tokens per reply and a few samples;
+`--json` prints one line. `benchmarks/chat_bench.py eval` runs the same code.
+
+## 17. Dialogs from a teacher model (2.16)
+
+```bash
+auralite distill --teacher qwen2.5-0.5b-instruct-q4_k_m.gguf --prompts prompts.txt \
+    --out chats.jsonl --system "You are a helpful assistant. Answer in one short sentence." \
+    --max-tokens 64 --license apache-2.0                     # Ctrl+C: run it again to go on
+auralite train --data chats.jsonl --resume base.pt --model student.pt
+auralite distill --teacher chat.pt --prompts questions.jsonl --out right.jsonl \
+    --judge exact --pairs pairs.jsonl                        # the model's own wrong answers
+```
+
+```python
+from auralite.engine import distill_dialogs, load_teacher, read_prompts
+prompts, _skipped = read_prompts("prompts.txt")
+meta = distill_dialogs(load_teacher("teacher.gguf"), prompts, "chats.jsonl", max_tokens=64)
+```
+
+`auralite distill` (GUI: Training tab, *Generate dialogs from a model*) has a
+**teacher** model answer a file of prompts and writes its replies as dialogs
+in the OpenAI format, ready for `auralite train --data`. The teacher can be any
+model AuraLite runs: a GGUF file (llama-cpp-python; the chat template stored in
+the file writes the prompt), a running llama.cpp server (`http://...`), a
+Hugging Face model (its own chat template), or an AuraLite checkpoint, the
+chat model itself included. A prompts file has one question per line (`.txt`),
+or JSON records: `{"prompt": ..., "answer": ...}` (also `question`,
+`instruction`; `reference`, `completion`, `response`, `output`) or dialogs, a
+final reply of which is the *reference answer*. `--system` puts a system
+message before prompts that have none; `--samples N` asks for N replies
+(sampled at `--temperature`, default 0.8; one reply is greedy by default).
+A reply cut at `--max-tokens` is dropped (`--keep-truncated` keeps it): a
+student would learn to stop mid-sentence.
+
+**Judges and pairs.** `--judge exact | contains | number` compares a reply
+with the reference answer (exact text, contained, the same last number),
+`regex:PATTERN` accepts the replies the pattern matches, and `teacher` asks
+the teacher which of two replies is better (`--samples 2`), twice with the
+order swapped; a verdict that follows the position is no verdict. With a judge
+only accepted replies become dialogs, and `--pairs FILE` writes preference
+pairs (TRL's format: `prompt`, `chosen`, `rejected`) for § 18: an accepted
+reply is chosen, or the reference answer when no reply was right, and a
+rejected reply is rejected. With the chat model as its own teacher and
+`--judge exact`, its wrong greedy answers become the rejected replies of
+*on-policy* pairs.
+
+**An interrupted run resumes.** After every prompt the files are flushed and
+`<out>.meta.json` records how far the run got and the byte length of each
+file. The same command continues where it stopped, after Ctrl+C (the CLI ends
+after the current prompt), the GUI's Stop, or a crash; half a record written
+when the process died is cut off first. More prompts with the same ones
+first continue the run too; another teacher, other prompts or other settings
+are refused (`--overwrite` starts again).
+
+**The teacher's license** goes into the metadata: the GGUF file's
+`general.license`, a Hugging Face model card's `license:`, or `--license`.
+When none is known (an AuraLite checkpoint aside), a warning says so. Some
+licenses forbid training other models on a model's outputs: check before you
+train on the dialogs. The metadata also records the settings, the counts
+(replies, kept, cut, rejected, pairs) and the speed.
+
+**Measured** (2 vCPU; Qwen2.5-0.5B-Instruct, Q4_K_M GGUF, 491 MB, Apache 2.0,
+llama-cpp-python 0.3.36; 1,200 short questions of `chat_bench.py questions`,
+`--system "You are a helpful assistant. Answer in one short sentence."`,
+`--max-tokens 64`). With nothing else running, 100 questions took 64 s with
+2 threads (5,700 questions an hour, 18 reply tokens a second, prompts
+included) and 98 s with 1 thread (3,700 an hour): **1,000 short replies in
+about 11 minutes**. The replies were 26 characters long (median; 10 tokens on
+average, the longest 164 characters), none was cut at 64 tokens. The run of
+1,200 questions was stopped with Ctrl+C after 41, killed after 61, stopped
+again after 229 and resumed each time with the same command: 1,200 dialogs,
+each question once and in order.
+
+The 0.8 M-parameter text model of § 15, fine-tuned on the dialogs of the
+first 1,000 questions (the defaults of § 16, 40 epochs), answered the 200
+others and **stopped by itself in 200 of 200** replies (no stray markers;
+the same reply as the teacher in 34 %). It learned the teacher's style —
+and its mistakes: asked whether a whale is bigger than a bee, both said no.
+
+## 18. Preference training: DPO and SimPO (2.16)
+
+```bash
+auralite train --data pairs.jsonl --resume chat.pt --method dpo --model dpo.pt     # DPO
+auralite train --data pairs.jsonl --resume chat.pt --method simpo --model simpo.pt # SimPO
+auralite train --data pairs.jsonl --resume chat.pt --lora 8 --model dpo_lora.pt    # adapters
+auralite chat-eval --model dpo.pt --data held_out_pairs.jsonl     # chosen likelier, %
+```
+
+```python
+engine.load_model("chat.pt")
+summary = engine.train(load_training_data("pairs.jsonl"), {"method": "dpo"})
+summary["preference"]["final"]    # accuracy, margin, rewards, likelihood_accuracy, kl
+```
+
+A `.jsonl` of **preference pairs** — a prompt and two replies, the chosen and
+the rejected one — trains the chat model in memory (`--resume`, or the GUI's
+model with the *Preference pairs* row: method, beta, learning rate, epochs) so
+that it prefers the chosen replies. The records can be TRL's (`prompt`,
+`chosen`, `rejected` as strings or messages; or `chosen` and `rejected` as
+whole conversations that differ only in the last reply), `{"messages": [...],
+"chosen", "rejected"}`, `{"system", "question", "chosen", "rejected"}` or
+OpenAI's preference fine-tuning format (`input`, `preferred_output`,
+`non_preferred_output`). Records with two equal replies or without a question
+are skipped and counted. Pairs train on their own: a file of pairs and a file
+of dialogs together are refused.
+
+* **DPO** (`method="dpo"`, the default for pairs; Rafailov et al., 2023). The
+  reward of a reply is `beta × (log p(reply) − log p_ref(reply))`, where
+  `p_ref` is the model before the run; the loss is `−log σ(reward(chosen) −
+  reward(rejected))`. The reference log-probabilities are computed once
+  before the first step and kept, so only one model is in memory. `beta`
+  (`preference_beta`, CLI `--beta`): 0.1, as in the paper, TRL and OpenAI's
+  preference fine-tuning. By default the loss is **DPO-Positive**'s (Pal et
+  al., 2024): `dpo_positive` (λ, 50 as in the paper) × `max(0, log
+  p_ref(chosen) − log p(chosen))` is taken off the reward difference, so the
+  chosen replies cannot become less likely than they were. Plain DPO
+  (`dpo_positive=0`) lowers both replies of pairs that differ in a token or
+  two — and loses exactly the answers it should fix (measured below).
+* **SimPO** (`method="simpo"`; Meng, Xia & Chen, NeurIPS 2024) needs no
+  reference model: the reward is `beta` × the mean log-probability per token
+  of the reply, and the chosen reply must win by `simpo_gamma` (`−log σ(Δ −
+  gamma)`). `beta` 2.0 (the paper used 2.0–2.5), `gamma` half of it (the
+  authors' starting point).
+* `preference_sft_weight` (default 0) adds the chosen reply's mean
+  cross-entropy to the loss (RPO, Pang et al., 2024).
+* `method="sft"` fine-tunes on the prompts and their chosen replies, as
+  dialogs (§ 15–16).
+
+A preference run trains every weight with AdamW (`lr`, default 3e-4 for DPO
+and 1e-4 for SimPO), or only LoRA adapters — `lora_rank` for a model without
+them, or the adapters the model has — at `lora_lr` (default 10 × `lr`); the
+embedding and the output layer stay as they are. The learning rate
+warms up for 10 % of the steps, then decays (cosine). `epochs` defaults to 3,
+`batch_size` (pairs per step) to the recipe's 32. Dropout is off during the
+run (the reference was computed without it). Every epoch the held-out pairs
+(`val_split`, 10 %) are measured: the loss, the **accuracy** (the chosen
+reply's reward is above the rejected one's — TRL's `rewards/accuracies`), the
+mean reward **margin**, the chosen and rejected rewards, the **likelihood
+accuracy** (the chosen reply is the likelier one) and the **KL divergence**
+from the starting model, per token of the chosen replies. They are in the
+progress lines, the summary's `preference` (before the run and after each
+epoch) and the CLI's last line. A prompt too long for the model is cut from
+its start; a reply longer than the model's context is cut. The run's
+optimizer is not kept (a checkpoint saved after it has none), and the
+checkpoint's `params_used["preference"]` records the method and its settings.
+`auralite chat-eval --data pairs.jsonl` reports how often the chosen reply of
+held-out pairs is the likelier one, for any model.
+
+DPO's accuracy reaches 100 % as soon as every chosen reply has gained a
+little on its rejected one (the rewards all start at 0); the likelihood
+accuracy and the task itself (`chat-eval`) say more.
+
+**Measured** (the chat models of § 16, one per seed; 500 held-out sums and
+differences answered greedily; pairs from 3,000 other ones: each model's own
+wrong greedy answer is rejected, the right one chosen, `auralite distill
+--teacher chat.pt --judge exact --pairs`, 606–878 pairs to train on; every
+run stopped by itself in 500 of 500 replies):
+
+| run (defaults: 3 epochs, batch 32) | seed 3 | seed 4 | seed 5 | mean |
+|---|---|---|---|---|
+| the SFT model | 77.2 % | 62.6 % | 62.8 % | 67.5 % |
+| **+ DPO** (DPO-Positive, `lr` 3e-4) | **82.2 %** | **71.6 %** | **70.4 %** | **74.7 %** (+7.2) |
+| + SimPO (`lr` 1e-4) | 76.0 % | 66.4 % | 70.0 % | 70.8 % (+3.3) |
+
+On the held-out pairs (10 %), DPO's accuracy went from 0 to 97.0 %, 93.9 % and
+94.7 %, with a KL divergence from the SFT model of 0.009–0.015 nats per
+token. The chosen reply became the likelier one in 25–33 % of the held-out
+pairs — the share of the model's mistakes on new problems that the run fixed
+(the pairs are its own greedy errors, so before the run it was 0–2 %). On the
+300 mixed dialogs of § 15–16 exact replies went from 88.3 / 84.3 / 87.0 %
+to 89.3 / 86.0 / 88.3 %: the sums and differences among them gained 1, 5
+and 4 of 72, the greetings of seed 3 two of 41; the other tasks were right
+before and after.
+
+Seed 3, other settings (exact sums and differences; the SFT model: 77.2 %):
+
+| run | lr 1e-4 | lr 3e-4 | lr 1e-3 |
+|---|---|---|---|
+| plain DPO (`dpo_positive=0`) | 76.2 % | 49.6 % | 15.2 % |
+| plain DPO + the chosen replies' cross-entropy (`preference_sft_weight=1`) | 78.6 % | 69.8 % | – |
+| **DPO-Positive** (λ 50, the default) | 79.0 % | **82.2 %** | 82.2 % |
+| SimPO | 76.0 % | 47.0 % | – |
+| SimPO + the chosen replies' cross-entropy | 77.8 % | – | – |
+
+Plain DPO did what its loss asks — at 1e-3 the chosen reply of 80 % of the
+held-out pairs became the likelier one — and still lost the answers: the
+chosen and the rejected reply differ in a digit or two, so lowering the
+rejected one lowered the chosen one too, and the probability went to other
+wrong answers (the KL divergence reached 0.9 nats per token). DPO-Positive
+keeps the chosen reply at least as likely as before, which is the fix Pal et
+al. (2024) propose for pairs with a small edit distance. Pairs from four
+replies sampled at temperature 1 per prompt (500 pairs from 1,000 prompts;
+the chosen one is a right sample) gave 81.0 %, slightly below the greedy
+errors.
+
+## 19. Reproduce
 
 ```bash
 python benchmarks/train_bench.py                     # step, dropout, loader
@@ -1066,7 +1387,56 @@ python benchmarks/chat_bench.py eval --model scratch.pt --data eval.jsonl
 (`base.json`: the model of `PARAMS` in the script with `"epochs": 8`; the
 first 300,000 characters of tinyshakespeare. `--seed 4` / `5` and
 `"epochs": 30, "early_stopping_patience": 0` in `PARAMS` for the other seeds
-and the fixed 690 steps; one text file trains in 2.15 exactly as in 2.14.2.)
+and the fixed 690 steps; one text file trains in 2.15 exactly as in 2.14.2.
+In 2.16 these runs need `--early-stop 3 --loss assistant` — with them a
+dialog run trains bit for bit as in 2.15 — and the LoRA row also
+`--lora-targets ffn --lora-lr 0.001`.)
+
+The 2.16 runs (§ 16), with the same files:
+
+```bash
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --out chat.pt    # default
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --out w0.pt --prompt-weight 0
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --out es.pt \
+    --loss assistant --early-stop 3                                       # 2.15's default
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --out packed.pt \
+    --prompt-weight 0 --pack
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --lora 8 --out lora.pt
+python benchmarks/chat_bench.py train --data chats.jsonl --base base.pt --lora 8 --out lora_new.pt \
+    --prompt-weight 0 --lora-embeddings new
+auralite chat-eval --model chat.pt --data eval.jsonl --json
+```
+
+(`--seed 4` / `5` for the other seeds.)
+
+The 2.16 teacher and preference runs (§ 17–18), with `base.pt` and the
+chat models `chat.pt` of the default row above:
+
+```bash
+python benchmarks/chat_bench.py questions prompts.txt --n 1200 --seed 2024
+auralite distill --teacher qwen2.5-0.5b-instruct-q4_k_m.gguf --prompts prompts.txt \
+    --out teacher.jsonl --system "You are a helpful assistant. Answer in one short sentence." \
+    --max-tokens 64 --n-ctx 1024 --threads 1 --license apache-2.0
+# the dialogs of the first 1,000 questions train, those of the last 200 are held out
+auralite train --data teacher_train.jsonl --resume base.pt --params student.json --model student.pt
+auralite chat-eval --model student.pt --data teacher_eval.jsonl --max-new-tokens 128 --json
+
+python benchmarks/chat_bench.py arith arith_train.jsonl --n 3000 --seed 55
+python benchmarks/chat_bench.py arith arith_val.jsonl --n 400 --seed 66
+python benchmarks/chat_bench.py arith arith_eval.jsonl --n 500 --seed 77
+auralite distill --teacher chat.pt --prompts arith_train.jsonl --out right.jsonl \
+    --judge exact --pairs pairs.jsonl --max-tokens 48       # (arith_val.jsonl: held-out pairs)
+auralite train --data pairs.jsonl --resume chat.pt --params seed3.json --model dpo.pt
+auralite train --data pairs.jsonl --resume chat.pt --params seed3.json --method simpo \
+    --model simpo.pt
+auralite chat-eval --model dpo.pt --data arith_eval.jsonl --json
+auralite chat-eval --model dpo.pt --data held_out_pairs.jsonl --json
+```
+
+(`student.json`: the model of `PARAMS` in `benchmarks/chat_bench.py` with
+`"epochs": 40`; `seed3.json`: `{"seed": 3}`, for every chat model; the other
+settings of § 18 through `--params`: `lr`, `dpo_positive`,
+`preference_sft_weight`.)
 
 (`muon_ns3` sets what is now the default; for the 5-iteration rows pass
 `"muon_ns_steps": 5`.) The § 7 runs used `engine.train` with the parameters in the

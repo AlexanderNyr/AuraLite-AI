@@ -12,6 +12,7 @@ learns the assistant's replies only).
 """
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import tempfile
@@ -36,15 +37,19 @@ from auralite.engine.corpus import TextCorpus
 from auralite.engine.dataset import (
     IGNORE_INDEX,
     CharDataset,
+    PackedDataset,
     WindowBatches,
+    pack_sequences,
     spread_indices,
     validation_split_point,
 )
 from auralite.engine.dialogs import DialogSet
-from auralite.engine.model import ModernTransformer, estimate_n_params
+from auralite.engine.model import ModernTransformer, estimate_n_params, lora_target_names
+from auralite.engine.preference import PREFERENCE_METHODS, PreferenceSet, resolve_method
 from auralite.engine.optimizers import (
     Muon,
     _ChainedOptimizers,
+    _no_weight_decay,
     adamw_param_groups,
     split_parameters_for_muon,
 )
@@ -65,7 +70,7 @@ from auralite.engine.recipe import (
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler
 from auralite.engine.tokenizers import BPETokenizer, CharTokenizer, tokenizer_from_dict
 from auralite.engine import tokenizer_io as _tok_io
-from auralite.engine.train_control import TrainControl
+from auralite.engine.train_control import SetupStopped, TrainControl
 
 import logging
 
@@ -74,12 +79,9 @@ logger = logging.getLogger("auralite")
 __all__ = ["TrainerMixin"]
 
 
-class _SetupStopped(Exception):
-    """Stop or finish pressed before the first training step (2.14.1)."""
-
-    def __init__(self, stage: str):
-        super().__init__(stage)
-        self.stage = stage
+#: Stop or finish pressed before the first training step (2.14.1; 2.16: the
+#: class lives in train_control.py, preference training raises it too).
+_SetupStopped = SetupStopped
 
 
 #: Engine attributes a run changes before its first step; a run stopped then
@@ -96,12 +98,121 @@ class _ReplyLoss(nn.Module):
     ``nn.CrossEntropyLoss``, but 0 (with a gradient of zeros) for a batch
     without any, where ``nn.CrossEntropyLoss`` returns NaN: a window can lie
     entirely inside a long user turn.
+
+    2.16: with a `prompt_weight` between 0 and 1 a prompt token (a target of
+    id + ``PROMPT_TARGET_OFFSET``, :func:`~auralite.engine.dialogs.dialog_targets`)
+    counts with that weight and a reply token with 1: the weighted mean.
     """
 
+    def __init__(self, prompt_weight: float = 0.0):
+        super().__init__()
+        self.prompt_weight = float(prompt_weight)
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if 0.0 < self.prompt_weight < 1.0:
+            prompt = targets >= _dialogs.PROMPT_TARGET_OFFSET
+            ids = torch.where(prompt, targets - _dialogs.PROMPT_TARGET_OFFSET, targets)
+            losses = F.cross_entropy(logits, ids, ignore_index=IGNORE_INDEX, reduction="none")
+            weights = torch.where(prompt, self.prompt_weight, 1.0) * (ids != IGNORE_INDEX)
+            weight = weights.sum()
+            return (losses * weights).sum() / torch.where(weight > 0, weight, 1.0)
         learned = (targets != IGNORE_INDEX).sum()
         total = F.cross_entropy(logits, targets, ignore_index=IGNORE_INDEX, reduction="sum")
         return total / learned.clamp(min=1)
+
+
+def _learned_weight(targets: torch.Tensor, prompt_weight: float) -> float:
+    """How much `targets` count in the loss: reply tokens 1, prompt tokens `prompt_weight`."""
+    learned = targets != IGNORE_INDEX
+    if 0.0 < prompt_weight < 1.0:
+        prompt = targets >= _dialogs.PROMPT_TARGET_OFFSET
+        return float((learned & ~prompt).sum()) + prompt_weight * float(prompt.sum())
+    return float(learned.sum())
+
+
+def _token_weighted_batches(loader: Any, accumulation_steps: int, prompt_weight: float):
+    """``(x, y, factor)`` for the batches of `loader`, a group of
+    `accumulation_steps` at a time (2.16, dialogs).
+
+    A batch's loss is its mean over the tokens it learns; times `factor` and
+    divided by `accumulation_steps` (as the training loop does) it becomes the
+    batch's summed loss divided by the tokens the whole group learns. So an
+    optimizer step averages over every learned token of the step, whatever
+    batch they are in — the same gradient as one batch as large as the group
+    (Hugging Face fixed the same in transformers 4.46). With one batch per
+    step `factor` is 1.
+    """
+    batches = iter(loader)
+    while True:
+        group = list(itertools.islice(batches, accumulation_steps))
+        if not group:
+            return
+        weights = [_learned_weight(yb, prompt_weight) for _xb, yb in group]
+        total = sum(weights)
+        for (xb, yb), weight in zip(group, weights, strict=True):
+            yield xb, yb, (weight * accumulation_steps / total) if total > 0 else 1.0
+
+
+def _zero_rows(grad: torch.Tensor, rows: int) -> torch.Tensor:
+    """`grad` with its first `rows` rows zeroed (2.16: LoRA trains only new token rows)."""
+    grad = grad.clone()
+    grad[:rows] = 0
+    return grad
+
+
+def _lora_param_groups(model: nn.Module, weight_decay: float, frozen_rows: bool) -> list[dict]:
+    """AdamW groups of a LoRA run (2.16): as `adamw_param_groups`, and with
+    `frozen_rows` the token embedding and output head are not decayed either —
+    decoupled weight decay would move their frozen rows, whose gradient is 0."""
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        keep = frozen_rows and name.split(".")[0] in ("embedding", "head")
+        (no_decay if keep or _no_weight_decay(name, param) else decay).append(param)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
+def _pack_dialogs(train: list, val: list, seq_length: int
+                  ) -> tuple[tuple[PackedDataset, PackedDataset | None], dict[str, Any]]:
+    """Training and validation windows of whole dialogs (2.16).
+
+    `train` and `val` hold ``(ids, targets, user turn starts)`` per dialog. A
+    window holds ``seq_length + 1`` tokens (``seq_length`` predictions); a
+    dialog longer than that is split where a user turn starts
+    (:func:`~auralite.engine.dialogs.split_at_turns`).
+    """
+    width = seq_length + 1
+    forced = split = 0
+
+    def pieces(dialogs: list) -> list[tuple[list[int], list[int]]]:
+        nonlocal forced, split
+        out = []
+        for ids, targets, starts in dialogs:
+            ranges, cuts = _dialogs.split_at_turns(len(ids), starts, width)
+            forced += cuts
+            split += len(ranges) > 1
+            out.extend((ids[a:b], targets[a:b]) for a, b in ranges)
+        return out
+
+    train_pieces = pieces(train)
+    train_ids, train_targets = pack_sequences(train_pieces, width)
+    # (the training windows are packed again for every epoch: PackedDataset)
+    val_set = None
+    if val:
+        val_ids, val_targets = pack_sequences(pieces(val), width)
+        val_set = PackedDataset(val_ids, val_targets)
+    used = sum(len(ids) for ids, _targets in train_pieces)
+    info = {"windows": int(train_ids.shape[0]),
+            "val_windows": len(val_set) if val_set is not None else 0,
+            "fill": used / max(1, train_ids.numel()), "forced_cuts": forced,
+            "split_dialogs": split}
+    return (PackedDataset(train_ids, train_targets, pieces=train_pieces), val_set), info
 
 
 def _undo_resize(model: Any, embedding: nn.Module, head: nn.Module) -> None:
@@ -276,7 +387,7 @@ class TrainerMixin:
                     f"{passes:.1f} times; dropout above {AUTO_DROPOUT_MAX_PASSES})")
         return chosen
 
-    def train(self, training_text: str | TextCorpus | DialogSet, params: dict,
+    def train(self, training_text: str | TextCorpus | DialogSet | PreferenceSet, params: dict,
               progress_callback=None, stop_event=None, finish_event=None, tokenizer=None):
         """Train (or continue training) the model.
 
@@ -305,6 +416,16 @@ class TrainerMixin:
 
         `tokenizer` (2.14.1): train a new model with this tokenizer instead
         of building one (see also the ``tokenizer_path`` parameter).
+
+        2.16: a :class:`~auralite.engine.preference.PreferenceSet` (pairs of a
+        prompt, a chosen and a rejected reply) trains the chat model in memory
+        with DPO (default; DPO-Positive's ``dpo_positive`` 50) or SimPO: the
+        ``method``, ``preference_beta``, ``simpo_gamma``, ``dpo_positive``
+        and ``preference_sft_weight`` parameters, and ``epochs`` (default 3)
+        and ``lr`` (default 3e-4 for DPO, 1e-4 for SimPO) with their own
+        defaults (``PreferenceTrainerMixin._train_preferences``). The summary
+        then has ``method`` and ``preference`` (the held-out accuracy, margin,
+        rewards and KL divergence before and after each epoch).
 
         progress_callback(epoch, total_epochs, train_loss, val_loss_or_None, info=None)
 
@@ -357,7 +478,8 @@ class TrainerMixin:
                              the validation split in non-overlapping windows
           early_stopping_patience: stop after N epochs without a better
                              validation loss (default 3 since 2.12; 0 = off;
-                             needs a validation split)
+                             needs a validation split). 2.16: dialogs default
+                             to 0; "auto" is the default either way
           restore_best_weights: end with the weights of the best validation
                              epoch (default: on when early stopping is on)
           early_stopping_cooldown: decay the learning rate for at most two
@@ -399,17 +521,51 @@ class TrainerMixin:
                              2.15: also for a continued model (fine-tuning
                              with adapters). On dialogs the token embedding
                              and the output head train too (the template's
-                             markers are new tokens)
+                             markers are new tokens; see lora_embeddings)
+          lora_targets     : 2.16, the projections that get adapters: "all"
+                             (default: the FFN's and the attention's), "ffn"
+                             (gate/up/down, all 2.15 had) or "attn"
+          lora_lr          : 2.16, learning rate of a LoRA run (AdamW, for the
+                             adapters and the embedding rows that train);
+                             default 10 × lr (LoRA wants a larger rate than
+                             full fine-tuning; docs/training.md, section 16)
+          lora_alpha       : 2.16, adapter scale numerator (default lora_rank)
+          lora_rslora      : 2.16, scale alpha / sqrt(rank) instead of
+                             alpha / rank (default False)
+          lora_embeddings  : 2.16, dialogs with LoRA: "all" (default, every row
+                             of the embedding and the head trains, as 2.15)
+                             or "new" (only the rows of new tokens: the base
+                             model stays as it was and an adapter file holds
+                             only those rows — smaller, but the replies were
+                             worse in the measured runs)
           val_start_char   : 2.15, validation starts at this character of the
                              text (a TextCorpus sets it to its first held-out
                              document); default: the last val_split of it
-          dialog_loss      : 2.15, dialogs only: "assistant" (default, the
-                             replies) or "all" (every token, as plain text)
+          dialog_loss      : 2.15, dialogs only: "assistant" (the replies) or
+                             "all" (every token, as plain text); 2.16: the
+                             same as prompt_loss_weight 0 or 1
+          prompt_loss_weight: 2.16, dialogs only: the weight of the prompt
+                             tokens (system and user turns, the markers that
+                             open a reply) in the loss, from 0 (the replies
+                             only) to 1 (every token); replies weigh 1.
+                             Default ("auto"): 0.1 (DEFAULT_PROMPT_LOSS_WEIGHT),
+                             or 0 for a LoRA run
+          dialog_packing   : 2.16, dialogs only: False (default) cuts the
+                             windows from the stream of dialogs at a fresh
+                             offset every epoch, as 2.15; True packs whole
+                             dialogs into the windows (a dialog longer than a
+                             window is split where a user turn starts), packed
+                             again every epoch
 
         2.15: dialogs add ``dialogs`` to the summary (train, val, template,
         loss, learned_tokens, added_tokens, skipped records), a TextCorpus
         ``documents`` and ``val_documents``. A dialog run starts a fresh
         optimizer and learning-rate schedule and runs on one computer.
+        2.16: on dialogs, validation measures the replies only (whatever the
+        prompt's weight), an optimizer step averages the loss over every token
+        it learns (with accumulation_steps > 1), early stopping is off unless
+        early_stopping_patience is given, and ``dialogs`` in the summary adds
+        prompt_loss_weight, packing, windows, fill and forced_cuts.
         """
         # 2.13: training stays on this thread; an idle OpenMP team of the
         # compute thread would only slow it down (compute_thread.py).
@@ -425,6 +581,10 @@ class TrainerMixin:
             training_text, params, corpus_info = self._resolve_training_data(training_text,
                                                                              params)
             with _compute.run_inline():
+                if isinstance(training_text, PreferenceSet):
+                    # 2.16: DPO / SimPO on preference pairs (preference.py)
+                    return cast(Any, self)._train_preferences(
+                        training_text, params, progress_callback, stop_event, finish_event)
                 cluster = _cluster.cluster_params(params)
                 if cluster["workers"] > 0 and getattr(self, "_cluster", None) is None:
                     # 2.14: wait for the workers, then hand them the run.
@@ -467,16 +627,39 @@ class TrainerMixin:
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
             self._release_corpus_tempfile()
             self._setup_undo = []
+            # 2.16: the hooks that kept a LoRA run off the base model's token
+            # rows go with the run (a later full fine-tune trains every row)
+            for hook in getattr(self, "_lora_row_hooks", None) or ():
+                hook.remove()
+            self._lora_row_hooks = []
             _compute.release_caller_pool()
 
     def _resolve_training_data(self, data: Any, params: dict
-                               ) -> tuple[str | DialogSet, dict, dict]:
+                               ) -> tuple[str | DialogSet | PreferenceSet, dict, dict]:
         """``(text or dialogs, params, corpus info)`` for `train` (2.15).
 
         A :class:`TextCorpus` becomes its training text; when it holds whole
         documents out for validation, ``val_start_char`` in the returned
         params says where they start (a cluster's workers get it too).
         """
+        # 2.16: preference pairs train with DPO or SimPO ("sft": on the chosen
+        # replies); a preference method needs pairs
+        method = resolve_method(params, data)
+        if isinstance(data, PreferenceSet):
+            if method == "sft":
+                logger.info("[AuraLite] method sft: fine-tuning on the chosen replies of the "
+                            "preference pairs")
+                data = data.as_dialogs()
+            elif int(params.get("cluster_workers") or 0) > 0 \
+                    or getattr(self, "_cluster", None) is not None:
+                raise ValueError("preference training runs on one computer: train without "
+                                 "cluster_workers")
+            else:
+                return data, params, {}
+        elif method in PREFERENCE_METHODS:
+            raise ValueError(f"method {method!r} trains on preference pairs (records with a "
+                             f"prompt, a chosen and a rejected reply), not on "
+                             f"{'dialogs' if isinstance(data, DialogSet) else 'text'}")
         if isinstance(data, DialogSet):
             if int(params.get("cluster_workers") or 0) > 0 \
                     or getattr(self, "_cluster", None) is not None:
@@ -498,8 +681,8 @@ class TrainerMixin:
                             f"end of the text (no document split fits val_split={val_split:g})")
             return text, params, info
         if not isinstance(data, str):
-            raise TypeError(f"train() takes a text, a TextCorpus or a DialogSet, not "
-                            f"{type(data).__name__}")
+            raise TypeError(f"train() takes a text, a TextCorpus or a DialogSet (2.16: or a "
+                            f"PreferenceSet), not {type(data).__name__}")
         return data, params, {}
 
     # ---- Only the tokenizer (2.14.1) -----------------------------------
@@ -679,8 +862,18 @@ class TrainerMixin:
         sample_stride = params.get("sample_stride")
         sample_stride = max(1, int(sample_stride)) if sample_stride else int(seq_length)
         val_max_tokens = params.get("val_max_tokens")
-        early_stopping_patience = max(0, int(params.get(
-            "early_stopping_patience", recipe["early_stopping_patience"]) or 0))
+        # 2.16: dialogs train for the epochs asked for unless a patience is
+        # given — early stopping cut the measured dialog runs short and cost
+        # them exact replies (docs/training.md, § 16)
+        # ("auto", 2.16, picks the same defaults: the GUI's field sends it)
+        patience = params.get("early_stopping_patience")
+        patience_given = patience is not None and not is_auto(patience)
+        if not patience_given:
+            patience = 0 if dialogs is not None else recipe["early_stopping_patience"]
+        early_stopping_patience = max(0, int(patience or 0))
+        if dialogs is not None and not patience_given:
+            logger.info("[AuraLite] Dialogs: early stopping is off (set "
+                        "early_stopping_patience to use it and to keep the best epoch)")
         restore_best_weights = bool(params.get("restore_best_weights",
                                                early_stopping_patience > 0))
         early_stopping_cooldown = bool(params.get("early_stopping_cooldown",
@@ -689,6 +882,16 @@ class TrainerMixin:
         cooldown_ratio = float(params.get("cooldown_ratio", recipe["cooldown_ratio"]))
         use_alibi    = params.get("use_alibi", False)
         lora_rank    = params.get("lora_rank", 0)
+        # 2.16: where the adapters go, their scale, their learning rate
+        lora_targets = str(params.get("lora_targets", "all") or "all").strip().lower()
+        lora_names = lora_target_names(lora_targets)
+        lora_alpha = params.get("lora_alpha")
+        lora_alpha = float(lora_alpha) if lora_alpha else None
+        lora_rslora = bool(params.get("lora_rslora", False))
+        lora_lr = float(params.get("lora_lr") or 10.0 * float(lr))
+        lora_embeddings = str(params.get("lora_embeddings", "all") or "all").strip().lower()
+        if lora_embeddings not in ("new", "all"):
+            raise ValueError(f"lora_embeddings must be 'new' or 'all', got {lora_embeddings!r}")
         resume_training_state = params.get("resume_training_state", True)
         use_ddp      = params.get("use_ddp", False)
         # 2.14: a run on several computers (cluster.py): DDP over gloo on the
@@ -814,6 +1017,28 @@ class TrainerMixin:
                             "(the continued model's are not restored)")
             optimizer_state_to_restore = scheduler_state_to_restore = None
             scaler_state_to_restore = None
+        # 2.16: the prompt's weight in the loss. Unless given ("auto"):
+        # DEFAULT_PROMPT_LOSS_WEIGHT (0.1) when every weight trains, 0 with LoRA
+        # adapters — 0.1 helped full fine-tuning and hurt LoRA on every seed
+        # measured (docs/training.md § 16). dialog_loss "assistant" is 0, "all" 1.
+        native_now: Any = getattr(self.model, "module", self.model)
+        lora_run = int(lora_rank or 0) > 0 or bool(
+            resuming and getattr(native_now, "lora_adapters", None))
+        if "dialog_loss" in params:
+            prompt_loss_weight = 1.0 if dialog_loss == "all" else 0.0
+        else:
+            prompt_loss_weight = 0.0 if lora_run else _dialogs.DEFAULT_PROMPT_LOSS_WEIGHT
+        given_weight = params.get("prompt_loss_weight")
+        if given_weight is not None and not is_auto(given_weight):
+            weight = float(given_weight)
+            if not 0.0 <= weight <= 1.0:
+                raise ValueError(f"prompt_loss_weight must be in [0, 1], got {weight}")
+            if "dialog_loss" in params and weight != prompt_loss_weight:
+                raise ValueError(f"dialog_loss={dialog_loss!r} and prompt_loss_weight={weight} "
+                                 f"disagree: give one of them (\"assistant\" is 0, \"all\" is 1)")
+            prompt_loss_weight = weight
+        dialog_loss = "all" if prompt_loss_weight >= 1.0 else "assistant"
+        dialog_packing = bool(params.get("dialog_packing", False))
         if "optimizer" not in params and optimizer_state_to_restore is not None:
             # 2.12: the default optimizer changed from AdamW to Muon. A model
             # continued with default params keeps the optimizer whose state is
@@ -1011,6 +1236,7 @@ class TrainerMixin:
 
         # ---- Model ----------------------------------------------------
         check_stop("model")
+        rows_before = 0            # 2.16: token rows of a continued model before new ones
         if not resuming:
             _setup_progress("Building model…", 0.30,
                             stage={"stage": "model", "stage_label": "Building the model"})
@@ -1043,7 +1269,11 @@ class TrainerMixin:
 
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
             if lora_rank > 0:
-                self.model.enable_lora(rank=lora_rank)
+                self.model.enable_lora(rank=lora_rank, targets=lora_targets,
+                                       alpha=lora_alpha, rslora=lora_rslora)
+                # 2.16: a new model has no base rows; every token row is its own
+                if self.model.lora_config is not None:
+                    self.model.lora_config.update(base_vocab=0, embedding_rows=lora_embeddings)
 
             # v2.6.5: report the *actual* size. `estimate_n_params` works from
             # the requested vocab_size (BPE may shrink it a lot), so GUI/CLI
@@ -1081,6 +1311,7 @@ class TrainerMixin:
             # 2.14 applied lora_rank to new models only)
             grown: Any = native
             rows = int(getattr(getattr(grown, "embedding", None), "num_embeddings", 0) or 0)
+            rows_before = rows
             if rows and int(self.vocab_size) > rows and hasattr(grown, "resize_token_embeddings"):
                 old_modules = (grown.embedding, grown.head)
                 grown.resize_token_embeddings(int(self.vocab_size))
@@ -1091,22 +1322,49 @@ class TrainerMixin:
                             f"new ones start as the mean of the others")
             if int(lora_rank or 0) > 0 and not getattr(grown, "lora_adapters", None) \
                     and hasattr(grown, "enable_lora"):
-                grown.enable_lora(rank=int(lora_rank))
+                grown.enable_lora(rank=int(lora_rank), targets=lora_targets,
+                                  alpha=lora_alpha, rslora=lora_rslora)
+                # 2.16: the rows the base model had (an adapter file holds the rest)
+                if grown.lora_config is not None:
+                    grown.lora_config.update(base_vocab=rows_before,
+                                             embedding_rows=lora_embeddings)
                 self._setup_undo.append(grown.disable_lora)
                 optimizer_state_to_restore = scheduler_state_to_restore = None
                 logger.info(f"[AuraLite] LoRA rank {int(lora_rank)} on the continued model "
-                            f"(a fresh optimizer)")
+                            f"({lora_targets}: {', '.join(lora_names)}; a fresh optimizer)")
         native_model: Any = getattr(self.model, "module", self.model)
+        frozen_rows = 0            # 2.16: LoRA on dialogs, embedding rows that stay as they are
         if dialogs is not None and getattr(native_model, "lora_adapters", None):
             # The template's markers may be new tokens: with LoRA the token
-            # embedding and the output head must still learn them.
-            flags = [(p, p.requires_grad) for p in (native_model.embedding.weight,
-                                                    native_model.head.weight)]
-            for p, _ in flags:
-                p.requires_grad_(True)
-            self._setup_undo.append(lambda flags=flags: [p.requires_grad_(f) for p, f in flags])
-            logger.info("[AuraLite] LoRA on dialogs: the token embedding and the output head "
-                        "train too")
+            # embedding and the output head must still learn them. 2.16: only
+            # their rows train; the base model's stay bit for bit as they were
+            # (their gradient is zeroed, and the embedding and head are not
+            # weight-decayed), so an adapter file holds the new rows only.
+            vocab_rows = int(native_model.embedding.num_embeddings)
+            lora_config = native_model.lora_config if isinstance(
+                getattr(native_model, "lora_config", None), dict) else {}
+            base_rows = int(lora_config.get("base_vocab", rows_before) or 0)
+            if lora_embeddings == "new" and 0 < base_rows:
+                frozen_rows = min(base_rows, vocab_rows)
+            lora_config["embedding_rows"] = lora_embeddings
+            if frozen_rows < vocab_rows:
+                flags = [(p, p.requires_grad) for p in (native_model.embedding.weight,
+                                                        native_model.head.weight)]
+                for p, _ in flags:
+                    p.requires_grad_(True)
+                self._setup_undo.append(lambda flags=flags: [p.requires_grad_(f) for p, f in flags])
+                if frozen_rows:
+                    hooks = [p.register_hook(lambda g, k=frozen_rows: _zero_rows(g, k))
+                             for p in {id(p): p for p, _ in flags}.values()]
+                    self._lora_row_hooks = hooks
+                    logger.info(f"[AuraLite] LoRA on dialogs: the {vocab_rows - frozen_rows:,} new "
+                                f"rows of the token embedding and the output head train too "
+                                f"(the other {frozen_rows:,} stay as they are)")
+                else:
+                    logger.info("[AuraLite] LoRA on dialogs: the token embedding and the output "
+                                "head train too")
+            else:
+                logger.info("[AuraLite] LoRA on dialogs: no new tokens, so only the adapters train")
 
         self._ddp_model = None
 
@@ -1117,8 +1375,11 @@ class TrainerMixin:
         # are trained by a companion AdamW, following Moonlight et al.
         has_lora = bool(getattr(self.model, "lora_adapters", None))
         if optimizer_name == "muon" and has_lora:
-            logger.warning("[AuraLite] WARNING: LoRA adapters are trained with AdamW "
-                           "(Muon is not recommended for low-rank adapters). Falling back to AdamW.")
+            # 2.16: only a warning when Muon was asked for (it is the default)
+            if params.get("optimizer") == "muon":
+                logger.warning("[AuraLite] WARNING: LoRA adapters are trained with AdamW "
+                               "(Muon is not recommended for low-rank adapters). Falling back "
+                               "to AdamW.")
             optimizer_name = "adamw"
 
         if optimizer_name == "muon":
@@ -1149,7 +1410,24 @@ class TrainerMixin:
             single_group_state = (
                 isinstance(optimizer_state_to_restore, dict)
                 and len(optimizer_state_to_restore.get("param_groups", [])) == 1)
-            if single_group_state:
+            if has_lora and not single_group_state:
+                # 2.16: LoRA learns at lora_lr (default 10 × lr); the embedding
+                # and head are not decayed when only their new rows train
+                self.optimizer = optim.AdamW(
+                    _lora_param_groups(self.model, weight_decay, bool(frozen_rows)),
+                    lr=lora_lr, betas=(0.9, 0.95))
+                adapter_params = sum(p.numel() for n, p in self.model.named_parameters()
+                                     if ".lora." in n)
+                others = sum(p.numel() for n, p in self.model.named_parameters()
+                             if p.requires_grad and ".lora." not in n)
+                if frozen_rows:
+                    others -= frozen_rows * int(native_model.d_model) * (
+                        1 if native_model.head.weight is native_model.embedding.weight else 2)
+                logger.info(f"[AuraLite] Optimizer: AdamW for LoRA (lr={lora_lr:g}): "
+                            f"{len(native_model.lora_pairs())} adapters of rank "
+                            f"{native_model.lora_rank} ({adapter_params:,} params)"
+                            + (f" + {others:,} other params" if others else ""))
+            elif single_group_state:
                 # Resuming a 2.7 optimizer state (one group): keep its layout so
                 # the Adam moments carry over exactly.
                 self.optimizer = optim.AdamW(
@@ -1171,8 +1449,10 @@ class TrainerMixin:
                 logger.info("[AuraLite] Restored optimizer state.")
             except Exception as e:
                 logger.warning(f"[AuraLite] WARNING: could not restore optimizer state: {e}")
-        # 2.15: dialogs learn the replies only (0 for a window without any)
-        criterion: nn.Module = _ReplyLoss() if dialogs is not None else nn.CrossEntropyLoss()
+        # 2.15: dialogs learn the replies only (0 for a window without any);
+        # 2.16: the prompt with prompt_loss_weight
+        criterion: nn.Module = (_ReplyLoss(prompt_loss_weight) if dialogs is not None
+                                else nn.CrossEntropyLoss())
 
         # Mixed precision. History: fp16 autocast + GradScaler on CUDA only.
         # v2.6.2 adds `amp_dtype`:
@@ -1227,6 +1507,10 @@ class TrainerMixin:
         encoded = None
         dialog_targets: torch.Tensor | None = None
         learned_tokens = 0
+        # 2.16: packed dialogs — (training windows, validation windows)
+        packed: tuple[PackedDataset, PackedDataset | None] | None = None
+        pack_info: dict[str, Any] = {}
+        token_count = 0
         if dialogs is not None:
             # 2.15: each dialog with its targets (the replies), the training
             # dialogs first; held in RAM (dialog sets are small)
@@ -1234,27 +1518,46 @@ class TrainerMixin:
                 logger.info("[AuraLite] Dialogs are tokenized in memory (corpus_cache "
                             "applies to texts)")
                 use_mmap = False
-            ids, targets = [], []
-            fit_tokens = 0
+            parts = []
             every = max(1, len(dialogs) // 200)
             for number, dialog in enumerate(train_dialogs + val_dialogs, 1):
-                dialog_ids, dialog_targets_list = _dialogs.encode_dialog(
-                    self.tokenizer, dialog, template, dialog_loss)
-                ids += dialog_ids
-                targets += dialog_targets_list
-                if number == len(train_dialogs):
-                    fit_tokens = len(ids)
-                    learned_tokens = sum(1 for t in targets if t != IGNORE_INDEX)
+                parts.append(_dialogs.encode_dialog_parts(self.tokenizer, dialog, template))
                 if number % every == 0 or number == len(dialogs):
                     tokenizing.update(number, len(dialogs), step="encode", unit="dialogs")
                     check_stop("tokenize")
+            train_parts, val_parts = parts[:len(train_dialogs)], parts[len(train_dialogs):]
+            fit_tokens = sum(len(ids) for ids, _reply, _starts in train_parts)
+            reply_tokens = sum(sum(reply) for _ids, reply, _starts in train_parts)
+            learned_tokens = fit_tokens if prompt_loss_weight >= 1.0 else reply_tokens
             if learned_tokens == 0:
                 raise ValueError("the training dialogs have no reply tokens to learn")
-            encoded = torch.tensor(ids, dtype=torch.long)
-            dialog_targets = torch.tensor(targets, dtype=torch.long)
-            logger.info(f"[AuraLite] Tokenized {len(dialogs):,} dialogs into {len(ids):,} tokens; "
-                        f"the loss learns {learned_tokens:,} of the "
-                        f"{fit_tokens:,} training tokens")
+            # validation measures the replies, whatever the prompt's weight
+            train_seqs = [(ids, _dialogs.dialog_targets(ids, reply, prompt_loss_weight), starts)
+                          for ids, reply, starts in train_parts]
+            val_seqs = [(ids, _dialogs.dialog_targets(ids, reply, 0.0), starts)
+                        for ids, reply, starts in val_parts]
+            token_count = sum(len(ids) for ids, _reply, _starts in parts)
+            weight_note = (f" (and the prompt's {fit_tokens - reply_tokens:,} with weight "
+                           f"{prompt_loss_weight:g})" if 0.0 < prompt_loss_weight < 1.0 else "")
+            logger.info(f"[AuraLite] Tokenized {len(dialogs):,} dialogs into {token_count:,} "
+                        f"tokens; the loss learns {learned_tokens:,} of the "
+                        f"{fit_tokens:,} training tokens{weight_note}")
+            if dialog_packing:
+                packed, pack_info = _pack_dialogs(train_seqs, val_seqs, int(seq_length))
+                logger.info(f"[AuraLite] Dialogs packed: {len(train_seqs):,} in "
+                            f"{pack_info['windows']:,} windows of {seq_length} tokens "
+                            f"({pack_info['fill']:.0%} filled), {pack_info['val_windows']:,} "
+                            f"validation windows; each window starts with a whole dialog")
+                if pack_info["forced_cuts"]:
+                    logger.warning(f"[AuraLite] WARNING: {pack_info['forced_cuts']:,} turns are "
+                                   f"longer than the context window (seq_length={seq_length}) "
+                                   f"and were cut; a longer seq_length keeps them whole")
+            else:
+                ids = [t for seq_ids, _targets, _starts in train_seqs + val_seqs for t in seq_ids]
+                targets = [t for _ids, seq_targets, _starts in train_seqs + val_seqs
+                           for t in seq_targets]
+                encoded = torch.tensor(ids, dtype=torch.long)
+                dialog_targets = torch.tensor(targets, dtype=torch.long)
         elif use_mmap:
             from auralite.engine.dataset import write_tokens_memmap
             cache_path = params.get("corpus_cache_path")
@@ -1292,7 +1595,8 @@ class TrainerMixin:
             encoded_bytes = encoded.numel() * encoded.element_size()
             logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
                         f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
-        token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
+        if packed is None:
+            token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
         per_token = len(training_text) / max(1, token_count)
         _setup_progress(
             f"Dialogs tokenized: {token_count:,} tokens, {learned_tokens:,} of them to learn"
@@ -1323,7 +1627,9 @@ class TrainerMixin:
         n_train_tokens = total_tokens
 
         # 2.15: dialogs validate on held-out dialogs only (none: no validation)
-        if val_split > 0 and (dialogs is None or val_dialogs):
+        if packed is not None:                 # 2.16: windows of whole dialogs
+            n_train_tokens = split_at = fit_tokens       # the dialogs' tokens, as 2.15
+        elif val_split > 0 and (dialogs is None or val_dialogs):
             if total_tokens < min_train_tokens + min_val_tokens:
                 logger.warning(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
                                f"encoding, need at least {min_train_tokens + min_val_tokens} "
@@ -1358,7 +1664,9 @@ class TrainerMixin:
                                f"reads the end of the training dialogs; hold out more "
                                f"dialogs (val_split)")
         net = cast(nn.Module, self.model)      # the module being trained (typed)
-        if use_mmap:
+        if packed is not None:
+            dataset = packed[0]
+        elif use_mmap:
             from auralite.engine.dataset import PagedDataset
             assert corpus_file is not None
             dataset = PagedDataset(corpus_file, seq_length, offset=0, limit=split_at,
@@ -1395,10 +1703,13 @@ class TrainerMixin:
             drop_last=bool(use_compile),
         )
         logger.info(f"[AuraLite] Epoch: {len(dataset):,} windows of {seq_length} tokens "
-                    f"(stride {sample_stride}) = {len(loader):,} batches")
+                    f"({'whole dialogs' if packed is not None else f'stride {sample_stride}'})"
+                    f" = {len(loader):,} batches")
 
         val_loader = None
-        if use_mmap:
+        if packed is not None:
+            val_ds = packed[1]
+        elif use_mmap:
             assert corpus_file is not None
             val_ds = (PagedDataset(corpus_file, seq_length, offset=split_at,
                                    limit=total_tokens - split_at, stride=seq_length)
@@ -1607,6 +1918,9 @@ class TrainerMixin:
                            max_run_steps=total_steps, steps_per_epoch=opt_steps_per_epoch,
                            clock=clock)
 
+        # 2.16: a dialog step with several batches averages over its learned
+        # tokens (one batch per step: the batch's mean, as before)
+        weigh_tokens = dialogs is not None and accumulation_steps > 1
         best_val = None
         best_epoch = None
         best_state = None
@@ -1628,8 +1942,12 @@ class TrainerMixin:
             epoch_t0       = time.time()
             last_report_t  = 0.0
 
-            # IMPROVED: gradient accumulation loop
-            for batch_idx, (xb, yb) in enumerate(loader):
+            # IMPROVED: gradient accumulation loop. 2.16: on dialogs a step
+            # averages over the tokens it learns (_token_weighted_batches)
+            batches: Any = (_token_weighted_batches(loader, accumulation_steps,
+                                                    prompt_loss_weight)
+                            if weigh_tokens else ((xb, yb, None) for xb, yb in loader))
+            for batch_idx, (xb, yb, token_factor) in enumerate(batches):
                 if cluster is not None:
                     sync_with_main()
                 if stop_event and stop_event.is_set():
@@ -1649,6 +1967,8 @@ class TrainerMixin:
                         output.reshape(-1, output.size(-1)),      # (B·T, vocab)
                         yb.reshape(-1),                           # (B·T,)
                     )
+                    if token_factor is not None:
+                        loss = loss * token_factor
                     base_model = train_model.module if hasattr(train_model, "module") else train_model
                     aux_loss = base_model.get_aux_loss() if hasattr(base_model, "get_aux_loss") else None
                     if aux_loss is not None:
@@ -1967,5 +2287,9 @@ class TrainerMixin:
                 "train": len(train_dialogs), "val": len(val_dialogs), "template": template,
                 "loss": dialog_loss, "learned_tokens": learned_tokens,
                 "added_tokens": added_tokens, "skipped": dialogs.skipped,
+                # 2.16
+                "prompt_loss_weight": prompt_loss_weight, "packing": packed is not None,
+                **({key: pack_info[key] for key in ("windows", "fill", "forced_cuts")}
+                   if pack_info else {}),
             }
         return dict(self.last_train_summary)

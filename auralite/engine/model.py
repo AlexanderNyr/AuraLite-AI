@@ -5,6 +5,8 @@ every name below, so `auralite.engine.<name>` keeps working.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import logging
@@ -148,6 +150,7 @@ class ModernTransformer(nn.Module):
         # LoRA adapters (initially None, enabled via enable_lora())
         self.lora_adapters: list | None = None
         self.lora_rank = 0
+        self.lora_config: dict | None = None      # 2.16: rank, targets, alpha, rslora
 
         # 2.11: generation attends to the trained length at most (see
         # `default_context_window`); `set_context_window(None)` lifts it.
@@ -358,25 +361,43 @@ class ModernTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     # ---- LoRA Support ------------------------------------------------
-    def enable_lora(self, rank: int = 8, target_modules: list[str] | None = None):
-        """Enable LoRA adapters on the FFN linear layers.
+    def enable_lora(self, rank: int = 8, target_modules: list[str] | None = None, *,
+                    targets: str = "ffn", alpha: float | None = None,
+                    rslora: bool = False):
+        """Enable LoRA adapters on the linear layers of every block.
 
         Freezes the whole base model and adds trainable low-rank adapters
-        that are actually applied in FeedForward.forward(). The adapters are
-        registered as submodules (`self.lora_adapters`) so they move with
-        `.to(device)` and are saved/loaded via the state dict.
+        that the forward pass of the FFN (`layer.ffn.lora`) and, 2.16, of the
+        attention (`layer.attn.lora`) actually applies. The adapters are
+        submodules, so they move with `.to(device)` and live in the state dict.
 
         Args:
             rank: LoRA rank (default 8)
-            target_modules: Names of FFN projections to adapt
-                            (default: ["gate", "up", "down"]).
+            target_modules: names of the projections to adapt, from
+                ``LORA_TARGETS["all"]``; overrides `targets` (2.15 passed
+                FFN names only).
+            targets: 2.16, ``"ffn"`` (gate/up/down, the default and all 2.15
+                did), ``"attn"`` (W_q/W_k/W_v/W_o) or ``"all"`` of them.
+            alpha: scale numerator (default `rank`).
+            rslora: scale ``alpha / sqrt(rank)`` instead of ``alpha / rank``.
         """
         if target_modules is None:
-            target_modules = ["gate", "up", "down"]
+            target_modules = list(lora_target_names(targets))
+        names = [str(n) for n in target_modules]
+        unknown = sorted(set(names) - set(LORA_TARGETS["all"]))
+        if unknown:
+            raise ValueError(f"unknown LoRA target modules {unknown}: use names from "
+                             f"{', '.join(LORA_TARGETS['all'])}")
+        if self.lora_adapters:
+            self.disable_lora()
 
         self.lora_rank = rank
+        self.lora_config = {"rank": int(rank), "targets": names,
+                            "alpha": float(alpha) if alpha else float(rank),
+                            "rslora": bool(rslora)}
         # plain list (NOT nn.ModuleList) so the adapters are registered only
-        # once — via layer.ffn.lora — and don't appear twice in state_dict.
+        # once — via layer.ffn.lora / layer.attn.lora — and don't appear twice
+        # in state_dict.
         self.lora_adapters = []
 
         # Freeze every base-model parameter
@@ -385,39 +406,81 @@ class ModernTransformer(nn.Module):
 
         for layer in self.layers:
             # nn.ModuleDict keys must NOT contain dots — use the plain
-            # projection name ("gate"/"up"/"down").
-            layer_lora = nn.ModuleDict()
-            for name in target_modules:
-                mod = getattr(layer.ffn, name, None)
-                if isinstance(mod, nn.Linear):
-                    lora = LoRALayer(mod.in_features, mod.out_features, rank)
-                    # LoRA params are created with requires_grad=True by default
-                    layer_lora[name] = lora
-            # wire the adapters into the FFN so forward() actually uses them
-            # (this also registers them as proper submodules of the model)
-            layer.ffn.lora = layer_lora
-            self.lora_adapters.append(layer_lora)
+            # projection name ("gate", "W_q", ...).
+            for part, part_names in (("ffn", LORA_TARGETS["ffn"]), ("attn", LORA_TARGETS["attn"])):
+                wanted = [n for n in names if n in part_names]
+                block = getattr(layer, part, None)
+                if not wanted or block is None:
+                    continue
+                layer_lora = nn.ModuleDict()
+                for name in wanted:
+                    mod = getattr(block, name, None)
+                    if isinstance(mod, nn.Linear):
+                        # LoRA params are created with requires_grad=True by default
+                        layer_lora[name] = LoRALayer(mod.in_features, mod.out_features, rank,
+                                                     alpha=alpha, rslora=rslora).to(
+                            device=mod.weight.device)
+                # wire the adapters into the block so forward() uses them
+                # (this also registers them as proper submodules of the model)
+                block.lora = layer_lora
+                self.lora_adapters.append(layer_lora)
 
     def disable_lora(self):
         """Disable LoRA and restore full training."""
         self.lora_rank = 0
         self.lora_adapters = None
+        self.lora_config = None
         for layer in self.layers:
-            layer.ffn.lora = None
+            for part in ("ffn", "attn"):
+                block = getattr(layer, part, None)
+                if block is not None and hasattr(block, "lora"):
+                    block.lora = None
         for param in self.parameters():
             param.requires_grad = True
+
+    def lora_pairs(self) -> list[tuple[str, nn.Linear, LoRALayer]]:
+        """``(name, base linear, adapter)`` of every LoRA adapter (2.16)."""
+        pairs = []
+        for i, layer in enumerate(self.layers):
+            for part in ("ffn", "attn"):
+                block = getattr(layer, part, None)
+                adapters = getattr(block, "lora", None) if block is not None else None
+                for name, adapter in (adapters.items() if adapters is not None else ()):
+                    pairs.append((f"layers.{i}.{part}.{name}", getattr(block, name), adapter))
+        return pairs
+
+    @torch.no_grad()
+    def merge_lora(self) -> int:
+        """Fold the adapters into the weights they adapt and remove them (2.16).
+
+        ``W += scale * B @ A`` for every adapter; afterwards the model is a
+        plain one (no LoRA, every parameter trainable) that computes the same
+        function, without the adapters' extra matrix products. Returns how
+        many weight matrices changed.
+        """
+        pairs = self.lora_pairs()
+        for _name, linear, adapter in pairs:
+            delta = adapter.delta_weight().to(device=linear.weight.device,
+                                              dtype=linear.weight.dtype)
+            linear.weight.add_(delta)
+        if self.lora_adapters is not None:
+            self.disable_lora()
+        return len(pairs)
 
 class LoRALayer(nn.Module):
     """LoRA (Low-Rank Adaptation) adapter for a linear layer.
 
-    Replaces W with W + (lora_B @ lora_A) / rank
+    Adds ``scale * (x @ A.T @ B.T)`` to the layer's output, ``scale = alpha /
+    rank`` (``alpha / sqrt(rank)`` with `rslora`, 2.16). B starts at zero, so
+    a new adapter does not change the model.
     """
     def __init__(self, in_features: int, out_features: int, rank: int = 8,
-                 alpha: float | None = None):
+                 alpha: float | None = None, rslora: bool = False):
         super().__init__()
         self.rank = rank
         self.alpha = alpha or rank  # default: alpha = rank (scaling = 1)
-        self.scaling = self.alpha / self.rank
+        self.rslora = bool(rslora)
+        self.scaling = self.alpha / (math.sqrt(self.rank) if self.rslora else self.rank)
 
         self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.02)
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
@@ -428,5 +491,25 @@ class LoRALayer(nn.Module):
         # result: x @ lora_A.T @ lora_B.T * scaling
         return (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
+    def delta_weight(self) -> torch.Tensor:
+        """The change this adapter makes to the weight it adapts (out, in)."""
+        return (self.lora_B @ self.lora_A) * self.scaling
 
-__all__ = ["ModernTransformer", "LoRALayer", "estimate_n_params"]
+
+#: Projections a LoRA adapter can sit on (2.16): the FFN's and the attention's.
+LORA_TARGETS = {"ffn": ("gate", "up", "down"), "attn": ("W_q", "W_k", "W_v", "W_o"),
+                "all": ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o")}
+
+
+def lora_target_names(targets: str | list | tuple) -> tuple[str, ...]:
+    """The projection names of `targets` ("ffn", "attn", "all" or a list of names)."""
+    if isinstance(targets, (list, tuple)):
+        return tuple(str(t) for t in targets)
+    key = str(targets or "ffn").strip().lower()
+    if key not in LORA_TARGETS:
+        raise ValueError(f"lora_targets must be one of {', '.join(LORA_TARGETS)}, got {targets!r}")
+    return LORA_TARGETS[key]
+
+
+__all__ = ["LORA_TARGETS", "LoRALayer", "ModernTransformer", "estimate_n_params",
+           "lora_target_names"]

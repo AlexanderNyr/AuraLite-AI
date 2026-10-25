@@ -15,6 +15,12 @@
     auralite tokenizer info    tok.json [--text sample.txt]
     auralite tokenizer encode  tok.json "some text"
     auralite tokenizer convert tokenizer.json --out tok.json
+    auralite chat-eval --model chat.pt --data held_out.jsonl [--limit 300] [--json]
+    auralite lora merge --model lora.pt --out merged.pt
+    auralite lora save  --model lora.pt --out adapter.pt
+    auralite lora apply --base base.pt --adapter adapter.pt --out chat.pt [--merge]
+    auralite distill --teacher teacher.gguf --prompts prompts.txt --out chats.jsonl
+    auralite train   --data prefs.jsonl --resume chat.pt --method dpo --model dpo.pt
 
 2.14.1: `auralite train --tokenizer FILE` trains with your own tokenizer: a file
 of `auralite tokenizer train`, a Hugging Face tokenizer.json (BPE), GPT-2
@@ -44,6 +50,20 @@ documents are joined with blank lines and validated on whole held-out
 documents); a `.jsonl` file of dialogs fine-tunes a chat model instead
 (`--template`, `--lora`): it learns to answer in the chat template and to stop
 at the end of its reply.
+
+2.16: dialogs train for every epoch asked for (early stopping only when
+asked); `--prompt-weight` learns the prompt too, with that weight;
+`--pack-dialogs` packs whole dialogs into the windows. LoRA puts adapters on
+every linear layer (`--lora-targets`), learns at 10x the learning rate
+(`--lora-lr`), and `--save-adapter` writes what the run trained to a file of
+its own; `auralite lora` merges, saves and applies adapters. `auralite
+chat-eval` measures a chat model on held-out dialogs (stop rate, exact
+replies, reply loss). `auralite distill` has a teacher model (GGUF, a llama.cpp
+server, Hugging Face or AuraLite) answer a file of prompts and writes its
+replies as dialogs (`--judge`, `--pairs`: preference pairs; an interrupted run
+resumes). A `.jsonl` of preference pairs (prompt, chosen, rejected) trains the
+chat model with DPO or SimPO (`--method`, `--beta`); `chat-eval` on pairs
+reports how often the chosen reply is the likelier one.
 """
 from __future__ import annotations
 
@@ -309,6 +329,12 @@ class _ProgressPrinter:
             return
         metric = "val SWD" if info.get("val_metric") == "swd" else "val"
         val = f" | {metric}={val_loss:.4f}" if val_loss is not None else ""
+        preference = info.get("preference") or {}
+        if preference.get("accuracy") is not None:          # 2.16: DPO / SimPO
+            val += (f" | accuracy {float(preference['accuracy']):.1%}, margin "
+                    f"{float(preference['margin']):.3f}")
+            if preference.get("kl") is not None:
+                val += f", KL {float(preference['kl']):.4f}"
         if val and info.get("val_bpb") is not None:
             val += f" ({float(info['val_bpb']):.4f} bits/byte)"
         if info.get("d_loss") is not None:              # 2.14.2: image GAN
@@ -328,7 +354,13 @@ def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
 
 def _describe_data(data) -> str:
     """One line about what `auralite train` read (2.15)."""
-    from auralite.engine import DialogSet
+    from auralite.engine import DialogSet, PreferenceSet
+    if isinstance(data, PreferenceSet):                     # 2.16
+        line = (f"{len(data):,} preference pairs from "
+                f"{', '.join(os.path.basename(p) for p in data.sources)}")
+        if data.skipped:
+            line += f" ({data.skipped:,} records skipped, the first: {data.first_skipped})"
+        return line
     if isinstance(data, DialogSet):
         line = f"{len(data):,} dialogs from {', '.join(os.path.basename(p) for p in data.sources)}"
         if data.skipped:
@@ -353,9 +385,31 @@ def cmd_train(args: argparse.Namespace) -> int:
     if not getattr(args, "quiet", False):
         print(f"data: {_describe_data(data)}")
     params = dict(DEFAULT_TRAIN_PARAMS)
+    given: dict = {}
     if args.params:
         with open(args.params, "r", encoding="utf-8") as f:
-            params.update(json.load(f))
+            given = json.load(f)
+        params.update(given)
+    # 2.16: preference pairs train with DPO or SimPO, on the model of --resume
+    from auralite.engine import PreferenceSet
+    method = getattr(args, "method", None) or str(params.get("method") or "auto")
+    pairs = isinstance(data, PreferenceSet) and method != "sft"
+    if getattr(args, "method", None):
+        params["method"] = args.method
+    if getattr(args, "beta", None) is not None:
+        params["preference_beta"] = float(args.beta)
+    if pairs:
+        # the epochs of a new model are not those of a preference run (default 3)
+        params = {k: v for k, v in params.items()
+                  if k in given or k not in DEFAULT_TRAIN_PARAMS}
+        if not getattr(args, "resume", None):
+            print("error: preference pairs train a chat model: give it with --resume "
+                  "(fine-tune a model on dialogs first)", file=sys.stderr)
+            return 2
+    elif method in ("dpo", "simpo"):
+        print(f"error: --method {method} needs preference pairs (records with a prompt, a "
+              f"chosen and a rejected reply)", file=sys.stderr)
+        return 2
     if getattr(args, "mmap", False) or getattr(args, "corpus_cache", None):
         params["corpus_cache"] = "mmap"
     if getattr(args, "corpus_cache", None):
@@ -364,6 +418,18 @@ def cmd_train(args: argparse.Namespace) -> int:
         params["chat_template"] = args.template
     if getattr(args, "lora", None):
         params["lora_rank"] = int(args.lora)
+    # 2.16: the prompt's weight, packing, LoRA's places, scale and learning rate
+    for flag, key in (("prompt_weight", "prompt_loss_weight"), ("lora_targets", "lora_targets"),
+                      ("lora_lr", "lora_lr"), ("lora_alpha", "lora_alpha")):
+        if getattr(args, flag, None) is not None:
+            params[key] = getattr(args, flag)
+    if getattr(args, "rslora", False):
+        params["lora_rslora"] = True
+    if getattr(args, "pack_dialogs", False):
+        params["dialog_packing"] = True
+    if getattr(args, "save_adapter", None) and not params.get("lora_rank"):
+        print("error: --save-adapter needs a LoRA run (--lora RANK)", file=sys.stderr)
+        return 2
     if isinstance(data, DialogSet) and getattr(args, "cluster_workers", None):
         print("error: chat fine-tuning on dialogs runs on one computer "
               "(drop --cluster-workers)", file=sys.stderr)
@@ -441,6 +507,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         return 130
     engine.save_model(args.model)
     line = f"saved: {args.model}"
+    if getattr(args, "save_adapter", None):
+        info = engine.save_adapter(args.save_adapter)
+        line += f" | adapter: {args.save_adapter} ({info['bytes'] / 1e6:.2f} MB)"
     summary = engine.last_train_summary or {}
     if summary.get("val_loss") is not None:
         line += f" | val loss {summary['val_loss']:.4f}"
@@ -448,6 +517,10 @@ def cmd_train(args: argparse.Namespace) -> int:
             line += f" ({summary['val_bpb']:.4f} bits/byte)"
     if summary.get("dialogs"):
         line += f" | chat template {summary['dialogs']['template']}"
+    report = summary.get("preference") or {}
+    if (report.get("final") or {}).get("accuracy") is not None:     # 2.16
+        line += (f" | {str(summary.get('method', '')).upper()}: held-out accuracy "
+                 f"{report['initial']['accuracy']:.1%} -> {report['final']['accuracy']:.1%}")
     reason = str(summary.get("stop_reason") or "")
     if reason:
         line += " | " + {"early_stopping": "stopped early (best epoch kept)",
@@ -457,6 +530,207 @@ def cmd_train(args: argparse.Namespace) -> int:
                          "max_steps": "max_steps reached"}.get(reason, reason)
     print(line)
     return 0
+
+
+def _load_engine(path: str) -> Any:
+    """An engine with the checkpoint `path` loaded, or None (the error printed)."""
+    from auralite.engine import AuraLiteEngine
+    if not os.path.exists(path):
+        print(f"error: checkpoint not found: {path}", file=sys.stderr)
+        return None
+    engine = AuraLiteEngine()
+    engine.load_model(path)
+    return engine
+
+
+def cmd_chat_eval(args: argparse.Namespace) -> int:
+    """2.16: stop rate, exact replies and reply loss on held-out dialogs."""
+    from auralite.engine import DataFormatError
+    engine = _load_engine(args.model)
+    if engine is None:
+        return 2
+    quiet = args.json or getattr(args, "quiet", False)
+    from auralite.engine import (DialogSet, PreferenceSet, evaluate_preferences,
+                                 load_training_data)
+    try:
+        data = load_training_data(args.data)
+    except (FileNotFoundError, DataFormatError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if isinstance(data, PreferenceSet):
+        # 2.16: how often the chosen reply of held-out pairs is the likelier one
+        try:
+            ranked = evaluate_preferences(engine, data, limit=args.limit)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(ranked))
+            return 0
+        print(f"pairs: {ranked['pairs']} | template {engine.default_chat_template}")
+        print(f"chosen reply likelier:          {ranked['accuracy']:.1%}")
+        print(f"chosen likelier per token:      {ranked['mean_accuracy']:.1%}")
+        print(f"log-probability margin:         {ranked['margin']:.3f} "
+              f"({ranked['mean_margin']:.4f} per token)")
+        return 0
+
+    def progress(done: int, total: int) -> None:
+        if not quiet and (done == total or done % max(1, total // 20) == 0):
+            print(f"\rreplies: {done}/{total}", end="" if done < total else "\n", flush=True)
+
+    try:
+        result = engine.evaluate_chat(data if isinstance(data, DialogSet) else args.data,
+                                      limit=args.limit, max_new_tokens=args.max_new_tokens,
+                                      temperature=args.temperature, on_progress=progress)
+    except (FileNotFoundError, DataFormatError, ValueError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    loss = result["reply_loss"]
+    bpb = result["reply_bpb"]
+    temperature = result["temperature"]
+    sampling = "greedy" if temperature <= 0 else f"temperature {temperature}"
+    loss_text = f"{loss:.4f} nats/token" if loss is not None else "n/a"
+    bpb_text = f"{bpb:.4f}" if bpb is not None else "n/a"
+    print(f"dialogs: {result['dialogs']} | template {result['template']} | {sampling}")
+    print(f"stopped by itself: {result['stop_rate']:.1%}")
+    print(f"exact replies:     {result['exact']:.1%}")
+    print(f"no stray markers:  {result['clean_rate']:.1%}")
+    print(f"reply loss:        {loss_text}")
+    print(f"reply bits/byte:   {bpb_text}")
+    for sample in result["samples"]:
+        mark = "=" if sample["exact"] else ("~" if sample["stopped"] else "!")
+        print(f"  {mark} {sample['user']!r} -> {sample['reply']!r}"
+              + ("" if sample["exact"] else f" (expected {sample['expected']!r})"))
+    return 0
+
+
+def cmd_lora(args: argparse.Namespace) -> int:
+    """2.16: merge LoRA adapters into a model, save them alone, or apply them to a base."""
+    if args.lora_command == "apply":
+        engine = _load_engine(args.base)
+        if engine is None:
+            return 2
+        if not os.path.exists(args.adapter):
+            print(f"error: adapter not found: {args.adapter}", file=sys.stderr)
+            return 2
+        try:
+            info = engine.load_adapter(args.adapter, check_base=not args.no_check,
+                                       merge=args.merge)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        engine.save_model(args.out)
+        print(f"saved: {args.out} | {info['adapters']} adapters"
+              + (", merged" if info["merged"] else "") + f", {info['new_rows']} new tokens")
+        return 0
+    engine = _load_engine(args.model)
+    if engine is None:
+        return 2
+    if not engine.has_lora():
+        print(f"error: {args.model} has no LoRA adapters", file=sys.stderr)
+        return 2
+    if args.lora_command == "merge":
+        merged = engine.merge_lora()
+        engine.save_model(args.out)
+        print(f"saved: {args.out} | {merged} weight matrices merged (no adapters left)")
+        return 0
+    info = engine.save_adapter(args.out)
+    print(f"saved: {args.out} | {info['bytes'] / 1e6:.2f} MB, {info['adapters']} adapters, "
+          f"{info['new_rows']} new token rows")
+    return 0
+
+
+def cmd_distill(args: argparse.Namespace) -> int:
+    """2.16: a teacher model answers a file of prompts; its replies become dialogs."""
+    from auralite.engine.distill import distill_dialogs, load_teacher, meta_path, read_prompts
+    if not os.path.exists(args.prompts):
+        print(f"error: prompts file not found: {args.prompts}", file=sys.stderr)
+        return 2
+    try:
+        prompts, skipped = read_prompts(args.prompts)
+    except (OSError, ValueError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if args.limit:
+        prompts = prompts[:int(args.limit)]
+    if not prompts:
+        print(f"error: no prompts in {args.prompts} (one per line in a .txt; records with "
+              f"\"prompt\" or dialogs in a .jsonl)", file=sys.stderr)
+        return 2
+    try:
+        teacher = load_teacher(args.teacher, license=args.license, n_ctx=args.n_ctx,
+                               n_threads=args.threads)
+    except (FileNotFoundError, ValueError, ImportError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    quiet = getattr(args, "quiet", False)
+    if not quiet:
+        print(f"teacher: {teacher.name} ({teacher.kind}) | license: "
+              f"{teacher.license or 'unknown (check the model card)'}")
+        print(f"prompts: {len(prompts):,} from {os.path.basename(args.prompts)}"
+              + (f" ({skipped:,} records without a question skipped)" if skipped else ""))
+    stop = threading.Event()
+    previous = _stop_on_sigint(stop, "stopping after this prompt; run the same command "
+                                     "again to continue")
+    shown = [0.0]
+
+    def progress(info: dict) -> None:
+        now = time.monotonic()
+        last = info["done"] == info["total"]
+        if quiet or (now - shown[0] < 1.0 and not last):
+            return
+        shown[0] = now
+        rate = float(info.get("prompts_per_second") or 0.0)
+        eta = info.get("eta_seconds")
+        text = (f"distill: {info['done']:,}/{info['total']:,} prompts | {info['kept']:,} "
+                f"dialogs | {info['pairs']:,} pairs | {60.0 * rate:.1f}/min")
+        if eta:
+            text += f" | ETA {_fmt_eta(float(eta))}"
+        end = "\n" if last or not sys.stdout.isatty() else ""
+        print(("\r" if sys.stdout.isatty() else "") + text, end=end, flush=True)
+
+    try:
+        meta = distill_dialogs(
+            teacher, prompts, args.out, samples=args.samples, system=args.system,
+            max_tokens=args.max_tokens, temperature=args.temperature, top_p=args.top_p,
+            judge=args.judge, pairs_path=args.pairs, keep_truncated=args.keep_truncated,
+            overwrite=args.overwrite, seed=args.seed,
+            prompts_file=os.path.abspath(args.prompts), on_progress=progress, stop_event=stop)
+    except ValueError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    counts, speed = meta["counts"], meta["speed"]
+    line = f"saved: {args.out} ({meta['files']['dialogs']['records']:,} dialogs)"
+    if args.pairs:
+        line += f" | {args.pairs} ({meta['files']['pairs']['records']:,} pairs)"
+    if counts.get("truncated"):
+        line += f" | {counts['truncated']:,} replies cut at --max-tokens dropped"
+    if counts.get("rejected"):
+        line += f" | {counts['rejected']:,} rejected by the judge"
+    if counts.get("no_reference"):
+        line += f" | {counts['no_reference']:,} prompts without a reference answer"
+    if speed.get("prompts_per_hour"):
+        line += (f" | {speed['prompts_per_hour']:,.0f} prompts/hour, "
+                 f"{speed.get('tokens_per_second') or 0:.1f} tokens/s")
+    print(line)
+    print(f"metadata: {meta_path(args.out)}")
+    if meta.get("stopped"):
+        print(f"stopped at {meta['progress']['done']:,} of {meta['progress']['total']:,}: run "
+              f"the same command again to continue")
+        return 130
+    return 0
+
+
+def _fmt_eta(seconds: float) -> str:
+    m, sec = divmod(int(max(0.0, seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
 
 
 def cmd_cluster_worker(args: argparse.Namespace) -> int:
@@ -913,6 +1187,10 @@ def cmd_info(args: argparse.Namespace) -> int:
     for k in keys:
         if k in ckpt:
             print(f"{k}: {ckpt[k]}")
+    if isinstance(ckpt.get("lora_config"), dict):        # 2.16: where the adapters sit
+        config = ckpt["lora_config"]
+        print(f"lora_targets: {', '.join(config.get('targets') or [])} "
+              f"(alpha {config.get('alpha')}, rslora {bool(config.get('rslora'))})")
     if ckpt.get("max_seq_len"):
         trained = ckpt.get("sliding_window")
         window = min(int(trained), int(ckpt["max_seq_len"])) if trained else int(ckpt["max_seq_len"])
@@ -1119,6 +1397,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora", type=int, metavar="RANK",
                    help="train LoRA adapters of this rank instead of every weight (with "
                         "--resume: fine-tune a model with adapters)")
+    p.add_argument("--lora-targets", choices=["all", "ffn", "attn"],
+                   help="LoRA: the layers that get adapters (default all: FFN and attention)")
+    p.add_argument("--lora-lr", type=float, metavar="LR",
+                   help="LoRA: learning rate (default 10x the learning rate)")
+    p.add_argument("--lora-alpha", type=float, metavar="ALPHA",
+                   help="LoRA: adapter scale numerator (default the rank)")
+    p.add_argument("--rslora", action="store_true",
+                   help="LoRA: scale adapters by alpha/sqrt(rank) (rank-stabilised LoRA)")
+    p.add_argument("--save-adapter", metavar="PATH",
+                   help="LoRA: also write the adapters and new token rows alone to PATH "
+                        "(apply them to the base with `auralite lora apply`)")
+    p.add_argument("--prompt-weight", type=float, metavar="W",
+                   help="dialogs: weight of the prompt tokens in the loss, 0 (the replies "
+                        "only) to 1 (every token); default 0.1, or 0 with --lora")
+    p.add_argument("--pack-dialogs", action="store_true",
+                   help="dialogs: pack whole dialogs into the windows (a long one split where "
+                        "a user turn starts) instead of cutting them from the stream")
+    p.add_argument("--method", choices=["auto", "sft", "dpo", "simpo"],
+                   help="preference pairs (prompt, chosen, rejected): dpo (default for pairs), "
+                        "simpo, or sft (fine-tune on the chosen replies); needs --resume")
+    p.add_argument("--beta", type=float, metavar="BETA",
+                   help="DPO / SimPO: reward scale beta (default 0.1 for DPO, 2.0 for SimPO; "
+                        "--params for lr, epochs, dpo_positive, simpo_gamma)")
     p.add_argument("--params", help="JSON file with training params")
     p.add_argument("--model", default="model.pt", help="output checkpoint")
     p.add_argument("--mmap", action="store_true",
@@ -1223,6 +1524,86 @@ def build_parser() -> argparse.ArgumentParser:
                    help="torch.compile the model for prompt processing")
     _add_context_flags(p)
     p.set_defaults(func=cmd_chat)
+
+    p = sub.add_parser("chat-eval", help="measure a chat model on held-out dialogs: stop "
+                                         "rate, exact replies, reply loss (or on preference "
+                                         "pairs: how often the chosen reply is likelier)")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--data", required=True, nargs="+", metavar="PATH",
+                   help="dialogs (.jsonl/.json: OpenAI messages, ShareGPT, Alpaca, ...) or "
+                        "preference pairs")
+    p.add_argument("--limit", type=int, default=None, metavar="N",
+                   help="the first N dialogs only")
+    p.add_argument("--max-new-tokens", type=int, default=48)
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="0 (default) replies greedily")
+    p.add_argument("--json", action="store_true", help="print the result as one JSON line")
+    p.set_defaults(func=cmd_chat_eval)
+
+    p = sub.add_parser("distill", help="have a teacher model answer prompts; save its "
+                                       "replies as dialogs (and preference pairs)")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--teacher", required=True, metavar="MODEL",
+                   help="a .gguf file (llama-cpp-python), an http:// llama.cpp server, a "
+                        "Hugging Face model (folder or hub id) or an AuraLite checkpoint")
+    p.add_argument("--prompts", required=True, metavar="FILE",
+                   help="one prompt per line (.txt), or .jsonl records: {\"prompt\": ..., "
+                        "\"answer\": ...} or dialogs (a final reply is the reference answer)")
+    p.add_argument("--out", required=True, metavar="FILE",
+                   help="dialogs to write (.jsonl, OpenAI messages: auralite train --data)")
+    p.add_argument("--samples", type=int, default=1, metavar="N",
+                   help="replies per prompt (default 1)")
+    p.add_argument("--system", metavar="TEXT",
+                   help="system message for prompts that have none")
+    p.add_argument("--max-tokens", type=int, default=256, metavar="N",
+                   help="reply length limit (default 256); replies cut there are dropped")
+    p.add_argument("--keep-truncated", action="store_true",
+                   help="keep replies cut at --max-tokens")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="sampling temperature (default 0 = greedy for one sample, 0.8 for more)")
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--judge", metavar="NAME",
+                   help="keep only replies the judge accepts: exact, contains or number (vs "
+                        "the reference answer), regex:PATTERN, or teacher (it picks the better "
+                        "of two replies; --samples 2)")
+    p.add_argument("--pairs", metavar="FILE",
+                   help="also write preference pairs (prompt, chosen, rejected) for "
+                        "--method dpo|simpo; needs --judge")
+    p.add_argument("--license", metavar="NAME",
+                   help="the teacher's license, recorded in the metadata (when the model "
+                        "file names none)")
+    p.add_argument("--limit", type=int, metavar="N", help="the first N prompts only")
+    p.add_argument("--overwrite", action="store_true",
+                   help="start again instead of resuming an earlier run on --out")
+    p.add_argument("--n-ctx", type=int, default=4096, metavar="N",
+                   help="GGUF: context length (default 4096)")
+    p.add_argument("--threads", type=int, metavar="N", help="GGUF: CPU threads")
+    p.set_defaults(func=cmd_distill)
+
+    p = sub.add_parser("lora", help="LoRA adapters: merge them, save them alone, apply them")
+    _add_common_flags(p, suppress_defaults=True)
+    lora_sub = p.add_subparsers(dest="lora_command", required=True)
+    q = lora_sub.add_parser("merge", help="fold the adapters into the weights (a plain model)")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("--model", required=True, help="checkpoint with LoRA adapters")
+    q.add_argument("--out", required=True, help="merged checkpoint")
+    q.set_defaults(func=cmd_lora)
+    q = lora_sub.add_parser("save", help="write the adapters and new token rows alone")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("--model", required=True, help="checkpoint with LoRA adapters")
+    q.add_argument("--out", required=True, help="adapter file")
+    q.set_defaults(func=cmd_lora)
+    q = lora_sub.add_parser("apply", help="put an adapter on the base model it was trained on")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("--base", required=True, help="the base checkpoint")
+    q.add_argument("--adapter", required=True, help="adapter file (auralite lora save)")
+    q.add_argument("--out", required=True, help="checkpoint to write")
+    q.add_argument("--merge", action="store_true", help="fold the adapters into the weights")
+    q.add_argument("--no-check", action="store_true",
+                   help="skip the check that the base is the adapter's own")
+    q.set_defaults(func=cmd_lora)
 
     p = sub.add_parser("serve", help="start the OpenAI-compatible API server")
     _add_common_flags(p, suppress_defaults=True)

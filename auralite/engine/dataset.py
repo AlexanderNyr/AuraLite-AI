@@ -1,6 +1,7 @@
 """Datasets for in-memory and memory-mapped token corpora."""
 from __future__ import annotations
 
+import bisect
 import math
 from pathlib import Path
 from typing import Iterable
@@ -287,6 +288,8 @@ class WindowBatches:
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        if hasattr(self.dataset, "set_epoch"):        # 2.16: packed dialogs
+            self.dataset.set_epoch(self.epoch, self._generator(3))
         max_offset = int(getattr(self.dataset, "max_window_offset", 0))
         if self.random_offsets and max_offset > 0:
             offset = int(torch.randint(0, max_offset + 1, (1,),
@@ -322,6 +325,98 @@ class WindowBatches:
             yield xb, yb
 
 
+class PackedDataset(Dataset):
+    """Windows that each hold whole pieces of text: packed dialogs (2.16).
+
+    `ids` and `targets` are ``(n, seq_length + 1)`` tensors from
+    :func:`pack_sequences`; window ``i`` gives ``x = ids[i, :-1]`` and ``y =
+    targets[i, 1:]``. A window starts where a dialog starts and ends after the
+    last dialog that fits in it (the rest is padding with an ``IGNORE_INDEX``
+    target), so no reply is learned without the question before it. There is
+    no stride and no window offset.
+
+    Given the `pieces` the windows were packed from, ``set_epoch`` (which
+    `WindowBatches` calls) packs them again for each epoch with ties between
+    pieces of one length broken at random: the same number of windows, each as
+    full as before, but different pieces side by side in every epoch.
+    """
+
+    def __init__(self, ids: torch.Tensor, targets: torch.Tensor,
+                 pieces: list[tuple[list[int], list[int]]] | None = None):
+        if ids.dim() != 2 or ids.shape != targets.shape or ids.shape[1] < 2:
+            raise ValueError(f"ids and targets must be (n, seq_length + 1) tensors of one "
+                             f"shape, got {tuple(ids.shape)} and {tuple(targets.shape)}")
+        self.ids = ids.contiguous()
+        self.targets = targets.contiguous()
+        self.seq_length = int(ids.shape[1]) - 1
+        self.pieces = pieces
+
+    def set_epoch(self, epoch: int, generator: torch.Generator) -> None:
+        """Pack the pieces again for `epoch` (see the class docs); no-op without them."""
+        if self.pieces:
+            ids, targets = pack_sequences(self.pieces, self.seq_length + 1,
+                                          generator=generator)
+            if ids.shape == self.ids.shape:
+                self.ids, self.targets = ids, targets
+
+    def __len__(self) -> int:
+        return int(self.ids.shape[0])
+
+    def __getitem__(self, idx: int):
+        return self.ids[idx, :-1], self.targets[idx, 1:]
+
+    def get_batch(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Windows `indices` as one ``(len(indices), seq_length)`` batch."""
+        return self.ids[indices][:, :-1], self.targets[indices][:, 1:]
+
+
+def pack_sequences(sequences: list[tuple[list[int], list[int]]], width: int,
+                   pad_id: int = 0, *, generator: torch.Generator | None = None
+                   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(ids, targets)`` tensors of shape ``(n, width)`` holding `sequences` (2.16).
+
+    Each sequence is ``(ids, targets)`` of at most `width` tokens and is kept
+    whole. Best-fit decreasing: the longest sequence goes first, each into the
+    window with the least room left that it fits in (a new window if none
+    does). In a window the sequences keep their order; the room after them is
+    `pad_id` with an ``IGNORE_INDEX`` target. With a `generator`, sequences of
+    one length go in a random order (and keep it in their windows): the
+    windows are as many and as full, with other sequences side by side.
+    """
+    width = int(width)
+    rank = (torch.randperm(len(sequences), generator=generator).tolist()
+            if generator is not None else list(range(len(sequences))))
+    order = sorted(range(len(sequences)), key=lambda i: (-len(sequences[i][0]), rank[i]))
+    room: list[tuple[int, int]] = []          # (free tokens, window), sorted
+    windows: list[list[int]] = []
+    for i in order:
+        n = len(sequences[i][0])
+        if n > width:
+            raise ValueError(f"a sequence of {n} tokens does not fit a window of {width}")
+        if n == 0:
+            continue
+        k = bisect.bisect_left(room, (n, -1))
+        if k < len(room):
+            free, w = room.pop(k)
+        else:
+            free, w = width, len(windows)
+            windows.append([])
+        windows[w].append(i)
+        if free - n > 0:
+            bisect.insort(room, (free - n, w))
+    ids = torch.full((len(windows), width), int(pad_id), dtype=torch.long)
+    targets = torch.full((len(windows), width), IGNORE_INDEX, dtype=torch.long)
+    for w, members in enumerate(windows):
+        at = 0
+        for i in sorted(members, key=rank.__getitem__):
+            seq_ids, seq_targets = sequences[i]
+            n = len(seq_ids)
+            ids[w, at:at + n] = torch.as_tensor(seq_ids, dtype=torch.long)
+            targets[w, at:at + n] = torch.as_tensor(seq_targets, dtype=torch.long)
+            at += n
+    return ids, targets
+
+
 def spread_indices(n: int, k: int) -> torch.Tensor:
     """`k` indices spread evenly over ``range(n)`` (all of them when ``k >= n``)."""
     if k >= n:
@@ -343,5 +438,5 @@ class _Subset:
         return self.dataset.get_batch(self.indices[positions])
 
 
-__all__ = ["IGNORE_INDEX", "CharDataset", "PagedDataset", "WindowBatches", "spread_indices",
-           "validation_split_point", "write_tokens_memmap"]
+__all__ = ["IGNORE_INDEX", "CharDataset", "PackedDataset", "PagedDataset", "WindowBatches",
+           "pack_sequences", "spread_indices", "validation_split_point", "write_tokens_memmap"]

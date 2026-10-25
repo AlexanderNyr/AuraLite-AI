@@ -32,13 +32,17 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "autosave_path", "batch_size", "bpe_pretokenizer", "bpe_vocab_size",
     "chat_template", "cluster_host", "cluster_port", "cluster_timeout_s", "cluster_token",
     "cluster_workers", "continue_training", "cooldown_ratio", "corpus_cache",
-    "corpus_cache_path", "d_ff", "d_model", "dialog_loss", "dropout", "early_stopping_cooldown",
-    "early_stopping_patience", "epochs", "grad_clip",
-    "kv_cache_dtype", "lora_rank", "lr", "lr_schedule", "max_steps",
+    "corpus_cache_path", "d_ff", "d_model", "dialog_loss", "dialog_packing", "dpo_positive",
+    "dropout",
+    "early_stopping_cooldown", "early_stopping_patience", "epochs", "grad_clip",
+    "kv_cache_dtype", "lora_alpha", "lora_embeddings", "lora_lr", "lora_rank", "lora_rslora",
+    "lora_targets", "lr", "lr_schedule", "max_steps", "method",
     "muon_adjust_lr", "muon_lr", "muon_momentum", "muon_ns_steps", "n_heads", "n_kv_heads",
-    "n_layers", "num_experts", "optimizer", "progress_every_batches",
-    "progress_every_seconds", "restore_best_weights", "resume_training_state",
-    "rope_scaling", "sample_stride", "seed", "seq_length", "sliding_window",
+    "n_layers", "num_experts", "optimizer", "preference_beta", "preference_sft_weight",
+    "progress_every_batches",
+    "progress_every_seconds", "prompt_loss_weight", "restore_best_weights",
+    "resume_training_state",
+    "rope_scaling", "sample_stride", "seed", "seq_length", "simpo_gamma", "sliding_window",
     "tie_word_embeddings", "time_budget_s", "tokenizer", "tokenizer_path", "use_alibi",
     "use_compile", "use_ddp",
     "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
@@ -171,6 +175,8 @@ def validate_params(params: dict) -> list[str]:
         value = params.get(key)
         if value is None and (none_ok or key not in params):
             continue
+        if key == "early_stopping_patience" and is_auto(value):
+            continue                   # 2.16: the default (0 on dialogs, else the recipe's)
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
             errors.append(f"{key} must be an integer, got {value!r}")
         elif value < low:
@@ -222,6 +228,41 @@ def validate_params(params: dict) -> list[str]:
                 errors.append(f"seed must be >= 0, got {seed_val}")
         except (TypeError, ValueError):
             errors.append(f"seed must be an integer, got {seed_val!r}")
+
+    # 2.16: chat fine-tuning and LoRA
+    for key, low, high in (("prompt_loss_weight", 0.0, 1.0), ("lora_lr", None, None),
+                           ("lora_alpha", None, None)):
+        value = params.get(key)
+        if value is None or (key == "prompt_loss_weight" and is_auto(value)):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            errors.append(f"{key} must be a number, got {value!r}")
+        elif low is not None and high is not None and not low <= value <= high:
+            errors.append(f"{key} must be in [{low}, {high}], got {value}")
+        elif low is None and value <= 0:
+            errors.append(f"{key} must be > 0, got {value}")
+    lora_targets = params.get("lora_targets")
+    if lora_targets is not None and str(lora_targets).strip().lower() not in ("all", "ffn", "attn"):
+        errors.append(f"lora_targets must be 'all', 'ffn' or 'attn', got {lora_targets!r}")
+    lora_embeddings = params.get("lora_embeddings")
+    if lora_embeddings is not None and str(lora_embeddings).strip().lower() not in ("new", "all"):
+        errors.append(f"lora_embeddings must be 'new' or 'all', got {lora_embeddings!r}")
+    # 2.16: preference training (DPO, SimPO; auralite/engine/preference.py)
+    method = params.get("method")
+    if method is not None and str(method).strip().lower() not in ("auto", "sft", "dpo", "simpo"):
+        errors.append(f"method must be 'auto', 'sft', 'dpo' or 'simpo', got {method!r}")
+    for key, value, low in (("preference_beta", params.get("preference_beta"), None),
+                            ("simpo_gamma", params.get("simpo_gamma"), 0.0),
+                            ("preference_sft_weight", params.get("preference_sft_weight"), 0.0),
+                            ("dpo_positive", params.get("dpo_positive"), 0.0)):
+        if value is None or is_auto(value):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            errors.append(f"{key} must be a number, got {value!r}")
+        elif low is None and value <= 0:
+            errors.append(f"{key} must be > 0, got {value}")
+        elif low is not None and value < low:
+            errors.append(f"{key} must be >= {low:g}, got {value}")
 
     if lr_schedule == "wsd":
         stable_ratio = params.get("wsd_stable_ratio", 0.8)

@@ -7,6 +7,7 @@ from ..common import (filedialog, json, messagebox, threading, tk, ttk)
 class EvaluationTabMixin:
     def _build_evaluation_tab(self):
         tab = self.tab_eval
+        self._build_chat_eval_frame(tab)
 
         try:
             from auralite.evaluation import HAS_LM_EVAL
@@ -171,3 +172,84 @@ class EvaluationTabMixin:
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
+    # ---- 2.16: a chat model on held-out dialogs (no lm-eval needed) -------
+    def _build_chat_eval_frame(self, tab):
+        frame = ttk.LabelFrame(tab, text="  💬  Chat model on dialogs  ", padding="10")
+        frame.pack(fill=tk.X, pady=(0, 8))
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X)
+        self.chat_eval_btn = ttk.Button(row, text="💬 Evaluate on dialogs…",
+                                        command=self._run_chat_eval)
+        self.chat_eval_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(row, text="Dialogs (max):").pack(side=tk.LEFT, padx=(12, 4))
+        self.chat_eval_limit_var = tk.StringVar(value="300")
+        ttk.Entry(row, textvariable=self.chat_eval_limit_var, width=6).pack(side=tk.LEFT)
+        self.chat_eval_status = ttk.Label(
+            row, text="Replies to the last user turn of held-out dialogs (.jsonl), compared "
+                      "with the dialog's own reply", style="Sub.TLabel")
+        self.chat_eval_status.pack(side=tk.LEFT, padx=12)
+        self.chat_eval_table = ttk.Treeview(frame, columns=("metric", "value"),
+                                            show="headings", height=7)
+        for column, width in (("metric", 260), ("value", 520)):
+            self.chat_eval_table.heading(column, text=column.title())
+            self.chat_eval_table.column(column, width=width, anchor=tk.W)
+        self.chat_eval_table.pack(fill=tk.X, pady=(6, 0))
+
+    def _run_chat_eval(self):
+        if not self.engine.model:
+            messagebox.showwarning("No Model", "Load or train a model first.")
+            return
+        try:
+            limit = int(self.chat_eval_limit_var.get()) if self.chat_eval_limit_var.get().strip() \
+                else None
+        except ValueError:
+            messagebox.showerror("Invalid Input", "The number of dialogs must be an integer.")
+            return
+        path = filedialog.askopenfilename(
+            title="Dialogs to evaluate on (held out from training)",
+            filetypes=[("Dialogs", "*.jsonl *.json"), ("All files", "*.*")])
+        if not path:
+            return
+        self.chat_eval_btn.config(state=tk.DISABLED)
+        for item in self.chat_eval_table.get_children():
+            self.chat_eval_table.delete(item)
+        self.chat_eval_status.config(text="Status: replying…")
+
+        def progress(done: int, total: int) -> None:
+            self.root.after(0, lambda: self.chat_eval_status.config(
+                text=f"Status: replying… {done}/{total}"))
+
+        def run():
+            try:
+                result = self.engine.evaluate_chat(path, limit=limit, on_progress=progress)
+                self.last_chat_eval = result
+                self.root.after(0, lambda: self._show_chat_eval(result))
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror("Chat evaluation", err))
+                self.root.after(0, lambda: self.chat_eval_status.config(text="Status: failed"))
+            finally:
+                self.root.after(0, lambda: self.chat_eval_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_chat_eval(self, result: dict):
+        def fmt(value, pattern):
+            return "n/a" if value is None else pattern.format(value)
+
+        rows = [
+            ("Stopped by itself", fmt(result["stop_rate"], "{:.1%}")),
+            ("Exact replies", fmt(result["exact"], "{:.1%}")),
+            ("No stray template markers", fmt(result["clean_rate"], "{:.1%}")),
+            ("Reply loss (nats per token)", fmt(result["reply_loss"], "{:.4f}")),
+            ("Reply bits per byte", fmt(result["reply_bpb"], "{:.4f}")),
+            ("New tokens per reply", fmt(result["mean_new_tokens"], "{:.1f}")),
+        ]
+        for sample in result.get("samples", []):
+            mark = "✓" if sample["exact"] else ("·" if sample["stopped"] else "…")
+            rows.append((f"{mark} {sample['user'][:40]}", sample["reply"][:120]))
+        for metric, value in rows:
+            self.chat_eval_table.insert("", tk.END, values=(metric, value))
+        self.chat_eval_status.config(
+            text=f"Status: {result['dialogs']} dialogs, {result['template']} template, "
+                 f"{result['seconds']:.0f} s")

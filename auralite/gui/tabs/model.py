@@ -23,6 +23,20 @@ class ModelTabMixin:
                                    command=self.load_model)
         self.load_btn.pack(side=tk.LEFT, padx=6)
 
+        # 2.16: LoRA adapters of a native model — fold them into the weights,
+        # save them alone (a few percent of the model), put them on a base
+        lora_row = ttk.Frame(io_frame)
+        lora_row.pack(pady=2)
+        self.lora_merge_btn = ttk.Button(lora_row, text="🔗 Merge LoRA",
+                                         command=self.merge_lora_adapters)
+        self.lora_merge_btn.pack(side=tk.LEFT, padx=6)
+        self.lora_save_btn = ttk.Button(lora_row, text="💾 Save LoRA adapter…",
+                                        command=self.save_lora_adapter)
+        self.lora_save_btn.pack(side=tk.LEFT, padx=6)
+        self.lora_load_btn = ttk.Button(lora_row, text="📂 Load LoRA adapter…",
+                                        command=self.load_lora_adapter)
+        self.lora_load_btn.pack(side=tk.LEFT, padx=6)
+
         self.model_file_label = ttk.Label(io_frame, text="No model loaded",
                                           foreground="gray")
         self.model_file_label.pack(pady=2)
@@ -675,3 +689,91 @@ class ModelTabMixin:
         self.hf_stop_ft_btn.config(state=tk.DISABLED)
         self.status_label.config(text="Status: Stopping fine-tune after the current step…")
 
+    # ---- 2.16: LoRA adapters of a native model ---------------------------
+    def _native_lora_ready(self, title: str) -> bool:
+        if self.engine.model is None or self.engine.is_gguf_model() or self.engine.is_hf_model():
+            messagebox.showinfo(title, "Load or train a native AuraLite model (.pt) first.")
+            return False
+        return True
+
+    def _refresh_after_lora(self):
+        """The model info and the Chat tab follow the changed model."""
+        refresh = getattr(self, "_refresh_model_info", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - cosmetic
+                pass
+
+    def merge_lora_adapters(self):
+        """Fold the LoRA adapters into the weights (a plain model again)."""
+        if not self._native_lora_ready("Merge LoRA"):
+            return
+        if not self.engine.has_lora():
+            messagebox.showinfo("Merge LoRA", "The model in memory has no LoRA adapters (train "
+                                              "with a LoRA rank, or load an adapter).")
+            return
+        try:
+            merged = self.engine.merge_lora()
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            messagebox.showerror("Merge LoRA", str(e))
+            return
+        self._refresh_after_lora()
+        messagebox.showinfo("LoRA merged", f"{merged} weight matrices now hold the adapters; "
+                                           f"the model has no adapters left and runs at full "
+                                           f"speed. Save it with «Save Model».")
+
+    def save_lora_adapter(self):
+        """Write the adapters and the rows of new tokens alone."""
+        if not self._native_lora_ready("Save LoRA adapter"):
+            return
+        if not self.engine.has_lora():
+            messagebox.showinfo("Save LoRA adapter", "The model in memory has no LoRA adapters.")
+            return
+        path = filedialog.asksaveasfilename(title="Save LoRA adapter", defaultextension=".pt",
+                                            filetypes=[("LoRA adapter", "*.pt"),
+                                                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            info = self.engine.save_adapter(path)
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            messagebox.showerror("Save LoRA adapter", str(e))
+            return
+        messagebox.showinfo("LoRA adapter saved",
+                            f"{os.path.basename(path)}: {info['bytes'] / 1e6:.2f} MB, "
+                            f"{info['adapters']} adapters, {info['new_rows']} new token rows.\n"
+                            f"Load the base model and «Load LoRA adapter…» to use it again.")
+
+    def load_lora_adapter(self):
+        """Put an adapter file on the base model in memory."""
+        if not self._native_lora_ready("Load LoRA adapter"):
+            return
+        path = filedialog.askopenfilename(title="Load LoRA adapter",
+                                          filetypes=[("LoRA adapter", "*.pt"),
+                                                     ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            info = self.engine.load_adapter(path)
+        except ValueError as e:
+            if "another base model" not in str(e):
+                messagebox.showerror("Load LoRA adapter", str(e))
+                return
+            if not messagebox.askyesno(
+                    "Another base model",
+                    f"{e}\n\nPut the adapter on the model in memory anyway?"):
+                return
+            try:
+                info = self.engine.load_adapter(path, check_base=False)
+            except Exception as err:  # noqa: BLE001 - shown to the user
+                messagebox.showerror("Load LoRA adapter", str(err))
+                return
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            messagebox.showerror("Load LoRA adapter", str(e))
+            return
+        self._refresh_after_lora()
+        messagebox.showinfo("LoRA adapter loaded",
+                            f"{info['adapters']} adapters and {info['new_rows']} new tokens "
+                            f"from {os.path.basename(path)}. «Merge LoRA» folds them into the "
+                            f"weights.")

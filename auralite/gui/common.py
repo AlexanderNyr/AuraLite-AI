@@ -26,6 +26,9 @@ from auralite.engine.tokenizer_io import describe_tokenizer, read_tokenizer_file
 # 2.15: folders of documents and dialogs for chat fine-tuning (the training tab).
 from auralite.engine.corpus import data_kind, load_training_data
 from auralite.engine.dialogs import SFT_TEMPLATES, DialogSet, dialog_plain_text
+# 2.16: preference pairs (DPO, SimPO) and dialogs from a teacher model (the training tab).
+from auralite.engine.preference import PreferenceSet
+from auralite.engine.distill import EngineTeacher, distill_dialogs, load_teacher, read_prompts
 from auralite.web_tools import build_web_context
 # Agent framework (optional)
 try:

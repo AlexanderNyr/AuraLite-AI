@@ -218,6 +218,9 @@ class Attention(nn.Module):
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        # 2.16: LoRA adapters on W_q/W_k/W_v/W_o (None until the model's
+        # enable_lora(targets="attn" or "all"); see `_proj`)
+        self.lora: nn.ModuleDict | None = None
 
         # QK-norm (v2.6): per-head RMSNorm applied to q/k BEFORE RoPE.
         # Stabilizes attention logits; standard in OLMo-2 / Gemma-2 / Qwen3.
@@ -464,6 +467,14 @@ class Attention(nn.Module):
         """Memory held by this layer's cache storage, in bytes."""
         return 0 if self._cache is None else self._cache.memory_bytes()
 
+    def _proj(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        """The projection `name` of `x`, plus its LoRA adapter's delta if it has one."""
+        out = getattr(self, name)(x)
+        lora = self.lora
+        if lora is not None and name in lora:
+            out = out + lora[name](x)
+        return out
+
     def truncate_cache(self, end: int) -> None:
         """Forget cached positions ``>= end`` (speculative-decoding rollback)."""
         if self._cache is not None:
@@ -475,9 +486,9 @@ class Attention(nn.Module):
                 capture: dict | None = None) -> torch.Tensor:
         B, T, _ = x.shape
 
-        q = self.W_q(x).view(B, T, self.n_heads,    self.head_dim)
-        k = self.W_k(x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self.W_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+        q = self._proj("W_q", x).view(B, T, self.n_heads,    self.head_dim)
+        k = self._proj("W_k", x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self._proj("W_v", x).view(B, T, self.n_kv_heads, self.head_dim)
 
         # QK-norm: normalize per head BEFORE rotary embeddings.
         if self.use_qk_norm:
@@ -555,7 +566,7 @@ class Attention(nn.Module):
                         window, x.device)
                     out = flex(q, k, v, block_mask=mask, enable_gqa=use_native_gqa)
                     out = out.transpose(1, 2).contiguous().view(B, T, -1)
-                    return self.W_o(out)
+                    return self._proj("W_o", out)
                 except Exception as err:  # noqa: BLE001 - fall back, never crash
                     _FLEX_FAILED.add(id(self))
                     logger.warning(
@@ -585,7 +596,7 @@ class Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, **sdpa_gqa_kw)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.W_o(out)
+        return self._proj("W_o", out)
 
     def reset_cache(self, capacity: int | None = None):
         """Drop the cache. `capacity` (optional) preallocates that many
@@ -614,11 +625,19 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.lora is None:
             return self.down(F.silu(self.gate(x)) * self.up(x))
-        # LoRA path: add low-rank deltas to each projection
-        g = self.gate(x) + self.lora["gate"](x)
-        u = self.up(x)   + self.lora["up"](x)
+        # LoRA path: add low-rank deltas to the projections that have one
+        lora = self.lora
+        g = self.gate(x)
+        if "gate" in lora:
+            g = g + lora["gate"](x)
+        u = self.up(x)
+        if "up" in lora:
+            u = u + lora["up"](x)
         h = F.silu(g) * u
-        return self.down(h) + self.lora["down"](h)
+        out = self.down(h)
+        if "down" in lora:
+            out = out + lora["down"](h)
+        return out
 
 def _graph_capture_active() -> bool:
     """True while torch.jit tracing, torch.compile/torch.export or the ONNX

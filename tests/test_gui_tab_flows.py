@@ -265,7 +265,8 @@ class TestTrainingFlow:
         assert app.tok_var.get() == R["tokenizer"]
         assert app.qk_norm_var.get() is R["use_qk_norm"]
         assert app.sched_var.get() == R["lr_schedule"]
-        assert int(app.early_stop_var.get()) == R["early_stopping_patience"]
+        # 2.16: "auto" = the recipe's patience on text, off on dialogs
+        assert app.early_stop_var.get() == "auto" and app.early_stop_param() == "auto"
         assert int(app.bpe_vocab_var.get()) == R["bpe_vocab_size"]
         assert float(app.params["lr"].get()) == R["lr"]
         assert int(app.params["batch_size"].get()) == R["batch_size"]

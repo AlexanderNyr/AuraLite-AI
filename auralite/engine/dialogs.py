@@ -22,6 +22,7 @@ marker stops by itself: ``generate_chat`` ends at that token.
 """
 from __future__ import annotations
 
+import bisect
 import random
 import re
 from dataclasses import dataclass, field
@@ -30,9 +31,12 @@ from typing import Any
 from auralite.chat_interface import CHAT_TEMPLATES, apply_chat_template
 from auralite.engine.dataset import IGNORE_INDEX
 
-__all__ = ["DIALOG_LOSSES", "DialogSet", "SFT_TEMPLATES", "SPLIT_SEED", "check_template",
-           "dialog_from_record", "dialog_plain_text", "encode_dialog", "generation_prompt",
-           "render_segments", "template_special_tokens", "text_from_record"]
+__all__ = ["DEFAULT_PROMPT_LOSS_WEIGHT", "DIALOG_LOSSES", "DialogSet", "PROMPT_TARGET_OFFSET",
+           "SFT_TEMPLATES", "SPLIT_SEED",
+           "check_template", "dialog_from_record", "dialog_plain_text", "dialog_targets",
+           "encode_dialog", "encode_dialog_parts", "encode_reply", "generation_prompt",
+           "held_out_split", "render_segments", "split_at_turns", "template_special_tokens",
+           "text_from_record"]
 
 #: Chat templates a model can be fine-tuned with: each reply ends with a
 #: marker that is also a stop string of the template, and the prompt of the
@@ -164,15 +168,24 @@ class DialogSet:
         out, picked at random with a fixed seed: whole dialogs, so validation
         measures replies to conversations the model has never seen.
         """
-        n = len(self.dialogs)
-        if n < 2 or not 0.0 < float(val_split) < 1.0:
-            return list(range(n)), []
-        k = min(n - 1, max(1, round(n * float(val_split))))
-        order = list(range(n))
-        random.Random(seed).shuffle(order)
-        held_out = set(order[:k])
-        return ([i for i in range(n) if i not in held_out],
-                [i for i in range(n) if i in held_out])
+        return held_out_split(len(self.dialogs), val_split, seed)
+
+
+def held_out_split(n: int, val_split: float, seed: int = SPLIT_SEED) -> tuple[list[int], list[int]]:
+    """``(training, validation)`` indices of `n` items, each in order (2.16).
+
+    `val_split` of them (at least one, never all) are held out, picked at
+    random with a fixed seed; :meth:`DialogSet.split` and the preference
+    pairs of :mod:`auralite.engine.preference` hold out alike.
+    """
+    if n < 2 or not 0.0 < float(val_split) < 1.0:
+        return list(range(n)), []
+    k = min(n - 1, max(1, round(n * float(val_split))))
+    order = list(range(n))
+    random.Random(seed).shuffle(order)
+    held_out = set(order[:k])
+    return ([i for i in range(n) if i not in held_out],
+            [i for i in range(n) if i in held_out])
 
 
 # ----------------------------------------------------------------------
@@ -208,6 +221,14 @@ def render_segments(dialog: list[dict], template: str,
     assistant reply up to and including its end marker (``loss=
     "assistant"``), or everything (``loss="all"``).
     """
+    return [(text, learn) for text, learn, _kind in _render_parts(dialog, template, loss)]
+
+
+def _render_parts(dialog: list[dict], template: str,
+                  loss: str = "assistant") -> list[tuple[str, bool, str]]:
+    """:func:`render_segments` with the kind of each piece: "system", "user",
+    "head" (what opens a reply), "reply" (the reply and its end marker) or
+    "tail" (what follows the end marker)."""
     template = check_template(template)
     if loss not in DIALOG_LOSSES:
         raise ValueError(f"dialog_loss must be one of {', '.join(DIALOG_LOSSES)}, got {loss!r}")
@@ -220,20 +241,20 @@ def render_segments(dialog: list[dict], template: str,
                          f"{head!r} + reply + {end!r}")
     tail = after[len(end):]
     everything = loss == "all"
-    out: list[tuple[str, bool]] = []
+    out: list[tuple[str, bool, str]] = []
     for message in dialog:
         role, content = message.get("role"), str(message.get("content", ""))
         if role == "system":
             if spec["system"]:
-                out.append((spec["system"].format(system=content), everything))
+                out.append((spec["system"].format(system=content), everything, "system"))
         elif role == "user":
-            out.append((spec["user"].format(user=content), everything))
+            out.append((spec["user"].format(user=content), everything, "user"))
         elif role == "assistant":
             if head:
-                out.append((head, everything))
-            out.append((before[len(head):] + content + end, True))
+                out.append((head, everything, "head"))
+            out.append((before[len(head):] + content + end, True, "reply"))
             if tail:
-                out.append((tail, everything))
+                out.append((tail, everything, "tail"))
     return out
 
 
@@ -260,3 +281,105 @@ def encode_dialog(tokenizer: Any, dialog: list[dict], template: str,
         ids.extend(piece)
         targets.extend(piece if learn else [IGNORE_INDEX] * len(piece))
     return ids, targets
+
+
+def encode_reply(tokenizer: Any, history: list[dict], reply: str,
+                 template: str) -> tuple[list[int], list[int]]:
+    """``(prompt ids, reply ids)`` of `reply` to the dialog `history` (2.16).
+
+    The prompt is the dialog and the markers that open a reply, the reply ids
+    are the reply and its end marker: the tokens :func:`encode_dialog` gives
+    that dialog with the reply as its last turn (each piece encoded on its
+    own), so a preference pair is scored on the text chat fine-tuning learned.
+    """
+    parts = _render_parts(list(history) + [{"role": "assistant", "content": str(reply)}],
+                          template, "assistant")
+    last = max(i for i, (_text, _learn, kind) in enumerate(parts) if kind == "reply")
+    prompt: list[int] = []
+    for text, _learn, _kind in parts[:last]:
+        prompt.extend(tokenizer.encode(text))
+    return prompt, list(tokenizer.encode(parts[last][0]))
+
+
+# ----------------------------------------------------------------------
+#  2.16: the prompt's weight in the loss, and dialogs in windows
+# ----------------------------------------------------------------------
+#: The prompt's weight in the loss when neither ``prompt_loss_weight`` nor
+#: ``dialog_loss`` is given and every weight trains (a LoRA run defaults to 0).
+#: 0.1 gave clearly better replies than the replies alone on the benchmark of
+#: docs/training.md § 16, and worse ones with LoRA; Huerta-Enochian & Ko
+#: (EMNLP 2024) found small weights best for short replies and the weight
+#: irrelevant for long ones.
+DEFAULT_PROMPT_LOSS_WEIGHT = 0.1
+
+#: The target of a prompt token when the prompt is learned with a weight
+#: between 0 and 1 (``prompt_loss_weight``): its id plus this offset, which
+#: tells the loss it is a prompt token. Plain cross-entropy fails loudly on
+#: such a target (an id beyond any vocabulary) instead of learning it in full.
+PROMPT_TARGET_OFFSET = 1 << 30
+
+
+def encode_dialog_parts(tokenizer: Any, dialog: list[dict],
+                        template: str) -> tuple[list[int], list[bool], list[int]]:
+    """``(token ids, reply mask, user turn starts)`` of one dialog (2.16).
+
+    The ids are those of :func:`encode_dialog`; ``reply[i]`` is True where
+    the token belongs to an assistant reply (or its end marker), and the
+    starts are the positions where the user's turns begin: the places a dialog
+    too long for one window is split at (:func:`split_at_turns`).
+    """
+    ids: list[int] = []
+    reply: list[bool] = []
+    starts: list[int] = []
+    for text, learn, kind in _render_parts(dialog, template, "assistant"):
+        piece = tokenizer.encode(text)
+        if kind == "user":
+            starts.append(len(ids))
+        ids.extend(piece)
+        reply.extend([learn] * len(piece))
+    return ids, reply, starts
+
+
+def dialog_targets(ids: list[int], reply: list[bool], prompt_weight: float = 0.0) -> list[int]:
+    """The targets of a dialog's tokens when its prompt has `prompt_weight` (2.16).
+
+    0 learns the replies only (``IGNORE_INDEX`` elsewhere, as ``dialog_loss=
+    "assistant"``), 1 learns every token (``dialog_loss="all"``); in between a
+    prompt token's target is its id plus :data:`PROMPT_TARGET_OFFSET`, which
+    the training loss weighs by `prompt_weight`.
+    """
+    weight = float(prompt_weight)
+    if weight <= 0.0:
+        return [i if r else IGNORE_INDEX for i, r in zip(ids, reply, strict=True)]
+    if weight >= 1.0:
+        return list(ids)
+    return [i if r else i + PROMPT_TARGET_OFFSET for i, r in zip(ids, reply, strict=True)]
+
+
+def split_at_turns(length: int, starts: list[int], window: int) -> tuple[list[tuple[int, int]], int]:
+    """A dialog of `length` tokens as ``[start, end)`` pieces of at most `window` tokens.
+
+    A dialog that fits stays whole. A longer one is cut where a user turn
+    starts (`starts`), as late as the window allows, so that each reply is
+    learned together with the question before it; where a single turn is
+    longer than the window it is cut at the window's end. Returns the pieces
+    and the number of such forced cuts.
+    """
+    window = max(1, int(window))
+    if length <= window:
+        return [(0, length)], 0
+    cuts = sorted({int(s) for s in starts if 0 < int(s) < length})
+    pieces: list[tuple[int, int]] = []
+    forced = 0
+    start = 0
+    while length - start > window:
+        limit = start + window
+        k = bisect.bisect_right(cuts, limit) - 1
+        if k >= 0 and cuts[k] > start:
+            end = cuts[k]
+        else:
+            end, forced = limit, forced + 1
+        pieces.append((start, end))
+        start = end
+    pieces.append((start, length))
+    return pieces, forced

@@ -457,9 +457,9 @@ class DecodeBatch:
                    write_rows: torch.Tensor | None, write_slots: torch.Tensor | None,
                    write_local: torch.Tensor | None) -> torch.Tensor:
         n = r1 - r0
-        q = attn.W_q(a).view(n, 1, attn.n_heads, attn.head_dim)
-        k = attn.W_k(a).view(n, 1, attn.n_kv_heads, attn.head_dim)
-        v = attn.W_v(a).view(n, 1, attn.n_kv_heads, attn.head_dim)
+        q = attn._proj("W_q", a).view(n, 1, attn.n_heads, attn.head_dim)
+        k = attn._proj("W_k", a).view(n, 1, attn.n_kv_heads, attn.head_dim)
+        v = attn._proj("W_v", a).view(n, 1, attn.n_kv_heads, attn.head_dim)
         if attn.use_qk_norm:
             q = attn.q_norm(q)
             k = attn.k_norm(k)
@@ -528,4 +528,4 @@ class DecodeBatch:
             out = F.scaled_dot_product_attention(q, k_all, v_all,
                                                  attn_mask=mask[:, None, None, :], **gqa_kw)
         out = out.transpose(1, 2).contiguous().view(n, 1, -1)
-        return attn.W_o(out)
+        return attn._proj("W_o", out)
