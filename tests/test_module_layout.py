@@ -59,6 +59,9 @@ DECOMPOSED = {
                    "evaluate_preferences"],
     "distill": ["CallableTeacher", "EngineTeacher", "distill_dialogs", "load_teacher",
                 "read_prompts"],
+    # 2.17: JSON mode, JSON schemas and tool calls (constrained decoding)
+    "structured": ["JsonConstraint", "JsonGrammar", "SchemaError", "StructuredMixin",
+                   "TokenTable", "compile_schema"],
 }
 
 #: Public surface of `model_engine/_legacy.py` at `base/upstream-main` (13d9f47) —

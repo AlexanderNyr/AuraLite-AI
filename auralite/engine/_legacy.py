@@ -122,6 +122,11 @@ from auralite.engine.distill import (  # noqa: E402,F401
     CallableTeacher, DistillPrompt, EngineTeacher, TeacherReply, distill_dialogs, load_teacher,
     read_prompts,
 )
+# 2.17: JSON mode, JSON schemas and tool calls (constrained decoding)
+from auralite.engine.structured import (  # noqa: E402,F401
+    JsonConstraint, JsonGrammar, SchemaError, StructuredMixin, TokenTable, compile_schema,
+    grammar_for_response_format, json_object_grammar, tool_grammar,
+)
 from auralite.engine import sampling as _sampling  # noqa: E402
 from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
@@ -390,7 +395,7 @@ _SDPA_GQA_SUPPORTED: bool | None = None
 
 class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                      InferenceBenchMixin, DecodeSlotsMixin, LoRAMixin, ChatEvalMixin,
-                     PreferenceTrainerMixin):
+                     PreferenceTrainerMixin, StructuredMixin):
     """Modern training & inference engine for AuraLite AI v2.1.
 
     IMPROVED (v2.1+):
@@ -540,6 +545,9 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         on_token: Any = None,
+        response_format: Any = None,
+        grammar: Any = None,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generate a response in chat/instruction mode.
@@ -549,10 +557,21 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             max_new_tokens: how many tokens to generate
             chat_template: one of CHAT_TEMPLATES keys
             system_prompt: optional system message to prepend
+            response_format: 2.17, OpenAI's ``{"type": "json_object"}`` or
+                ``{"type": "json_schema", "json_schema": {"schema": ...}}``:
+                the answer is valid JSON (``auralite.engine.structured``)
+            grammar: 2.17, a compiled ``JsonGrammar`` (instead of response_format)
+            stats: 2.17, a dict that gets ``finish_reason`` ("stop": the model
+                ended, "length": cut at max_new_tokens) and, for native models,
+                ``completion_tokens``
 
         Returns:
             Generated assistant response (without the prompt).
         """
+        if grammar is None and response_format is not None:
+            grammar = grammar_for_response_format(response_format)
+        if grammar is not None and self.is_hf_model():
+            self.structured_check(grammar)
         if not HAS_CHAT_SUPPORT:
             raise RuntimeError("chat_interface.py is required for chat mode.")
         if chat_template is None:
@@ -592,11 +611,14 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                     min_p=min_p,
                     stream=False,
                     stop=stop_strs,
+                    **self._gguf_structured_kwargs(grammar),
                 )
                 try:
                     content = result["choices"][0]["message"]["content"] or ""
                 except Exception:
                     return ""
+                if stats is not None:
+                    stats["finish_reason"] = result["choices"][0].get("finish_reason") or "stop"
                 # Same contract as every other path (and as streaming): stripped.
                 return content.strip()
             else:
@@ -605,6 +627,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                     prompt, max_new_tokens, temperature, top_k, top_p,
                     repetition_penalty, min_p, stop=stop_strs,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
+                    grammar=grammar, stats=stats,
                 )
                 return self._truncate_at_stop(full[len(prompt):], stop_strs).strip()
 
@@ -626,19 +649,31 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         else:
             # Native AuraLite model
             ids = self._prepare_prompt_ids(prompt, max_gen_tokens=max_new_tokens)
+            stop_ids = self._stop_token_ids(stop_strs)
+            constraint = self._json_constraint(grammar, max_new_tokens)
+            # (overrides written before 2.17 do not take the keyword)
+            extra: dict[str, Any] = {"constraint": constraint} if constraint is not None else {}
             result_ids = self._generate_ids(
                 ids, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p=min_p,
-                stop_token_ids=self._stop_token_ids(stop_strs),
+                stop_token_ids=stop_ids,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 on_token=on_token,
+                **extra,
             )
             # Return only the newly generated part (token-based slice),
             # cut at the first stop marker (incl. multi-token ones).
             generated_ids = result_ids[len(ids):]
             text = self._decode_after(ids, generated_ids)
-            return self._truncate_at_stop(text, stop_strs).strip()
+            answer = self._truncate_at_stop(text, stop_strs)
+            if stats is not None:
+                ended = (len(generated_ids) < max_new_tokens or len(answer) < len(text)
+                         or bool(generated_ids and generated_ids[-1] in stop_ids)
+                         or bool(constraint is not None and constraint.done))
+                stats["finish_reason"] = "stop" if ended else "length"
+                stats["completion_tokens"] = len(generated_ids)
+            return answer.strip()
 
     def generate_chat_streaming(
         self,
@@ -656,6 +691,9 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         on_token: Any = None,
+        response_format: Any = None,
+        grammar: Any = None,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
         """
         Streaming version of generate_chat — yields text pieces one by one.
@@ -672,11 +710,14 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         """
         started = False
         pending = ""          # trailing whitespace, emitted only if text follows
+        if grammar is None and response_format is not None:
+            grammar = grammar_for_response_format(response_format)
         for piece in self._generate_chat_streaming_raw(
                 messages, max_new_tokens, temperature, top_k, top_p,
                 repetition_penalty, min_p, chat_template, system_prompt,
                 stop_tokens, presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty, on_token=on_token):
+                frequency_penalty=frequency_penalty, on_token=on_token, grammar=grammar,
+                stats=stats):
             if not piece:
                 continue
             if not started:
@@ -707,8 +748,12 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         on_token: Any = None,
+        grammar: Any = None,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
         """Unprocessed streaming implementation (see generate_chat_streaming)."""
+        if grammar is not None and self.is_hf_model():
+            self.structured_check(grammar)
         if not HAS_CHAT_SUPPORT:
             raise RuntimeError("chat_interface.py is required for chat mode.")
         if chat_template is None:
@@ -769,15 +814,20 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                     min_p=min_p,
                     stream=True,
                     stop=stop_strs,
+                    **self._gguf_structured_kwargs(grammar),
                 )
                 for chunk in stream:
                     try:
+                        if stats is not None and chunk["choices"][0].get("finish_reason"):
+                            stats["finish_reason"] = chunk["choices"][0]["finish_reason"]
                         delta = chunk["choices"][0].get("delta", {}).get("content", "")
                         if delta:
                             out, hit = _consume(delta)
                             if out:
                                 yield out
                             if hit:
+                                if stats is not None:
+                                    stats["finish_reason"] = "stop"
                                 return
                     except Exception:
                         continue
@@ -787,7 +837,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                 # Fallback: non-streaming
                 full = self.generate_chat(
                     messages, max_new_tokens, temperature, top_k, top_p,
-                    repetition_penalty, min_p, chat_template, system_prompt
+                    repetition_penalty, min_p, chat_template, system_prompt,
+                    grammar=grammar, stats=stats,
                 )
                 yield full
             return
@@ -827,10 +878,14 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
         hit_stop = False
-        tokens = self._iter_token_ids(ids, max_new_tokens, sp, on_token=on_token)
+        constraint = self._json_constraint(grammar, max_new_tokens)
+        extra: dict[str, Any] = {"constraint": constraint} if constraint is not None else {}
+        tokens = self._iter_token_ids(ids, max_new_tokens, sp, on_token=on_token, **extra)
         stream = self._stream_decoder(ids)     # 2.14.1: exact for plugged-in BPE too
+        count = 0
         try:
             for nxt in tokens:
+                count += 1
                 if nxt in stop_ids:
                     hit_stop = True
                     break
@@ -841,6 +896,10 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                     break
         finally:
             tokens.close()      # frees the KV cache now, not at garbage collection
+        if stats is not None:
+            ended = hit_stop or count < max_new_tokens or bool(constraint and constraint.done)
+            stats["finish_reason"] = "stop" if ended else "length"
+            stats["completion_tokens"] = count
         if not hit_stop:
             out, hit_stop = _consume(stream.flush())
             if out:
@@ -1237,7 +1296,9 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                             min_p: float = 0.0,
                             stop: list[str] | None = None, *,
                             presence_penalty: float = 0.0,
-                            frequency_penalty: float = 0.0) -> str:
+                            frequency_penalty: float = 0.0,
+                            grammar: Any = None,
+                            stats: Optional[Dict[str, Any]] = None) -> str:
         if not is_gguf_like(self.model):
             raise ValueError("No GGUF model loaded.")
         if self.model.use_chat_completion:
@@ -1246,10 +1307,12 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                 max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=False,
-                stop=stop,
+                stop=stop, **self._gguf_structured_kwargs(grammar),
             )
             try:
                 suffix = out["choices"][0].get("message", {}).get("content", "")
+                if stats is not None:
+                    stats["finish_reason"] = out["choices"][0].get("finish_reason") or "stop"
             except Exception:
                 suffix = ""
         else:
@@ -1257,10 +1320,12 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                 prompt, max_tokens=length, temperature=temperature,
                 top_k=top_k, top_p=top_p, min_p=min_p,
                 repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=False,
-                stop=stop,
+                stop=stop, **self._gguf_structured_kwargs(grammar),
             )
             try:
                 suffix = out["choices"][0].get("text", "")
+                if stats is not None:
+                    stats["finish_reason"] = out["choices"][0].get("finish_reason") or "stop"
             except Exception:
                 suffix = ""
         return prompt + suffix

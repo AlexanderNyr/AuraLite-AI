@@ -185,7 +185,8 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 Supported: `/v1/chat/completions`, `/v1/completions` (SSE streaming included),
 `stop`, `seed`, `top_k`, `repetition_penalty`, `stream_options.include_usage`,
 `n` (up to 16 choices) and `logprobs` / `top_logprobs` (up to 20, native models;
-2.14), `/v1/models`, `/health`, `/metrics` (Prometheus). Rate limiting returns
+2.14), `response_format` and `tools` / `tool_choice` (2.17, below),
+`/v1/models`, `/health`, `/metrics` (Prometheus). Rate limiting returns
 `429` with `Retry-After`; when all generation slots are busy requests **queue**
 for `AURALITE_QUEUE_TIMEOUT` seconds (default 10) before answering `503` — a
 burst of clients gets answers, not a `503` storm. Concurrent requests (and the
@@ -206,6 +207,37 @@ Log-probabilities are those of the model's own distribution (the raw
 logits), whatever the temperature or top-k/top-p, as vLLM reports them by
 default. A request with a `seed` decodes its choices one after another, so the
 result is reproducible.
+
+### JSON mode, structured outputs and tools (2.17)
+
+```bash
+# any JSON object
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Authorization: Bearer sk-local' -H 'Content-Type: application/json' \
+  -d '{"model":"auralite","messages":[{"role":"user","content":"Anna, 34, Riga"}],
+       "response_format":{"type":"json_object"}}'
+# JSON that follows a schema
+  ... "response_format":{"type":"json_schema","json_schema":{"name":"person","schema":
+       {"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},
+        "required":["name","age"]}}}
+# a function call
+  ... "tools":[{"type":"function","function":{"name":"get_weather","parameters":
+       {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+      "tool_choice":"auto"
+```
+
+The answer of a native model is decoded under a JSON grammar: it always parses
+and follows the schema (a GGUF model gets a llama.cpp grammar). A call comes
+back as `message.tool_calls` with `finish_reason: "tool_calls"`, streamed in
+OpenAI's chunks too; send the result back as a `{"role": "tool",
+"tool_call_id": ..., "content": ...}` message. The official client works as
+is — `client.chat.completions.parse(..., response_format=MyPydanticModel)`
+and `pydantic_function_tool` included: [examples/openai_structured.py](../examples/openai_structured.py).
+Ollama clients: `"format": "json"` (or a schema) and `tools` on `/api/chat`.
+From Python: `engine.generate_json(messages, schema)`,
+`engine.chat_with_tools(messages, tools)`; in the terminal:
+`auralite chat --model chat.pt --json-schema person.json`. Details and
+measurements: [engine.md](engine.md) § 12.
 
 A GGUF model can be served without loading it twice: run `llama-server` yourself
 and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or

@@ -218,7 +218,8 @@ class GenerationMixin:
 
     def _iter_token_ids(self, ids: list[int], length: int, sp: SamplingParams,
                         stop_token_ids: set[int] | None = None, *,
-                        on_token: TokenCallback | None = None) -> Iterator[int]:
+                        on_token: TokenCallback | None = None,
+                        constraint: Any = None) -> Iterator[int]:
         """The decode loop every native generation path shares (2.8).
 
         Yields each newly sampled id (a stop token is yielded, then the loop
@@ -242,6 +243,11 @@ class GenerationMixin:
 
         `on_token(token_id, logits)` (2.14), when given, sees every sampled id
         with the raw logits it was drawn from (the server's ``logprobs``).
+
+        `constraint` (2.17, :class:`~auralite.engine.structured.JsonConstraint`)
+        masks the logits before every draw and follows the drawn tokens; the
+        loop ends when the JSON is complete. ``on_token`` still sees the raw
+        logits (the model's own distribution).
         """
         if self.model is None:
             raise ValueError("Train or load a model first!")
@@ -259,12 +265,20 @@ class GenerationMixin:
             with self._decode_step(slot), torch.inference_mode():
                 t = torch.tensor([ids], dtype=torch.long, device=self.device)
                 logits = self._prefill(t)
-                nxt = self._sample_with(logits[0, -1], sp, history)
-                if on_token is not None:
-                    on_token(nxt, logits[0, -1])
+                step_logits = logits[0, -1]
+                if constraint is None:
+                    nxt = self._sample_with(step_logits, sp, history)
+                    if on_token is not None:
+                        on_token(nxt, step_logits)
+            if constraint is not None:          # masks are built outside the model lock
+                with torch.inference_mode():
+                    nxt = constraint.advance(self._sample_with(constraint.mask(step_logits),
+                                                               sp, history))
+                    if on_token is not None:
+                        on_token(nxt, step_logits)
             history.append(nxt)
             yield nxt
-            if nxt in stop:
+            if nxt in stop or (constraint is not None and constraint.done):
                 return
             engine_model = self.model
             if length > 1 and len(history) < hard_cap:
@@ -289,20 +303,30 @@ class GenerationMixin:
                     with torch.inference_mode():
                         step_logits = _compute.compute_thread.run_in_group(
                             batch, [(row, nxt, pos)])[0]
-                        nxt = self._sample_with(step_logits, sp, history)
+                        if constraint is not None:
+                            nxt = constraint.advance(self._sample_with(
+                                constraint.mask(step_logits), sp, history))
+                        else:
+                            nxt = self._sample_with(step_logits, sp, history)
                         if on_token is not None:
                             on_token(nxt, step_logits)
                 else:
                     with self._decode_step(slot), torch.inference_mode():
                         t = torch.tensor([[nxt]], dtype=torch.long, device=self.device)
                         logits = self._infer(t, start_pos=pos, use_cache=True)
-                        nxt = self._sample_with(logits[0, -1], sp, history)
+                        step_logits = logits[0, -1]
+                        if constraint is None:
+                            nxt = self._sample_with(step_logits, sp, history)
+                    if constraint is not None:
+                        with torch.inference_mode():
+                            nxt = constraint.advance(self._sample_with(
+                                constraint.mask(step_logits), sp, history))
                     if on_token is not None:
                         with torch.inference_mode():
-                            on_token(nxt, logits[0, -1])
+                            on_token(nxt, step_logits)
                 history.append(nxt)
                 yield nxt
-                if nxt in stop:
+                if nxt in stop or (constraint is not None and constraint.done):
                     return
         finally:
             if batch is not None and row is not None:
@@ -317,13 +341,17 @@ class GenerationMixin:
                       stop_token_ids: set[int] | None = None,
                       *, presence_penalty: float = 0.0,
                       frequency_penalty: float = 0.0,
-                      on_token: TokenCallback | None = None) -> list[int]:
+                      on_token: TokenCallback | None = None,
+                      constraint: Any = None) -> list[int]:
         if self.model is None:
             raise ValueError("Train or load a model first!")
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
+        # a constraint only when there is one: overrides of the loop (tests,
+        # subclasses) written before 2.17 do not take the keyword
+        extra: dict[str, Any] = {"constraint": constraint} if constraint is not None else {}
         return list(ids) + list(self._iter_token_ids(list(ids), length, sp, stop_token_ids,
-                                                     on_token=on_token))
+                                                     on_token=on_token, **extra))
 
     def _propose_prompt_lookup(self, ids: list[int], max_proposals: int,
                                ngram: int = 2, max_lookback: int = 512) -> list[int]:
@@ -565,7 +593,8 @@ class GenerationMixin:
                  min_p: float = 0.0, *,
                  presence_penalty: float = 0.0,
                  frequency_penalty: float = 0.0,
-                 on_token: TokenCallback | None = None) -> str:
+                 on_token: TokenCallback | None = None,
+                 grammar: Any = None) -> str:
         """Continue `start_str` by up to `length` tokens.
 
         `presence_penalty` / `frequency_penalty` (2.8, OpenAI semantics) lower
@@ -575,14 +604,20 @@ class GenerationMixin:
 
         `on_token(token_id, logits)` (2.14, native models only) is called for
         every generated token with the logits it was sampled from.
+
+        `grammar` (2.17, a :class:`~auralite.engine.structured.JsonGrammar`):
+        the continuation is valid JSON of that grammar.
         """
         if on_token is not None:
             self._require_native_for_token_callback()
+        if grammar is not None and self.is_hf_model():
+            self.structured_check(grammar)               # type: ignore[attr-defined]
         if self.is_gguf_model():
             return self._gguf_generate_text(
                 start_str, length, temperature, top_k, top_p,
                 repetition_penalty=repetition_penalty, min_p=min_p,
                 presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
+                grammar=grammar,
             )
 
         if self.is_hf_model():
@@ -599,11 +634,13 @@ class GenerationMixin:
             return self.hf_proxy.generate(start_str, **kwargs)
 
         ids = self._prepare_prompt_ids(start_str, max_gen_tokens=length)
+        constraint = self._json_constraint(grammar, length)  # type: ignore[attr-defined]
+        extra: dict[str, Any] = {"constraint": constraint} if constraint is not None else {}
         result_ids = self._generate_ids(
             ids, length, temperature, top_k, top_p,
             repetition_penalty=repetition_penalty, min_p=min_p,
             presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
-            on_token=on_token)
+            on_token=on_token, **extra)
         return start_str + self._decode_after(ids, result_ids[len(ids):])
 
     # ---- Text of generated ids (2.14.1) --------------------------------
@@ -764,17 +801,22 @@ class GenerationMixin:
                            min_p: float = 0.0, *,
                            presence_penalty: float = 0.0,
                            frequency_penalty: float = 0.0,
-                           on_token: TokenCallback | None = None) -> Iterator[str]:
+                           on_token: TokenCallback | None = None,
+                           grammar: Any = None) -> Iterator[str]:
         """Generate text token-by-token, yielding each new token as it's produced.
 
         Yields individual decoded tokens so the GUI can update in real-time.
-        `on_token` as in :meth:`generate`: called before the token's text is
-        yielded.
+        `on_token` and `grammar` as in :meth:`generate`: `on_token` is called
+        before the token's text is yielded.
         """
         if self.model is None:
             raise ValueError("Train or load a model first!")
         if on_token is not None:
             self._require_native_for_token_callback()
+        if grammar is not None and self.is_hf_model():
+            self.structured_check(grammar)               # type: ignore[attr-defined]
+        gguf_grammar = (self._gguf_structured_kwargs(grammar)  # type: ignore[attr-defined]
+                        if grammar is not None and self.is_gguf_model() else {})
 
         if self.is_gguf_model():
             if not is_gguf_like(self.model):
@@ -785,6 +827,7 @@ class GenerationMixin:
                     max_tokens=length, temperature=temperature,
                     top_k=top_k, top_p=top_p, min_p=min_p,
                     repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=True,
+                    **gguf_grammar,
                 )
                 for chunk in stream:
                     try:
@@ -798,6 +841,7 @@ class GenerationMixin:
                     start_str, max_tokens=length, temperature=temperature,
                     top_k=top_k, top_p=top_p, min_p=min_p,
                     repeat_penalty=repetition_penalty, **self._gguf_penalty_kwargs(presence_penalty, frequency_penalty), stream=True,
+                    **gguf_grammar,
                 )
                 for chunk in stream:
                     try:
@@ -830,7 +874,9 @@ class GenerationMixin:
         sp = self._sampling_params(temperature, top_k, top_p, repetition_penalty, min_p,
                                    presence_penalty, frequency_penalty)
         stream = self._stream_decoder(ids)
-        for nxt in self._iter_token_ids(ids, length, sp, on_token=on_token):
+        constraint = self._json_constraint(grammar, length)  # type: ignore[attr-defined]
+        extra: dict[str, Any] = {"constraint": constraint} if constraint is not None else {}
+        for nxt in self._iter_token_ids(ids, length, sp, on_token=on_token, **extra):
             yield stream.step(nxt)
         rest = stream.flush()
         if rest:

@@ -1,3 +1,104 @@
+# 📦 v2.17.0 — JSON mode, JSON schemas and tool calls on the server
+
+The server now answers OpenAI's `response_format` (`json_object`,
+`json_schema`) and `tools` / `tool_choice`, and Ollama's `format` and
+`tools`, where 2.16 refused them. A native model writes the answer under a
+JSON grammar — **constrained decoding** — that also keeps room for the
+shortest valid ending, so **every answer parses and follows the schema**,
+whatever the model, the sampling and `max_tokens`: an untrained model wrote
+200 of 200 valid answers per case, where 0 of 50 parsed without the grammar,
+and the grammar cost no measurable speed. Tool calls come back as OpenAI's
+`tool_calls` (streamed too) and Ollama's `message.tool_calls`. GGUF models
+get the same schema as a llama.cpp grammar. The official `openai` client
+works as is, `chat.completions.parse` with Pydantic models and
+`pydantic_function_tool` included ([examples/openai_structured.py](examples/openai_structured.py)).
+Details: [docs/engine.md § 12](docs/engine.md#12-json-mode-json-schemas-and-tools-217).
+
+**What changed for existing clients**
+
+| | 2.17.0 | 2.16.0 |
+|---|---|---|
+| `response_format` json_object / json_schema, `tools`, Ollama `format` / `tools` | served (native and GGUF models; HTTP 400 for Hugging Face models) | HTTP 400 `unsupported_parameter` |
+| messages | `content` may be null or a list of text parts; `tool_calls`, `tool_call_id`, `name` | `content` a string |
+| `finish_reason` of a text answer | `"stop"` when the model ended it, `"length"` at `max_tokens` | `"length"` unless `stop` was given |
+| `logprobs` | from the raw logits (also under a grammar) | the same |
+
+**Constrained decoding** (`auralite/engine/structured.py`)
+
+- `compile_schema(schema)`, `json_object_grammar()`, `tool_grammar(tools,
+  mode, name)` build a `JsonGrammar`: a byte-level pushdown automaton
+  (`feed(state, byte)`) that also knows the length of the shortest valid
+  ending of every state (`cost`, `ending`). Supported: `type` (and lists of
+  types), `properties`, `required`, `additionalProperties`, `items`, `enum`,
+  `const`, `anyOf` / `oneOf` whose alternatives start differently,
+  `minLength` / `maxLength`, `minItems` / `maxItems`, `nullable`, local
+  `$ref` with recursion; annotations are ignored; `pattern`, `minimum`,
+  `allOf` and the other keywords a grammar cannot follow raise `SchemaError`.
+  Keys in the schema's order, optional ones may be left out; the root is an
+  object or an array. Compiled grammars are cached.
+- `TokenTable`: the bytes of every token (special and unknown tokens left
+  out) in a prefix tree, and an int16 cost vector per grammar state (LRU).
+  `JsonConstraint` masks the logits of one generation and follows its tokens:
+  a token is allowed only while the shortest ending still fits into the
+  tokens left, so the answer always closes; the decode loop stops when the
+  JSON is complete. Masks are built outside the model lock.
+- Engine: `generate_chat(..., response_format=..., grammar=...)`, the same
+  for `generate_chat_streaming`, `generate`, `generate_streaming`;
+  `generate_json(messages, schema)`, `chat_with_tools(messages, tools,
+  tool_choice)`, `structured_check(grammar, max_new_tokens)` (a vocabulary
+  without the needed characters, or a `max_tokens` below the shortest answer,
+  is refused before generating). `generate_chat(..., stats={})` reports
+  `finish_reason` (and the native token count).
+- GGUF: the schema becomes a llama.cpp grammar (`llama_cpp_grammar`; raw
+  control characters kept out of strings); `GGUFModelProxy` takes `grammar`,
+  `LlamaServerProxy` sends `json_schema` / `response_format`. A JSON cut at
+  `max_tokens` comes back with `finish_reason` `"length"`.
+
+**Tools**
+
+- `normalize_tools`, `resolve_tool_choice` (`none`, `auto`, `required`, a
+  function's name), `tools_system_prompt`, `plain_messages` (content parts,
+  assistant `tool_calls`, `tool` results, `developer` messages),
+  `parse_tool_call`, `openai_tool_calls`, `tool_call_schema` (for llama.cpp,
+  `$defs` hoisted).
+- `tool_choice="auto"`: the first character decides — `{` starts a call,
+  anything else is an ordinary answer. One call per answer.
+
+**Server** (`auralite/server/openai_server.py`)
+
+- `/v1/chat/completions`: `response_format`, `tools`, `tool_choice`,
+  `parallel_tool_calls`, legacy `functions` / `function_call` (answered with
+  `function_call`); requests are checked before a stream starts (schema,
+  model, vocabulary, `max_tokens`: HTTP 400 with `invalid_json_schema`,
+  `invalid_value` or `unsupported_parameter`). JSON mode never falls back to
+  plain text.
+- Ollama: `format` (`"json"` or a schema) on `/api/chat` and
+  `/api/generate`; `tools` on `/api/chat` → `message.tool_calls` with the
+  arguments as an object.
+
+**CLI**: `auralite chat --json` and `--json-schema FILE`.
+
+**Measured** (docs/engine.md § 12; 2 vCPU)
+
+| | parse | follow the schema |
+|---|---|---|
+| untrained model, 200 answers per case (record, nested, JSON mode, tool call), temperature 1 | **100 %** (without the grammar: 0 of 50) | **100 %** |
+| person-record chat model (0.8 M), 3 seeds, 300 prompts, temperature 1 | 95.3 / 93.3 / 95.3 % → **100 %** | the same |
+| the same after 3 epochs, temperature 1 | 14.7 / 18.3 / 7.7 % → **100 %** | 10.3 / 11.7 / 5.7 % → **100 %** |
+
+Greedy answers that were valid anyway did not change (95.0 / 73.0 / 85.0 %
+exact records with and without the grammar); speed 641–702 tokens/s without
+and 663–731 with the grammar. Qwen2.5-0.5B-Instruct (GGUF) behind `auralite
+serve`: the four requests of the example through the official client in
+11 s, the Pydantic record right; with two tools and `tool_choice="auto"` the
+right decision in 12 of 16 prompts, all 10 calls valid.
+
+**Tests**: `tests/test_structured_v217.py` (25), `tests/test_server_structured_v217.py`
+(27; the official `openai` client is now a test dependency), a real llama.cpp
+test in `tests/test_gguf_real.py`; 45 mutations of the new code all caught.
+Plain generation (no grammar) gives the same text as 2.16 on every path
+tested: greedy and sampled, streamed, chat, batched choices and the server.
+
 # 📦 v2.16.0 — chat 2: dialogs train to the end, the prompt's weight, LoRA on every layer, chat-eval, dialogs from a teacher, DPO and SimPO
 
 Chat fine-tuning now trains for every epoch asked for — early stopping cut

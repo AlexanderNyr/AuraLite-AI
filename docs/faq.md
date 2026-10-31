@@ -330,3 +330,24 @@ keeps the model close to where it started; SimPO needs no reference model.
 Run the chat model itself as the teacher with `--judge exact` and its own
 wrong answers become the rejected replies. See [training.md](training.md)
 § 17–18.
+
+## 17. Can the server answer in JSON, or call my functions (tools)?
+
+Since 2.17, yes — with OpenAI's own parameters, so the official client and
+LangChain-style frameworks work unchanged. `response_format={"type":
+"json_object"}` asks for any JSON object, `{"type": "json_schema",
+"json_schema": {"schema": {...}}}` (what `client.chat.completions.parse` sends
+for a Pydantic model) for JSON that follows a schema, and `tools` /
+`tool_choice` for a function call: the reply then carries `tool_calls`
+(OpenAI) or `message.tool_calls` (Ollama's `/api/chat`; `format` works there
+too). A native AuraLite model writes the answer under a JSON grammar
+(*constrained decoding*): every token that would break the JSON is masked,
+and the grammar keeps room for the shortest valid ending, so **every answer
+parses and follows the schema**, even from a tiny or untrained model. A GGUF
+model gets the same schema as a llama.cpp grammar. What the model writes
+inside the JSON — the right name, a sensible argument — still depends on the
+model: fine-tune it on examples (§ 15). The schema keywords a grammar can
+follow (`type`, `properties`, `required`, `items`, `enum`, `const`, `anyOf`,
+lengths, `$ref`) are supported; `pattern`, `minimum` and the like are refused
+with an error rather than ignored. See [engine.md](engine.md) § 12 and
+[quickstart.md](quickstart.md) § 4.

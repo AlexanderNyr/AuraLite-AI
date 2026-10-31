@@ -39,12 +39,19 @@ def ollama_generate_response(model: str, prompt: str, response: str, *,
 
 def ollama_chat_response(model: str, content: str, *, done: bool = True,
                          prompt_eval_count: int = 0,
-                         eval_count: int = 0) -> dict[str, Any]:
-    """`/api/chat` payload (final chunk when `done=True`)."""
+                         eval_count: int = 0,
+                         tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """`/api/chat` payload (final chunk when `done=True`).
+
+    `tool_calls` (2.17): Ollama's ``[{"function": {"name", "arguments": {...}}}]``.
+    """
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     payload: dict[str, Any] = {
         "model": model,
         "created_at": _now_iso(),
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "done": done,
     }
     if done:

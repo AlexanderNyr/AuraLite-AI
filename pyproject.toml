@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.16.0"
+version = "2.17.0"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -64,7 +64,10 @@ test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
         # only by accident (a dev machine), which broke CI on clean runners.
         "pyyaml>=6",
         # tests/test_packaging.py builds a real wheel offline (no isolation).
-        "setuptools>=77"]
+        "setuptools>=77",
+        # 2.17: the official OpenAI client reads JSON mode and tool calls from
+        # the server (tests/test_server_structured_v217.py)
+        "openai>=1.40"]
 lint = ["ruff>=0.5", "pyright>=1.1"]
 # v2.6.6: llama-cpp-python left `full` for its own `gguf` extra. PyPI only has its
 # source distribution, so every `pip install '.[full]'` compiled llama.cpp (and

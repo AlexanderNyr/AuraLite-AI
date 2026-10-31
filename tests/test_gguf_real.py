@@ -88,15 +88,72 @@ def test_server_usage_is_consistent_between_plain_and_streamed(server):
 
 @pytest.mark.parametrize("extra", [
     # 2.14: n up to 16 is served by every backend (see the next test); 17 is
-    # still refused. Log-probabilities stay native-only.
-    {"n": 17}, {"logprobs": True}, {"response_format": {"type": "json_object"}},
-    {"tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]},
+    # still refused. Log-probabilities stay native-only. (2.17: JSON mode and
+    # tools are served, see below.)
+    {"n": 17}, {"logprobs": True},
 ])
 def test_server_refuses_features_it_would_silently_drop(server, extra):
     r = server.post("/v1/chat/completions",
                     json={"messages": MESSAGES, "max_tokens": 4, **extra})
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "unsupported_parameter"
+
+
+@pytest.fixture(scope="module")
+def engine_1k():
+    """Room for the tools' system message (longer than 256 tokens)."""
+    from auralite.engine import AuraLiteEngine
+
+    engine = AuraLiteEngine()
+    engine.load_gguf_model(GGUF, n_ctx=1024)
+    return engine
+
+
+def test_json_mode_and_tools_run_under_a_llama_cpp_grammar(engine, engine_1k, monkeypatch):
+    """2.17: the real llama.cpp follows the grammar AuraLite builds from the schema.
+
+    (A model as small as this one can write one string until max_tokens: such
+    an answer is cut, and the server says finish_reason "length".)
+    """
+    schema = {"type": "object", "properties": {"name": {"type": "string", "maxLength": 8},
+                                               "n": {"type": "integer"}},
+              "required": ["name", "n"]}
+    text = engine.generate_chat(MESSAGES, 48, temperature=0.0,
+                                response_format={"type": "json_schema",
+                                                 "json_schema": {"schema": schema}})
+    value = json.loads(text)
+    assert set(value) == {"name", "n"} and isinstance(value["n"], int)
+    text = engine.generate_chat(MESSAGES, 24, temperature=0.0,
+                                response_format={"type": "json_object"})
+    assert "\n" not in text.replace("\\n", "")          # strings: no raw control characters
+    tools = [{"type": "function", "function": {"name": "tell", "parameters": {
+        "type": "object", "properties": {"mood": {"enum": ["happy", "sad"]}},
+        "required": ["mood"]}}}]
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import auralite.server.openai_server as srv
+
+    monkeypatch.setattr(srv, "_engine", engine_1k)
+    monkeypatch.setattr(srv, "_rate_bucket", {})
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        r = client.post("/v1/chat/completions", json={
+            "messages": MESSAGES, "max_tokens": 48, "temperature": 0, "tools": tools,
+            "tool_choice": "required"})
+        assert r.status_code == 200, r.text
+        choice = r.json()["choices"][0]
+        call = choice["message"]["tool_calls"][0]["function"]
+        assert call["name"] == "tell" and json.loads(call["arguments"])["mood"] in ("happy", "sad")
+        assert choice["finish_reason"] == "tool_calls"
+        r = client.post("/v1/chat/completions", json={
+            "messages": MESSAGES, "max_tokens": 16, "temperature": 0,
+            "response_format": {"type": "json_object"}})
+        choice = r.json()["choices"][0]
+        try:
+            json.loads(choice["message"]["content"])
+            assert choice["finish_reason"] == "stop"
+        except ValueError:
+            assert choice["finish_reason"] == "length"
 
 
 def test_server_serves_n_choices_on_a_real_gguf_model(server):

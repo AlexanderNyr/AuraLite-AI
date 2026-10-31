@@ -2,9 +2,11 @@
 
 How a native AuraLite model (`.pt` / `.safetensors`) turns a prompt into
 text, what changed in 2.8, how much of the history a generated token
-attends to (2.11, section 9), which thread does the work (2.13, section 10)
-and how concurrent generations share a forward pass (2.14, section 11). GGUF
-and Hugging Face models run in their own runtimes and are not covered here.
+attends to (2.11, section 9), which thread does the work (2.13, section 10),
+how concurrent generations share a forward pass (2.14, section 11) and how
+an answer is kept to valid JSON (2.17, section 12). GGUF and Hugging Face
+models run in their own runtimes and are not covered here (except for the
+llama.cpp grammar of section 12).
 
 Speed numbers on this page come from `python benchmarks/core_bench.py`, run
 on a 2-vCPU x86 machine with torch 2.14.1 on CPU (eager mode, batch 1). The
@@ -495,3 +497,134 @@ Python, and the four generations sample in turn under the GIL between two
 passes. `/v1/completions` through FastAPI's test client, one request at a
 time and four at once, two runs: 991 / 839 and 2,210 / 2,042 tokens/s (2.13
 path: 866 / 776 and 790 / 738).
+
+## 12. JSON mode, JSON schemas and tools (2.17)
+
+```python
+engine.generate_chat(messages, response_format={"type": "json_object"})        # any object
+engine.generate_chat(messages, response_format={"type": "json_schema",
+                                                "json_schema": {"schema": schema}})
+engine.generate_json(messages, schema)            # the same, parsed
+engine.chat_with_tools(messages, tools, tool_choice="auto")   # {"content", "tool_calls"}
+```
+
+```bash
+auralite chat --model chat.pt --json-schema person.json --prompt "Anna is 34 and lives in Riga."
+```
+
+The server takes OpenAI's `response_format` and `tools` / `tool_choice`
+(legacy `functions` / `function_call` too) on `/v1/chat/completions`, and
+Ollama's `format` and `tools` on `/api/chat` and `/api/generate`
+([quickstart.md](quickstart.md) § 4, [examples/openai_structured.py](../examples/openai_structured.py)).
+
+**Constrained decoding.** `auralite/engine/structured.py` compiles the schema
+into a byte-level pushdown automaton (`JsonGrammar`): its state is a small
+stack of frames (an object waiting for a key, a string with an open escape,
+a number after its `.`), and `feed(state, byte)` returns the next state or
+refuses the byte. A `TokenTable` keeps the bytes of every token of the
+model's tokenizer in a prefix tree, so the tokens that start alike are
+checked once. Before every draw a `JsonConstraint` walks the tree from the
+current state and gives `-inf` to every token the automaton refuses
+(special tokens and the unknown token included); sampling, temperature,
+top-k/top-p and penalties then work on what is left. The result is cached
+per state: inside a string, or at every `"name":`, the state repeats, and
+the mask costs a dictionary lookup.
+
+**The answer always ends.** The automaton also knows the length of the
+shortest valid ending of every state (`cost`: close the string, add the
+required keys still missing with the shortest values of their types, close
+the brackets). A token is allowed only while that ending still fits into the
+tokens that remain, so the last tokens close the JSON, whatever the model
+wants. An answer is complete, valid JSON and valid against the schema for
+any model, any sampling settings and any `max_tokens` from the length of the
+shortest answer up; a smaller `max_tokens` is refused before generating
+(HTTP 400 with that length). The generation stops as soon as the JSON is
+complete. A model needs a token of its own for every character the shortest
+endings use (`{`, `"`, a digit, the keys of the schema, ...); a model whose
+vocabulary lacks one is refused with the characters named. Log-probabilities
+(`logprobs`) still come from the raw logits.
+
+**The schema.** Supported: `type` (object, array, string, number, integer,
+boolean, null, or a list of them), `properties`, `required`,
+`additionalProperties` (false, or a schema for the values of a free-form
+object), `items`, `enum`, `const`, `anyOf` / `oneOf` with alternatives that
+start differently (an object and null, a string and a number, ...),
+`minLength` / `maxLength`, `minItems` / `maxItems`, `nullable` and local
+`$ref` (`#/$defs/...`, recursion included) — what Pydantic models and
+OpenAI's strict mode produce. Annotations (`title`, `description`, `default`,
+`format`, ...) are ignored, as JSON Schema says. Keywords a grammar cannot
+follow (`pattern`, `minimum` / `maximum`, `multipleOf`, `uniqueItems`,
+`allOf`, `not`, ...) are refused with an error, not ignored. The keys come in
+the schema's order and optional ones may be left out (OpenAI's structured
+outputs order them the same way); the root is an object (or an array). Up to
+8 whitespace characters may stand between two tokens of the JSON, a number
+has at most 24 characters, and JSON mode (`json_object`) is any object nested
+at most 8 levels deep.
+
+**Tools.** `tools` become a system message that lists the functions and asks
+for a call as `{"name": ..., "arguments": {...}}` (`tools_system_prompt`);
+the call is generated under a grammar in which the name is one of the tools
+and the arguments follow that tool's `parameters` (`tool_grammar`). With
+`tool_choice="required"` the answer is a call, with a function's name it is
+that call, with `"auto"` the model decides by its first character: `{`
+starts a call, anything else is an ordinary answer, decoded freely. One call
+per answer (`parallel_tool_calls` is accepted; the answer has one call). A
+call comes back as OpenAI's `tool_calls` with `finish_reason` `tool_calls`
+(streamed: the id and the name first, then the arguments), or as Ollama's
+`message.tool_calls`. In the history, an assistant message with `tool_calls`
+becomes the JSON call it made and a `tool` message a user turn that names
+the function (`plain_messages`). What the model writes — whether it calls,
+which name, which arguments — depends on the model; the grammar only makes
+it a valid call.
+
+**GGUF models** get the same schema as a llama.cpp grammar
+(`llama_cpp.llama_grammar.json_schema_to_gbnf`, with raw control characters
+kept out of strings; a llama.cpp server gets the schema itself). llama.cpp's
+grammar cannot plan the ending: a model that is still writing when
+`max_tokens` ends leaves the JSON open, and the server says
+`finish_reason` `"length"`. Hugging Face models are refused (HTTP 400).
+Since 2.17 the server's `finish_reason` also says why a text answer ended
+(`"stop"` when the model ended it, `"length"` at `max_tokens`); 2.16 said
+`"length"` unless `stop` was given.
+
+**Measured** (`benchmarks/json_bench.py`, 2 vCPU). A model that has never
+been trained (random weights, a character vocabulary of printable ASCII), 200
+answers per case at temperature 1 with `max_tokens` from the shortest answer
+to 96 tokens more:
+
+| case | shortest answer (tokens) | parse | follow the schema | without the grammar |
+|---|---|---|---|---|
+| record (3 required keys) | 29 | **100 %** | **100 %** | 0 of 50 parse |
+| nested (array of objects, enum, nullable, maxLength) | 30 | **100 %** | **100 %** | 0 of 50 |
+| JSON mode | 2 | **100 %** | – | 0 of 50 |
+| tool call (2 tools) | 46 | **100 %** | **100 %** (valid calls) | 0 of 50 |
+
+A small chat model (the 0.8 M model of `chat_bench.py`, trained on 2,000
+dialogs that ask for a person's record in words, about 80 s for 20 epochs),
+300 other prompts, seeds 3–5; *exact*: the expected record:
+
+| model, temperature | parse without → with the grammar | exact without → with |
+|---|---|---|
+| 20 epochs, greedy | 100 / 100 / 100 % → **100 %** | 95.0 / 73.0 / 85.0 % → the same |
+| 20 epochs, temperature 1 | 95.3 / 93.3 / 95.3 % → **100 %** | 63.3 / 15.7 / 30.3 % → 60.3 / 18.3 / 28.7 % |
+| 3 epochs, greedy | 89.3 / 95.0 / 0.0 % → **100 %** | 0 % |
+| 3 epochs, temperature 1 | 14.7 / 18.3 / 7.7 % → **100 %** | 0 % |
+
+Greedy answers that were valid anyway did not change; with sampling the
+exact records stayed within the noise of 300 answers. The grammar cost no
+measurable speed: 641–702 tokens/s without and 663–731 with it (means of the
+three seeds per row; the runs differ more among themselves), with 15–55
+distinct automaton states per 300 answers. The 3-epoch models had not
+learnt the format yet; under the grammar every answer was a record, with
+the wrong values.
+
+Qwen2.5-0.5B-Instruct (Q4_K_M GGUF, llama.cpp grammar) behind `auralite
+serve`, through the official `openai` client (3.42): the four requests of
+`examples/openai_structured.py` — JSON mode, `chat.completions.parse` with a
+Pydantic model, a `pydantic_function_tool` call and the answer with the
+tool's result — took 11 s in all, and the parsed record was right
+(`name='Anna Berzina' age=34 address=Address(city='Riga',
+country='Latvia')`). With two tools and `tool_choice="auto"` the model
+decided right in 12 of 16 prompts: it called for 7 of the 8 that needed a
+tool and answered 5 of the 8 that did not; all 10 calls had valid
+arguments.

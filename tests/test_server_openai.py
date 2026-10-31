@@ -573,22 +573,27 @@ CHAT = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
 
 
 class TestUnsupportedParameters:
-    @pytest.mark.parametrize("extra,param", [
-        ({"n": 17}, "n"),                       # 2.14: up to 16 choices
-        ({"logprobs": True}, "logprobs"),       # not a native model
-        ({"top_logprobs": 3}, "top_logprobs"),
-        ({"response_format": {"type": "json_object"}}, "response_format"),
+    # 2.17: JSON mode and tools are served for native and GGUF models; the fake
+    # engine is neither, so it still refuses them (before generating).
+    @pytest.mark.parametrize("extra,param,code", [
+        ({"n": 17}, "n", "unsupported_parameter"),       # 2.14: up to 16 choices
+        ({"logprobs": True}, "logprobs", "unsupported_parameter"),   # not a native model
+        ({"top_logprobs": 3}, "top_logprobs", "unsupported_parameter"),
+        ({"response_format": {"type": "json_object"}}, "response_format",
+         "unsupported_parameter"),
         ({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}},
-         "response_format"),
-        ({"tools": [{"type": "function", "function": {"name": "f"}}]}, "tools"),
-        ({"functions": [{"name": "f"}]}, "tools"),
+         "response_format", "invalid_json_schema"),           # no schema at all
+        ({"response_format": {"type": "yaml"}}, "response_format", "unsupported_parameter"),
+        ({"tools": [{"type": "function", "function": {"name": "f"}}]}, "tools",
+         "unsupported_parameter"),
+        ({"functions": [{"name": "f"}]}, "functions", "unsupported_parameter"),
     ])
-    def test_chat_rejects_what_it_cannot_do(self, client, extra, param):
+    def test_chat_rejects_what_it_cannot_do(self, client, extra, param, code):
         c, engine = client
         r = c.post("/v1/chat/completions", json={**CHAT, **extra})
         assert r.status_code == 400
         error = r.json()["error"]
-        assert error["param"] == param and error["code"] == "unsupported_parameter"
+        assert error["param"] == param and error["code"] == code
         assert error["type"] == "invalid_request_error"
         assert engine.chat_calls == []          # rejected before generating
 
@@ -623,6 +628,7 @@ class TestUnsupportedParameters:
         ("/api/generate", {"prompt": "hi", "stream": False, "format": "json"}),
     ])
     def test_ollama_endpoints_reject_structured_output(self, client, path, body):
+        # 2.17: served for native and GGUF models (tests/test_server_structured_v217.py)
         c, _ = client
         r = c.post(path, json=body)
         assert r.status_code == 400 and r.json()["error"]["code"] == "unsupported_parameter"

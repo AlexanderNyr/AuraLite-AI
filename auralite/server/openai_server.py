@@ -34,6 +34,11 @@ models) on /v1/completions and /v1/chat/completions, streaming included. The
 choices of one request decode together (batched decoding) unless a `seed` asks
 for reproducible output; then they run one after another.
 
+2.17: `response_format` (`json_object`, `json_schema`) and `tools` /
+`tool_choice` on /v1/chat/completions, `format` and `tools` on the Ollama
+endpoints: native models decode under a JSON grammar (constrained decoding,
+`auralite/engine/structured.py`), GGUF models under a llama.cpp grammar.
+
 NOTE: run with a single uvicorn worker (the default). Generation state and the
 rate limiter are per-process; multiple workers would load N model copies and
 fragment the rate limiting.
@@ -60,6 +65,7 @@ except Exception as e:  # pragma: no cover - optional dependency
     raise ImportError("Install serving dependencies: pip install fastapi uvicorn pydantic") from e
 
 from auralite.engine import AuraLiteEngine
+from auralite.engine import structured as _structured
 from auralite.engine.sampling import token_logprobs
 from auralite.engine.utils import sanitize_prompt
 
@@ -306,7 +312,12 @@ class CompletionRequest(_SamplingOptions):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # 2.17: content parts, and the messages of tool calls (content may be null)
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    function_call: dict[str, Any] | None = None
 
 
 class ChatCompletionRequest(_SamplingOptions):
@@ -321,6 +332,7 @@ class ChatCompletionRequest(_SamplingOptions):
     response_format: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
     functions: list[dict[str, Any]] | None = None
     function_call: str | dict[str, Any] | None = None
 
@@ -381,14 +393,10 @@ def _unsupported(req: BaseModel) -> list[tuple[str, str]]:
     if get("suffix"):
         problems.append(("suffix", "suffix (fill-in-the-middle) is not supported"))
     response_format = get("response_format")
-    if response_format and response_format.get("type", "text") != "text":
-        problems.append(("response_format", "structured output (JSON mode / json_schema) "
-                                            "is not supported; omit response_format"))
-    tool_choice = get("tool_choice")
-    if (get("tools") or get("functions")) and tool_choice != "none":
-        problems.append(("tools", "tool / function calling is not supported"))
-    if get("format"):
-        problems.append(("format", "structured output (format) is not supported"))
+    if response_format and response_format.get("type", "text") not in (
+            "text", "json_object", "json_schema"):
+        problems.append(("response_format", "type must be text, json_object or json_schema"))
+    # 2.17: JSON mode, JSON schemas and tools are served (see `_structured_request`)
     return problems
 
 
@@ -992,19 +1000,114 @@ def completions(req: CompletionRequest, request: Request):
             "choices": choices, "usage": usage}
 
 
+# ---------------------------------------------------------------------------
+# JSON mode, JSON schemas and tool calls (2.17)
+# ---------------------------------------------------------------------------
+class _Structured:
+    """What a request asks for beyond plain text: JSON, or a tool call."""
+
+    def __init__(self, grammar: Any, tools: list[dict], mode: str, name: str | None,
+                 legacy: bool) -> None:
+        self.grammar = grammar
+        self.tools = tools
+        self.mode = mode            # "none" (JSON only), "auto" or "required"
+        self.name = name
+        self.legacy = legacy        # `functions` / `function_call` (deprecated API)
+
+    @property
+    def calls(self) -> bool:
+        return bool(self.tools) and self.mode != "none"
+
+
+def _bad_request(param: str, message: str, code: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"error": {
+        "message": message, "type": "invalid_request_error", "param": param, "code": code}})
+
+
+def _structured_request(req: BaseModel, engine: Any, max_tokens: int) -> _Structured | None:
+    """The grammar a request asks for (None: plain text), checked before generating.
+
+    OpenAI: `response_format`, `tools` / `tool_choice` (legacy `functions` /
+    `function_call`); Ollama: `format` ("json" or a schema) and `tools`.
+    """
+    get = lambda name: getattr(req, name, None)  # noqa: E731 - tiny local accessor
+    legacy = bool(get("functions")) and not get("tools")
+    param = "functions" if legacy else "tools"
+    try:
+        tools = _structured.normalize_tools(get("tools"), get("functions"))
+        mode, name = _structured.resolve_tool_choice(
+            get("function_call") if legacy else get("tool_choice"), tools)
+    except _structured.SchemaError as err:
+        raise _bad_request(param, str(err), "invalid_value") from err
+    grammar = None
+    if tools and mode != "none":
+        try:
+            grammar = _structured.tool_grammar(tools, mode, name)
+        except _structured.SchemaError as err:
+            raise _bad_request(param, str(err), "invalid_json_schema") from err
+    else:
+        tools, mode = [], "none"
+        fmt = get("format")
+        param = "format" if fmt not in (None, "") else "response_format"
+        spec: Any = ("json" if fmt == "json" else fmt) if param == "format" \
+            else get("response_format")
+        try:
+            grammar = _structured.grammar_for_response_format(spec)
+        except _structured.SchemaError as err:
+            raise _bad_request(param, str(err), "invalid_json_schema") from err
+    if grammar is None:
+        return None
+    is_gguf = getattr(engine, "is_gguf_model", None)
+    check = getattr(engine, "structured_check", None)
+    if not callable(check) or not (_native_engine(engine) or (callable(is_gguf) and is_gguf())):
+        raise _bad_request(param, f"Unsupported parameter '{param}': JSON mode and tools need "
+                                  "a native AuraLite model or a GGUF model.",
+                           "unsupported_parameter")
+    try:
+        check(grammar, max_tokens)
+    except ValueError as err:
+        raise _bad_request(param, str(err), "unsupported_parameter") from err
+    return _Structured(grammar, tools, mode, name, legacy)
+
+
+def _request_messages(req: Any, structured: _Structured | None) -> list[dict]:
+    """Plain {"role", "content"} turns; with tools, the system message lists them."""
+    raw = [m.model_dump() for m in req.messages]
+    try:
+        if structured is not None and structured.calls:
+            return _structured.plain_messages(raw, structured.tools, structured.mode,
+                                              structured.name)
+        return _structured.plain_messages(raw)
+    except _structured.SchemaError as err:
+        raise _bad_request("messages", str(err), "invalid_value") from err
+
+
+def _tool_message(call: dict, legacy: bool) -> dict[str, Any]:
+    """The assistant message of one call (OpenAI's tool_calls or legacy function_call)."""
+    if legacy:
+        return {"role": "assistant", "content": None,
+                "function_call": {"name": call["name"],
+                                  "arguments": json.dumps(call["arguments"], ensure_ascii=False)}}
+    return {"role": "assistant", "content": None,
+            "tool_calls": _structured.openai_tool_calls(call)}
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 def chat_completions(req: ChatCompletionRequest, request: Request):
     check_rate_limit(request)
     reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
-    messages = [m.model_dump() for m in req.messages]
+    structured = _structured_request(req, engine, req.max_tokens)
+    messages = _request_messages(req, structured)
     stops = req.stops()
     sampling = _sampling_kwargs(req)
     # The native chat path understands stop sequences itself (v2.6.5), so the
     # streamed text is cut inside the engine instead of by a post-filter.
     chat_kwargs = {**sampling, "max_new_tokens": req.max_tokens,
                    "temperature": req.temperature, "stop_tokens": stops or None}
+    if structured is not None:
+        chat_kwargs["grammar"] = structured.grammar
     n = req.n or 1
     want_logprobs = bool(req.logprobs)
     top_n = int(req.top_logprobs or 0)
@@ -1019,11 +1122,31 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
     # prompt_tokens matches what the model actually saw (streaming included).
     prompt_for_usage = _chat_prompt_text(engine, messages)
     finish_reason = "stop" if stops else "length"
+    call_reason = "function_call" if structured is not None and structured.legacy \
+        else "tool_calls"
+
+    def reason_for(text: str, stats: dict) -> str:
+        """Why a choice ended. 2.17: the engine says it (`stats`: "stop" when the
+        model ended, "length" at max_tokens); JSON mode ends with the JSON, and
+        JSON that does not parse was cut at max_tokens (GGUF models, whose
+        llama.cpp grammar cannot plan the ending)."""
+        if structured is not None and not structured.calls:
+            try:
+                json.loads(text)
+            except ValueError:
+                return "length"
+            return "stop"
+        return stats.get("finish_reason") or finish_reason
+
+    def as_call(text: str) -> dict | None:
+        if structured is None or not structured.calls:
+            return None
+        return _structured.parse_tool_call(text, structured.tools)
 
     if req.stream:
         stream_id = f"chatcmpl-{uuid.uuid4().hex}"   # one id for the whole stream
 
-        def frame(index: int, delta: dict[str, str], reason: str | None = None,
+        def frame(index: int, delta: dict[str, Any], reason: str | None = None,
                   logprobs: dict[str, Any] | None = None) -> str:
             choice: dict[str, Any] = {"delta": delta, "index": index, "finish_reason": reason}
             if want_logprobs and reason is None:
@@ -1034,16 +1157,57 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                      "choices": [choice]}
             return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
+        def call_deltas(j: int, text: str, stats: dict) -> Iterator[dict[str, Any]]:
+            """A call as OpenAI streams it: id and name first, then the arguments."""
+            call = as_call(text)
+            if call is None:                    # the model answered after all
+                yield {"index": j, "logprobs": None,
+                       "delta": {"role": "assistant", "content": text}}
+                yield {"index": j, "finish": reason_for(text, stats), "full": text}
+                return
+            message = _tool_message(call, structured is not None and structured.legacy)
+            if "function_call" in message:
+                fn = message["function_call"]
+                yield {"index": j, "logprobs": None, "delta": {
+                    "role": "assistant", "content": None,
+                    "function_call": {"name": fn["name"], "arguments": ""}}}
+                yield {"index": j, "logprobs": None,
+                       "delta": {"function_call": {"arguments": fn["arguments"]}}}
+            else:
+                tc = message["tool_calls"][0]
+                yield {"index": j, "logprobs": None, "delta": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"index": 0, "id": tc["id"], "type": "function",
+                                    "function": {"name": tc["function"]["name"],
+                                                 "arguments": ""}}]}}
+                yield {"index": j, "logprobs": None, "delta": {"tool_calls": [{
+                    "index": 0, "function": {"arguments": tc["function"]["arguments"]}}]}}
+            yield {"index": j, "finish": call_reason, "full": text}
+
         def produce(j: int) -> Iterator[dict[str, Any]]:
             log = _TokenLog(engine, top_n) if want_logprobs else None
             text = ""
             first = True
-            stream = backend.generate_chat_streaming(messages, **with_log(chat_kwargs, log))
+            # with tools, a reply that starts with "{" is a call: held back whole
+            decided = None if structured is not None and structured.calls else "text"
+            if structured is not None and structured.mode == "required":
+                decided = "call"
+            stats: dict = {}
+            stream = backend.generate_chat_streaming(
+                messages, **with_log({**chat_kwargs, "stats": stats}, log))
             try:
                 for tok in stream:
                     if _shutdown.is_set():
                         break  # server shutting down: stop generating cleanly
                     text += tok
+                    if decided is None:
+                        head = text.lstrip()
+                        if not head:
+                            continue
+                        decided = "call" if head.startswith("{") else "text"
+                        tok = text
+                    if decided == "call":
+                        continue
                     entries = None
                     if log is not None:
                         entries = _chat_logprobs(log.take(log.leading_whitespace() + len(text)))
@@ -1054,10 +1218,13 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
                     first = False
             finally:
                 _close(stream)
+            if decided == "call":
+                yield from call_deltas(j, text, stats)
+                return
             if first:   # nothing generated: still announce the role
                 yield {"index": j, "delta": {"role": "assistant", "content": ""},
                        "logprobs": {"content": []} if log is not None else None}
-            yield {"index": j, "finish": finish_reason, "full": text}
+            yield {"index": j, "finish": reason_for(text, stats), "full": text}
 
         def gen():
             texts = [""] * n
@@ -1080,27 +1247,42 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
 
     def one(j: int):
         log = _TokenLog(engine, top_n) if want_logprobs else None
+        stats: dict = {}
+        if structured is not None:      # no plain-text fallback: the grammar must hold
+            try:
+                content = backend.generate_chat(
+                    messages, **with_log({**chat_kwargs, "stats": stats}, log))
+                return content, log, stats
+            except ValueError as err:   # e.g. llama.cpp: the prompt exceeds the context
+                raise _bad_request("tools" if structured.calls else "response_format",
+                                   str(err), "invalid_value") from err
         try:
-            content = backend.generate_chat(messages, **with_log(chat_kwargs, log))
+            content = backend.generate_chat(messages,
+                                            **with_log({**chat_kwargs, "stats": stats}, log))
         except Exception:
             log = _TokenLog(engine, top_n) if want_logprobs else None
+            stats = {}
             full = backend.generate(prompt_for_usage, length=req.max_tokens,
                                     temperature=req.temperature, **with_log(sampling, log))
             content = full[len(prompt_for_usage):] if full.startswith(prompt_for_usage) else full
-        return cut_at_stop(content, stops), log
+        return cut_at_stop(content, stops), log, stats
 
     with _Busy():
         with seeded_rng(req.seed):
             answers = _run_choices(one, n, together)
     choices = []
-    for j, (content, log) in enumerate(answers):
-        choice: dict[str, Any] = {"index": j,
-                                  "message": {"role": "assistant", "content": content},
-                                  "finish_reason": finish_reason}
+    for j, (content, log, stats) in enumerate(answers):
+        call = as_call(content)
+        if call is not None and structured is not None:
+            choice: dict[str, Any] = {"index": j, "finish_reason": call_reason,
+                                      "message": _tool_message(call, structured.legacy)}
+        else:
+            choice = {"index": j, "message": {"role": "assistant", "content": content},
+                      "finish_reason": reason_for(content, stats)}
         if log is not None:
             choice["logprobs"] = _chat_logprobs(log.take(log.leading_whitespace() + len(content)))
         choices.append(choice)
-    chat_usage = _usage(engine, prompt_for_usage, "".join(c for c, _ in answers))
+    chat_usage = _usage(engine, prompt_for_usage, "".join(c for c, _, _ in answers))
     _metric("tokens_generated_total", chat_usage["completion_tokens"])
     return {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
             "created": int(time.time()), "model": req.model,
@@ -1190,6 +1372,9 @@ def ollama_generate(req: OllamaGenerateRequest, request: Request):
                                                        "repetition_penalty", "min_p",
                                                        "presence_penalty", "frequency_penalty")
                 and (v or k not in ("presence_penalty", "frequency_penalty"))}
+    structured = _structured_request(req, engine, max_tokens)     # 2.17: `format`
+    if structured is not None:
+        sampling["grammar"] = structured.grammar
     stops = opts.get("stop") or []
     seed = opts.get("seed")
     prompt = sanitize_prompt(req.prompt)
@@ -1245,17 +1430,26 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
     reject_unsupported(req)
     engine = get_engine()
     backend = _backend(engine)
-    messages = [m.model_dump() for m in req.messages]
-    prompt_text = _chat_prompt_text(engine, messages)
     opts = _ollama_options(req.options)
     max_tokens = int(opts.pop("max_tokens", 128))
     temperature = float(opts.pop("temperature", 0.7))
+    structured = _structured_request(req, engine, max_tokens)     # 2.17: format, tools
+    messages = _request_messages(req, structured)
+    prompt_text = _chat_prompt_text(engine, messages)
     sampling = {k: v for k, v in opts.items() if k in ("top_k", "top_p",
                                                        "repetition_penalty", "min_p",
                                                        "presence_penalty", "frequency_penalty")
                 and (v or k not in ("presence_penalty", "frequency_penalty"))}
     chat_kwargs = {**sampling, "max_new_tokens": max_tokens,
                    "temperature": temperature, "stop_tokens": opts.get("stop") or None}
+    if structured is not None:
+        chat_kwargs["grammar"] = structured.grammar
+
+    def ollama_calls(text: str) -> list[dict[str, Any]] | None:
+        if structured is None or not structured.calls:
+            return None
+        call = _structured.parse_tool_call(text, structured.tools)
+        return None if call is None else [{"function": call}]
 
     def ndjson(payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False) + "\n"
@@ -1263,13 +1457,25 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
     if req.stream:
         def gen():
             completion_text = ""
+            held = structured is not None and structured.calls
             with _Busy():
                 with seeded_rng(opts.get("seed")):
                     for tok in backend.generate_chat_streaming(messages, **chat_kwargs):
                         if _shutdown.is_set():
                             break
                         completion_text += tok
-                        yield ndjson(ollama_chat_response(req.model, tok, done=False))
+                        if held and structured is not None and structured.mode == "auto":
+                            head = completion_text.lstrip()
+                            if head and not head.startswith("{"):
+                                held = False            # an ordinary answer: stream it
+                                tok = completion_text
+                        if not held:
+                            yield ndjson(ollama_chat_response(req.model, tok, done=False))
+                if held:
+                    calls = ollama_calls(completion_text)
+                    yield ndjson(ollama_chat_response(
+                        req.model, "" if calls else completion_text, done=False,
+                        tool_calls=calls))
                 _metric("tokens_generated_total", _safe_len(engine, completion_text))
                 yield ndjson(ollama_chat_response(
                     req.model, "", prompt_eval_count=_safe_len(engine, prompt_text),
@@ -1278,19 +1484,23 @@ def ollama_chat(req: OllamaChatRequest, request: Request):
 
     with _Busy():
         with seeded_rng(opts.get("seed")):
-            try:
+            if structured is not None:          # no plain-text fallback: the grammar must hold
                 content = backend.generate_chat(messages, **chat_kwargs)
-            except Exception:
-                # Same fallback as /v1/chat/completions: engines without a chat
-                # path answer the rendered prompt. Until v2.6.6 every error was
-                # swallowed here and the client got HTTP 200 with "" as answer.
-                full = backend.generate(prompt_text, length=max_tokens,
-                                        temperature=temperature, **sampling)
-                content = full[len(prompt_text):] if full.startswith(prompt_text) else full
+            else:
+                try:
+                    content = backend.generate_chat(messages, **chat_kwargs)
+                except Exception:
+                    # Same fallback as /v1/chat/completions: engines without a chat
+                    # path answer the rendered prompt. Until v2.6.6 every error was
+                    # swallowed here and the client got HTTP 200 with "" as answer.
+                    full = backend.generate(prompt_text, length=max_tokens,
+                                            temperature=temperature, **sampling)
+                    content = full[len(prompt_text):] if full.startswith(prompt_text) else full
     _metric("tokens_generated_total", _safe_len(engine, content))
-    return ollama_chat_response(req.model, content,
+    calls = ollama_calls(content)
+    return ollama_chat_response(req.model, "" if calls else content,
                                 prompt_eval_count=_safe_len(engine, prompt_text),
-                                eval_count=_safe_len(engine, content))
+                                eval_count=_safe_len(engine, content), tool_calls=calls)
 
 
 def _safe_len(engine, text: str) -> int:

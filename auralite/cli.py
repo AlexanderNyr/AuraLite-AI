@@ -773,13 +773,37 @@ def cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _chat_grammar(args: argparse.Namespace):
+    """The JSON grammar of `auralite chat --json / --json-schema FILE` (2.17), or None."""
+    from auralite.engine import structured
+
+    if getattr(args, "json_schema", None):
+        with open(args.json_schema, "r", encoding="utf-8") as f:
+            return structured.compile_schema(json.load(f))
+    if getattr(args, "json", False):
+        return structured.json_object_grammar()
+    return None
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     from auralite.engine import AuraLiteEngine
+    from auralite.engine.structured import SchemaError
+    try:
+        grammar = _chat_grammar(args)
+    except (OSError, ValueError, SchemaError) as err:
+        print(f"error: --json-schema: {err}", file=sys.stderr)
+        return 2
     engine = AuraLiteEngine()
     engine.load_model(args.model)
     engine.set_context_window(_context_window_arg(args))
     if getattr(args, "compile", False):
         engine.enable_inference_compile()
+    if grammar is not None:
+        try:
+            engine.structured_check(grammar, args.length)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     history: list[dict] = []
     if args.system:
         history.append({"role": "system", "content": args.system})
@@ -789,7 +813,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         reply = engine.generate_chat(history, args.length,
                                      temperature=args.temperature,
                                      top_k=args.top_k, top_p=args.top_p,
-                                     chat_template=args.template)
+                                     chat_template=args.template, grammar=grammar)
         history.append({"role": "assistant", "content": reply})
         print(f"assistant: {reply}")
 
@@ -1522,6 +1546,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model for prompt processing")
+    p.add_argument("--json", action="store_true",
+                   help="answer with a JSON object (JSON mode, constrained decoding)")
+    p.add_argument("--json-schema", metavar="FILE",
+                   help="answer with JSON that follows this JSON schema (a .json file)")
     _add_context_flags(p)
     p.set_defaults(func=cmd_chat)
 

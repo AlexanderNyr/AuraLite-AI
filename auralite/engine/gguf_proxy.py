@@ -315,10 +315,14 @@ class GGUFModelProxy:
                           min_p: float = 0.0, stream: bool = False,
                           stop: list[str] | None = None,
                           presence_penalty: float = 0.0,
-                          frequency_penalty: float = 0.0):
+                          frequency_penalty: float = 0.0,
+                          grammar: Any = None):
+        """`grammar` (2.17): a ``llama_cpp.LlamaGrammar`` the text must follow."""
         kwargs: dict[str, Any] = _penalty_kwargs(presence_penalty, frequency_penalty)
         if stop:
             kwargs["stop"] = list(stop)
+        if grammar is not None:
+            kwargs["grammar"] = grammar
         return self._generate_locked(lambda: self.llama.create_completion(
             prompt=prompt,
             max_tokens=max(0, int(max_tokens)),
@@ -338,16 +342,19 @@ class GGUFModelProxy:
                                stop: list[str] | None = None,
                                presence_penalty: float = 0.0,
                                frequency_penalty: float = 0.0,
-                               seed: int | None = None):
+                               seed: int | None = None, grammar: Any = None):
         """Use llama.cpp chat formatting for instruction/chat GGUF models.
 
         `seed` (2.16): the sampling seed of this call (``auralite distill``).
+        `grammar` (2.17): a ``llama_cpp.LlamaGrammar`` the answer must follow.
         """
         kwargs: dict[str, Any] = _penalty_kwargs(presence_penalty, frequency_penalty)
         if stop:
             kwargs["stop"] = list(stop)
         if seed is not None:
             kwargs["seed"] = int(seed)
+        if grammar is not None:
+            kwargs["grammar"] = grammar
         return self._generate_locked(lambda: self.llama.create_chat_completion(
             messages=messages,
             max_tokens=max(0, int(max_tokens)),
@@ -453,7 +460,9 @@ class LlamaServerProxy:
                           min_p: float = 0.0, stream: bool = False,
                           stop: list[str] | None = None,
                           presence_penalty: float = 0.0,
-                          frequency_penalty: float = 0.0):
+                          frequency_penalty: float = 0.0,
+                          json_schema: dict | None = None):
+        """`json_schema` (2.17): the server's grammar-constrained JSON (``json_schema``)."""
         payload = {
             **_penalty_kwargs(presence_penalty, frequency_penalty),
             "prompt": prompt,
@@ -467,6 +476,8 @@ class LlamaServerProxy:
         }
         if stop:
             payload["stop"] = list(stop)
+        if json_schema is not None:
+            payload["json_schema"] = json_schema
         return self._generate(payload, stream=stream, chat=False)
 
     def create_chat_completion(self, messages: list[dict], *, max_tokens: int = 50,
@@ -476,7 +487,9 @@ class LlamaServerProxy:
                                stop: list[str] | None = None,
                                presence_penalty: float = 0.0,
                                frequency_penalty: float = 0.0,
-                               seed: int | None = None):
+                               seed: int | None = None,
+                               json_schema: dict | None = None):
+        """`json_schema` (2.17): sent as OpenAI's ``response_format`` json_schema."""
         payload = {
             **_penalty_kwargs(presence_penalty, frequency_penalty),
             "messages": messages,
@@ -492,6 +505,9 @@ class LlamaServerProxy:
             payload["stop"] = list(stop)
         if seed is not None:
             payload["seed"] = int(seed)
+        if json_schema is not None:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "auralite", "schema": json_schema}}
         return self._generate(payload, stream=stream, chat=True)
 
     def _generate(self, payload: dict, *, stream: bool, chat: bool):
