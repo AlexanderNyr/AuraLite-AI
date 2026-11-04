@@ -1,3 +1,155 @@
+# 📦 v2.18.1 — Hugging Face models in AuraLite's engine: import, QLoRA without bitsandbytes, 8-bit AdamW, export to Hugging Face and GGUF
+
+Pretrained models now come into AuraLite's own engine. `auralite import
+hf:ORG/NAME` reads **Llama, Mistral, Qwen2/2.5 and Qwen3** checkpoints into a
+native model — downloaded with resume and checked against the Hub's sha256,
+built without transformers, computing exactly what transformers computes
+(SmolLM2-135M: bit-identical logits) — so a pretrained model fine-tunes,
+chats, serves and quantizes like one trained with AuraLite. **QLoRA without
+bitsandbytes** (`--quantize nf4`: 4-bit NormalFloat weights, double
+quantization, LoRA adapters in float32) runs on any CPU PyTorch runs on,
+AVX-only ones included, and on GPUs; **8-bit AdamW** (`--optimizer
+adamw8bit`) keeps a quarter of AdamW's optimizer memory. The result exports
+back as a **Hugging Face folder** (transformers 4.46 and 5.x load it, same
+logits) or a **GGUF file** for llama.cpp, Ollama and LM Studio. Fixed on the
+way: YaRN RoPE scaling blended the wrong way round, and the KV cache of a
+long-context model reserved twice its whole window for every reply.
+Details: [docs/training.md § 21](docs/training.md#21-hugging-face-models-in-auralites-engine-import-qlora-8-bit-adamw-export-2181).
+
+**What changed for existing users**
+
+| | 2.18.1 | 2.18.0 |
+|---|---|---|
+| `auralite import hf:ORG/NAME` / `train --resume hf:...` | Llama / Mistral / Qwen2 / Qwen3 as a native model | — (transformers backend only) |
+| `train --quantize nf4`, `--optimizer adamw8bit` | QLoRA (4-bit base) and 8-bit AdamW states, no extra package | — (`bitsandbytes` through transformers only) |
+| `export --format hf` / `--format gguf` | a transformers folder / a GGUF file | — |
+| `rope_scaling` type `yarn`, new models | the paper's blend (= transformers) | the reverse blend (fast dimensions interpolated) |
+| `rope_scaling` type `yarn`, checkpoints of 2.6–2.18.0 | unchanged (marked `yarn_blend: "legacy"` on load) | — |
+| KV cache with a context window | grows from what the generation needs up to two windows | two whole windows reserved per layer (and per decode-batch row) at the first token |
+| RoPE tables | 4,096 positions built up front, more on demand | the whole `max_seq_len` |
+| LoRA on dialogs of an imported / 4-bit model | the token rows stay as they are (`lora_embeddings="new"`) | every row trained (`"all"`, still the default for native models) |
+| chat templates | `llama3` added (also for fine-tuning) | chatml, gemma, phi for fine-tuning |
+
+Checkpoints of native models are unchanged (the new fields are written only
+when they differ from the defaults, so 2.18.0 still reads them).
+
+**Import** (`auralite/engine/hf_models.py`, `safetensors_lite.py`)
+
+- `hf_model_dir("hf:ORG/NAME[@REV]")`: `config.json`, the tokenizer files,
+  `generation_config.json` and the safetensors weights (sharded or not) to
+  `$AURALITE_HOME/hf/ORG__NAME/REV`; `.part` files continue with HTTP
+  ranges; sizes and sha256 from the Hub's own answer (`X-Linked-Size`,
+  `X-Linked-Etag` — the CDN's ETag is Xet's hash), checked after the
+  download; a complete folder is used offline afterwards; `HF_TOKEN` (or
+  `huggingface-cli login`) for gated models, not sent on to another host;
+  `HF_ENDPOINT` for mirrors.
+- `native_config`: Llama, Mistral (sliding window), Qwen2 (q/k/v biases),
+  Qwen3 (explicit head size, shared q/k norms); RoPE default / `linear` /
+  `llama3` / `yarn`; transformers 4 and 5 configs. Everything else is refused
+  by name (activations, MLP / output biases, `dynamic` / `longrope` RoPE,
+  interleaved RoPE, per-layer sliding windows, unknown or missing tensors,
+  shapes that disagree with the config).
+- `import_hf`: the model is built on the meta device, every tensor read,
+  converted and placed one at a time (float32, bfloat16 or float16), or
+  straight into NF4; the tokenizer (`HFBPETokenizer`), the chat template
+  (from the model's Jinja template), BOS handling and the original config
+  travel with the checkpoint (`hf_source`).
+- `ModernTransformer(head_dim=, qkv_bias=, norm_eps=, qk_norm_shared=)`,
+  RoPE `llama3`, `rebuild_rope_tables`; `HeadwiseRMSNorm(shared=)`;
+  `arch_fields_2181`, `model_kwargs_from_checkpoint`; `auralite info` shows
+  them.
+
+**QLoRA** (`auralite/engine/nf4.py`)
+
+- `NF4Linear`: QLoRA's 16 NF4 levels, blocks of 64, absmax scales stored as
+  int8 around their mean (blocks of 256) — 4.13 bits per weight; a custom
+  autograd function decodes the weight in the forward and the backward pass
+  (one embedding lookup decodes a byte into two weights; on a CPU into one
+  reusable buffer per thread, which kept glibc's heap from fragmenting: +59
+  instead of +276 MB for a forward pass of Qwen2.5-0.5B); the weight gets no
+  gradient, LoRA adapters sit on it; `merge_lora` dequantizes adapted layers;
+  `quantize_model_nf4`, `dequantize_model_nf4`, `nf4_config`,
+  `install_nf4_shells`.
+- `train(quantize_base="nf4")` / `--quantize nf4` / the GUI's *4-bit base
+  (QLoRA)*; a 4-bit base trains adapters only; `engine.quantize_nf4()`.
+- 4-bit checkpoints (`quantization` entry) load on the meta device and get
+  memory only for what they hold.
+
+**8-bit AdamW** (`auralite/engine/optim8bit.py`): `AdamW8bit` — blockwise
+dynamic 8-bit moments (blocks of 256, float32 below 4,096 values), AdamW's
+update in float32, a positive second moment never codes to zero;
+`optimizer="adamw8bit"` / `--optimizer adamw8bit` / the GUI's *8-bit AdamW*;
+a continued run resumes it by itself; `estimate_training_memory` counts 2.04
+bytes per weight for it (and takes `weight_bytes` for a 4-bit base and
+`head_dim`).
+
+**Export** (`hf_models.export_hf`, `auralite/engine/gguf_writer.py`)
+
+- `export_hf`: config (the family the model came from, or the one its
+  features call for), safetensors in shards of 4 GB, tokenizer files with
+  the chat template (Jinja for chatml, llama3, gemma, phi), generation
+  config; adapters merged and NF4 dequantized tensor by tensor, the model in
+  memory untouched.
+- `export_gguf`: GGUF v3, F32 / F16 / BF16 / Q8_0; llama.cpp's tensor names,
+  q/k permutation for the `llama` architecture, `rope_freqs` for Llama 3.1,
+  the byte-level BPE vocabulary with token types and merges, the
+  pre-tokenizer name found by hashing the ids of llama.cpp's test text,
+  BOS / EOS / EOT, the chat template; `read_gguf`.
+- Refused with a reason: ALiBi, MoE, per-head QK-norm, legacy YaRN, AuraLite's
+  own tokenizers; GGUF of SentencePiece-style tokenizers.
+
+**Fixed**
+
+- YaRN (`rope_scaling={"type": "yarn"}`) interpolated the fast,
+  short-wavelength dimensions and kept the slow ones, the reverse of the
+  paper and of transformers (cos/sin off by up to 2.3); since 2.6. New models
+  get the paper's blend; older checkpoints keep theirs.
+- The KV cache of a model with a context window reserved twice the window in
+  every layer, and a decode batch twice the window in every row, at the first
+  token: one 32-token reply of an 8,192-token model reserved ~0.75 GB, and
+  `chat-eval` of SmolLM2-135M was killed at 1.48 GB; now 762 MB.
+- `memory_plan="auto"` that found no batch to fit warned and ran the whole
+  batch anyway (and the system killed it); it now tries one window per
+  forward pass with gradient checkpointing. A LoRA run's estimate no longer
+  counts a gradient for the frozen output layer.
+- A DDP run of a 4-bit base broadcast its frozen weights at every step.
+- A LoRA run's log could count frozen embedding rows as negative "other
+  params".
+
+**CLI**: `auralite import SOURCE --out FILE [--quantize nf4] [--dtype]
+[--revision]`; `train --resume hf:...|FOLDER --quantize nf4 --optimizer
+muon|adamw|adamw8bit`; `export --format hf|gguf [--quant f16|q8_0|bf16|f32]
+[--dtype]`; `--template llama3`.
+
+**GUI**: Model tab *⚙ Import into AuraLite engine*; Training tab *4-bit base
+(QLoRA)* and *8-bit AdamW*; Export tab *🤗 Export HF folder* and *🦙 Export
+GGUF*.
+
+**Docs**: training.md § 21, engine.md § 2 and § 13, faq § 19, quickstart;
+releasing.md: `PYPI_PUBLISH` must be a *repository* variable (a job-level
+`if` cannot see environment variables — why 2.17.0 was not uploaded), and
+what to do with a draft release left by a failed `release` job.
+
+**Measured** (docs/training.md § 21; 2 vCPU, 2 GB)
+
+| | 2.18.1 |
+|---|---|
+| SmolLM2-135M imported (float32) vs transformers 5.22 | largest logit difference 0.0, perplexity 32.2235 = 32.2235, same token ids; 1.5 s |
+| tiny Llama / Llama 3.1 / Qwen2 / Mistral / Qwen3 vs transformers | within 4e-7 (4.46.3 and 5.22) |
+| `auralite import hf:HuggingFaceTB/SmolLM2-135M --out smol.pt --quantize nf4` | download, sha256, 4-bit: 12.1 s, 0.17 GB of weights, process peak 633 MB |
+| NF4 | 9.3 % weight error; perplexity 31.25 → 38.30 (135M model) |
+| LoRA, float base / QLoRA + 8-bit AdamW, 61,440 tokens | 207 / 142 tokens/s, peak 1,418 / 1,054 MB, exact replies 0 → 69 % / 61 % |
+| QLoRA imported straight into 4 bits (`--resume hf:... --quantize nf4`), batches of 2 × 4 | 196 tokens/s, peak 1,393 MB, validation loss 0.2395, exact replies 60 % |
+| Qwen2.5-0.5B-Instruct, QLoRA + 8-bit AdamW on the 2 GB machine (1 window × 8, checkpointing), 20,480 tokens | 39 tokens/s, peak 1,477 MB, exact replies 10 % → 80 % (30 dialogs) |
+| GGUF of SmolLM2-135M in llama.cpp | same tokens; F16 within 0.045 of transformers, top token equal 256 / 256; perplexity 31.03 (F16), 31.33 (Q8_0) |
+| `chat-eval` of SmolLM2-135M (KV-cache fix) | 762 MB (killed at 1.48 GB before) |
+
+**Tests**: `tests/test_hf_v2181.py` (no optional packages: Hugging Face
+checkpoints written by the test and an independent reference forward pass
+of the five families, downloads from a local stand-in for the Hub, the CLI)
+and `tests/test_hf_native_real.py` (transformers and llama.cpp, in the
+`integrations` CI job on transformers 4.46.3 and the latest).
+
 # 📦 v2.18.0 — big data and big models: token shards, Hugging Face datasets, memory plans, exact resumption
 
 Training data no longer has to fit in memory, and a big model no longer has

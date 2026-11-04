@@ -1619,7 +1619,9 @@ training steps peaked within −8 % to +17 % of the estimate in five CPU runs,
 and the two runs it said would not fit were the two the system killed.
 The FineWeb run above with 16 windows a step was killed at 1.3 GB after the
 warning; with `--memory-plan auto` it ran as 4 windows × 4 accumulation
-steps.
+steps. (2.18.1: when no batch fits, `auto` tries the smallest step — one
+window per forward pass, gradient checkpointing — instead of the whole
+batch; § 21.5.)
 
 **The loss in chunks**: the output layer and the cross-entropy are computed
 a chunk of tokens at a time (`loss_chunk_tokens`, default "auto": once a
@@ -1656,8 +1658,8 @@ file, not in a copy in memory.
 
 Pretrained Hugging Face models (Llama, Qwen, Mistral) imported into the
 native engine, QLoRA without bitsandbytes and the export back to Hugging
-Face are the next part. Token shards train on one computer (a cluster run
-reads a text).
+Face came in 2.18.1 (§ 21). Token shards train on one computer (a cluster
+run reads a text).
 
 ### 20.6 Reproduce
 
@@ -1675,3 +1677,262 @@ pytest tests/test_bigdata_v218.py
 "d_ff": 704, "seq_length": 256, "batch_size": 16, "seed": 0, "dropout": 0.0,
 "tie_word_embeddings": true}`; `bpe8k.json` from `auralite tokenizer train`
 or the folder of a first `data prepare`.)
+
+## 21. Hugging Face models in AuraLite's engine: import, QLoRA, 8-bit AdamW, export (2.18.1)
+
+Llama, Mistral, Qwen2 (2.5) and Qwen3 checkpoints are the decoder AuraLite
+builds itself — RMSNorm, RoPE, grouped-query attention, SwiGLU — under other
+tensor names and with a few more settings (q/k/v biases, the RMSNorm
+epsilon, the head size, a shared QK-norm, Llama 3.1's RoPE scaling). 2.18.1
+reads them into a native model, so a pretrained model fine-tunes, chats,
+serves and quantizes like one trained with AuraLite — without transformers,
+without bitsandbytes, on any CPU PyTorch runs on (AVX without AVX2 included)
+and on GPUs — and writes the result back as a Hugging Face folder or a GGUF
+file. (The transformers backend of the Model tab, `load_hf_model`, is still
+there for every other architecture.)
+
+### 21.1 Import
+
+```bash
+auralite import hf:HuggingFaceTB/SmolLM2-135M-Instruct --out smol.pt
+auralite import hf:Qwen/Qwen2.5-1.5B-Instruct --out qwen.pt --quantize nf4
+auralite import ./Llama-3.2-1B-Instruct --out llama.pt          # a downloaded folder
+auralite info --model qwen.pt                                   # imported_from, quantization
+```
+
+API: `engine.import_hf_model("hf:ORG/NAME", quantize="nf4")`; GUI: Model tab,
+*⚙ Import into AuraLite engine* (the model name field and the 4-bit box).
+
+* **Download**: `hf:ORG/NAME[@REVISION]` fetches `config.json`,
+  `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` and the
+  safetensors weights (sharded or not) to `~/.auralite/hf/ORG__NAME/REVISION`
+  (`AURALITE_HOME`). An interrupted download continues where it stopped (HTTP
+  ranges on `.part` files); every weight file is checked against the sha256
+  the Hub publishes for it; a complete download is used offline afterwards,
+  without a single request. Gated models (Llama) need their license accepted
+  on huggingface.co and `HF_TOKEN` (or `huggingface-cli login`); the token
+  is not sent on to the download CDN. `HF_ENDPOINT` points at a mirror.
+  Qwen2.5-0.5B-Instruct (988 MB) downloaded and checked in 20 s here.
+* **What is reproduced**: `LlamaForCausalLM` (Llama 2/3/3.1/3.2, SmolLM,
+  TinyLlama, …), `MistralForCausalLM` (with its sliding window),
+  `Qwen2ForCausalLM` (Qwen2, Qwen2.5, DeepSeek-R1-Distill-Qwen) and
+  `Qwen3ForCausalLM`; RoPE default, `linear`, `llama3` and `yarn`; tied or
+  untied embeddings; a `config.json` written by transformers 4 or 5
+  (`rope_parameters`). Anything that would compute another function is
+  refused with its name — another activation, MLP or output-projection
+  biases, `dynamic`/`longrope` RoPE, per-layer sliding windows, MoE layers,
+  unknown tensors — never approximated. Weights must be safetensors (no
+  pickled `.bin`), the tokenizer a `tokenizer.json` BPE (all of the above).
+* **Exactly the same model**: SmolLM2-135M imported in float32 gives
+  *bit-identical* logits to transformers 5.22 (largest difference 0.0 over
+  256 positions × 49,152 tokens) and the same perplexity (32.2235 on 4,088
+  tokens of tinyshakespeare); its tokenizer gives the same ids. Tiny random
+  Llama, Llama 3.1 (RoPE scaling), Qwen2 (biases), Mistral (sliding window 16
+  on 40 tokens) and Qwen3 (head size 32 ≠ 64/4, shared q/k norms) models made
+  by transformers agree within 4e-7 (`tests/test_hf_native_real.py`, also on
+  transformers 4.46.3).
+* **Memory**: the model is built on PyTorch's "meta" device — no random
+  weights are made first — and each tensor is read, converted (bf16 → the
+  `--dtype`, float32 by default) and placed one at a time: SmolLM2-135M took
+  1.5 s and its 0.54 GB. RoPE tables cover 4,096 positions up front and grow
+  when a longer sequence comes (a 128k-context model held 64 MB of tables
+  per layer otherwise).
+* **Chat**: the chat template comes from the model's own
+  (`<|im_start|>` → chatml, `<|start_header_id|>` → the new **llama3**
+  template, `<start_of_turn>` → gemma, `[INST]` → mistral); a base model
+  gets chatml when its tokenizer has those markers. A model whose tokenizer
+  adds a BOS token (Llama, Mistral) gets it at the start of every prompt.
+  `llama3` is also a fine-tuning template (`--template llama3`).
+
+### 21.2 QLoRA: LoRA on a 4-bit base
+
+```bash
+auralite train --data dialogs.jsonl --resume hf:Qwen/Qwen2.5-1.5B-Instruct --quantize nf4 --lora 16 --memory-plan auto --model qwen-chat.pt
+auralite train --data dialogs.jsonl --resume smol.pt --lora 16 --model smol-chat.pt     # LoRA on a float base
+```
+
+`--quantize nf4` (API: `quantize_base="nf4"`; GUI: *4-bit base (QLoRA)*
+next to the LoRA rank) stores the attention and feed-forward weights of the
+continued model as NF4, the 4-bit NormalFloat of the QLoRA paper: blocks of
+64 weights, each with its largest magnitude, and 16 levels that are the
+quantiles of a normal distribution; the block scales are themselves stored
+in 8 bits ("double quantization"). That is 4.13 bits per weight instead of
+32. The adapters train in float32; embeddings, output head and norms stay as
+they are. Each forward pass decodes a layer's weight for its matrix product
+and the backward pass decodes it again — no float copy of the weights stays
+in memory — so a 4-bit model costs extra time per step, less the more tokens
+a step holds (one table lookup turns a byte into two weights: 0.5 ms for a
+1536×576 matrix, 3.6 times faster than indexing). On a CPU the decoded
+weight goes into one reusable buffer per thread, the size of the largest
+matrix: as fresh 10–250 MB tensors at every step, they fragmented the C
+library's heap — one forward pass of 16 tokens through Qwen2.5-0.5B grew
+the process by 276 MB that way, by 59 MB with the buffer, at the same speed.
+Importing with
+`--quantize nf4` never holds the float model at all; `--resume hf:...
+--quantize nf4` does the same in one command.
+
+* A 4-bit base trains adapters only (the trainer says so otherwise), and an
+  imported or 4-bit model keeps its token rows by default
+  (`lora_embeddings="new"`): training a 50k–150k-row embedding costs more
+  memory than the adapters.
+* Saved checkpoints keep the 4-bit layers (a `quantization` entry; they load
+  without a float copy); `auralite lora merge` writes a float model with the
+  adapters folded in; export (§ 21.4) does the same on the way.
+* **The price of 4 bits**: NF4 reconstructs a weight matrix with 9.3 %
+  relative error (block 64; 8.8 % with block 32); SmolLM2-135M's perplexity
+  rises from 31.25 to 38.30 (4 windows of 512 tokens; double quantization
+  changes it by 0.04). Small models lose the most — the QLoRA paper measured
+  7B–65B models — and the adapters learn to work with the base they see.
+* **Generation** with a 4-bit model decodes every weight for every token:
+  for chatting, serving or scoring many replies, merge the adapters
+  (`auralite lora merge`) or export to GGUF — the 100 replies of the run
+  below took 217 s from the 4-bit model, 93 s from the float one.
+
+**A measured run** — SmolLM2-135M learning a reply format (2,000 arithmetic
+dialogs, "13 plus 39 is 52."), LoRA rank 16 on every projection, 60 steps of
+8 windows × 128 tokens (61,440 tokens), `lora_lr` 1e-3, `--memory-plan auto`,
+2 vCPU (Xeon, AVX-512), 2 GB of memory; exact replies on 100 held-out dialogs:
+
+| run | tokens/s | peak memory | validation loss | exact replies | stop rate |
+|---|---|---|---|---|---|
+| base model (no training) | — | — | — | 0 % | 0 % |
+| LoRA, float32 base | 207 (batches of 1 window) | 1,418 MB | 0.2224 | 69 % | 100 % |
+| QLoRA, imported into 4 bits | 196 (batches of 2 windows × 4) | 1,393 MB | 0.2395 | 60 % | 100 % |
+| QLoRA + 8-bit AdamW | 142 (batches of 1) | 1,054 MB | 0.2393 | 61 % | 100 % |
+
+(The memory plan picks the batch from the free memory — one window per step
+in two runs, two in the other, which also spreads the cost of decoding the
+4-bit weights over more tokens; the float base needs 0.54 GB for its
+weights, the 4-bit base 0.17 GB.)
+
+Qwen2.5-0.5B-Instruct on the same 2 GB machine (from its 4-bit import,
+8-bit AdamW, `loss_chunk_tokens` 32; the memory plan found no batch that fit
+the 364 MB left and ran the 8 windows of a step one at a time with gradient
+checkpointing): 20 steps (20,480 tokens) at 39 tokens/s, peak 1,477 MB,
+validation loss 0.050; exact replies on 30 held-out dialogs went from 10 %
+to 80 % (the base model's sums were right, in its own words: "49 + 6 =
+55").
+
+**Bigger models on a CPU** — honest numbers. A LoRA or QLoRA step costs about
+4 × (parameters) floating-point operations per token; this 2-vCPU machine
+did about 110 GFLOP/s on the 135M model, which predicts the following for
+batches of one window (a 4-core i5-2400 with AVX but no FMA has a similar
+peak, an i3-2100 about half of it — measure with a 20-step run):
+
+| model | QLoRA weights in memory | tokens/s (estimate) | 150,000 tokens (≈ 1,000 dialogs) |
+|---|---|---|---|
+| SmolLM2-360M | 0.35 GB | ~70 | 36 min |
+| Qwen2.5-0.5B | 0.73 GB | ~45 (measured: 39, with checkpointing) | ~1 h |
+| Qwen2.5-1.5B / Llama-3.2-1B | 1.6 GB | ~12–18 | 2.5–3.5 h |
+| Llama-3.2-3B | 3.0 GB | ~6–9 | 5–7 h |
+| Qwen2.5-7B / Llama-3.1-8B | 7.7–7.8 GB | ~2–3 | 14–21 h |
+
+(Weights only: 0.52 bytes per block weight + 4 bytes per embedding and
+output-head weight; training adds activations — the plan logs the total.)
+So: on a CPU, models up to ~1.5B fine-tune on a thousand dialogs overnight;
+7–8B models are possible with 12 GB or more of memory and patience. On a
+CUDA GPU the same commands run (bf16 autocast) — not measured for this
+release.
+
+### 21.3 8-bit AdamW
+
+`--optimizer adamw8bit` (API: `optimizer="adamw8bit"`; GUI: *8-bit AdamW*)
+keeps AdamW's two moments in 8 bits — blocks of 256 values with their
+largest magnitude and a dynamic code that is fine near zero (Dettmers et al.,
+2022) — 2.04 bytes per weight instead of 8; tensors under 4,096 values keep
+float32 moments, and the update itself is AdamW's, in float32. It is what
+makes full fine-tuning (no LoRA) fit: a 1B-parameter model needs 4 GB of
+weights, 4 GB of gradients and 8 GB of AdamW state — 2 GB with 8-bit states.
+Measured: a tiny Qwen2 fine-tuned for 40 steps ended at a validation loss of
+3.856 against 3.841 with AdamW (its checkpoint 0.75 MB instead of 1.33 MB);
+the QLoRA run above reached the same validation loss with it (0.2393).
+A checkpoint resumes as 8-bit by itself, and the memory plan counts it.
+
+### 21.4 Export: Hugging Face and GGUF
+
+```bash
+auralite export --model qwen-chat.pt --format hf --out qwen-chat-hf          # transformers, vLLM
+auralite export --model qwen-chat.pt --format gguf --quant q8_0 --out qwen-chat.gguf
+```
+
+API: `engine.export_hf_model(folder)`, `engine.export_gguf_model(path,
+quant="f16")`; GUI: Export tab, *🤗 Export HF folder* / *🦙 Export GGUF*.
+LoRA adapters are merged and 4-bit layers dequantized on the way, one tensor
+at a time, without changing the model in memory.
+
+* **Hugging Face folder**: `config.json` (the family the model came from,
+  or Llama / Mistral / Qwen2 / Qwen3 from its features; the RoPE settings in
+  the transformers 4 and 5 forms), `model.safetensors` (bf16 by default;
+  shards of 4 GB with an index), `tokenizer.json`, `tokenizer_config.json`
+  with the chat template, `generation_config.json`. transformers 4.46.3 and
+  5.22 load it and compute AuraLite's logits (float32: equal; a QLoRA model
+  with merged adapters within 1e-5), its tokenizer gives the same ids and
+  `apply_chat_template` writes the same prompt.
+* **GGUF** for llama.cpp, Ollama and LM Studio: F16, Q8_0, BF16 or F32
+  (`llama-quantize model.gguf out.gguf Q4_K_M` makes the smaller types),
+  with the byte-level BPE tokenizer, its merges and special tokens, the
+  pre-tokenizer under the name llama.cpp knows it by (recognized from the
+  token ids of llama.cpp's own test text, as its converter does), the chat
+  template and Llama 3.1's RoPE scaling. SmolLM2-135M in llama.cpp 0.3.36:
+  the same tokens as AuraLite; logits within 0.045 of transformers in F16
+  (the top token equal at all 256 positions), perplexity 31.03 (F16) and
+  31.33 (Q8_0); the files took 0.4 and 0.6 s to write (271 and 145 MB).
+* **What cannot be exported**: ALiBi and mixture-of-experts models, QK-norm
+  with a different scale per head (Qwen3's is shared), YaRN models trained
+  before 2.18.1, and models with AuraLite's own char/BPE tokenizers (they
+  have no `tokenizer.json` form: train with `--tokenizer hf:...` to export).
+  GGUF needs a byte-level BPE tokenizer (Llama 3, Qwen, SmolLM, GPT-2 style);
+  SentencePiece-style ones (Llama 2, Mistral 7B) go through `--format hf` and
+  llama.cpp's `convert_hf_to_gguf.py`. Mistral's sliding window has no GGUF
+  form: llama.cpp attends further on prompts longer than the window.
+
+### 21.5 Fixed on the way
+
+* **YaRN** (`rope_scaling` type `yarn`) blended the wrong way round since
+  2.6: it interpolated the fast, short-wavelength dimensions and kept the
+  slow ones — the opposite of the paper and of transformers (cos/sin differed
+  by up to 2.3). New models get the paper's blend (equal to transformers to
+  the last bit); checkpoints written before keep the frequencies they were
+  trained with (`yarn_blend: "legacy"`).
+* **KV cache of long-context models**: a generation reserved twice the
+  model's context window in every layer (and every row of a decode batch),
+  even for a short reply. SmolLM2's 8,192-token window made one chat reply
+  reserve about 0.75 GB and a decode batch 3 GB — `chat-eval` was killed at
+  1.48 GB on this machine; now the cache grows from what the reply needs
+  (prompt + new tokens) up to the window, and the same run peaks at 762 MB.
+  This also affected 2.18's big presets (windows of 1,024–2,048 tokens).
+* **`memory_plan="auto"` when nothing fits**: the plan warned and then ran
+  the whole batch anyway, which the system killed; it now tries the smallest
+  step — one window per forward pass, the same batch through gradient
+  accumulation, gradient checkpointing — and says so. A LoRA run's estimate
+  no longer counts a gradient for the frozen output layer (1.1 GB for
+  Qwen2.5's 151,936 × 896 matrix).
+* A cluster (DDP) run of a 4-bit base no longer broadcasts its frozen 4-bit
+  weights at every step.
+* A LoRA run's log counted the frozen embedding rows as negative "other
+  params".
+
+### 21.6 Not yet
+
+CUDA was not measured for this release (the code paths are the standard
+ones: NF4 decodes in the compute dtype, autocast applies). Frozen bf16
+storage of a big model's embeddings on a CPU, NF4 output heads, other
+architectures (Gemma, Phi, MoE), multimodal models and GGUF of
+SentencePiece-style tokenizers are not done.
+
+### 21.7 Reproduce
+
+```bash
+auralite import hf:HuggingFaceTB/SmolLM2-135M --out smol.pt
+python arith_data.py train.jsonl 2000 1 && python arith_data.py eval.jsonl 200 99
+auralite chat-eval --model smol.pt --data eval.jsonl --limit 100 --json
+auralite train --data train.jsonl --resume smol.pt --lora 16 --pack-dialogs --params p.json --model lora.pt
+auralite train --data train.jsonl --resume hf:HuggingFaceTB/SmolLM2-135M --quantize nf4 --lora 16 --pack-dialogs --params p.json --model qlora.pt
+auralite export --model qlora.pt --format gguf --quant q8_0 --out qlora.gguf
+pytest tests/test_hf_v2181.py tests/test_hf_native_real.py
+```
+
+(`p.json`: `{"max_steps": 60, "batch_size": 8, "seq_length": 128,
+"lora_lr": 0.001, "epochs": 1, "val_split": 0.05, "memory_plan": "auto",
+"seed": 1}`; `arith_data.py` writes "What is 13 plus 39?" → "13 plus 39 is
+52." dialogs.)

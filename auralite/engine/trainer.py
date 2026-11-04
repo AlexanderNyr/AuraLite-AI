@@ -44,6 +44,7 @@ from auralite.engine import cluster as _cluster
 from auralite.engine import compute_thread as _compute
 from auralite.engine import dialogs as _dialogs
 from auralite.engine import shards as _shards
+from auralite.engine import nf4 as _nf4
 from auralite.engine import sizing as _sizing
 from auralite.engine.corpus import TextCorpus
 from auralite.engine.losses import AUTO_MIN_VALUES, ChunkedLoss, auto_chunk_tokens
@@ -58,6 +59,7 @@ from auralite.engine.dataset import (
     validation_split_point,
 )
 from auralite.engine.dialogs import DialogSet
+from auralite.engine.optim8bit import AdamW8bit, is_8bit_state
 from auralite.engine.model import ModernTransformer, estimate_n_params, lora_target_names
 from auralite.engine.preference import PREFERENCE_METHODS, PreferenceSet, resolve_method
 from auralite.engine.optimizers import (
@@ -292,6 +294,51 @@ def _pack_dialogs(train: list, val: list, seq_length: int
             "fill": used / max(1, train_ids.numel()), "forced_cuts": forced,
             "split_dialogs": split}
     return (PackedDataset(train_ids, train_targets, pieces=train_pieces), val_set), info
+
+
+def _nf4_bytes(model: nn.Module) -> int:
+    """Bytes of a model's weights, its 4-bit layers counted as they are stored."""
+    from auralite.engine.hf_models import model_bytes
+    return model_bytes(model)
+
+
+def _restored_optimizer_name(state: Any) -> str:
+    """The optimizer a saved state belongs to: a chained Muon state is a list,
+    an AdamW state a dict, 8-bit AdamW's has coded moments (2.18.1)."""
+    if is_8bit_state(state):
+        return "adamw8bit"
+    return "muon" if isinstance(state, list) else "adamw"
+
+
+def _new_adamw(optimizer_name: str, params: Any, **kwargs: Any) -> torch.optim.Optimizer:
+    """torch's AdamW, or AdamW with 8-bit moments for ``optimizer="adamw8bit"`` (2.18.1)."""
+    if optimizer_name == "adamw8bit":
+        logger.info("[AuraLite] AdamW keeps its moments in 8 bits (2 bytes per weight "
+                    "instead of 8)")
+        return AdamW8bit(params, **kwargs)
+    return optim.AdamW(params, **kwargs)
+
+
+def _quantize_base_nf4(model: Any, params: dict) -> bool:
+    """QLoRA (2.18.1): the base model's block weights in 4 bits when
+    ``quantize_base="nf4"`` asks for it; True when it quantized them."""
+    if str(params.get("quantize_base") or "").lower() != "nf4" or _nf4.nf4_layers(model):
+        return False
+    if getattr(model, "lora_adapters", None):
+        raise ValueError("quantize_base='nf4': the model has LoRA adapters already; "
+                         "merge them first (auralite lora merge)")
+    n_quantized = _nf4.quantize_model_nf4(model)
+    logger.info(f"[AuraLite] QLoRA: {n_quantized} layers of the base model in 4 bits "
+                f"(NF4, {_sizing.format_bytes(_nf4_bytes(model))} in memory)")
+    return True
+
+
+def _require_lora_on_nf4(model: Any, has_lora: bool) -> None:
+    """A 4-bit (NF4) base trains LoRA adapters only (2.18.1)."""
+    if _nf4.nf4_layers(model) and not has_lora:
+        raise ValueError("this model's base is stored in 4 bits (NF4, QLoRA): train LoRA "
+                         "adapters on it (lora_rank; CLI --lora RANK), or import the model "
+                         "again without --quantize to train every weight")
 
 
 def _undo_resize(model: Any, embedding: nn.Module, head: nn.Module) -> None:
@@ -647,7 +694,9 @@ class TrainerMixin:
                              or "new" (only the rows of new tokens: the base
                              model stays as it was and an adapter file holds
                              only those rows — smaller, but the replies were
-                             worse in the measured runs)
+                             worse in the measured runs). 2.18.1: "new" is the
+                             default for an imported Hugging Face model or a
+                             4-bit base (QLoRA)
           val_start_char   : 2.15, validation starts at this character of the
                              text (a TextCorpus sets it to its first held-out
                              document); default: the last val_split of it
@@ -868,10 +917,13 @@ class TrainerMixin:
                 n_heads=int(native.n_heads), d_ff=int(native.d_ff),
                 vocab_size=int(native.head.out_features), n_kv_heads=native.n_kv_heads,
                 tie_word_embeddings=bool(native.tie_word_embeddings),
-                optimizer="muon" if optimizer == "muon" else "adamw", amp=amp,
-                lora_rank=lora_rank, dropout=float(getattr(native, "dropout", 0) or 0),
+                optimizer=optimizer if optimizer in ("muon", "adamw8bit") else "adamw",
+                amp=amp, lora_rank=lora_rank,
+                dropout=float(getattr(native, "dropout", 0) or 0),
                 device=self.device.type, use_moe=bool(getattr(native, "use_moe", False)),
-                num_experts=int(getattr(native, "num_experts", 4) or 4))
+                num_experts=int(getattr(native, "num_experts", 4) or 4),
+                head_dim=int(getattr(native, "head_dim", 0) or 0) or None,
+                weight_bytes=_nf4_bytes(native) if _nf4.nf4_layers(native) else None)
         except (AttributeError, TypeError, ValueError):
             return None, micro, accumulation, chunk_tokens
         chunked = None if auto_chunk else bool(chunk_tokens)
@@ -898,9 +950,19 @@ class TrainerMixin:
                             + (", gradient checkpointing" if plan["gradient_checkpointing"]
                                else "") + f" fit the {_sizing.format_bytes(free)} free")
             else:
+                # 2.18.1: the smallest step (one window, gradient checkpointing)
+                # rather than the whole batch - the estimate errs on the safe
+                # side, the whole batch would not have run at all
+                micro, accumulation = plan["micro_batch"], plan["accumulation_steps"]
+                if not checkpointing and hasattr(native, "set_gradient_checkpointing"):
+                    native.set_gradient_checkpointing(True)
+                    self._setup_undo.append(lambda m=native: m.set_gradient_checkpointing(False))
+                estimate = plan["estimate"]
                 logger.warning("[AuraLite] WARNING: memory_plan=auto found no batch that fits "
-                               f"the {_sizing.format_bytes(free)} free: a smaller model, LoRA "
-                               "or a GPU")
+                               f"the {_sizing.format_bytes(free)} free; trying the smallest "
+                               f"(1 window x {accumulation} accumulation steps, gradient "
+                               "checkpointing) - if it runs out of memory: a smaller model, "
+                               "LoRA / QLoRA (--quantize nf4), shorter windows or a GPU")
         if auto_chunk and estimate["chunked_loss"] and not chunk_tokens:
             chunk_tokens = auto_chunk_tokens(dims["vocab_size"])
         parts = ", ".join(f"{name} {_sizing.format_bytes(estimate[name])}" for name in
@@ -1107,6 +1169,14 @@ class TrainerMixin:
             self._corpus_cache_path = None
         logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
 
+    def _default_lora_rows(self, continue_training: bool) -> str:
+        """``lora_embeddings`` by default: "new" for a pretrained (imported or
+        4-bit) model that continues - training a 50k-150k row embedding and head
+        costs more memory than the adapters themselves - else "all" (2.18.1)."""
+        pretrained = bool(getattr(self, "hf_source", None)) or (
+            self.model is not None and bool(_nf4.nf4_layers(self.model)))
+        return "new" if pretrained and continue_training else "all"
+
     def _train_impl(self, training_text: str | DialogSet | TokenShards, params: dict,
                     progress_callback=None, stop_event=None, finish_event=None,
                     tokenizer=None, corpus_info: dict | None = None):
@@ -1218,7 +1288,9 @@ class TrainerMixin:
         lora_alpha = float(lora_alpha) if lora_alpha else None
         lora_rslora = bool(params.get("lora_rslora", False))
         lora_lr = float(params.get("lora_lr") or 10.0 * float(lr))
-        lora_embeddings = str(params.get("lora_embeddings", "all") or "all").strip().lower()
+        rows_default = self._default_lora_rows(bool(continue_training))
+        lora_embeddings = str(params.get("lora_embeddings", rows_default)
+                              or rows_default).strip().lower()
         if lora_embeddings not in ("new", "all"):
             raise ValueError(f"lora_embeddings must be 'new' or 'all', got {lora_embeddings!r}")
         resume_training_state = params.get("resume_training_state", True)
@@ -1391,7 +1463,7 @@ class TrainerMixin:
             # 2.12: the default optimizer changed from AdamW to Muon. A model
             # continued with default params keeps the optimizer whose state is
             # restored (a chained Muon state is a list, an AdamW state a dict).
-            optimizer_name = "muon" if isinstance(optimizer_state_to_restore, list) else "adamw"
+            optimizer_name = _restored_optimizer_name(optimizer_state_to_restore)
 
         # ---- Live progress helpers ------------------------------------
         # progress_every_batches: 0 = auto (≈1% of epoch, min 1, max 25)
@@ -1641,6 +1713,8 @@ class TrainerMixin:
                 use_qk_norm=use_qk_norm,
             ).to(self.device)
 
+            # a new model comes from no Hugging Face checkpoint (2.18.1)
+            self.hf_source = None
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank, targets=lora_targets,
@@ -1694,6 +1768,8 @@ class TrainerMixin:
                 optimizer_state_to_restore = scheduler_state_to_restore = None
                 logger.info(f"[AuraLite] Vocabulary {rows:,} → {self.vocab_size:,} tokens: the "
                             f"new ones start as the mean of the others")
+            if _quantize_base_nf4(grown, params):        # 2.18.1: QLoRA
+                optimizer_state_to_restore = scheduler_state_to_restore = None
             if int(lora_rank or 0) > 0 and not getattr(grown, "lora_adapters", None) \
                     and hasattr(grown, "enable_lora"):
                 grown.enable_lora(rank=int(lora_rank), targets=lora_targets,
@@ -1754,6 +1830,7 @@ class TrainerMixin:
         # transformer blocks; embeddings / norm scales / an untied LM head
         # are trained by a companion AdamW, following Moonlight et al.
         has_lora = bool(getattr(self.model, "lora_adapters", None))
+        _require_lora_on_nf4(native_model, has_lora)
         if optimizer_name == "muon" and has_lora:
             # 2.16: only a warning when Muon was asked for (it is the default)
             if params.get("optimizer") == "muon":
@@ -1787,38 +1864,41 @@ class TrainerMixin:
                             f"AdamW ({len(adam_decay_params) + len(adam_no_decay_params)} params, lr={lr})")
 
         if optimizer_name != "muon":
+            # 2.18.1: "adamw8bit" is AdamW with 8-bit moments (optim8bit.py)
             single_group_state = (
                 isinstance(optimizer_state_to_restore, dict)
                 and len(optimizer_state_to_restore.get("param_groups", [])) == 1)
             if has_lora and not single_group_state:
                 # 2.16: LoRA learns at lora_lr (default 10 × lr); the embedding
                 # and head are not decayed when only their new rows train
-                self.optimizer = optim.AdamW(
+                self.optimizer = _new_adamw(
+                    optimizer_name,
                     _lora_param_groups(self.model, weight_decay, bool(frozen_rows)),
                     lr=lora_lr, betas=(0.9, 0.95))
                 adapter_params = sum(p.numel() for n, p in self.model.named_parameters()
                                      if ".lora." in n)
                 others = sum(p.numel() for n, p in self.model.named_parameters()
                              if p.requires_grad and ".lora." not in n)
-                if frozen_rows:
+                if frozen_rows and native_model.embedding.weight.requires_grad:
                     others -= frozen_rows * int(native_model.d_model) * (
                         1 if native_model.head.weight is native_model.embedding.weight else 2)
-                logger.info(f"[AuraLite] Optimizer: AdamW for LoRA (lr={lora_lr:g}): "
+                optimizer_label = {"adamw8bit": "AdamW (8-bit states)"}.get(optimizer_name, "AdamW")
+                logger.info(f"[AuraLite] Optimizer: {optimizer_label} for LoRA (lr={lora_lr:g}): "
                             f"{len(native_model.lora_pairs())} adapters of rank "
                             f"{native_model.lora_rank} ({adapter_params:,} params)"
                             + (f" + {others:,} other params" if others else ""))
             elif single_group_state:
                 # Resuming a 2.7 optimizer state (one group): keep its layout so
                 # the Adam moments carry over exactly.
-                self.optimizer = optim.AdamW(
-                    self.model.parameters(), lr=lr,
+                self.optimizer = _new_adamw(
+                    optimizer_name, self.model.parameters(), lr=lr,
                     weight_decay=weight_decay, betas=(0.9, 0.95),
                 )
             else:
                 # 2.8: weight decay on the weight matrices only (no norm gains,
                 # embeddings or biases), as the Muon path already did.
-                self.optimizer = optim.AdamW(
-                    adamw_param_groups(self.model, weight_decay), lr=lr,
+                self.optimizer = _new_adamw(
+                    optimizer_name, adamw_param_groups(self.model, weight_decay), lr=lr,
                     betas=(0.9, 0.95),
                 )
         self.optimizer_name = optimizer_name
@@ -2283,6 +2363,9 @@ class TrainerMixin:
                 device_ids=([self.local_rank] if torch.cuda.is_available()
                             and self.device.type == "cuda" else None),
                 find_unused_parameters=bool(use_moe),
+                # 2.18.1: a 4-bit base is frozen buffers, the same on every
+                # computer - broadcasting it each step would send the model
+                broadcast_buffers=not _nf4.nf4_layers(native_model),
             )
             logger.info(f"[AuraLite] Model wrapped with DistributedDataParallel (world_size={self.world_size})")
 

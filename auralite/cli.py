@@ -456,6 +456,18 @@ def cmd_train(args: argparse.Namespace) -> int:
             params[key] = getattr(args, flag)
     if getattr(args, "rslora", False):
         params["lora_rslora"] = True
+    if getattr(args, "optimizer", None):
+        params["optimizer"] = args.optimizer
+    if getattr(args, "quantize", None):
+        if not params.get("lora_rank"):
+            print("error: --quantize nf4 (QLoRA) trains LoRA adapters: add --lora RANK",
+                  file=sys.stderr)
+            return 2
+        if not getattr(args, "resume", None):
+            print("error: --quantize nf4 needs a model to fine-tune: --resume CHECKPOINT or "
+                  "hf:ORG/NAME", file=sys.stderr)
+            return 2
+        params["quantize_base"] = args.quantize
     if getattr(args, "pack_dialogs", False):
         params["dialog_packing"] = True
     if getattr(args, "save_adapter", None) and not params.get("lora_rank"):
@@ -505,10 +517,23 @@ def cmd_train(args: argparse.Namespace) -> int:
         # 2.11: continue a checkpoint — e.g. on longer windows ("train short,
         # extend long", docs/training.md); a longer seq_length extends the
         # model's context.
-        if not os.path.exists(args.resume):
+        from auralite.engine.hf_models import HFModelError, describe_import, is_hf_model_spec
+        if is_hf_model_spec(args.resume):
+            # 2.18.1: a Hugging Face model, imported (and quantized) in memory
+            try:
+                info = engine.import_hf_model(args.resume, quantize=getattr(args, "quantize", None),
+                                              progress_callback=_TransferPrinter(
+                                                  getattr(args, "quiet", False)))
+            except (HFModelError, FileNotFoundError, InterruptedError) as err:
+                print(f"error: {err}", file=sys.stderr)
+                return 2
+            if not getattr(args, "quiet", False):
+                print(f"imported: {describe_import(info)}")
+        elif not os.path.exists(args.resume):
             print(f"error: checkpoint not found: {args.resume}", file=sys.stderr)
             return 2
-        engine.load_model(args.resume)
+        else:
+            engine.load_model(args.resume)
         params["continue_training"] = True
         run = getattr(engine, "_resume_run_state", None)
         if getattr(args, "continue_run", False):
@@ -723,7 +748,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                          **dims)
     if not plan["fits"]:
         print(f"does not fit even 1 window per step with gradient checkpointing "
-              f"({format_bytes(plan['estimate']['total'])}): a smaller preset, LoRA, or a GPU")
+              f"({format_bytes(plan['estimate']['total'])}): a smaller preset, LoRA / QLoRA "
+              f"(--quantize nf4), or a GPU")
         return 1
     advice = [f"batch_size {plan['micro_batch']}", f"accumulation_steps "
               f"{plan['accumulation_steps']}"]
@@ -1072,7 +1098,64 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 
 #: `auralite export --format` → default file suffix.
-EXPORT_SUFFIXES = {"pt2": ".pt2", "onnx": ".onnx", "torchscript": ".torchscript.pt"}
+EXPORT_SUFFIXES = {"pt2": ".pt2", "onnx": ".onnx", "torchscript": ".torchscript.pt",
+                   # 2.18.1: a Hugging Face folder, a GGUF file (llama.cpp, Ollama)
+                   "hf": "-hf", "gguf": ".gguf"}
+
+
+class _TransferPrinter:
+    """Progress of `auralite import` / `export`: downloads, conversion, writing (2.18.1)."""
+
+    def __init__(self, quiet: bool = False):
+        self.quiet = quiet
+        self.last = 0.0
+        self.shown = ""
+
+    def __call__(self, info: dict) -> None:
+        if self.quiet:
+            return
+        now = time.monotonic()
+        stage = info.get("stage")
+        if stage == "download":
+            total = int(info.get("all_total") or info.get("total") or 0)
+            done = int(info.get("all_bytes") or info.get("bytes") or 0)
+            text = f"downloading {info.get('file')}: {done / 1e6:,.0f}" + (
+                f" / {total / 1e6:,.0f} MB ({100 * done / total:.0f} %)" if total else " MB")
+        else:
+            text = f"{stage}: {info.get('done')}/{info.get('total')}"
+        final = stage != "download" and info.get("done") == info.get("total")
+        if not final and now - self.last < 2.0:
+            return
+        self.last = now
+        if text != self.shown:
+            print(text, flush=True)
+            self.shown = text
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import a Hugging Face Llama / Mistral / Qwen2 / Qwen3 as a native checkpoint (2.18.1)."""
+    from auralite.engine import AuraLiteEngine
+    from auralite.engine.hf_models import HFModelError, describe_import
+    source = args.source
+    if not str(source).lower().startswith("hf:") and not os.path.isdir(source):
+        print(f"error: {source} is neither hf:ORG/NAME nor a model folder", file=sys.stderr)
+        return 2
+    if getattr(args, "revision", None) and str(source).lower().startswith("hf:") \
+            and "@" not in source:
+        source = f"{source}@{args.revision}"
+    engine = AuraLiteEngine()
+    try:
+        info = engine.import_hf_model(source, quantize=args.quantize, dtype=args.dtype,
+                                      progress_callback=_TransferPrinter(args.quiet))
+    except (HFModelError, FileNotFoundError, InterruptedError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    engine.save_model(args.out, include_optimizer=False)
+    print(f"imported: {describe_import(info)}")
+    print(f"saved: {args.out} ({os.path.getsize(args.out) / 1e9:.2f} GB) | fine-tune: auralite "
+          f"train --data DIALOGS.jsonl --resume {args.out} --lora 16"
+          + ("" if args.quantize else " [--quantize nf4]"))
+    return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -1092,6 +1175,29 @@ def cmd_export(args: argparse.Namespace) -> int:
               "(.gguf and Hugging Face models have their own tooling)", file=sys.stderr)
         return 2
     out = args.out or os.path.splitext(args.model)[0] + EXPORT_SUFFIXES[args.format]
+    if args.format in ("hf", "gguf"):
+        # 2.18.1: for transformers / vLLM and for llama.cpp / Ollama / LM Studio
+        from auralite.engine.hf_models import HFModelError
+        try:
+            if args.format == "hf":
+                info = engine.export_hf_model(out, dtype=args.dtype or "bfloat16",
+                                              progress_callback=_TransferPrinter(args.quiet))
+                print(f"exported: {out}/ ({info['architecture']}, {info['dtype']}, "
+                      f"{info['bytes'] / 1e9:.2f} GB in {info['shards']} file(s), chat "
+                      f"template {info['chat_template']}; LoRA adapters merged)")
+            else:
+                info = engine.export_gguf_model(out, quant=args.quant,
+                                                progress_callback=_TransferPrinter(args.quiet))
+                for warning in info["warnings"]:
+                    print(f"warning: {warning}", file=sys.stderr)
+                print(f"exported: {out} (GGUF {info['type']}, llama.cpp architecture "
+                      f"{info['architecture']}, pre-tokenizer {info['pre_tokenizer']}, "
+                      f"{info['bytes'] / 1e9:.2f} GB) | smaller: llama-quantize {out} "
+                      f"OUT.gguf Q4_K_M")
+        except HFModelError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        return 0
     exporter = ModelExporter(engine.model, engine.tokenizer, engine.device)
     try:
         if args.format == "pt2":
@@ -1446,10 +1552,21 @@ def cmd_info(args: argparse.Namespace) -> int:
         return 2
     keys = ["checkpoint_version", "chat_template", "vocab_size", "d_model", "n_heads",
             "n_kv_heads", "n_layers", "d_ff", "max_seq_len", "use_alibi", "use_qk_norm",
-            "sliding_window", "rope_scaling", "dropout", "lora_rank"]
+            "sliding_window", "rope_scaling", "dropout", "lora_rank",
+            # 2.18.1: the fields of a model imported from Hugging Face
+            "head_dim", "qkv_bias", "norm_eps", "qk_norm_shared"]
     for k in keys:
         if k in ckpt:
             print(f"{k}: {ckpt[k]}")
+    source = ckpt.get("hf_source")
+    if isinstance(source, dict):
+        print(f"imported_from: {source.get('repo')} ({source.get('architecture')})")
+    quantization = ckpt.get("quantization")
+    if isinstance(quantization, dict):
+        print(f"quantization: {quantization.get('method')} on "
+              f"{len(quantization.get('modules') or [])} layers (block "
+              f"{quantization.get('block_size')}, double quantization "
+              f"{bool(quantization.get('double_quant'))})")
     if isinstance(ckpt.get("lora_config"), dict):        # 2.16: where the adapters sit
         config = ckpt["lora_config"]
         print(f"lora_targets: {', '.join(config.get('targets') or [])} "
@@ -1667,7 +1784,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-plan", choices=["off", "warn", "auto"],
                    help="warn (default): log the estimated memory and warn when it is more "
                         "than is free; auto: also split the batch (gradient accumulation) and "
-                        "turn on gradient checkpointing to fit")
+                        "turn on gradient checkpointing to fit (when nothing fits: the "
+                        "smallest step, one window with checkpointing)")
     p.add_argument("--autosave", metavar="PATH",
                    help="save the run here as it trains (every 30 minutes unless "
                         "--autosave-steps / --autosave-minutes); --resume PATH "
@@ -1688,7 +1806,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-config", metavar="NAME", help="hf: datasets: the configuration")
     p.add_argument("--hf-split", metavar="NAME", help="hf: datasets: the split (default train)")
     p.add_argument("--template", metavar="NAME",
-                   help="dialogs: the chat template (chatml, gemma or phi; default: the "
+                   help="dialogs: the chat template (chatml, gemma, phi or llama3; default: the "
                         "continued model's, else chatml)")
     p.add_argument("--lora", type=int, metavar="RANK",
                    help="train LoRA adapters of this rank instead of every weight (with "
@@ -1704,6 +1822,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-adapter", metavar="PATH",
                    help="LoRA: also write the adapters and new token rows alone to PATH "
                         "(apply them to the base with `auralite lora apply`)")
+    p.add_argument("--quantize", choices=["nf4"],
+                   help="QLoRA: keep the --resume model's attention and feed-forward weights "
+                        "in 4 bits while LoRA adapters train (needs --lora)")
+    p.add_argument("--optimizer", choices=["muon", "adamw", "adamw8bit"],
+                   help="default muon (AdamW for LoRA); adamw8bit: AdamW with 8-bit states, "
+                        "a quarter of AdamW's optimizer memory")
     p.add_argument("--prompt-weight", type=float, metavar="W",
                    help="dialogs: weight of the prompt tokens in the loss, 0 (the replies "
                         "only) to 1 (every token); default 0.1, or 0 with --lora")
@@ -1730,7 +1854,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "GPT-2 vocab.json (+ merges.txt) or a checkpoint")
     p.add_argument("--resume", metavar="CHECKPOINT",
                    help="continue training this checkpoint (a longer seq_length in "
-                        "--params extends its context)")
+                        "--params extends its context); 2.18.1: or hf:ORG/NAME / a model "
+                        "folder, imported first (Llama, Mistral, Qwen2, Qwen3)")
     p.add_argument("--time-budget", type=_parse_duration, metavar="DURATION",
                    help="end training after this long (90, 90s, 10m, 1.5h), counted from "
                         "the start; the learning-rate decay is sized to end on time")
@@ -1999,12 +2124,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="drop the perplexity cache before scoring")
     p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("export", help="export a checkpoint as .pt2 (torch.export), ONNX "
-                                      "or TorchScript")
+    p = sub.add_parser("import", help="import a Hugging Face Llama / Mistral / Qwen2 / Qwen3 "
+                                      "as a native checkpoint (to fine-tune, chat, export)")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("source", metavar="SOURCE",
+                   help="hf:ORG/NAME[@REVISION] (downloaded to ~/.auralite/hf, resumable; "
+                        "HF_TOKEN for gated models) or a local model folder")
+    p.add_argument("--out", required=True, help="checkpoint to write (.pt or .safetensors)")
+    p.add_argument("--quantize", choices=["nf4"],
+                   help="nf4: attention and feed-forward weights in 4 bits (QLoRA base; "
+                        "about 1/7 of the float32 memory)")
+    p.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="float32",
+                   help="of the weights that are not quantized (default float32, for CPU "
+                        "training; bfloat16 for GPU inference)")
+    p.add_argument("--revision", help="branch, tag or commit (default main)")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("export", help="export a checkpoint as a Hugging Face folder, GGUF, "
+                                      ".pt2 (torch.export), ONNX or TorchScript")
     _add_common_flags(p, suppress_defaults=True)
     p.add_argument("--model", required=True, help="native AuraLite checkpoint (.pt/.safetensors)")
     p.add_argument("--format", choices=sorted(EXPORT_SUFFIXES), default="pt2",
-                   help="pt2 (default, torch.export), onnx, torchscript (deprecated)")
+                   help="pt2 (default, torch.export), onnx, torchscript (deprecated); 2.18.1: "
+                        "hf (a transformers folder) and gguf (llama.cpp, Ollama, LM Studio)")
+    p.add_argument("--quant", choices=["f16", "q8_0", "bf16", "f32"], default="f16",
+                   help="gguf: weight type (default f16; llama-quantize makes Q4_K_M etc.)")
+    p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"],
+                   help="hf: weight dtype (default bfloat16)")
     p.add_argument("--out", help="output file (default: the checkpoint name with the "
                                  "format's suffix)")
     p.add_argument("--static", action="store_true",

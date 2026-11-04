@@ -43,7 +43,7 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "muon_adjust_lr", "muon_lr", "muon_momentum", "muon_ns_steps", "n_heads", "n_kv_heads",
     "n_layers", "num_experts", "optimizer", "preference_beta", "preference_sft_weight",
     "prepare_max_tokens", "progress_every_batches",
-    "progress_every_seconds", "prompt_loss_weight", "restore_best_weights",
+    "progress_every_seconds", "prompt_loss_weight", "quantize_base", "restore_best_weights",
     "resume_training_state",
     "rope_scaling", "sample_stride", "seed", "seq_length", "shards_dir", "simpo_gamma",
     "sliding_window",
@@ -228,8 +228,13 @@ def validate_params(params: dict) -> list[str]:
 
     # v2.6: modern training stack validation
     optimizer_name = str(params.get("optimizer", DEFAULT_RECIPE["optimizer"])).lower()
-    if optimizer_name not in ("adamw", "muon"):
-        errors.append(f"optimizer must be 'adamw' or 'muon', got {optimizer_name!r}")
+    if optimizer_name not in ("adamw", "muon", "adamw8bit"):
+        errors.append(f"optimizer must be 'adamw', 'adamw8bit' or 'muon', got {optimizer_name!r}")
+    quantize_base = str(params.get("quantize_base") or "none").lower()
+    if quantize_base not in ("none", "nf4"):
+        errors.append(f"quantize_base must be 'nf4' or None, got {params.get('quantize_base')!r}")
+    elif quantize_base == "nf4" and not int(params.get("lora_rank") or 0):
+        errors.append("quantize_base='nf4' (QLoRA) trains LoRA adapters: set lora_rank")
     if optimizer_name == "muon":
         muon_lr = params.get("muon_lr", 0.02)
         if muon_lr <= 0:

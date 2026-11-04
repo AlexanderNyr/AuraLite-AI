@@ -194,8 +194,13 @@ class KVCache:
                 return
         if self.window is not None:
             # Room for the window, the slack and a few chunks: compaction then
-            # runs once per ~window steps instead of on every token.
-            target = max(needed, 2 * (self.window + self.slack))
+            # runs once per ~window steps instead of on every token. 2.18.1:
+            # never more than the generation reserved (prompt + new tokens)
+            # or twice what it holds: a model with a 32k-128k window
+            # (imported from Hugging Face) allocated that whole window twice
+            # for every short reply - gigabytes per generation.
+            grown = max(self.reserve, 2 * self.capacity)
+            target = max(needed, min(2 * (self.window + self.slack), grown))
         else:
             target = max(needed, self.reserve, 2 * self.capacity)
         self._allocate(like, _round_capacity(target))

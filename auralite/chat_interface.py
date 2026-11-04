@@ -97,6 +97,14 @@ CHAT_TEMPLATES = {
         "assistant": "<|assistant|>\n{assistant}<|end|>\n",
         "stop": ["<|end|>"],
     },
+    # 2.18.1: Llama 3 / 3.1 / 3.2 Instruct (imported Hugging Face models)
+    "llama3": {
+        "name": "Llama 3 (Meta)",
+        "system": "<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>",
+        "user": "<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>",
+        "assistant": "<|start_header_id|>assistant<|end_header_id|>\n\n{assistant}<|eot_id|>",
+        "stop": ["<|eot_id|>", "<|end_of_text|>"],
+    },
     "simple": {
         "name": "Simple (no special tokens)",
         "system": "System: {system}\n",
@@ -150,6 +158,8 @@ def apply_chat_template(
             prompt_parts.append("<start_of_turn>model\n")
         elif template_name == "phi":
             prompt_parts.append("<|assistant|>\n")
+        elif template_name == "llama3":
+            prompt_parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
         elif template_name in ("llama2", "mistral"):
             # Llama-2 / Mistral style already ends with [/INST]
             pass

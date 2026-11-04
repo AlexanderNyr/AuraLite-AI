@@ -57,6 +57,19 @@ from .sizing import (  # noqa: E402
     preset_params,
 )
 
+# 2.18.1: Hugging Face models in the native engine, QLoRA (NF4), 8-bit AdamW, export
+from .hf_models import (  # noqa: E402
+    HFImport,
+    HFModelError,
+    SUPPORTED_ARCHITECTURES,
+    export_hf,
+    hf_model_dir,
+    import_hf,
+)
+from .gguf_writer import export_gguf, read_gguf  # noqa: E402
+from .nf4 import NF4Linear, dequantize_model_nf4, quantize_model_nf4  # noqa: E402
+from .optim8bit import AdamW8bit  # noqa: E402
+
 # Same for the llama.cpp backends: `GGUFModelProxy` travels through `_legacy`
 # (name compatibility), the server runtime and its helpers are imported here.
 from .logging_utils import (  # noqa: E402

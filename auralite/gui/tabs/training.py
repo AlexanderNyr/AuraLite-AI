@@ -205,6 +205,14 @@ class TrainTabMixin:
         ttk.Entry(row1b, textvariable=self.lora_lr_var,
                   width=7).pack(side=tk.LEFT, padx=2)
 
+        # 2.18.1: QLoRA (the continued model's base in 4 bits) and 8-bit AdamW
+        self.qlora_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1b, text="4-bit base (QLoRA)",
+                        variable=self.qlora_var).pack(side=tk.LEFT, padx=(8, 2))
+        self.adam8_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1b, text="8-bit AdamW",
+                        variable=self.adam8_var).pack(side=tk.LEFT, padx=2)
+
         self.checkpoint_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row1b, text="Gradient Checkpointing (VRAM saving)",
                         variable=self.checkpoint_var).pack(side=tk.LEFT, padx=12)
@@ -1025,6 +1033,18 @@ class TrainTabMixin:
             return
         if tokenizer_path:
             params["tokenizer_path"] = tokenizer_path
+        # 2.18.1: 8-bit AdamW states, and QLoRA (the continued model in 4 bits)
+        adam8 = getattr(self, "adam8_var", None)
+        if adam8 is not None and adam8.get():
+            params["optimizer"] = "adamw8bit"
+        qlora = getattr(self, "qlora_var", None)
+        if qlora is not None and qlora.get():
+            if not params.get("lora_rank") or not params.get("continue_training"):
+                messagebox.showerror("QLoRA", "The 4-bit base (QLoRA) fine-tunes the current "
+                                              "model with LoRA: check «Continue training "
+                                              "current model» and set a LoRA rank.")
+                return
+            params["quantize_base"] = "nf4"
 
         # NEW: Validate parameters before training
         errors = validate_params(params)

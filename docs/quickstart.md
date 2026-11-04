@@ -296,14 +296,36 @@ not what the marketing usually claims.
 | `.pt` (AuraLite) | yes | yes | Safe load by default (`weights_only=True`); pre-2.6.5 files load through a scoped numpy allowlist. `AURALITE_UNSAFE_LOAD=1` is the explicit opt-in for exotic old files. |
 | `.safetensors` | save/load | yes | Weights + JSON metadata, no pickle. Text and image models. Needs the optional `safetensors` package (`pip install safetensors` or the `[safetensors]` extra). |
 | `.gguf` | no | yes | Inference-only (llama.cpp). Perplexity/cross-entropy scoring supported in-process; `llama-server` mode trades that for shared memory. |
-| Hugging Face | export | via `transformers` | `auralite` export commands / GUI Export tab; needs `.[full]`. |
+| Hugging Face | import (2.18.1) / export | natively after `auralite import`, or via `transformers` | `auralite import hf:ORG/NAME` reads Llama / Mistral / Qwen2 / Qwen3 into a native checkpoint (no extra packages); `auralite export --format hf` writes a transformers folder. Other architectures: the transformers backend (`.[hf]`). |
+
+## Fine-tune a pretrained model (2.18.1)
+
+```bash
+auralite import hf:HuggingFaceTB/SmolLM2-360M-Instruct --out smol.pt        # or a downloaded folder
+auralite train --data chats.jsonl --resume smol.pt --lora 16 --memory-plan auto --model smol-chat.pt
+auralite train --data chats.jsonl --resume hf:Qwen/Qwen2.5-1.5B-Instruct --quantize nf4 --lora 16 --memory-plan auto --model qwen-chat.pt
+auralite lora merge --model qwen-chat.pt --out qwen-merged.pt              # a float model, fast to chat with
+auralite export --model qwen-chat.pt --format gguf --quant q8_0 --out qwen-chat.gguf
+```
+
+Llama, Mistral, Qwen2/2.5 and Qwen3 models load into AuraLite's own engine
+(the same logits as transformers), `--quantize nf4` trains LoRA adapters on
+a 4-bit copy (QLoRA, no bitsandbytes, any CPU), `--optimizer adamw8bit`
+keeps 8-bit optimizer states, and the result exports back to Hugging Face or
+GGUF. Speeds on a CPU and what fits: [training.md](training.md) § 21.
 
 ## Export for deployment
 
 ```bash
 auralite export --model model.pt                      # model.pt2 (torch.export), the default
 auralite export --model model.pt --format onnx        # model.onnx (pip install -e '.[export]')
+auralite export --model chat.pt --format gguf         # llama.cpp / Ollama / LM Studio (2.18.1)
+auralite export --model chat.pt --format hf           # a transformers folder (2.18.1)
 ```
+
+GGUF and Hugging Face export need a model with a Hugging Face tokenizer — an
+imported one, or one trained with `--tokenizer hf:...` — and merge LoRA
+adapters on the way.
 
 | Format | Runs with | Notes |
 |---|---|---|

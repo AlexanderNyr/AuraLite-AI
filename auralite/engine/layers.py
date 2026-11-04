@@ -57,6 +57,14 @@ class _RMSNormFunction(torch.autograd.Function):
         return grad_x.to(ctx.x_dtype), grad_w.to(weight.dtype), None
 
 
+def linear_dtype(module: nn.Module) -> torch.dtype:
+    """The dtype a projection computes in: its weight's, or a 4-bit layer's (2.18.1)."""
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return weight.dtype
+    return getattr(module, "dtype", torch.float32)
+
+
 def _rms_norm(module: nn.Module, x: torch.Tensor, weight: torch.Tensor,
               eps: float) -> torch.Tensor:
     """The shared forward of `RMSNorm` / `HeadwiseRMSNorm`."""
@@ -92,10 +100,13 @@ class HeadwiseRMSNorm(nn.Module):
     Expected input layout: ``(batch, seq, num_heads, head_dim)``.
     """
 
-    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6):
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6,
+                 shared: bool = False):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_heads, head_dim))
+        # 2.18.1: `shared` = one (head_dim,) scale for every head, as Qwen3's
+        # q_norm / k_norm (imported models keep the exact layout)
+        self.weight = nn.Parameter(torch.ones(head_dim) if shared else torch.ones(num_heads, head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _rms_norm(self, x, self.weight, self.eps)
@@ -177,6 +188,11 @@ def _flex_block_mask(batch: int, heads: int, q_len: int, kv_len: int,
         _FLEX_BLOCK_MASKS[key] = mask
     return mask
 
+#: Positions of the RoPE tables an attention layer builds up front (2.18.1);
+#: longer sequences grow them on demand.
+ROPE_TABLE_PREBUILD = 4096
+
+
 class Attention(nn.Module):
     """Multi-Head Self-Attention with RoPE, optional GQA, and KV-cache.
 
@@ -196,10 +212,16 @@ class Attention(nn.Module):
                  sliding_window: int | None = None,
                  kv_cache_dtype: str | None = None,
                  use_flex_attention: bool = False,
-                 use_qk_norm: bool = False):
+                 use_qk_norm: bool = False,
+                 head_dim: int | None = None,
+                 qkv_bias: bool = False,
+                 norm_eps: float = 1e-6,
+                 qk_norm_shared: bool = False):
         super().__init__()
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
+        # 2.18.1: an explicit head size (Qwen3, Mistral Nemo: n_heads * head_dim
+        # differs from d_model); by default d_model / n_heads as before
+        self.head_dim = int(head_dim) if head_dim else d_model // n_heads
         self.n_kv_heads = (n_kv_heads or None) or n_heads
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads for GQA")
@@ -214,9 +236,10 @@ class Attention(nn.Module):
         self.use_flex_attention = bool(use_flex_attention)
         self.use_qk_norm = bool(use_qk_norm)
 
-        self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
-        self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
-        self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=False)
+        # 2.18.1: `qkv_bias` - biases on the query/key/value projections (Qwen2)
+        self.W_q = nn.Linear(d_model, n_heads * self.head_dim, bias=bool(qkv_bias))
+        self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
+        self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         # 2.16: LoRA adapters on W_q/W_k/W_v/W_o (None until the model's
         # enable_lora(targets="attn" or "all"); see `_proj`)
@@ -225,12 +248,17 @@ class Attention(nn.Module):
         # QK-norm (v2.6): per-head RMSNorm applied to q/k BEFORE RoPE.
         # Stabilizes attention logits; standard in OLMo-2 / Gemma-2 / Qwen3.
         if self.use_qk_norm:
-            self.q_norm = HeadwiseRMSNorm(n_heads, self.head_dim)
-            self.k_norm = HeadwiseRMSNorm(self.n_kv_heads, self.head_dim)
+            self.q_norm = HeadwiseRMSNorm(n_heads, self.head_dim, eps=norm_eps,
+                                          shared=qk_norm_shared)
+            self.k_norm = HeadwiseRMSNorm(self.n_kv_heads, self.head_dim, eps=norm_eps,
+                                          shared=qk_norm_shared)
 
-        # Pre-compute RoPE cos / sin as persistent buffers (move with .to(device))
+        # Pre-compute RoPE cos / sin as buffers (move with .to(device)). 2.18.1:
+        # at most ROPE_TABLE_PREBUILD positions up front - an imported model
+        # with a 128k context would hold 64 MB of tables per layer otherwise;
+        # `_apply_rope` grows them when a longer sequence comes.
         self.max_seq_len = max_seq_len
-        self._build_rope_buffers(max_seq_len)
+        self._build_rope_buffers(min(int(max_seq_len), ROPE_TABLE_PREBUILD))
         # v2.6.3: native GQA in SDPA (torch>=2.5) removes the per-step
         # repeat_interleave copy of the whole KV cache. Detect once per process.
         self._sdpa_enable_gqa = _sdpa_supports_gqa() if self.n_rep > 1 else False
@@ -287,6 +315,19 @@ class Attention(nn.Module):
 
         if factor <= 1.0 or scale_type in {"none", ""}:
             return inv_freq, mscale
+        if scale_type == "llama3":
+            # 2.18.1: Llama 3.1's frequency-dependent scaling (as transformers):
+            # long wavelengths are divided by `factor`, short ones kept, and
+            # those in between blended smoothly.
+            original = float(scaling.get("original_max_position_embeddings", 8192))
+            low_factor = float(scaling.get("low_freq_factor", 1.0))
+            high_factor = float(scaling.get("high_freq_factor", 4.0))
+            wavelen = 2 * math.pi / inv_freq
+            scaled = torch.where(wavelen > original / low_factor, inv_freq / factor, inv_freq)
+            smooth = (original / wavelen - low_factor) / (high_factor - low_factor)
+            blended = (1 - smooth) * scaled / factor + smooth * scaled
+            medium = (wavelen >= original / high_factor) & (wavelen <= original / low_factor)
+            return torch.where(medium, blended, scaled), mscale
         if scale_type in {"ntk", "dynamic_ntk"}:
             # NTK-aware scaling with the LLaMA-family "dynamic NTK" formula,
             # evaluated once at max_seq_len: the frequencies are static (they
@@ -300,10 +341,21 @@ class Attention(nn.Module):
             beta_slow = float(scaling.get("beta_slow", 1.0))
             low = math.floor(self._yarn_find_correction_dim(beta_fast, self.head_dim, base, original))
             high = math.ceil(self._yarn_find_correction_dim(beta_slow, self.head_dim, base, original))
-            ramp = self._yarn_linear_ramp_mask(low, high, self.head_dim // 2)
             extrapolation = inv_freq
             interpolation = inv_freq / factor
-            inv_freq = interpolation * (1.0 - ramp) + extrapolation * ramp
+            if scaling.get("yarn_blend") == "legacy":
+                # Models trained before 2.18.1 keep the frequencies they learned
+                # with: the blend ran the wrong way round (it interpolated the
+                # fast, short-wavelength dimensions and kept the slow ones).
+                ramp = self._yarn_linear_ramp_mask(low, high, self.head_dim // 2)
+                inv_freq = interpolation * (1.0 - ramp) + extrapolation * ramp
+            else:
+                # The paper's blend, as transformers computes it (2.18.1): the
+                # dimensions that turn many times over the original length are
+                # kept, the slow ones are interpolated.
+                ramp = self._yarn_linear_ramp_mask(max(low, 0), min(high, self.head_dim - 1),
+                                                   self.head_dim // 2)
+                inv_freq = interpolation * ramp + extrapolation * (1.0 - ramp)
             # DeepSeek/LLaMA YaRN convention: attention_factor defaults to
             # 0.1*ln(factor)+1.0 and scales both cos and sin.
             mscale = float(scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0))
@@ -437,7 +489,7 @@ class Attention(nn.Module):
         cache = self._cache
         if cache is None or cache.length == 0:
             return None
-        dtype = self.W_k.weight.dtype
+        dtype = linear_dtype(self.W_k)
         return cache.read(dtype, last=cache.window)
 
     @property
@@ -784,17 +836,23 @@ class TransformerBlock(nn.Module):
                  use_flex_attention: bool = False,
                  use_moe: bool = False,
                  num_experts: int = 4,
-                 use_qk_norm: bool = False):
+                 use_qk_norm: bool = False,
+                 head_dim: int | None = None,
+                 qkv_bias: bool = False,
+                 norm_eps: float = 1e-6,
+                 qk_norm_shared: bool = False):
         super().__init__()
-        self.attn_norm = RMSNorm(d_model)
+        self.attn_norm = RMSNorm(d_model, eps=norm_eps)
         self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
                                    use_alibi=use_alibi,
                                    rope_scaling=rope_scaling,
                                    sliding_window=sliding_window,
                                    kv_cache_dtype=kv_cache_dtype,
                                    use_flex_attention=use_flex_attention,
-                                   use_qk_norm=use_qk_norm)
-        self.ffn_norm  = RMSNorm(d_model)
+                                   use_qk_norm=use_qk_norm,
+                                   head_dim=head_dim, qkv_bias=qkv_bias,
+                                   norm_eps=norm_eps, qk_norm_shared=qk_norm_shared)
+        self.ffn_norm  = RMSNorm(d_model, eps=norm_eps)
         self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
         self.dropout   = ResidualDropout(dropout) if dropout > 0 else nn.Identity()
         self.use_checkpoint = use_checkpoint
@@ -819,4 +877,4 @@ class TransformerBlock(nn.Module):
         return self._forward_impl(x, start_pos, use_cache, capture)
 
 
-__all__ = ["RMSNorm", "HeadwiseRMSNorm", "Attention", "FeedForward", "Top2MoE", "ResidualDropout", "TransformerBlock", "_get_flex_attention", "_flex_attention_available", "_flex_block_mask", "_FLEX_COMPILED", "_sdpa_supports_gqa"]
+__all__ = ["ROPE_TABLE_PREBUILD", "linear_dtype", "RMSNorm", "HeadwiseRMSNorm", "Attention", "FeedForward", "Top2MoE", "ResidualDropout", "TransformerBlock", "_get_flex_attention", "_flex_attention_available", "_flex_block_mask", "_FLEX_COMPILED", "_sdpa_supports_gqa"]

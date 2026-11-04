@@ -97,7 +97,8 @@ from auralite.engine.layers import (  # noqa: E402,F401
     _get_flex_attention, _sdpa_supports_gqa,
 )
 from auralite.engine.model import (  # noqa: E402,F401
-    LoRALayer, ModernTransformer, estimate_n_params,
+    ARCH_DEFAULTS_2181, LoRALayer, ModernTransformer, arch_fields_2181, estimate_n_params,
+    model_kwargs_from_checkpoint,
 )
 from auralite.engine.dataset import (  # noqa: E402,F401
     CharDataset, WindowBatches, spread_indices, validation_split_point,
@@ -443,6 +444,9 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self.vocab_size  = 0
         self.params_used: dict = {}          # remember last training/load params
         self._compiled_inference_model = None  # torch.compile for generation (v2.6.5)
+        # 2.18.1: the Hugging Face model a native model was imported from
+        # (its config and tokenizer settings, for export), or None
+        self.hf_source: dict | None = None
         self._compile_seconds = 0.0
         self.last_val_loss: float | None = None
         #: validation loss in bits per UTF-8 byte (2.11): comparable across
@@ -1542,6 +1546,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "num_experts": getattr(model, "num_experts", 4),
             "tie_word_embeddings": getattr(model, "tie_word_embeddings", False),
             "use_qk_norm": getattr(model, "use_qk_norm", False),
+            # 2.18.1: the fields of models imported from Hugging Face
+            **{key: getattr(model, key, default) for key, default in ARCH_DEFAULTS_2181.items()},
         }
 
     # ---- Diagnostics (GUI visualisations, v2.6.5) ----------------------
@@ -1734,6 +1740,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "num_experts": getattr(self.model, 'num_experts', 4),
             "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
             "use_qk_norm": getattr(self.model, 'use_qk_norm', False),
+            # 2.18.1: Hugging Face architecture fields, origin and 4-bit layers
+            **self._v2181_entries(),
             # v2.6.2: chat template used at training time
             "chat_template": self.default_chat_template,
             "rng_state": {
@@ -1798,12 +1806,33 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "num_experts": getattr(self.model, 'num_experts', 4),
             "tie_word_embeddings": getattr(self.model, 'tie_word_embeddings', True),
             "use_qk_norm": getattr(self.model, 'use_qk_norm', False),
+            **self._v2181_entries(),
             "chat_template": self.default_chat_template,
             "format": "auralite",
             "checkpoint_version": 3,
             # 2.16: where LoRA adapters sit and their scale
             **self._lora_config_entry(),
         }
+
+    def _v2181_entries(self) -> dict:
+        """Checkpoint entries of 2.18.1, present only when they say something.
+
+        The architecture fields of an imported model (head size, q/k/v
+        biases, norm epsilon, a shared QK-norm), where it came from (its
+        Hugging Face config, for export) and its 4-bit (NF4) layers.
+        """
+        from auralite.engine.nf4 import nf4_config
+        model = getattr(self.model, "module", self.model)
+        if not isinstance(model, nn.Module):             # no native model (GGUF proxy)
+            return {}
+        entries = arch_fields_2181(model)
+        source = getattr(self, "hf_source", None)
+        if source:
+            entries["hf_source"] = source
+        quantization = nf4_config(model)
+        if quantization:
+            entries["quantization"] = quantization
+        return entries
 
     def _lora_config_entry(self) -> dict:
         """``{"lora_config": ...}`` for a model with LoRA adapters, else ``{}`` (2.16)."""
@@ -1929,26 +1958,24 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self.vocab_size  = checkpoint["vocab_size"]
         self.params_used = checkpoint.get("params_used", {})
 
-        self.model = ModernTransformer(
-            vocab_size  = self.vocab_size,
-            d_model     = checkpoint["d_model"],
-            n_heads     = checkpoint["n_heads"],
-            n_layers    = checkpoint["n_layers"],
-            d_ff        = checkpoint["d_ff"],
-            max_seq_len = checkpoint.get("max_seq_len", 4096),
-            n_kv_heads  = checkpoint.get("n_kv_heads"),
-            dropout     = checkpoint.get("dropout", 0.0),
-            use_alibi   = checkpoint.get("use_alibi", False),
-            use_gradient_checkpointing = checkpoint.get("use_gradient_checkpointing", False),
-            rope_scaling = checkpoint.get("rope_scaling", None),
-            sliding_window = checkpoint.get("sliding_window", None),
-            kv_cache_dtype = checkpoint.get("kv_cache_dtype", None),
-            use_flex_attention = checkpoint.get("use_flex_attention", False),
-            use_moe = checkpoint.get("use_moe", False),
-            num_experts = checkpoint.get("num_experts", 4),
-            tie_word_embeddings = checkpoint.get("tie_word_embeddings", True),
-            use_qk_norm = checkpoint.get("use_qk_norm", False),
-        ).to(self.device)
+        # 2.18.1: the architecture fields of imported models; a model with
+        # 4-bit (NF4) layers is built on the "meta" device and gets its
+        # memory only for what it holds (no float copy of those weights).
+        self.hf_source = checkpoint.get("hf_source") or None
+        model_kwargs = model_kwargs_from_checkpoint(checkpoint)
+        quantization = checkpoint.get("quantization")
+        if isinstance(quantization, dict) and quantization.get("method") == "nf4":
+            from auralite.engine.nf4 import install_nf4_shells
+            with torch.device("meta"):
+                shell = ModernTransformer(**model_kwargs)
+            install_nf4_shells(shell, quantization)
+            shell = shell.to_empty(device=self.device)
+            if shell.tie_word_embeddings:
+                shell.tie_weights()             # to_empty makes new parameters
+            shell.rebuild_rope_tables(self.device)
+            self.model = shell
+        else:
+            self.model = ModernTransformer(**model_kwargs).to(self.device)
 
         # Re-create LoRA adapters BEFORE loading the state dict so their
         # parameters exist as keys in the model (they are registered via
@@ -2028,6 +2055,95 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
                     logger.warning("CPU INT8 load-time quantization failed, "
                                    "keeping fp32 model: %s", e)
         _compute.release_caller_pool()        # 2.13: generation uses the compute thread
+
+    # ---- Hugging Face models in the native engine (2.18.1) -------------
+    def import_hf_model(self, source: str, *, quantize: str | None = None,
+                        dtype: str = "float32", progress_callback=None,
+                        stop_event=None) -> dict:
+        """Load a Hugging Face Llama / Mistral / Qwen2 / Qwen3 as a native model.
+
+        `source` is a model folder or ``hf:REPO[@REV]`` (downloaded to
+        ``~/.auralite/hf``, resumable). The result trains, chats, saves and
+        exports like any AuraLite model; ``quantize="nf4"`` keeps the
+        attention and feed-forward weights in 4 bits, the base of QLoRA
+        (``train(..., continue_training=True, lora_rank=...)``). Returns a
+        summary (``hf_models.describe_import`` turns it into a line).
+        """
+        from auralite.engine.hf_models import import_hf
+        result = import_hf(source, quantize=quantize, dtype=dtype, device=self.device,
+                           progress_callback=progress_callback, stop_event=stop_event)
+        self.backend = "torch"
+        self.gguf_path = None
+        self.hf_path = None
+        self._ddp_model = None
+        if self._compiled_inference_model is not None:
+            self.disable_inference_compile()
+        self.model = result.model
+        self.tokenizer = result.tokenizer
+        self.vocab_size = int(result.model.embedding.num_embeddings)
+        self.default_chat_template = result.chat_template
+        self.hf_source = result.source
+        self.params_used = {"imported_from": str(source),
+                            "architecture": result.info["architecture"],
+                            "chat_template": result.chat_template}
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+        self._resume_optimizer_state = None
+        self._resume_scheduler_state = None
+        self._resume_scaler_state = None
+        self._resume_optimizer_file = None
+        self._resume_run_state = self._run_state = None
+        _compute.release_caller_pool()
+        return dict(result.info)
+
+    def quantize_nf4(self, *, block_size: int = 64, double_quant: bool = True) -> int:
+        """Store the attention and feed-forward weights in 4 bits (NF4) - QLoRA's base.
+
+        For a loaded native model (trained or imported); LoRA adapters
+        trained on top then learn what the base cannot. Returns how many
+        layers were quantized (0 if they are 4-bit already). Lossy: keep the
+        float checkpoint if you want to train every weight later.
+        """
+        from auralite.engine.nf4 import nf4_layers, quantize_model_nf4
+        model = getattr(self.model, "module", self.model)
+        if not isinstance(model, ModernTransformer):
+            raise ValueError("4-bit (NF4) quantization needs a native AuraLite model")
+        if getattr(model, "lora_adapters", None):
+            raise ValueError("merge or remove the LoRA adapters first (auralite lora merge)")
+        if nf4_layers(model):
+            return 0
+        if self._compiled_inference_model is not None:
+            self.disable_inference_compile()
+        return quantize_model_nf4(model, block_size=block_size, double_quant=double_quant)
+
+    def export_hf_model(self, out_dir: str, *, dtype: str = "bfloat16",
+                        progress_callback=None) -> dict:
+        """Write the native model as a Hugging Face folder (transformers, vLLM, ...)."""
+        from auralite.engine.hf_models import export_hf
+        if self.model is None or self.is_gguf_model() or self.is_hf_model():
+            raise ValueError("export needs a native AuraLite model (train, load or import one)")
+        return export_hf(self.model, self.tokenizer, out_dir,
+                         chat_template=self.default_chat_template or "chatml",
+                         source=getattr(self, "hf_source", None), dtype=dtype,
+                         progress_callback=progress_callback)
+
+    def export_gguf_model(self, path: str, *, quant: str = "f16",
+                          progress_callback=None) -> dict:
+        """Write the native model as a GGUF file (llama.cpp, Ollama, LM Studio)."""
+        from auralite.engine.gguf_writer import export_gguf
+        if self.model is None or self.is_gguf_model() or self.is_hf_model():
+            raise ValueError("export needs a native AuraLite model (train, load or import one)")
+        return export_gguf(self.model, self.tokenizer, path, quant=quant,
+                           chat_template=self.default_chat_template or "chatml",
+                           source=getattr(self, "hf_source", None),
+                           progress_callback=progress_callback)
+
+    def _prompt_bos_id(self) -> int | None:
+        """The BOS id an imported model expects at the start of a prompt (2.18.1)."""
+        source = getattr(self, "hf_source", None) or {}
+        bos = source.get("bos_token_id")
+        return int(bos) if source.get("add_bos_token") and bos is not None else None
 
     # ---- Quantization Integration (NEW v2.2) ---------------------------
     def quantize_model(self, method: str = "dynamic", bits: str = "int8",

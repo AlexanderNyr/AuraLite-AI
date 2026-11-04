@@ -20,6 +20,7 @@ from auralite.engine import sampling as _sampling
 from auralite.engine.batching import DecodeBatch, batchable_model, max_batch_rows
 from auralite.engine.decode_slots import DecodeSlot, _unwrap
 from auralite.engine.gguf_proxy import is_gguf_like
+from auralite.engine.layers import linear_dtype
 from auralite.engine.sampling import SamplingParams
 from auralite.engine import tokenizer_io as _tok_io
 
@@ -150,7 +151,7 @@ class GenerationMixin:
             return None
         attn = model.layers[0].attn
         batch = DecodeBatch(model, rows, spec=attn.kv_cache_dtype, window=caches[0].window,
-                            dtype=attn.W_k.weight.dtype, device=caches[0].k.device,
+                            dtype=linear_dtype(attn.W_k), device=caches[0].k.device,
                             retire_when_idle=shared)
         return batch if batch.compatible(caches) else None
 
@@ -184,6 +185,11 @@ class GenerationMixin:
             raise ValueError("Train or load a model first!")
 
         ids = self.encode(start_str)
+        # 2.18.1: an imported Llama / Mistral expects its BOS token first
+        bos_of = getattr(self, "_prompt_bos_id", None)
+        bos = bos_of() if callable(bos_of) else None
+        if isinstance(bos, int) and (not ids or ids[0] != bos):
+            ids = [bos, *ids]
         if not ids:
             ids = [0]
 

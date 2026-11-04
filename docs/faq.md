@@ -373,3 +373,21 @@ practical — a crash costs the steps since the last autosave, nothing more.
 On a CPU, expect about a thousand tokens per second for a 15M-parameter
 model (2 vCPU): a billion tokens is a GPU's job. See
 [training.md](training.md) § 20.
+
+## 19. Can I fine-tune Llama / Qwen / Mistral? On my CPU?
+
+Yes, since 2.18.1, and in AuraLite's own engine: `auralite import
+hf:ORG/NAME` (or `--resume hf:ORG/NAME` straight in `auralite train`) reads
+Llama, Mistral, Qwen2/2.5 and Qwen3 checkpoints — computing exactly what
+transformers computes — and `--lora 16 --quantize nf4` trains LoRA adapters
+on a 4-bit copy of the model (QLoRA) without bitsandbytes, so it also runs
+on CPUs without AVX2. Then `auralite export --format gguf` (llama.cpp,
+Ollama, LM Studio) or `--format hf` (transformers). On a CPU the limit is
+time: about four floating-point operations per parameter and token, so a
+135M model trained at ~200 tokens/s on 2 vCPU here, a 1.5B model at an
+estimated 12–18, a 7–8B model at 2–3 (and it needs about 8 GB for its
+weights in 4 bits plus the activations). A thousand short dialogs fine-tune a
+model up to ~1.5B overnight; bigger models want a GPU. Chatting with the
+4-bit model itself is slow on a CPU (every weight is decoded for every
+token): merge the adapters or export to GGUF first. See
+[training.md](training.md) § 21.

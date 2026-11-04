@@ -2485,3 +2485,100 @@ class TestChatTab:
         chat_app._clear_chat_history()
         assert chat_app.chat_history == []
         assert chat_app.chat_text.content == ""
+
+
+# ----------------------------------------------------------------------
+#  2.18.1: Hugging Face models in the native engine, QLoRA, GGUF / HF export
+# ----------------------------------------------------------------------
+class TestHuggingFaceNative:
+    def test_import_into_the_engine_prepares_a_fine_tune(self, app, monkeypatch):
+        seen = {}
+
+        def fake_import(source, quantize=None, progress_callback=None, **kwargs):
+            seen.update(source=source, quantize=quantize)
+            assert progress_callback is not None
+            progress_callback({"stage": "download", "file": "model.safetensors",
+                               "bytes": 10, "total": 20})
+            progress_callback({"stage": "convert", "done": 3, "total": 9})
+            return {"architecture": "LlamaForCausalLM", "params": 135_000_000,
+                    "quantize": quantize, "dtype": "float32", "context": 8192,
+                    "chat_template": "chatml", "memory_bytes": 1.7e8, "seconds": 1.0,
+                    "quantized_layers": 210 if quantize else 0}
+
+        monkeypatch.setattr(app.engine, "import_hf_model", fake_import)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        app.hf_model_var.set("HuggingFaceTB/SmolLM2-135M")
+        app.hf_4bit_var.set(True)
+        app.continue_var.set(False)
+        app.lora_var.set("0")
+
+        app._import_hf_native()
+
+        assert seen == {"source": "hf:HuggingFaceTB/SmolLM2-135M", "quantize": "nf4"}
+        assert app.continue_var.get() is True and app.lora_var.get() == "16"
+        assert app.qlora_var.get() is True
+        assert "Imported" in app.status_label.config.call_args.kwargs["text"]
+        assert app.hf_native_btn.config.call_args.kwargs["state"] == "normal"
+
+    def test_import_errors_are_shown(self, app, monkeypatch):
+        def boom(*a, **k):
+            raise ValueError("GPT2LMHeadModel: AuraLite imports LlamaForCausalLM, ...")
+
+        monkeypatch.setattr(app.engine, "import_hf_model", boom)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        errors = sys.modules["tkinter.messagebox"].showerror
+        errors.reset_mock()
+        app.hf_model_var.set("openai-community/gpt2")
+
+        app._import_hf_native()
+
+        assert errors.call_args.args[0] == "Import Error"
+        assert "AuraLite imports" in errors.call_args.args[1]
+
+    def test_qlora_needs_continued_training_and_lora(self, app, tmp_path, monkeypatch):
+        tiny_train_params(app, write_corpus(tmp_path))
+        app.qlora_var.set(True)
+        errors = sys.modules["tkinter.messagebox"].showerror
+        errors.reset_mock()
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+
+        app.start_training()
+
+        assert errors.call_args.args[0] == "QLoRA"
+        assert app.engine.model is None
+
+    def test_eight_bit_adamw_reaches_the_engine(self, app, tmp_path, monkeypatch):
+        tiny_train_params(app, write_corpus(tmp_path))
+        app.adam8_var.set(True)
+        seen = {}
+
+        def fake_train(text, params, **kwargs):
+            seen.update(params)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(app.engine, "train", fake_train)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+
+        app.start_training()
+
+        assert seen.get("optimizer") == "adamw8bit" and "quantize_base" not in seen
+
+    def test_hf_and_gguf_export_buttons(self, app, trained_ckpt_path, tmp_path, monkeypatch):
+        load_tiny_model(app, trained_ckpt_path)
+        monkeypatch.setattr(threading, "Thread", InlineThread)
+        calls = []
+        monkeypatch.setattr(app.engine, "export_gguf_model", lambda path, quant: calls.append(
+            ("gguf", path, quant)) or {"path": path, "architecture": "llama", "bytes": 2e6,
+                                       "warnings": ["llama.cpp does not know ..."]})
+        monkeypatch.setattr(app.engine, "export_hf_model", lambda folder: calls.append(
+            ("hf", folder)) or {"folder": folder, "architecture": "LlamaForCausalLM",
+                                "bytes": 4e6})
+        app.exp_gguf_quant_var.set("q8_0")
+        target = str(tmp_path / "m.gguf")
+        with dialog_double("filedialog.asksaveasfilename", target):
+            app._export_gguf()
+        with dialog_double("filedialog.askdirectory", str(tmp_path / "hf")):
+            app._export_hf_folder()
+        assert calls == [("gguf", target, "q8_0"), ("hf", str(tmp_path / "hf"))]
+        assert "GGUF" in app.exp_log_text.content and "warning" in app.exp_log_text.content
+        assert "Hugging Face folder" in app.exp_status.config.call_args.kwargs["text"]

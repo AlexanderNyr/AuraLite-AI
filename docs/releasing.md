@@ -12,7 +12,7 @@ built or uploaded from a laptop.
 
    ```bash
    python scripts/check_version_consistency.py          # all strings agree?
-   python scripts/check_version_consistency.py v2.18.0   # ...and match the tag you will push?
+   python scripts/check_version_consistency.py v2.18.1   # ...and match the tag you will push?
    ```
 
 2. **Green CI on the commit you will tag**, including the `package` job: it
@@ -45,14 +45,14 @@ built or uploaded from a laptop.
    ```
 
    A real release can also be started by hand for an existing tag:
-   `gh workflow run release.yml -f tag=v2.18.0 -f dry_run=false` — the jobs then
+   `gh workflow run release.yml -f tag=v2.18.1 -f dry_run=false` — the jobs then
    check out that tag, not the branch the button was pressed on.
 
 4. **Tag and push.**
 
    ```bash
-   git tag v2.18.0
-   git push origin v2.18.0
+   git tag v2.18.1
+   git push origin v2.18.1
    ```
 
 ## What the workflow does
@@ -86,21 +86,33 @@ store, rotate or leak. Until you opt in, the `pypi` job is skipped.
    - Environment name: `pypi`
 2. On GitHub: *Settings → Environments → New environment* `pypi` (add required
    reviewers here if every upload should be approved by a person).
-3. On GitHub: *Settings → Secrets and variables → Actions → Variables* →
-   `PYPI_PUBLISH` = `true`.
+3. On GitHub: *Settings → Secrets and variables → Actions → Variables* tab →
+   **Repository variables** → *New repository variable* `PYPI_PUBLISH` = `true`.
+   It must be a *repository* (or organization) variable: the `pypi` job is
+   switched on by `if: vars.PYPI_PUBLISH == 'true'` on the job itself, and a
+   job-level `if` is decided before the job enters its environment, so a
+   variable defined only in the `pypi` *environment* is invisible there and
+   the job is skipped without an error (that is why 2.17.0 was not uploaded).
+   A copy in the environment does no harm, but only the repository variable
+   counts.
 
 The next pushed tag publishes — or, for a tag that is already pushed, *Actions →
-Release → Run workflow* with that `tag` and `dry_run` unticked. When this page
-was written (2026-10-12) the name `auralite-ai` was still free on PyPI. Steps 1
-and 2 were done for 2.17.0; with step 3 the first upload is 2.18.0. Check it
-afterwards with `pip install auralite-ai==2.18.0` in a fresh virtual
-environment.
+Release → Run workflow* with that `tag` and `dry_run` unticked. 2.18.0 was the
+first upload (2026-11-04, PEP 740 provenance from `release.yml`, environment
+`pypi`). Check a release afterwards with `pip install auralite-ai==VERSION` in
+a fresh virtual environment.
 
 ## When something goes wrong
 
 - A failed job can be re-run from the Actions page; the tag stays.
 - A bad tag can be removed before anything was published:
-  `git push --delete origin v2.18.0 && git tag -d v2.18.0`.
+  `git push --delete origin v2.18.1 && git tag -d v2.18.1`.
+- The GitHub Release is published draft first (the action creates a draft,
+  uploads the files, then publishes it). If that job fails half way — during
+  a GitHub incident, say — a draft can be left behind that only the
+  repository's owners see: publish it on the *Releases* page, or re-run only
+  the `release` job. Re-running the whole workflow would fail in `pypi`,
+  because PyPI already has those files.
 - PyPI never accepts the same file name twice. If a broken version reached PyPI,
   *yank* it on pypi.org and release the next patch version — do not try to
   re-upload the same number.

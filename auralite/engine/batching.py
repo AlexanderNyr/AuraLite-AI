@@ -195,7 +195,10 @@ class DecodeBatch:
             first = caches[0]
             length, start = int(first.length), int(first.start)
             if self.window is not None:
-                need = max(length + 1, 2 * (self.window + self.codec.slack))
+                # 2.18.1: what the generation reserved, up to two windows
+                # (a long-context model's window no longer fills each row)
+                need = max(length + 1, min(2 * (self.window + self.codec.slack),
+                                           int(capacity)))
             else:
                 need = max(length + 1, int(capacity))
             self._ensure_capacity(need)

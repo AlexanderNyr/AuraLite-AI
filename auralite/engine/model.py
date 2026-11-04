@@ -12,14 +12,16 @@ import torch.nn as nn
 import logging
 from typing import cast
 
-from .layers import Attention, RMSNorm, TransformerBlock
+from .layers import ROPE_TABLE_PREBUILD, Attention, RMSNorm, TransformerBlock
+from .nf4 import NF4Linear
 
 logger = logging.getLogger("auralite")
 
 
 def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
                       d_ff: int, n_heads: int,
-                      n_kv_heads: int | None = None) -> int:
+                      n_kv_heads: int | None = None,
+                      head_dim: int | None = None) -> int:
     """Rough parameter count for a LLaMA-style decoder-only transformer.
 
     Mirrors `ModernTransformer`, which by default keeps the input embedding and
@@ -27,7 +29,7 @@ def estimate_n_params(vocab_size: int, d_model: int, n_layers: int,
     Accurate to within ~3% of `model.count_parameters()` for typical configs.
     """
     n_kv = n_kv_heads if (n_kv_heads and n_kv_heads > 0) else n_heads
-    head_dim = d_model // max(1, n_heads)
+    head_dim = int(head_dim) if head_dim else d_model // max(1, n_heads)
 
     # Input embedding + separate output head (untied by default).
     embed = vocab_size * d_model        # token embedding
@@ -93,9 +95,17 @@ class ModernTransformer(nn.Module):
                  use_moe: bool = False,
                  num_experts: int = 4,
                  tie_word_embeddings: bool = False,
-                 use_qk_norm: bool = False):
+                 use_qk_norm: bool = False,
+                 head_dim: int | None = None,
+                 qkv_bias: bool = False,
+                 norm_eps: float = 1e-6,
+                 qk_norm_shared: bool = False):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        # 2.18.1: the fields of models imported from Hugging Face (hf_models.py)
+        # - an explicit head size, q/k/v biases (Qwen2), the RMSNorm epsilon
+        # and one QK-norm scale shared by the heads (Qwen3)
+        if not head_dim:
+            assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         # n_kv_heads == 0 means "no GQA" (use MHA, i.e. n_kv_heads = n_heads).
         # Normalise here so the %-modulo below never divides by zero.
         if n_kv_heads in (0, "0"):
@@ -112,7 +122,12 @@ class ModernTransformer(nn.Module):
         self.dropout     = dropout
         self.use_alibi   = use_alibi
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.rope_scaling = rope_scaling or {}
+        rope_scaling = dict(rope_scaling or {})
+        if str(rope_scaling.get("type", "")).lower() == "yarn":
+            # 2.18.1: YaRN blends as in the paper; a checkpoint written before
+            # says "legacy" (load_model) and keeps its frequencies
+            rope_scaling.setdefault("yarn_blend", "paper")
+        self.rope_scaling = rope_scaling
         self.sliding_window = int(sliding_window) if sliding_window else None
         self.kv_cache_dtype = kv_cache_dtype
         self.use_flex_attention = bool(use_flex_attention)
@@ -120,6 +135,10 @@ class ModernTransformer(nn.Module):
         self.num_experts = int(num_experts)
         self.tie_word_embeddings = bool(tie_word_embeddings)
         self.use_qk_norm = bool(use_qk_norm)
+        self.head_dim = int(head_dim) if head_dim else d_model // n_heads
+        self.qkv_bias = bool(qkv_bias)
+        self.norm_eps = float(norm_eps)
+        self.qk_norm_shared = bool(qk_norm_shared)
 
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.layers      = nn.ModuleList([
@@ -132,10 +151,12 @@ class ModernTransformer(nn.Module):
                              use_flex_attention=use_flex_attention,
                              use_moe=use_moe,
                              num_experts=num_experts,
-                             use_qk_norm=use_qk_norm)
+                             use_qk_norm=use_qk_norm,
+                             head_dim=head_dim, qkv_bias=qkv_bias,
+                             norm_eps=norm_eps, qk_norm_shared=qk_norm_shared)
             for _ in range(n_layers)
         ])
-        self.final_norm  = RMSNorm(d_model)
+        self.final_norm  = RMSNorm(d_model, eps=norm_eps)
         self.head        = nn.Linear(d_model, vocab_size, bias=False)
 
         # Modern weight init (GPT-2 / LLaMA style)
@@ -216,12 +237,25 @@ class ModernTransformer(nn.Module):
             attn.rope_scaling = dict(self.rope_scaling or {})
             attn.max_seq_len = new_len
             device = attn.rope_cos.device
-            attn._build_rope_buffers(new_len)
+            attn._build_rope_buffers(max(min(new_len, ROPE_TABLE_PREBUILD),
+                                         int(attn.rope_cos.shape[0])))
             attn.rope_cos = attn.rope_cos.to(device)
             attn.rope_sin = attn.rope_sin.to(device)
         if follow:
             self.set_context_window(self.default_context_window())
         return True
+
+    def rebuild_rope_tables(self, device: torch.device | str | None = None) -> None:
+        """Build every layer's RoPE tables again (2.18.1).
+
+        For a model made on the "meta" device (imports, 4-bit checkpoints),
+        whose tables are placeholders until the weights are in place.
+        """
+        for attn in self._attention_layers():
+            attn._build_rope_buffers(min(int(attn.max_seq_len), ROPE_TABLE_PREBUILD))
+            if device is not None:
+                attn.rope_cos = attn.rope_cos.to(device)
+                attn.rope_sin = attn.rope_sin.to(device)
 
     def tie_weights(self):
         """Tie output projection and token embedding weights in-place.
@@ -373,7 +407,10 @@ class ModernTransformer(nn.Module):
         return sum(attn.kv_cache_bytes() for attn in self._attention_layers())
 
     def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        """Every weight, the 4-bit (NF4) ones of a QLoRA base included (2.18.1)."""
+        quantized = sum(m.in_features * m.out_features for m in self.modules()
+                        if isinstance(m, NF4Linear))
+        return sum(p.numel() for p in self.parameters()) + quantized
 
     def count_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -433,11 +470,13 @@ class ModernTransformer(nn.Module):
                 layer_lora = nn.ModuleDict()
                 for name in wanted:
                     mod = getattr(block, name, None)
-                    if isinstance(mod, nn.Linear):
-                        # LoRA params are created with requires_grad=True by default
+                    if isinstance(mod, (nn.Linear, NF4Linear)):
+                        # LoRA params are created with requires_grad=True by
+                        # default; 2.18.1: also on a 4-bit layer (QLoRA), in float32
+                        device = mod.weight.device if isinstance(mod, nn.Linear) else mod.device
                         layer_lora[name] = LoRALayer(mod.in_features, mod.out_features, rank,
                                                      alpha=alpha, rslora=rslora).to(
-                            device=mod.weight.device)
+                            device=device)
                 # wire the adapters into the block so forward() uses them
                 # (this also registers them as proper submodules of the model)
                 block.lora = layer_lora
@@ -477,7 +516,14 @@ class ModernTransformer(nn.Module):
         many weight matrices changed.
         """
         pairs = self.lora_pairs()
-        for _name, linear, adapter in pairs:
+        for name, linear, adapter in pairs:
+            if isinstance(linear, NF4Linear):
+                # 2.18.1: a 4-bit base layer becomes a float32 one first: the
+                # sum is not rounded back to 4 bits
+                plain = linear.to_linear()
+                layer_index, part, attr = name.split(".")[1:]
+                setattr(getattr(self.layers[int(layer_index)], part), attr, plain)
+                linear = plain
             delta = adapter.delta_weight().to(device=linear.weight.device,
                                               dtype=linear.weight.dtype)
             linear.weight.add_(delta)
@@ -514,6 +560,65 @@ class LoRALayer(nn.Module):
         return (self.lora_B @ self.lora_A) * self.scaling
 
 
+#: 2.18.1 architecture fields (models imported from Hugging Face) and their
+#: defaults. A checkpoint stores only those that differ, so the files of
+#: native models stay readable by older versions.
+ARCH_DEFAULTS_2181 = {"head_dim": None, "qkv_bias": False, "norm_eps": 1e-6,
+                      "qk_norm_shared": False}
+
+
+def arch_fields_2181(model: nn.Module) -> dict:
+    """The 2.18.1 architecture fields of `model` that differ from the defaults."""
+    out: dict = {}
+    d_model, n_heads = int(getattr(model, "d_model", 0)), int(getattr(model, "n_heads", 1))
+    head_dim = int(getattr(model, "head_dim", 0) or 0)
+    if head_dim and (d_model % n_heads or head_dim != d_model // n_heads):
+        out["head_dim"] = head_dim
+    if getattr(model, "qkv_bias", False):
+        out["qkv_bias"] = True
+    eps = float(getattr(model, "norm_eps", 1e-6))
+    if eps != 1e-6:
+        out["norm_eps"] = eps
+    if getattr(model, "qk_norm_shared", False):
+        out["qk_norm_shared"] = True
+    return out
+
+
+def checkpoint_rope_scaling(value: dict | None) -> dict | None:
+    """A checkpoint's rope_scaling; YaRN written before 2.18.1 is marked legacy."""
+    if isinstance(value, dict) and str(value.get("type", "")).lower() == "yarn" \
+            and "yarn_blend" not in value:
+        return {**value, "yarn_blend": "legacy"}
+    return value
+
+
+def model_kwargs_from_checkpoint(checkpoint: dict) -> dict:
+    """The :class:`ModernTransformer` arguments stored in a checkpoint."""
+    kwargs = dict(
+        vocab_size=checkpoint["vocab_size"],
+        d_model=checkpoint["d_model"],
+        n_heads=checkpoint["n_heads"],
+        n_layers=checkpoint["n_layers"],
+        d_ff=checkpoint["d_ff"],
+        max_seq_len=checkpoint.get("max_seq_len", 4096),
+        n_kv_heads=checkpoint.get("n_kv_heads"),
+        dropout=checkpoint.get("dropout", 0.0),
+        use_alibi=checkpoint.get("use_alibi", False),
+        use_gradient_checkpointing=checkpoint.get("use_gradient_checkpointing", False),
+        rope_scaling=checkpoint_rope_scaling(checkpoint.get("rope_scaling", None)),
+        sliding_window=checkpoint.get("sliding_window", None),
+        kv_cache_dtype=checkpoint.get("kv_cache_dtype", None),
+        use_flex_attention=checkpoint.get("use_flex_attention", False),
+        use_moe=checkpoint.get("use_moe", False),
+        num_experts=checkpoint.get("num_experts", 4),
+        tie_word_embeddings=checkpoint.get("tie_word_embeddings", True),
+        use_qk_norm=checkpoint.get("use_qk_norm", False),
+    )
+    for key, default in ARCH_DEFAULTS_2181.items():
+        kwargs[key] = checkpoint.get(key, default)
+    return kwargs
+
+
 #: Projections a LoRA adapter can sit on (2.16): the FFN's and the attention's.
 LORA_TARGETS = {"ffn": ("gate", "up", "down"), "attn": ("W_q", "W_k", "W_v", "W_o"),
                 "all": ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o")}
@@ -529,5 +634,6 @@ def lora_target_names(targets: str | list | tuple) -> tuple[str, ...]:
     return LORA_TARGETS[key]
 
 
-__all__ = ["LORA_TARGETS", "LoRALayer", "ModernTransformer", "estimate_n_params",
-           "lora_target_names"]
+__all__ = ["ARCH_DEFAULTS_2181", "LORA_TARGETS", "LoRALayer", "ModernTransformer",
+           "arch_fields_2181", "checkpoint_rope_scaling", "estimate_n_params",
+           "lora_target_names", "model_kwargs_from_checkpoint"]

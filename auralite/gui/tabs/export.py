@@ -69,6 +69,26 @@ class ExportTabMixin:
         ttk.Checkbutton(row2, text="Dynamic axes (batch & seq_len)",
                         variable=self.exp_onnx_dyn_var).pack(side=tk.LEFT, padx=(20, 4))
 
+        # ---- 2.18.1: Hugging Face folder and GGUF ----
+        hub_frame = ttk.LabelFrame(tab, text="  🤗  Hugging Face folder / 🦙 GGUF (llama.cpp, "
+                                             "Ollama, LM Studio)  ", padding="10")
+        hub_frame.pack(fill=tk.X, pady=(0, 8))
+        row3 = ttk.Frame(hub_frame)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text="GGUF type:").pack(side=tk.LEFT, padx=4)
+        self.exp_gguf_quant_var = tk.StringVar(value="f16")
+        ttk.Combobox(row3, textvariable=self.exp_gguf_quant_var,
+                     values=["f16", "q8_0", "bf16", "f32"], state="readonly",
+                     width=6).pack(side=tk.LEFT, padx=4)
+        self.exp_hf_btn = ttk.Button(row3, text="🤗 Export HF folder",
+                                     command=self._export_hf_folder)
+        self.exp_hf_btn.pack(side=tk.LEFT, padx=(16, 4))
+        self.exp_gguf_btn = ttk.Button(row3, text="🦙 Export GGUF", command=self._export_gguf)
+        self.exp_gguf_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(hub_frame, text="Imported Hugging Face models and models trained with a "
+                                  "Hugging Face tokenizer; LoRA adapters are merged, 4-bit "
+                                  "layers dequantized.", style="Sub.TLabel").pack(anchor=tk.W)
+
         # ---- Actions ----
         action_frame = ttk.Frame(tab)
         action_frame.pack(fill=tk.X, pady=10)
@@ -113,6 +133,47 @@ class ExportTabMixin:
             return False
         return True
 
+
+    def _export_hf_folder(self):
+        """2.18.1: a transformers folder (config, safetensors, tokenizer)."""
+        if not self._check_can_export():
+            return
+        folder = filedialog.askdirectory(title="Folder for the Hugging Face model (new or empty)")
+        if not folder:
+            return
+        self._export_hub(lambda: self.engine.export_hf_model(folder), "Hugging Face folder")
+
+    def _export_gguf(self):
+        """2.18.1: a GGUF file for llama.cpp, Ollama and LM Studio."""
+        if not self._check_can_export():
+            return
+        path = filedialog.asksaveasfilename(title="Save GGUF", defaultextension=".gguf",
+                                            filetypes=[("GGUF (llama.cpp)", "*.gguf"),
+                                                       ("All files", "*.*")])
+        if not path:
+            return
+        quant = self.exp_gguf_quant_var.get()
+        self._export_hub(lambda: self.engine.export_gguf_model(path, quant=quant), "GGUF")
+
+    def _export_hub(self, job, label: str) -> None:
+        self.exp_status.config(text=f"Status: Exporting a {label}...")
+
+        def run():
+            try:
+                info = job()
+                where = info.get("folder") or info.get("path")
+                notes = "".join(f"\n  warning: {w}" for w in info.get("warnings", []))
+                self.root.after(0, lambda: (
+                    self._log_export(f"✅ {label}: {where} ({info.get('architecture')}, "
+                                     f"{info.get('bytes', 0) / 1e6:,.0f} MB){notes}"),
+                    self.exp_status.config(text=f"Status: {label} exported ✓")))
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda: (
+                    messagebox.showerror(f"{label} Export Error", err),
+                    self.exp_status.config(text="Status: Export failed ✗")))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _log_export(self, msg: str):
         self.exp_log_text.insert(tk.END, msg + "\n")

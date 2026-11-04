@@ -44,16 +44,19 @@ __all__ = ["DEFAULT_PROMPT_LOSS_WEIGHT", "DIALOG_LOSSES", "DialogSet", "PROMPT_T
 #: template has no end marker; "llama2" and "mistral" write no ``</s>`` after
 #: a reply in the history of a prompt, so a model would learn one text and be
 #: prompted with another.
-SFT_TEMPLATES = ("chatml", "gemma", "phi")
+SFT_TEMPLATES = ("chatml", "gemma", "phi", "llama3")
 
 #: The marker the model learns to end a reply with (a stop string of the template).
-_END_OF_REPLY = {"chatml": "<|im_end|>", "gemma": "<end_of_turn>", "phi": "<|end|>"}
+_END_OF_REPLY = {"chatml": "<|im_end|>", "gemma": "<end_of_turn>", "phi": "<|end|>",
+                 "llama3": "<|eot_id|>"}
 
 #: Markers of each template that become special tokens (one id each).
 _SPECIAL_TOKENS = {
     "chatml": ["<|im_start|>", "<|im_end|>"],
     "gemma": ["<start_of_turn>", "<end_of_turn>"],
     "phi": ["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"],
+    # 2.18.1: Llama 3 Instruct models (imported from Hugging Face)
+    "llama3": ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
 }
 
 #: What the loss learns: the assistant's replies (default) or every token.

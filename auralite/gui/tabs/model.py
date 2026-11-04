@@ -95,6 +95,11 @@ class ModelTabMixin:
         self.hf_load_btn = ttk.Button(hf_btn_row, text="📥 Load HF Model",
                                       command=self._load_hf_model)
         self.hf_load_btn.pack(side=tk.LEFT, padx=4)
+        # 2.18.1: Llama / Mistral / Qwen2 / Qwen3 into AuraLite's own engine
+        # (no transformers; 4-bit = NF4, QLoRA on CPU too)
+        self.hf_native_btn = ttk.Button(hf_btn_row, text="⚙ Import into AuraLite engine",
+                                        command=self._import_hf_native)
+        self.hf_native_btn.pack(side=tk.LEFT, padx=4)
 
         self.hf_apply_lora_btn = ttk.Button(hf_btn_row, text="🔧 Apply LoRA (for fine-tune)",
                                             command=self._apply_lora_to_hf, state=tk.DISABLED)
@@ -321,6 +326,63 @@ class ModelTabMixin:
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
+
+    # ---- 2.18.1: Hugging Face models in the native engine -------------------
+    def _import_hf_native(self):
+        """Import the model named above (or a folder) as a native AuraLite model."""
+        name = str(self.hf_model_var.get() or "").strip()
+        if not name:
+            messagebox.showinfo("No model", "Enter a Hugging Face model name (ORG/NAME) or "
+                                            "choose a downloaded folder first.")
+            return
+        source = name if (os.path.isdir(name) or name.lower().startswith("hf:")) else f"hf:{name}"
+        quantize = "nf4" if self.hf_4bit_var.get() else None
+        self.hf_native_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"Status: Importing {name} into the AuraLite engine… ⏳")
+
+        def progress(info):
+            if info.get("stage") == "download":
+                total = info.get("all_total") or info.get("total") or 0
+                done = info.get("all_bytes") or info.get("bytes") or 0
+                text = (f"Status: Downloading {info.get('file')}: {done / 1e6:,.0f}"
+                        + (f" / {total / 1e6:,.0f} MB" if total else " MB"))
+            else:
+                text = f"Status: Converting the weights {info.get('done')}/{info.get('total')}…"
+            self.root.after(0, lambda t=text: self.status_label.config(text=t))
+
+        def run():
+            try:
+                info = self.engine.import_hf_model(source, quantize=quantize,
+                                                   progress_callback=progress)
+                self.root.after(0, self._hf_native_imported, name, info)
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Import Error", f"Could not import {name}:\n{err}"))
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Status: Import failed ✗"))
+            finally:
+                self.root.after(0, lambda: self.hf_native_btn.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _hf_native_imported(self, name: str, info: dict) -> None:
+        from auralite.engine.hf_models import describe_import
+        self.is_trained = True
+        self.gen_btn.config(state=tk.NORMAL)
+        self.save_btn.config(state=tk.NORMAL)
+        self.param_label.config(text=f"Parameters: {int(info.get('params', 0)):,}")
+        self.model_file_label.config(text=f"Imported: {name} (native engine)",
+                                     foreground="black")
+        self.status_label.config(text=f"Status: Imported ✅ {describe_import(info)} — Training "
+                                      f"tab: «Continue training» + LoRA rank fine-tunes it")
+        if hasattr(self, "continue_var"):
+            self.continue_var.set(True)
+        if hasattr(self, "lora_var") and str(self.lora_var.get()).strip() in ("", "0"):
+            self.lora_var.set("16")
+        if info.get("quantize") == "nf4" and hasattr(self, "qlora_var"):
+            self.qlora_var.set(True)
+        self._refresh_model_info()
 
     def _browse_local_hf_model(self):
         """Open folder dialog to select an already downloaded HF model directory."""

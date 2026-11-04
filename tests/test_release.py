@@ -425,7 +425,8 @@ def test_integrations_job_runs_real_hf_and_llama_cpp_without_skipping():
     assert "--only-binary llama-cpp-python" in joined          # never compile llama.cpp
     assert "abetlen.github.io/llama-cpp-python/whl/cpu" in joined
     assert "find_spec('bitsandbytes') is None" in joined       # HF must work without it
-    for suite in ("tests/test_hf_real.py", "tests/test_gguf_real.py"):
+    for suite in ("tests/test_hf_real.py", "tests/test_gguf_real.py",
+                  "tests/test_hf_native_real.py"):          # 2.18.1: native import/export
         assert suite in joined
     # The "minimum" leg installs exactly the lower bounds the `hf` extra promises.
     assert job["strategy"]["matrix"]["hf"] == ["latest", "minimum"]

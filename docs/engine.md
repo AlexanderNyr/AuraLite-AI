@@ -77,6 +77,18 @@ what the smaller reads save. 2.8 made int8 cheaper anyway: nothing is
 re-quantized, so per-token time stays close to fp32 as the context grows
 (table in section 8).
 
+**2.18.1: the window no longer sizes the storage.** With a window (the
+model's context window, section 9) the cache used to reserve twice the
+window the first time a layer wrote to it, and a decode batch reserved the
+same for each of its rows. That was harmless for windows of a few hundred
+tokens and ruinous for imported Hugging Face models with 8k–128k-token
+contexts: one short reply of SmolLM2-135M (window 8,192) reserved about
+0.75 GB of KV storage, a decode batch 3 GB, and `chat-eval` was killed at
+1.48 GB on a 2 GB machine. Now the storage starts at what the generation
+reserved (prompt + new tokens) and grows geometrically up to two windows;
+compaction past the window works as before. The same `chat-eval` peaks at
+762 MB.
+
 ## 3. Sampling (`auralite/engine/sampling.py`)
 
 The filters are applied in the same order as in 2.7:
@@ -639,3 +651,56 @@ country='Latvia')`). With two tools and `tool_choice="auto"` the model
 decided right in 12 of 16 prompts: it called for 7 of the 8 that needed a
 tool and answered 5 of the 8 that did not; all 10 calls had valid
 arguments.
+
+## 13. Hugging Face models in the native engine (2.18.1)
+
+`auralite/engine/hf_models.py` maps Llama, Mistral, Qwen2 and Qwen3
+checkpoints onto `ModernTransformer`, which gained the four settings they
+need: `head_dim` (an explicit head size: Qwen3, Mistral Nemo), `qkv_bias`
+(Qwen2's q/k/v biases), `norm_eps` (the RMSNorm epsilon: 1e-5 for Llama,
+1e-6 for Qwen) and `qk_norm_shared` (one QK-norm scale for every head, as
+Qwen3's `q_norm`/`k_norm`), plus the `llama3` RoPE scaling. A checkpoint
+stores these fields only when they differ from the defaults, so the files of
+native models stay readable by 2.18.0.
+
+| API | what it does |
+|---|---|
+| `engine.import_hf_model(source, quantize=None, dtype="float32")` | `source`: a model folder or `hf:ORG/NAME[@REV]` (downloaded, resumable, sha256-checked); builds the model on the meta device and places each tensor, optionally as NF4 |
+| `engine.quantize_nf4()` | the loaded model's attention and feed-forward linears to 4 bits (`nf4.NF4Linear`) |
+| `engine.export_hf_model(folder, dtype="bfloat16")` | config, sharded safetensors, tokenizer files; adapters merged, NF4 dequantized |
+| `engine.export_gguf_model(path, quant="f16")` | GGUF v3 (`gguf_writer.py`): F32 / F16 / BF16 / Q8_0 |
+| `import_hf`, `export_hf`, `export_gguf`, `read_gguf`, `AdamW8bit`, `NF4Linear` | the same pieces without an engine (`auralite.engine`) |
+
+The tensor names: `model.embed_tokens` ↔ `embedding`, `input_layernorm` ↔
+`attn_norm`, `self_attn.{q,k,v,o}_proj` ↔ `attn.W_{q,k,v,o}`,
+`self_attn.{q,k}_norm` ↔ `attn.{q,k}_norm`, `post_attention_layernorm` ↔
+`ffn_norm`, `mlp.{gate,up,down}_proj` ↔ `ffn.{gate,up,down}`, `model.norm` ↔
+`final_norm`, `lm_head` ↔ `head`. Everything else that would be needed —
+or anything in the file without a place — is an error, not a guess.
+`safetensors_lite.py` reads and writes the safetensors format itself (a
+header and raw tensors), one tensor at a time, so neither a 7B import nor an
+export holds a second copy of the model.
+
+**NF4** (`nf4.py`): `NF4Linear` holds packed 4-bit codes and its block
+scales as buffers (an optimizer never sees them) and runs a custom autograd
+function that decodes the weight in the forward pass for `x @ W.T` and again
+in the backward pass for the input's gradient; the weight gets no gradient.
+On a CPU both decode into one float32 buffer per thread (the size of the
+largest matrix) instead of a new tensor each time: repeated 10–250 MB
+temporaries fragment glibc's heap once its mmap threshold has grown.
+LoRA adapters sit on it as on an `nn.Linear`; `merge_lora` turns an adapted
+NF4 layer into a float one first (the sum is not rounded back to 4 bits).
+A checkpoint with NF4 layers is loaded on the meta device and given memory
+only for what it holds (`to_empty`), so the float weights never exist.
+
+**8-bit AdamW** (`optim8bit.py`): moments decoded, updated and coded again
+one tensor at a time, blocks of 256 with dynamic 8-bit codes; small tensors
+stay float32; a positive second moment never codes to zero.
+
+**GGUF** (`gguf_writer.py`): metadata in llama.cpp's keys, tensors under its
+names with dimensions innermost first, q/k rows permuted for the `llama`
+architecture (llama.cpp rotates pairs GPT-J style there; Qwen's NeoX rotation
+is AuraLite's own), Llama 3.1's scaling as a `rope_freqs` tensor, the BPE
+vocabulary with token types, merges and the pre-tokenizer name — found by
+hashing the token ids of llama.cpp's test text, as `convert_hf_to_gguf.py`
+does. Measured numbers: [training.md](training.md) § 21.

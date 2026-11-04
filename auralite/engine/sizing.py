@@ -69,16 +69,17 @@ def preset_params(name: str) -> dict[str, Any]:
 def count_parameters(*, d_model: int, n_layers: int, n_heads: int, d_ff: int,
                      vocab_size: int, n_kv_heads: int | None = None,
                      tie_word_embeddings: bool = False, use_qk_norm: bool = True,
-                     use_moe: bool = False, num_experts: int = 4) -> dict[str, int]:
+                     use_moe: bool = False, num_experts: int = 4,
+                     head_dim: int | None = None) -> dict[str, int]:
     """``{"total", "muon", "adamw", "embedding"}`` parameters of a ModernTransformer.
 
     ``muon`` are the hidden matrices Muon trains, ``adamw`` the rest
     (embeddings, the head, norms) — the split of ``optimizer="muon"``.
     """
     kv = int(n_kv_heads or n_heads)
-    head_dim = d_model // n_heads
+    head_dim = int(head_dim or d_model // n_heads)      # 2.18.1: imported models
     kv_width = kv * head_dim
-    attn = d_model * d_model * 2 + d_model * kv_width * 2
+    attn = d_model * n_heads * head_dim * 2 + d_model * kv_width * 2
     ffn = 3 * d_model * d_ff
     if use_moe:
         ffn = ffn * int(num_experts) + d_model * int(num_experts)
@@ -106,7 +107,9 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
                              gradient_checkpointing: bool = False,
                              chunked_loss: bool | None = None, lora_rank: int = 0,
                              dropout: float = 0.0, device: str = "cpu",
-                             use_moe: bool = False, num_experts: int = 4) -> dict[str, Any]:
+                             use_moe: bool = False, num_experts: int = 4,
+                             head_dim: int | None = None,
+                             weight_bytes: int | None = None) -> dict[str, Any]:
     """Bytes one training step holds, by part, and their ``total``.
 
     `batch_size` is the micro-batch (windows per forward pass); gradient
@@ -114,15 +117,20 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
     ``loss_chunk_tokens="auto"`` does. With `lora_rank` only the adapters (and
     nothing else) are counted as trained. An estimate: expect it within about
     20 % (measured on CPU; CUDA adds its own caching allocator).
+
+    2.18.1: ``optimizer="adamw8bit"`` keeps 2 bytes of state per weight
+    instead of 8; `weight_bytes` replaces the float32 weights of the estimate
+    (a 4-bit QLoRA base); `head_dim` for models whose heads are not
+    ``d_model / n_heads`` wide.
     """
     from auralite.engine.losses import AUTO_MIN_VALUES, auto_chunk_tokens
 
     counts = count_parameters(d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
                               vocab_size=vocab_size, n_kv_heads=n_kv_heads,
                               tie_word_embeddings=tie_word_embeddings, use_moe=use_moe,
-                              num_experts=num_experts)
+                              num_experts=num_experts, head_dim=head_dim)
     total_params = counts["total"]
-    kv_width = int(n_kv_heads or n_heads) * (d_model // n_heads)
+    kv_width = int(n_kv_heads or n_heads) * int(head_dim or d_model // n_heads)
     if lora_rank:
         per_layer = 2 * lora_rank * (4 * d_model + 2 * kv_width) + 3 * lora_rank * (
             2 * d_model + 2 * d_ff)
@@ -132,9 +140,10 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
         trained = total_params
         muon_trained = counts["muon"] if optimizer == "muon" else 0
         adamw_trained = trained - muon_trained
-    weights = 4 * total_params
+    weights = 4 * total_params if weight_bytes is None else int(weight_bytes)
     gradients = 4 * trained
-    optimizer_bytes = 4 * muon_trained + 8 * adamw_trained
+    adamw_state = 2.04 if optimizer == "adamw8bit" else 8      # 8-bit: codes + block scales
+    optimizer_bytes = 4 * muon_trained + adamw_state * adamw_trained
     tokens = int(batch_size) * int(seq_length)
     per_layer = _activation_values(d_model, n_heads, kv_width, d_ff, dropout) * 4
     if amp in ("bf16", "fp16"):
@@ -148,9 +157,11 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
     chunked = (logit_values >= AUTO_MIN_VALUES) if chunked_loss is None else bool(chunked_loss)
     if chunked:
         # a chunk's logits and the softmax's temporary; the output matrix's
-        # gradient and its update; the hidden states' gradient
+        # gradient and its update (2.18.1: none with LoRA, whose output layer
+        # is frozen); the hidden states' gradient
+        head_grad = 0 if lora_rank else 2 * 4 * vocab_size * d_model
         logits = (3 * 4 * min(tokens, auto_chunk_tokens(vocab_size)) * vocab_size
-                  + 2 * 4 * vocab_size * d_model + 4 * tokens * d_model)
+                  + head_grad + 4 * tokens * d_model)
     else:
         out_bytes = 2 if amp in ("bf16", "fp16") else 4
         logits = logit_values * (out_bytes + 4 + 4 + 4)
