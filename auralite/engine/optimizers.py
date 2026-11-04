@@ -182,7 +182,18 @@ class _ChainedOptimizers:
 
     def __init__(self, *optimizers):
         self.optimizers = [o for o in optimizers if o is not None]
-        self.param_groups = [pg for o in self.optimizers for pg in o.param_groups]
+
+    @property
+    def param_groups(self) -> list[dict]:
+        """The sub-optimizers' parameter groups, as they are now.
+
+        2.18: a list made once went stale when ``load_state_dict`` replaced
+        the sub-optimizers' group dicts: the learning-rate schedule then set
+        the rate of groups no optimizer read, and a continued Muon run (2.6 to
+        2.17) trained at the rate saved in its checkpoint, whatever the
+        schedule said.
+        """
+        return [pg for o in self.optimizers for pg in o.param_groups]
 
     def zero_grad(self, set_to_none: bool = True):
         for opt in self.optimizers:

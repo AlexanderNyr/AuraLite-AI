@@ -668,6 +668,8 @@ class PreferenceTrainerMixin:
         engine.scheduler = None
         engine._resume_optimizer_state = None
         engine._resume_scheduler_state = None
+        engine._resume_optimizer_file = None           # 2.18
+        engine._resume_run_state = engine._run_state = None
         report = {
             "method": method, "beta": beta, "gamma": gamma if method == "simpo" else None,
             "sft_weight": sft_weight, "positive": positive, "lr": rate, "lora": lora,

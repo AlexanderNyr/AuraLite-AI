@@ -313,7 +313,9 @@ def test_known_train_params_match_what_train_reads():
     from auralite.engine import KNOWN_TRAIN_PARAMS, _legacy
 
     source = (inspect.getsource(_legacy.AuraLiteEngine._train_impl)
-              + inspect.getsource(_legacy.validate_params))
+              + inspect.getsource(_legacy.validate_params)
+              # 2.18: raw data too big for the memory is prepared before the run
+              + inspect.getsource(_legacy.AuraLiteEngine._prepare_text_sources))
     read = set(re.findall(r'params\.get\(\s*"([a-z_0-9]+)"', source))
     assert read == set(KNOWN_TRAIN_PARAMS)
 

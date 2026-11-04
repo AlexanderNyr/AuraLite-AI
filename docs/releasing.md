@@ -12,7 +12,7 @@ built or uploaded from a laptop.
 
    ```bash
    python scripts/check_version_consistency.py          # all strings agree?
-   python scripts/check_version_consistency.py v2.17.0   # ...and match the tag you will push?
+   python scripts/check_version_consistency.py v2.18.0   # ...and match the tag you will push?
    ```
 
 2. **Green CI on the commit you will tag**, including the `package` job: it
@@ -45,14 +45,14 @@ built or uploaded from a laptop.
    ```
 
    A real release can also be started by hand for an existing tag:
-   `gh workflow run release.yml -f tag=v2.17.0 -f dry_run=false` — the jobs then
+   `gh workflow run release.yml -f tag=v2.18.0 -f dry_run=false` — the jobs then
    check out that tag, not the branch the button was pressed on.
 
 4. **Tag and push.**
 
    ```bash
-   git tag v2.17.0
-   git push origin v2.17.0
+   git tag v2.18.0
+   git push origin v2.18.0
    ```
 
 ## What the workflow does
@@ -89,14 +89,18 @@ store, rotate or leak. Until you opt in, the `pypi` job is skipped.
 3. On GitHub: *Settings → Secrets and variables → Actions → Variables* →
    `PYPI_PUBLISH` = `true`.
 
-The next pushed tag publishes. When this page was written (2026-10-12) the name
-`auralite-ai` was still free on PyPI.
+The next pushed tag publishes — or, for a tag that is already pushed, *Actions →
+Release → Run workflow* with that `tag` and `dry_run` unticked. When this page
+was written (2026-10-12) the name `auralite-ai` was still free on PyPI. Steps 1
+and 2 were done for 2.17.0; with step 3 the first upload is 2.18.0. Check it
+afterwards with `pip install auralite-ai==2.18.0` in a fresh virtual
+environment.
 
 ## When something goes wrong
 
 - A failed job can be re-run from the Actions page; the tag stays.
 - A bad tag can be removed before anything was published:
-  `git push --delete origin v2.17.0 && git tag -d v2.17.0`.
+  `git push --delete origin v2.18.0 && git tag -d v2.18.0`.
 - PyPI never accepts the same file name twice. If a broken version reached PyPI,
   *yank* it on pypi.org and release the next patch version — do not try to
   re-upload the same number.

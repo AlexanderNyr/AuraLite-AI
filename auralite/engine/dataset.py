@@ -207,6 +207,110 @@ class PagedDataset(Dataset):
         return windows[:, :-1], windows[:, 1:]
 
 
+class ShardedDataset(Dataset):
+    """Windows of token shards: flat files of token ids on disk (2.18, big datasets).
+
+    `PagedDataset` over several files, as ``auralite data prepare`` writes
+    them (:class:`~auralite.engine.shards.TokenShards`). `shards` are
+    ``(path, tokens)`` pairs, or ``(path, tokens, start)`` for the tokens of
+    a file from token `start` on; every file is memory-mapped and a batch reads
+    only the pages of its windows, so a dataset far larger than the memory
+    trains. A window never spans two files: a file shorter than
+    ``seq_length + 1`` tokens gives none. `stride` and ``set_window_offset``
+    work as in `PagedDataset`; a file shorter than the offset uses the
+    largest offset it can. At most `open_files` files are mapped at a time
+    (a terabyte of shards is thousands of files).
+    """
+
+    def __init__(self, shards: Iterable[tuple], seq_length: int, *,
+                 dtype: str = "uint16", stride: int = 1, open_files: int = 128):
+        if seq_length < 1:
+            raise ValueError(f"seq_length must be >= 1, got {seq_length}")
+        self.seq_length = int(seq_length)
+        self.stride = max(1, int(stride))
+        self.dtype = np.dtype(dtype)
+        self.n_tokens = 0
+        self._files: list[tuple[str, int, int]] = []
+        self._spans: list[int] = []
+        self._open: dict[int, np.memmap] = {}
+        self._open_files = max(1, int(open_files))
+        counts: list[int] = []
+        for entry in shards:
+            path, tokens = entry[0], int(entry[1])
+            start = int(entry[2]) if len(entry) > 2 else 0
+            self.n_tokens += tokens
+            span = tokens - self.seq_length
+            if span < 1:
+                continue
+            self._files.append((str(path), tokens, start))
+            self._spans.append(span)
+            counts.append(_window_count(span, self.stride))
+        self._starts = np.concatenate([[0], np.cumsum(counts, dtype=np.int64)]).astype(np.int64)
+        self._len = int(self._starts[-1])
+        self._arange = np.arange(self.seq_length + 1, dtype=np.int64)
+        self.window_offset = 0
+
+    @property
+    def shards(self) -> int:
+        """How many files have at least one window."""
+        return len(self._files)
+
+    def _map(self, s: int) -> np.memmap:
+        found = self._open.pop(s, None)
+        if found is None:
+            if len(self._open) >= self._open_files:
+                self._open.pop(next(iter(self._open)))       # the least recently used
+            path, tokens, start = self._files[s]
+            found = np.memmap(path, dtype=self.dtype, mode="r", shape=(tokens,),
+                              offset=start * self.dtype.itemsize)
+        self._open[s] = found
+        return found
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        state["_open"] = {}
+        return state
+
+    @property
+    def max_window_offset(self) -> int:
+        """Largest valid argument of :meth:`set_window_offset`."""
+        return max((min(self.stride, span) - 1 for span in self._spans), default=0)
+
+    def set_window_offset(self, offset: int) -> None:
+        offset = int(offset)
+        if not 0 <= offset <= self.max_window_offset:
+            raise ValueError(f"window offset must be in [0, {self.max_window_offset}], "
+                             f"got {offset}")
+        self.window_offset = offset
+
+    def __len__(self) -> int:
+        return self._len
+
+    def _windows(self, idx: np.ndarray) -> np.ndarray:
+        if len(idx) and (int(idx.min()) < 0 or int(idx.max()) >= self._len):
+            raise IndexError(f"window index out of range [0, {self._len})")
+        shard = np.searchsorted(self._starts, idx, side="right") - 1
+        local = idx - self._starts[shard]
+        out = np.empty((len(idx), self.seq_length + 1), dtype=np.int64)
+        for s in np.unique(shard):
+            rows = np.nonzero(shard == s)[0]
+            offset = min(self.window_offset, max(0, min(self.stride, self._spans[s]) - 1))
+            starts = local[rows] * self.stride + offset
+            out[rows] = self._map(int(s))[starts[:, None] + self._arange]
+        return out
+
+    def __getitem__(self, idx: int):
+        window = torch.from_numpy(self._windows(np.asarray([int(idx)], dtype=np.int64))[0])
+        return window[:-1].clone(), window[1:].clone()
+
+    def get_batch(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Windows `indices` as one ``(len(indices), seq_length)`` batch."""
+        idx = np.asarray(indices.numpy() if isinstance(indices, torch.Tensor) else indices,
+                         dtype=np.int64)
+        windows = torch.from_numpy(self._windows(idx))
+        return windows[:, :-1], windows[:, 1:]
+
+
 def write_tokens_memmap(path: str | Path, chunks: Iterable, *,
                         dtype: str = "uint32") -> int:
     """Write token-id chunks to a flat memory-mapped file; return the count.
@@ -244,6 +348,54 @@ def write_tokens_memmap(path: str | Path, chunks: Iterable, *,
     return total
 
 
+#: Above this many windows an epoch's order is not a `torch.randperm` (8 bytes
+#: per window) but a keyed pseudo-random permutation computed batch by batch
+#: (2.18): a 100 GB dataset has billions of windows.
+LAZY_SHUFFLE_WINDOWS = 1 << 24
+
+_MASK64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+def _mix64(x: np.ndarray) -> np.ndarray:
+    """splitmix64's finalizer on uint64 arrays (wraps modulo 2**64)."""
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def permute_indices(positions: np.ndarray, n: int, seed: int) -> np.ndarray:
+    """Element `positions` of a pseudo-random permutation of ``range(n)`` (2.18).
+
+    A keyed 4-round Feistel network on the smallest even number of bits that
+    covers `n`, with cycle walking for the values it maps past ``n - 1``: a
+    bijection of ``range(n)`` that needs no memory, so any batch of an epoch
+    (and the first batch after a resume) is computed on its own. `seed`
+    picks the permutation.
+    """
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    bits = max(2, (int(n) - 1).bit_length())
+    bits += bits & 1
+    half = np.uint64(bits // 2)
+    mask = np.uint64((1 << (bits // 2)) - 1)
+    keys = [_mix64(np.asarray([(int(seed) * 4 + r + 1) & 0xFFFFFFFFFFFFFFFF], dtype=np.uint64))[0]
+            for r in range(4)]
+
+    def rounds(x: np.ndarray) -> np.ndarray:
+        left, right = x >> half, x & mask
+        for key in keys:
+            left, right = right, left ^ (_mix64(right ^ key) & mask)
+        return (left << half) | right
+
+    with np.errstate(over="ignore"):
+        y = rounds(np.asarray(positions, dtype=np.uint64) & _MASK64)
+        outside = y >= np.uint64(n)
+        while outside.any():
+            y[outside] = rounds(y[outside])
+            outside = y >= np.uint64(n)
+    return y.astype(np.int64)
+
+
 class WindowBatches:
     """In-process batches for `CharDataset` / `PagedDataset` (2.9).
 
@@ -259,6 +411,9 @@ class WindowBatches:
     * ``rank`` / ``world_size`` shard each epoch like `DistributedSampler`
       (``drop_last=False``): the permutation is padded by wrapping around so
       that every rank runs the same number of batches.
+    * 2.18: ``skip_batches(k)`` starts the next pass at batch `k` (a resumed
+      run continues its epoch exactly). Above `LAZY_SHUFFLE_WINDOWS` windows
+      the order comes from :func:`permute_indices`, one batch at a time.
     """
 
     def __init__(self, dataset, batch_size: int, *, shuffle: bool = True,
@@ -281,6 +436,7 @@ class WindowBatches:
         # second graph for it, so the compiled training path drops it.
         self.drop_last = bool(drop_last) and self._per_rank() >= self.batch_size
         self.epoch = 0
+        self._skip = 0
 
     def _generator(self, salt: int) -> torch.Generator:
         return torch.Generator().manual_seed(
@@ -304,9 +460,17 @@ class WindowBatches:
             return self._per_rank() // self.batch_size
         return math.ceil(self._per_rank() / self.batch_size)
 
+    def skip_batches(self, count: int) -> None:
+        """Start the next pass over the data at batch `count` (2.18, resumed runs)."""
+        self._skip = max(0, int(count))
+
     def __iter__(self):
         n = len(self.dataset)
+        first, self._skip = self._skip, 0
         if n == 0:
+            return
+        if self.shuffle and n > LAZY_SHUFFLE_WINDOWS:
+            yield from self._lazy_batches(n, first)
             return
         if self.shuffle:
             order = torch.randperm(n, generator=self._generator(2))
@@ -318,8 +482,21 @@ class WindowBatches:
                 order = torch.cat([order, order[:total - n]])
             order = order[self.rank::self.world_size]
         stop = len(self) * self.batch_size if self.drop_last else len(order)
-        for start in range(0, stop, self.batch_size):
+        for start in range(first * self.batch_size, stop, self.batch_size):
             xb, yb = self.dataset.get_batch(order[start:start + self.batch_size])
+            if self.pin_memory:
+                xb, yb = xb.pin_memory(), yb.pin_memory()
+            yield xb, yb
+
+    def _lazy_batches(self, n: int, first: int):
+        """The batches of an epoch of `n` windows, ordered by `permute_indices`."""
+        seed = int(torch.randint(0, 2 ** 62, (1,), generator=self._generator(2)))
+        stop = len(self) * self.batch_size if self.drop_last else self._per_rank()
+        for start in range(first * self.batch_size, stop, self.batch_size):
+            local = np.arange(start, min(start + self.batch_size, stop), dtype=np.int64)
+            positions = (local * self.world_size + self.rank) % n
+            order = torch.from_numpy(permute_indices(positions, n, seed))
+            xb, yb = self.dataset.get_batch(order)
             if self.pin_memory:
                 xb, yb = xb.pin_memory(), yb.pin_memory()
             yield xb, yb
@@ -438,5 +615,6 @@ class _Subset:
         return self.dataset.get_batch(self.indices[positions])
 
 
-__all__ = ["IGNORE_INDEX", "CharDataset", "PackedDataset", "PagedDataset", "WindowBatches",
-           "pack_sequences", "spread_indices", "validation_split_point", "write_tokens_memmap"]
+__all__ = ["IGNORE_INDEX", "LAZY_SHUFFLE_WINDOWS", "CharDataset", "PackedDataset", "PagedDataset",
+           "ShardedDataset", "WindowBatches", "pack_sequences", "permute_indices", "spread_indices",
+           "validation_split_point", "write_tokens_memmap"]

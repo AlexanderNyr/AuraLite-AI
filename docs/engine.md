@@ -154,6 +154,17 @@ Both forms produce the same outputs and gradients, which a test checks.
   to it. (In 2.8 an "epoch" contained `tokens - seq_length` windows, so a
   step budget was the practical way to bound a run. Since 2.9 an epoch is
   one pass over the text — see [training.md](training.md).)
+* **The output layer and the loss in chunks** (2.18, `losses.py`): from 2**24
+  logits per batch the trainer asks the model for its last hidden states
+  (`forward(return_hidden=True)`) and computes the head and the
+  cross-entropy a chunk of tokens at a time, with the gradients of the
+  hidden states and of the output matrix accumulated in the forward pass.
+  The same loss and gradients (float32: within 1e-6), one chunk of logits in
+  memory instead of three to four full copies, and 5–15 % faster on CPU.
+* **A continued Muon run follows its schedule** (2.18): the chained
+  Muon + AdamW optimizer read its parameter groups once, so after a restore
+  the scheduler moved groups no optimizer used and the run kept its
+  checkpoint's learning rate ([training.md](training.md) § 20.3).
 
 ## 7. BPE pre-tokenizer
 

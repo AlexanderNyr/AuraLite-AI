@@ -288,8 +288,13 @@ class ModernTransformer(nn.Module):
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False,
                 capture: dict | None = None,
-                logits_to_keep: int | None = None) -> torch.Tensor:
+                logits_to_keep: int | None = None,
+                return_hidden: bool = False) -> torch.Tensor:
         """Returns logits (B, T, vocab_size) — for all positions by default.
+
+        ``return_hidden=True`` (2.18) returns the final hidden states (B, T,
+        d_model) instead, before the LM head: the trainer then computes the
+        head and the loss in chunks of tokens (``losses.linear_cross_entropy``).
 
         Training uses every position (dense next-token loss, nanoGPT-style).
         Generation only needs the newest position: ``logits_to_keep=1`` (2.8)
@@ -309,7 +314,20 @@ class ModernTransformer(nn.Module):
         if logits_to_keep is not None and 0 < int(logits_to_keep) < h.shape[1]:
             h = h[:, -int(logits_to_keep):]
         h = self.final_norm(h)
+        if return_hidden:
+            return h
         return self.head(h)
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Recompute each block's activations in backward instead of keeping them (2.18).
+
+        Saves most of the activation memory of a training step (about 90 %
+        measured) for about a third more compute; also for a loaded model.
+        """
+        self.use_gradient_checkpointing = bool(enabled)
+        for layer in self.layers:
+            if isinstance(layer, TransformerBlock):
+                layer.use_checkpoint = bool(enabled)
 
     def get_aux_loss(self) -> torch.Tensor | None:
         """Return summed auxiliary losses (currently MoE load balancing)."""

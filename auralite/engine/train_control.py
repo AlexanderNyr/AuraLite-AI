@@ -75,6 +75,8 @@ class TrainControl:
         self.start_time = float(start_time)
         self.loop_start = clock()
         self.run_steps = 0
+        self._steps_before = 0                  # 2.18: steps of the run before a resume
+        self._validation_since_start = 0.0
         self.end_step: int | None = None        # scheduler step that ends the run
         self.finishing = False                  # a finish decay is running
         self.finish_reason = "finished"
@@ -86,11 +88,37 @@ class TrainControl:
         self._next_plan_time: float | None = None
         self._epochs_bound = False              # the epochs end the run before the budget
 
+    # ---- a resumed run (2.18) -----------------------------------------------
+    def state_dict(self) -> dict:
+        """What a continued run needs to decide as this one would have (plain values)."""
+        return {"run_steps": self.run_steps, "end_step": self.end_step,
+                "finishing": self.finishing, "finish_reason": self.finish_reason,
+                "finish_started_at": self.finish_started_at, "validation_s": self.validation_s,
+                "last_validation_s": self.last_validation_s, "epochs_bound": self._epochs_bound}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Continue from :meth:`state_dict` (the clock restarts its step-time estimates)."""
+        self.run_steps = int(state.get("run_steps", 0))
+        self._steps_before = self.run_steps
+        end = state.get("end_step")
+        self.end_step = int(end) if end is not None else None
+        self.finishing = bool(state.get("finishing", False))
+        self.finish_reason = str(state.get("finish_reason", "finished"))
+        started = state.get("finish_started_at")
+        self.finish_started_at = int(started) if started is not None else None
+        self.validation_s = float(state.get("validation_s", 0.0))
+        self.last_validation_s = float(state.get("last_validation_s", 0.0))
+        self._epochs_bound = bool(state.get("epochs_bound", False))
+        self.loop_start = self.clock()
+        self._validation_since_start = 0.0
+        self._last_plan = None
+
     # ---- inputs ------------------------------------------------------
     def note_validation(self, seconds: float) -> None:
         """A validation pass took `seconds` (one runs after every epoch and at the end)."""
         self.last_validation_s = max(0.0, float(seconds))
         self.validation_s += self.last_validation_s
+        self._validation_since_start += self.last_validation_s
 
     @property
     def active(self) -> bool:
@@ -174,7 +202,9 @@ class TrainControl:
         if self.end_step is None or self.run_steps <= 0:
             return default
         step = int(getattr(self.scheduler, "step_count", self.run_steps))
-        per_step = (self.clock() - self.loop_start) / self.run_steps
+        if self.run_steps <= self._steps_before:
+            return default
+        per_step = (self.clock() - self.loop_start) / (self.run_steps - self._steps_before)
         return max(0.0, (self.end_step - step) * per_step)
 
     # ---- time budgets ------------------------------------------------
@@ -185,7 +215,7 @@ class TrainControl:
         budget = self.time_budget_s
         assert budget is not None
         now = self.clock()
-        if self.run_steps < self.FIRST_PLAN_STEP:
+        if self.run_steps - self._steps_before < self.FIRST_PLAN_STEP:
             return
         if self._next_plan_time is not None and now < self._next_plan_time:
             return
@@ -194,7 +224,8 @@ class TrainControl:
             return                               # frozen: the decay has begun
         # Seconds per optimizer step without validation: since the last plan
         # (follows a machine that slows down), or since the start at first.
-        per_step = (now - self.loop_start - self.validation_s) / max(1, self.run_steps)
+        per_step = ((now - self.loop_start - self._validation_since_start)
+                    / max(1, self.run_steps - self._steps_before))
         if self._last_plan is not None:
             t_prev, steps_prev, val_prev = self._last_plan
             d_steps = self.run_steps - steps_prev

@@ -149,6 +149,31 @@ CONFIG_PRESETS = {
     },
 }
 
+# 2.18: big from-scratch models for big data (auralite.engine.sizing); one pass
+# over the data, the batch split to fit the memory (memory_plan "auto").
+def _big_presets() -> dict:
+    try:
+        from auralite.engine.sizing import MODEL_PRESETS
+    except Exception:                            # pragma: no cover - torch missing
+        return {}
+    presets = {}
+    for name, label, lr in (("125m", "Big 125M (big data, GPU or patience)", 0.0006),
+                            ("350m", "Big 350M (big data, GPU)", 0.0003),
+                            ("700m", "Big 700M (big data, GPU 16 GB+)", 0.0003),
+                            ("1.2b", "Big 1.2B (big data, GPU 24 GB+)", 0.0002)):
+        preset = MODEL_PRESETS[name]
+        presets[label] = {
+            "d_model": preset["d_model"], "d_ff": preset["d_ff"], "n_heads": preset["n_heads"],
+            "n_layers": preset["n_layers"], "seq_length": preset["seq_length"],
+            "batch_size": 32, "lr": lr, "epochs": 1, "dropout": 0.0, "grad_clip": 1.0,
+            "n_kv_heads": preset["n_kv_heads"],
+            "use_gradient_checkpointing": name != "125m", "rope_scaling": None,
+        }
+    return presets
+
+
+CONFIG_PRESETS.update(_big_presets())
+
 
 class ConsoleRedirector(io.TextIOBase):
     """Thread-safe redirector that forwards writes to a Tk Text widget.

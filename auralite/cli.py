@@ -354,7 +354,9 @@ def _progress(epoch: int, total: int, train_loss: float, val_loss: float | None,
 
 def _describe_data(data) -> str:
     """One line about what `auralite train` read (2.15)."""
-    from auralite.engine import DialogSet, PreferenceSet
+    from auralite.engine import DialogSet, PreferenceSet, TextSources, TokenShards
+    if isinstance(data, (TokenShards, TextSources)):        # 2.18: big data
+        return data.describe()
     if isinstance(data, PreferenceSet):                     # 2.16
         line = (f"{len(data):,} preference pairs from "
                 f"{', '.join(os.path.basename(p) for p in data.sources)}")
@@ -377,19 +379,48 @@ def _describe_data(data) -> str:
 def cmd_train(args: argparse.Namespace) -> int:
     from auralite.engine import AuraLiteEngine, DataFormatError, DialogSet, load_training_data
     # 2.15: files, folders and globs; text documents or dialogs
+    from auralite.engine import TextSources, TokenShards
+    stream = {"always": True, "never": False}.get(str(getattr(args, "stream", "") or ""))
     try:
-        data = load_training_data(args.text)
+        data = load_training_data(args.text, stream=stream)
     except (FileNotFoundError, DataFormatError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
+    if isinstance(data, TextSources):           # 2.18: Hugging Face datasets, record fields
+        data.text_field = getattr(args, "text_field", None) or data.text_field
+        data.hf_config = getattr(args, "hf_config", None)
+        data.hf_split = getattr(args, "hf_split", None)
     if not getattr(args, "quiet", False):
         print(f"data: {_describe_data(data)}")
+    big = isinstance(data, (TokenShards, TextSources))
     params = dict(DEFAULT_TRAIN_PARAMS)
+    if big:
+        params.pop("epochs")                    # 2.18: one pass over big data by default
+    if getattr(args, "preset", None):
+        # 2.18: a model size from the presets (auralite plan --list); --params wins
+        from auralite.engine import preset_params
+        try:
+            params.update(preset_params(args.preset))
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     given: dict = {}
     if args.params:
         with open(args.params, "r", encoding="utf-8") as f:
             given = json.load(f)
         params.update(given)
+    for flag, key in (("max_tokens", "max_tokens"), ("eval_every", "eval_every_steps"),
+                      ("memory_plan", "memory_plan"), ("shards_dir", "shards_dir"),
+                      ("autosave", "autosave_path"), ("autosave_steps", "autosave_every_steps"),
+                      ("autosave_minutes", "autosave_every_minutes")):
+        if getattr(args, flag, None) is not None:
+            params[key] = getattr(args, flag)
+    if getattr(args, "shards_dir", None):
+        params["shards_dir"] = os.path.abspath(args.shards_dir)
+    if getattr(args, "autosave", None) and not (params.get("autosave_every_steps")
+                                                or params.get("autosave_every_minutes")
+                                                or params.get("autosave_every")):
+        params["autosave_every_minutes"] = 30.0
     # 2.16: preference pairs train with DPO or SimPO, on the model of --resume
     from auralite.engine import PreferenceSet
     method = getattr(args, "method", None) or str(params.get("method") or "auto")
@@ -443,11 +474,15 @@ def cmd_train(args: argparse.Namespace) -> int:
             return 2
     if getattr(args, "tokenizer", None):
         # 2.14.1: train with your own tokenizer (auralite tokenizer train, a
-        # Hugging Face tokenizer.json, GPT-2 vocab.json + merges.txt, a checkpoint)
-        if not os.path.exists(args.tokenizer):
+        # Hugging Face tokenizer.json, GPT-2 vocab.json + merges.txt, a checkpoint);
+        # 2.18: or hf:MODEL, the tokenizer.json of a Hugging Face model
+        if str(args.tokenizer).lower().startswith("hf:"):
+            params["tokenizer_path"] = args.tokenizer
+        elif not os.path.exists(args.tokenizer):
             print(f"error: tokenizer file not found: {args.tokenizer}", file=sys.stderr)
             return 2
-        params["tokenizer_path"] = os.path.abspath(args.tokenizer)
+        else:
+            params["tokenizer_path"] = os.path.abspath(args.tokenizer)
     # v2.6.5: validate the merged params against the typed config so typos in
     # --params (e.g. "epoch" instead of "epochs") fail loudly instead of being
     # silently ignored by train().
@@ -475,6 +510,22 @@ def cmd_train(args: argparse.Namespace) -> int:
             return 2
         engine.load_model(args.resume)
         params["continue_training"] = True
+        run = getattr(engine, "_resume_run_state", None)
+        if getattr(args, "continue_run", False):
+            # 2.18: the interrupted run's own parameters (only these may change)
+            keep = ("autosave_path", "autosave_every_steps", "autosave_every_minutes",
+                    "autosave_every", "time_budget_s", "eval_every_steps", "memory_plan")
+            params = {key: value for key, value in params.items() if key in keep}
+            params.update(continue_training=True, continue_run=True)
+        elif isinstance(run, dict) and not run.get("finished") and \
+                not getattr(args, "quiet", False):
+            print(f"note: {args.resume} holds an unfinished run (optimizer step "
+                  f"{int(run.get('run_opt_steps', 0)):,}); add --continue-run to continue it "
+                  f"exactly where it stopped")
+    elif getattr(args, "continue_run", False):
+        print("error: --continue-run needs --resume CHECKPOINT (an autosave of the run)",
+              file=sys.stderr)
+        return 2
     if getattr(args, "time_budget", None):
         params["time_budget_s"] = float(args.time_budget)
     if getattr(args, "cluster_workers", None):
@@ -495,7 +546,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             data, params,
             progress_callback=None if getattr(args, "quiet", False) else _ProgressPrinter(),
             stop_event=stop_event, finish_event=finish_event)
-    except (TokenizerFormatError, FileNotFoundError) as err:
+    except (TokenizerFormatError, FileNotFoundError, DataFormatError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
     finally:
@@ -529,7 +580,195 @@ def cmd_train(args: argparse.Namespace) -> int:
                          "stopped": "stopped",
                          "max_steps": "max_steps reached"}.get(reason, reason)
     print(line)
+    if reason == "stopped" and not summary.get("restored_best") and \
+            not getattr(args, "quiet", False):
+        print(f"continue this run later: auralite train --data ... --resume {args.model} "
+              f"--continue-run")
     return 0
+
+
+def cmd_data_prepare(args: argparse.Namespace) -> int:
+    """2.18: tokenize big data into token shards (``auralite data prepare``)."""
+    from auralite.engine import DataFormatError, prepare_dataset
+    from auralite.engine.hf_bpe import TokenizerFormatError
+    if args.tokenizer and not str(args.tokenizer).lower().startswith("hf:") \
+            and not os.path.exists(args.tokenizer):
+        print(f"error: tokenizer file not found: {args.tokenizer}", file=sys.stderr)
+        return 2
+    finish_event, stop_event = threading.Event(), threading.Event()
+    previous = _graceful_sigint(finish_event, stop_event)
+    printer = None if args.quiet else _StagePrinter()
+    try:
+        shards = prepare_dataset(
+            args.sources, args.out, tokenizer=args.tokenizer, vocab_size=args.vocab_size,
+            tokenizer_kind=args.kind, pretokenizer=args.pretokenizer,
+            val_fraction=args.val_fraction, val_max_tokens=args.val_max_tokens,
+            shard_tokens=args.shard_tokens, workers=args.workers, text_field=args.text_field,
+            hf_config=args.hf_config, hf_split=args.hf_split, max_tokens=args.max_tokens,
+            max_documents=args.max_documents, separator=args.separator,
+            fast_tokenizer=not args.no_fast, overwrite=args.overwrite,
+            progress_callback=printer, stop_event=_EitherEvent(stop_event, finish_event))
+    except (FileNotFoundError, DataFormatError, TokenizerFormatError, ValueError,
+            RuntimeError) as err:
+        if printer is not None:
+            printer.end()
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    if printer is not None:
+        printer.end()
+    print(f"{'stopped' if shards.stopped else 'ready'}: {shards.describe()} in {shards.folder}")
+    if shards.stopped:
+        print("run the same command again to continue where it stopped")
+        return 130
+    print(f"train on it: auralite train --data {shards.folder} --preset 125m")
+    return 0
+
+
+def cmd_data_info(args: argparse.Namespace) -> int:
+    """2.18: what a prepared dataset holds."""
+    from auralite.engine import DataFormatError, TokenShards
+    try:
+        shards = TokenShards.open(args.dataset)
+    except (FileNotFoundError, DataFormatError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    manifest = shards.manifest
+    if args.json:
+        print(json.dumps(manifest, ensure_ascii=False))
+        return 0
+    stats = manifest.get("stats") or {}
+    tok = manifest.get("tokenizer") or {}
+    print(shards.describe())
+    print(f"  folder:     {shards.folder}")
+    print(f"  tokenizer:  {tok.get('description', '?')}")
+    print(f"  token type: {shards.dtype}; documents end with "
+          f"{json.dumps((manifest.get('separator') or {}).get('token') or (manifest.get('separator') or {}).get('text', ''))}")
+    if stats.get("chars_per_token"):
+        print(f"  {stats.get('chars', 0):,} characters, {stats['chars_per_token']:.2f} per token")
+    for source in manifest.get("sources") or []:
+        print(f"  source:     {source.get('spec')}")
+    skipped = stats.get("skipped") or {}
+    if skipped:
+        print("  skipped:    " + ", ".join(f"{n:,} {why}" for why, n in skipped.items()))
+    if stats.get("not_utf8"):
+        print(f"  not UTF-8:  {len(stats['not_utf8'])} file(s)")
+    if not shards.complete:
+        print("  the preparation did not finish: run it again to continue")
+    return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """2.18: the memory a training run needs, and a batch plan that fits."""
+    from auralite.engine import MODEL_PRESETS, available_memory, plan_training, preset_params
+    from auralite.engine.sizing import count_parameters, format_bytes, parse_size
+    if args.list:
+        print(f"{'preset':>6}  {'d_model':>7}  {'layers':>6}  {'heads':>5}  {'d_ff':>5}  "
+              f"{'params (vocab ' + format(args.vocab, ',') + ')':>22}")
+        for name, preset in MODEL_PRESETS.items():
+            counts = count_parameters(vocab_size=args.vocab, **{k: v for k, v in preset.items()
+                                                                 if k != "seq_length"})
+            print(f"{name:>6}  {preset['d_model']:>7}  {preset['n_layers']:>6}  "
+                  f"{preset['n_heads']:>5}  {preset['d_ff']:>5}  {counts['total'] / 1e6:>20.1f}M")
+        return 0
+    model: dict = {"d_model": 128, "n_layers": 4, "n_heads": 4, "d_ff": 256, "seq_length": 64}
+    if args.preset:
+        try:
+            model.update(preset_params(args.preset))
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+    if args.params:
+        with open(args.params, "r", encoding="utf-8") as f:
+            given = json.load(f)
+        model.update({k: v for k, v in given.items() if k in (
+            "d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff", "seq_length", "batch_size",
+            "accumulation_steps", "tie_word_embeddings", "optimizer", "amp_dtype", "lora_rank",
+            "dropout")})
+    seq = int(args.seq_length or model.get("seq_length", 64))
+    batch = int(args.batch_size or model.get("batch_size", 32))
+    try:
+        memory = parse_size(args.memory) if args.memory else available_memory(args.device)
+    except ValueError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    dims = {"d_model": int(model["d_model"]), "n_layers": int(model["n_layers"]),
+            "n_heads": int(model["n_heads"]), "d_ff": int(model["d_ff"]),
+            "n_kv_heads": model.get("n_kv_heads") or None, "vocab_size": int(args.vocab),
+            "tie_word_embeddings": bool(model.get("tie_word_embeddings", False)),
+            "optimizer": str(args.optimizer or model.get("optimizer") or "muon"),
+            "amp": str(args.amp or model.get("amp_dtype") or "none"),
+            "lora_rank": int(model.get("lora_rank") or 0),
+            "dropout": float(model.get("dropout", 0.0) if not isinstance(model.get("dropout"),
+                                                                           str) else 0.0),
+            "device": args.device, "seq_length": seq}
+    from auralite.engine import estimate_training_memory
+    estimate = estimate_training_memory(batch_size=batch,
+                                        gradient_checkpointing=bool(args.checkpointing), **dims)
+    print(f"model: {estimate['parameters'] / 1e6:,.1f}M parameters "
+          f"(d_model {dims['d_model']}, {dims['n_layers']} layers, vocab {dims['vocab_size']:,})"
+          f"; windows of {seq} tokens, batch {batch}")
+    for part in ("weights", "gradients", "optimizer", "activations", "logits", "overhead"):
+        print(f"  {part:<12} {format_bytes(estimate[part]):>10}")
+    print(f"  {'total':<12} {format_bytes(estimate['total']):>10}"
+          + (" (loss in chunks)" if estimate["chunked_loss"] else ""))
+    if not memory:
+        print("free memory unknown: give --memory 16GB")
+        return 0
+    print(f"memory: {format_bytes(memory)} {'given' if args.memory else 'free now'} "
+          f"({args.device})")
+    plan = plan_training(int(memory * 0.9), batch_size=batch, gradient_checkpointing=False,
+                         **dims)
+    if not plan["fits"]:
+        print(f"does not fit even 1 window per step with gradient checkpointing "
+              f"({format_bytes(plan['estimate']['total'])}): a smaller preset, LoRA, or a GPU")
+        return 1
+    advice = [f"batch_size {plan['micro_batch']}", f"accumulation_steps "
+              f"{plan['accumulation_steps']}"]
+    if plan["gradient_checkpointing"]:
+        advice.append("use_gradient_checkpointing true")
+    print(f"fits as: {', '.join(advice)} (about {format_bytes(plan['estimate']['total'])}); "
+          f"auralite train --memory-plan auto does this by itself")
+    return 0
+
+
+class _EitherEvent:
+    """``is_set()`` of two events (the first Ctrl+C of a preparation stops it too)."""
+
+    def __init__(self, first: threading.Event, second: threading.Event):
+        self.first, self.second = first, second
+
+    def is_set(self) -> bool:
+        return self.first.is_set() or self.second.is_set()
+
+
+class _StagePrinter:
+    """One updating line for stage events (``auralite data prepare``)."""
+
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self.last = 0.0
+        self.width = 0
+
+    def __call__(self, info: dict) -> None:
+        now = time.time()
+        if now - self.last < self.interval and info.get("stage_percent") != 100.0:
+            return
+        self.last = now
+        text = str(info.get("message", ""))[:150]
+        pad = max(0, self.width - len(text))
+        self.width = len(text)
+        if sys.stdout.isatty():
+            print("\r" + text + " " * pad, end="", flush=True)
+        else:
+            print(text, flush=True)
+
+    def end(self) -> None:
+        if self.width and sys.stdout.isatty():
+            print()
+        self.width = 0
 
 
 def _load_engine(path: str) -> Any:
@@ -1414,7 +1653,40 @@ def build_parser() -> argparse.ArgumentParser:
                    help="training data (UTF-8): text files, folders (their .txt/.md/.jsonl "
                         "files), globs; .jsonl/.json files of {\"text\": ...} records, or of "
                         "dialogs ({\"messages\": [...]}, ShareGPT, Alpaca, prompt/completion) "
-                        "to fine-tune a chat model")
+                        "to fine-tune a chat model; 2.18: a folder of `auralite data prepare`, "
+                        "compressed (.gz .bz2 .xz .zst) and .parquet files, hf:NAME datasets "
+                        "(text over 256 MB is tokenized into shards first)")
+    # 2.18: big models and big data
+    p.add_argument("--preset", metavar="SIZE",
+                   help="a model size: 25m, 45m, 125m, 350m, 700m, 1.2b, 2.4b (auralite plan "
+                        "--list); --params overrides its fields")
+    p.add_argument("--max-tokens", type=int, metavar="N",
+                   help="train on this many tokens (a budget; the epochs follow from it)")
+    p.add_argument("--eval-every", type=int, metavar="STEPS",
+                   help="also validate every STEPS optimizer steps")
+    p.add_argument("--memory-plan", choices=["off", "warn", "auto"],
+                   help="warn (default): log the estimated memory and warn when it is more "
+                        "than is free; auto: also split the batch (gradient accumulation) and "
+                        "turn on gradient checkpointing to fit")
+    p.add_argument("--autosave", metavar="PATH",
+                   help="save the run here as it trains (every 30 minutes unless "
+                        "--autosave-steps / --autosave-minutes); --resume PATH "
+                        "--continue-run continues it after a stop or a crash")
+    p.add_argument("--autosave-steps", type=int, metavar="N", help="autosave every N steps")
+    p.add_argument("--autosave-minutes", type=float, metavar="M", help="autosave every M minutes")
+    p.add_argument("--continue-run", action="store_true",
+                   help="with --resume: continue the run saved in that checkpoint exactly "
+                        "where it stopped (same data order, schedule and counters)")
+    p.add_argument("--stream", choices=["auto", "always", "never"], default="auto",
+                   help="tokenize text into shards on disk first: auto (over 256 MB, "
+                        "compressed, Parquet, hf:), always, never")
+    p.add_argument("--shards-dir", metavar="DIR",
+                   help="where raw data is tokenized to (default: under ~/.auralite/datasets, "
+                        "reused by later runs)")
+    p.add_argument("--text-field", metavar="NAME",
+                   help="the text field of .jsonl/.parquet/hf: records (default text)")
+    p.add_argument("--hf-config", metavar="NAME", help="hf: datasets: the configuration")
+    p.add_argument("--hf-split", metavar="NAME", help="hf: datasets: the split (default train)")
     p.add_argument("--template", metavar="NAME",
                    help="dialogs: the chat template (chatml, gemma or phi; default: the "
                         "continued model's, else chatml)")
@@ -1475,6 +1747,70 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cluster-timeout", type=_parse_duration, metavar="DURATION",
                    help="how long to wait for the workers (default 10m)")
     p.set_defaults(func=cmd_train)
+
+    # 2.18: big datasets as token shards, and memory plans
+    p = sub.add_parser("data", help="prepare big datasets: tokenize them once into shards")
+    data_sub = p.add_subparsers(dest="data_command", required=True)
+    q = data_sub.add_parser("prepare", help="tokenize files, folders or a Hugging Face dataset "
+                                            "into token shards (resumable)")
+    _add_common_flags(q, suppress_defaults=True)
+    q.add_argument("sources", nargs="+", metavar="SOURCE",
+                   help="files, folders, globs (text, .jsonl, .json, .parquet; .gz .bz2 .xz "
+                        ".zst) and hf:NAME[:CONFIG][@SPLIT] datasets")
+    q.add_argument("--out", required=True, metavar="DIR", help="the dataset folder to write")
+    q.add_argument("--tokenizer", metavar="FILE",
+                   help="tokenizer file, checkpoint, or hf:MODEL (its tokenizer.json); "
+                        "default: fit a new BPE on a sample of the data")
+    q.add_argument("--vocab-size", type=int, default=8192, metavar="N",
+                   help="a new tokenizer's vocabulary (default 8192)")
+    q.add_argument("--kind", choices=["bpe", "char"], default="bpe",
+                   help="a new tokenizer: bpe (default) or char")
+    q.add_argument("--pretokenizer", choices=["gpt", "ws"], default="gpt",
+                   help="a new BPE's pre-tokenizer (default gpt)")
+    q.add_argument("--val-fraction", type=float, default=0.01, metavar="F",
+                   help="share of the documents held out for validation (default 0.01)")
+    q.add_argument("--val-max-tokens", type=int, default=10_000_000, metavar="N",
+                   help="at most this many validation tokens (default 10M)")
+    q.add_argument("--max-tokens", type=int, metavar="N", help="stop after this many tokens")
+    q.add_argument("--max-documents", type=int, metavar="N",
+                   help="stop after this many documents")
+    q.add_argument("--workers", type=int, metavar="N",
+                   help="tokenizer processes (default: cores - 1, one for small data)")
+    q.add_argument("--text-field", default="text", metavar="NAME",
+                   help="the text field of records (default text)")
+    q.add_argument("--hf-config", metavar="NAME", help="hf: datasets: the configuration")
+    q.add_argument("--hf-split", metavar="NAME", help="hf: datasets: the split (default train)")
+    q.add_argument("--separator", choices=["auto", "eos", "blank-line", "none"],
+                   default="auto", help="what ends a document (default: the tokenizer's "
+                                        "end-of-text token, else a blank line)")
+    q.add_argument("--shard-tokens", type=int, default=1 << 27, metavar="N",
+                   help="tokens per shard file (default 134M)")
+    q.add_argument("--no-fast", action="store_true",
+                   help="never use the tokenizers package (Rust) for Hugging Face tokenizers")
+    q.add_argument("--overwrite", action="store_true",
+                   help="replace a dataset already in --out")
+    q.set_defaults(func=cmd_data_prepare)
+    q = data_sub.add_parser("info", help="describe a prepared dataset")
+    q.add_argument("dataset", metavar="DIR")
+    q.add_argument("--json", action="store_true", help="print the whole manifest")
+    q.set_defaults(func=cmd_data_info)
+
+    p = sub.add_parser("plan", help="the memory a training run needs, and a batch that fits")
+    p.add_argument("--preset", metavar="SIZE", help="a model size (see --list)")
+    p.add_argument("--params", metavar="FILE", help="JSON training params (model fields)")
+    p.add_argument("--list", action="store_true", help="list the model presets")
+    p.add_argument("--vocab", type=int, default=32000, metavar="N",
+                   help="vocabulary size (default 32000)")
+    p.add_argument("--seq-length", type=int, metavar="N", help="tokens per window")
+    p.add_argument("--batch-size", type=int, metavar="N", help="windows per optimizer step")
+    p.add_argument("--memory", metavar="SIZE",
+                   help="memory to plan for (16GB); default: free now on --device")
+    p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--optimizer", choices=["muon", "adamw"], help="default muon")
+    p.add_argument("--amp", choices=["none", "bf16", "fp16"], help="mixed precision")
+    p.add_argument("--checkpointing", action="store_true",
+                   help="estimate with gradient checkpointing")
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("cluster-worker",
                        help="help another computer train: join its runs over the network")

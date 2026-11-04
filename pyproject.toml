@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.17.0"
+version = "2.18.0"
 description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -96,7 +96,11 @@ export = ["onnx>=1.15", "onnxruntime>=1.17", "onnxscript>=0.5"]
 hf = ["transformers>=4.46", "peft>=0.13", "accelerate>=1.1"]
 # 4-/8-bit QLoRA loading — the only feature that needs bitsandbytes (2.6.6).
 qlora = ["auralite-ai[hf]", "bitsandbytes>=0.43; platform_system != 'Darwin'"]
-dev = ["auralite-ai[test,lint,full,serve,rag]"]
+# 2.18: big datasets — Hugging Face datasets streamed (hf:NAME), Parquet and .zst
+# files (Python 3.14 reads .zst itself), and the Rust tokenizers package for
+# Hugging Face tokenizer.json files (checked to give AuraLite's ids, then used)
+data = ["datasets>=2.18", "pyarrow>=14", "zstandard>=0.22", "tokenizers>=0.15"]
+dev = ["auralite-ai[test,lint,full,serve,rag,data]"]
 
 [tool.setuptools.packages.find]
 # 2.7.0: one import package. The flat layout installed 16 top-level names

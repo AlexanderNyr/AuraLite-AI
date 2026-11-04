@@ -28,21 +28,25 @@ class ParamValidationError(Exception):
 #: else is ignored — `unknown_train_params` names those keys so a typo such as
 #: "seq_len" for "seq_length" no longer trains silently with the default.
 KNOWN_TRAIN_PARAMS = frozenset({
-    "accumulation_steps", "amp_dtype", "autosave_every", "autosave_every_steps",
+    "accumulation_steps", "amp_dtype", "autosave_every", "autosave_every_minutes",
+    "autosave_every_steps",
     "autosave_path", "batch_size", "bpe_pretokenizer", "bpe_vocab_size",
     "chat_template", "cluster_host", "cluster_port", "cluster_timeout_s", "cluster_token",
-    "cluster_workers", "continue_training", "cooldown_ratio", "corpus_cache",
+    "cluster_workers", "continue_run", "continue_training", "cooldown_ratio", "corpus_cache",
     "corpus_cache_path", "d_ff", "d_model", "dialog_loss", "dialog_packing", "dpo_positive",
     "dropout",
     "early_stopping_cooldown", "early_stopping_patience", "epochs", "grad_clip",
+    "eval_every_steps",
     "kv_cache_dtype", "lora_alpha", "lora_embeddings", "lora_lr", "lora_rank", "lora_rslora",
-    "lora_targets", "lr", "lr_schedule", "max_steps", "method",
+    "lora_targets", "loss_chunk_tokens", "lr", "lr_schedule", "max_steps", "max_tokens",
+    "memory_plan", "method",
     "muon_adjust_lr", "muon_lr", "muon_momentum", "muon_ns_steps", "n_heads", "n_kv_heads",
     "n_layers", "num_experts", "optimizer", "preference_beta", "preference_sft_weight",
-    "progress_every_batches",
+    "prepare_max_tokens", "progress_every_batches",
     "progress_every_seconds", "prompt_loss_weight", "restore_best_weights",
     "resume_training_state",
-    "rope_scaling", "sample_stride", "seed", "seq_length", "simpo_gamma", "sliding_window",
+    "rope_scaling", "sample_stride", "seed", "seq_length", "shards_dir", "simpo_gamma",
+    "sliding_window",
     "tie_word_embeddings", "time_budget_s", "tokenizer", "tokenizer_path", "use_alibi",
     "use_compile", "use_ddp",
     "use_flex_attention", "use_gradient_checkpointing", "use_moe", "use_qk_norm",
@@ -153,6 +157,28 @@ def validate_params(params: dict) -> list[str]:
     if ns_steps is not None and (isinstance(ns_steps, bool) or not isinstance(ns_steps, int)
                                  or not 1 <= ns_steps <= 10):
         errors.append(f"muon_ns_steps must be an integer from 1 to 10, got {ns_steps!r}")
+    # 2.18: long runs and big models
+    for key in ("max_tokens", "eval_every_steps", "prepare_max_tokens"):
+        value = params.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or value < 0):
+            errors.append(f"{key} must be a whole number >= 0, got {value!r}")
+    minutes = params.get("autosave_every_minutes")
+    if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+                                or minutes < 0):
+        errors.append(f"autosave_every_minutes must be a number >= 0, got {minutes!r}")
+    plan = params.get("memory_plan")
+    if plan is not None and plan not in ("off", "warn", "auto"):
+        errors.append(f"memory_plan must be \"off\", \"warn\" or \"auto\", got {plan!r}")
+    chunk = params.get("loss_chunk_tokens")
+    if chunk is not None and not is_auto(chunk) and (
+            isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0):
+        errors.append(f"loss_chunk_tokens must be \"auto\" or a whole number >= 0, got "
+                      f"{chunk!r}")
+    for key in ("shards_dir",):
+        value = params.get(key)
+        if value is not None and not isinstance(value, str):
+            errors.append(f"{key} must be a string, got {value!r}")
     if grad_clip <= 0:
         errors.append(f"grad_clip must be > 0, got {grad_clip}")
     if bpe_vocab_size < 2:

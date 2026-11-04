@@ -94,21 +94,36 @@ def _numpy_reconstruct_globals() -> list:
     return allow
 
 
-def safe_torch_load(path: str, map_location=None, allow_unsafe: bool = False):
+def safe_torch_load(path: str, map_location=None, allow_unsafe: bool = False,
+                    mmap: bool = False):
     """Load a ``.pt`` checkpoint with ``weights_only=True`` (safe by default).
 
     Raises a descriptive ``ValueError`` when the file needs the unrestricted
     unpickler. Pass ``allow_unsafe=True`` (or set ``AURALITE_UNSAFE_LOAD=1``)
     only for files you trust — that path can execute arbitrary code.
+
+    2.18: ``mmap=True`` maps the tensors from the file instead of reading them
+    into memory (a big checkpoint loads without a second copy in RAM); files
+    in the old, non-zip format load as before.
     """
     import torch.serialization as _ts
+
+    def _plain(weights_only: bool):
+        if mmap:
+            try:
+                return torch.load(path, map_location=map_location, weights_only=weights_only,
+                                  mmap=True)
+            except RuntimeError as err:
+                if "mmap" not in str(err).lower():
+                    raise
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
 
     def _load(weights_only: bool):
         allowlist = _numpy_reconstruct_globals()
         if allowlist and weights_only:
             with _ts.safe_globals(allowlist):
-                return torch.load(path, map_location=map_location, weights_only=True)
-        return torch.load(path, map_location=map_location, weights_only=weights_only)
+                return _plain(True)
+        return _plain(weights_only)
 
     try:
         return _load(weights_only=True)

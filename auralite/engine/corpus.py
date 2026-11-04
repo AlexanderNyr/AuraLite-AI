@@ -221,8 +221,8 @@ def _record_kind(location: str, record: Any) -> str:
         f"(\"text\"); rename the file to .txt to train on it as plain text")
 
 
-def load_training_data(paths: Any, *, separator: str = DOCUMENT_SEPARATOR
-                       ) -> TextCorpus | DialogSet | PreferenceSet:
+def load_training_data(paths: Any, *, separator: str = DOCUMENT_SEPARATOR,
+                       stream: bool | None = None) -> Any:
     """Read `paths` (files, folders, globs) as a :class:`TextCorpus`, a
     :class:`DialogSet` or (2.16) a :class:`~auralite.engine.preference.PreferenceSet`.
 
@@ -231,7 +231,26 @@ def load_training_data(paths: Any, *, separator: str = DOCUMENT_SEPARATOR
     then train on preference pairs).
     Files of a folder that are not UTF-8 are skipped (`TextCorpus.skipped`);
     a file given by name must be readable.
+
+    2.18, big data: a folder prepared by ``auralite data prepare`` gives
+    :class:`~auralite.engine.shards.TokenShards`; text too big for the memory
+    (more than 256 MB, ``AURALITE_STREAM_THRESHOLD_MB``), compressed and
+    Parquet files and Hugging Face datasets (``hf:NAME``) give
+    :class:`~auralite.engine.shards.TextSources`, which ``train()`` tokenizes
+    into shards first. `stream` True always streams text, False never does
+    (raw files are read into memory as in 2.17).
     """
+    from auralite.engine import shards as _shards
+
+    items = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
+    if len(items) == 1 and _shards.is_dataset_folder(items[0]):
+        return _shards.TokenShards.open(items[0])
+    if any(_shards.is_dataset_folder(item) for item in items):
+        raise DataFormatError("a prepared dataset trains on its own: give its folder alone")
+    if stream is not False:
+        sources = _streamed_sources(items, bool(stream))
+        if sources is not None:
+            return sources
     explicit = {os.path.normcase(os.path.abspath(p))
                 for p in ([paths] if isinstance(paths, (str, os.PathLike)) else list(paths))
                 if os.path.isfile(os.fspath(p))}
@@ -319,14 +338,26 @@ def load_training_data(paths: Any, *, separator: str = DOCUMENT_SEPARATOR
                       skipped_records=bad_records)
 
 
-def data_kind(paths: Any) -> str:
-    """``"dialogs"``, ``"preferences"`` (2.16) or ``"text"``: what
-    :func:`load_training_data` makes of `paths`.
+def _streamed_sources(items: list, force: bool) -> Any:
+    """`TextSources` when `items` should be streamed through token shards, else None."""
+    from auralite.engine import shards as _shards
 
-    A quick look for the GUI: only the first record of each ``.jsonl`` /
-    ``.json`` file is read. ``""`` when the paths cannot be read
-    (:func:`load_training_data` then says why).
-    """
+    names = [os.fspath(item) for item in items]
+    try:
+        total, files, special = _shards.stream_sources_bytes(names)
+    except (OSError, ValueError):
+        return None                               # the 2.15 reader names the problem
+    if not (force or special or total > _shards.stream_threshold()):
+        return None
+    local = [name for name in names if not name.lower().startswith("hf:")]
+    if local and not special and _records_kind(local) in ("dialogs", "preferences"):
+        return None                               # dialogs and pairs are read in memory
+    return _shards.TextSources(sources=names, total_bytes=total, files=files)
+
+
+def _records_kind(paths: Any) -> str:
+    """``"dialogs"``, ``"preferences"`` or ``"text"`` from the first record of each
+    record file (``""`` when the paths cannot be read)."""
     try:
         for path in collect_files(paths):
             if path.suffix.lower() not in _RECORD_SUFFIXES:
@@ -339,3 +370,26 @@ def data_kind(paths: Any) -> str:
     except (OSError, ValueError):
         return ""
     return "text"
+
+
+def data_kind(paths: Any) -> str:
+    """``"dialogs"``, ``"preferences"`` (2.16) or ``"text"``: what
+    :func:`load_training_data` makes of `paths`.
+
+    A quick look for the GUI: only the first record of each ``.jsonl`` /
+    ``.json`` file is read. ``""`` when the paths cannot be read
+    (:func:`load_training_data` then says why). 2.18: ``"shards"`` for a
+    prepared dataset, ``"big"`` for raw text that is tokenized into shards
+    first (too big for the memory, compressed, Parquet, Hugging Face).
+    """
+    from auralite.engine import shards as _shards
+
+    items = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
+    if len(items) == 1 and _shards.is_dataset_folder(items[0]):
+        return "shards"
+    kind = _records_kind(items)
+    if kind in ("dialogs", "preferences"):
+        return kind
+    if _streamed_sources(items, False) is not None:
+        return "big"
+    return kind

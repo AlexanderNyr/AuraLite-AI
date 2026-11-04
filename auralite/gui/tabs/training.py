@@ -325,6 +325,10 @@ class TrainTabMixin:
         self.folder_btn = ttk.Button(top_row, text="📁 Select Folder",
                                      command=self.select_folder)
         self.folder_btn.pack(side=tk.LEFT, padx=4)
+        # 2.18: tokenize big data once into shards on disk
+        self.prepare_btn = ttk.Button(top_row, text="📦 Prepare Dataset",
+                                      command=self.prepare_dataset_gui)
+        self.prepare_btn.pack(side=tk.LEFT, padx=4)
 
         self.train_btn = ttk.Button(top_row, text="🚀 Start Training",
                                     command=self.start_training,
@@ -549,6 +553,8 @@ class TrainTabMixin:
             title="Select Training File",
             filetypes=[("Text, dialogs or pairs", "*.txt *.md *.jsonl *.json"),
                        ("Text files", "*.txt"), ("Dialogs or preference pairs (JSONL)", "*.jsonl"),
+                       # 2.18: big data, tokenized into shards first
+                       ("Compressed or Parquet", "*.gz *.bz2 *.xz *.zst *.parquet"),
                        ("All files", "*.*")],
         )
         if file_path:
@@ -574,6 +580,11 @@ class TrainTabMixin:
         elif kind == "preferences":
             text += " — preference pairs: trains the chat model in memory (see «Preference " \
                     "pairs»)"
+        elif kind == "shards":
+            text += " — a prepared dataset: trains from disk with its own tokenizer"
+        elif kind == "big":
+            text += " — big data: tokenized into shards on disk first (once; 📦 Prepare " \
+                    "Dataset chooses where)"
         self.file_label.config(text=text, foreground="black")
         self.train_btn.config(state=tk.NORMAL)
         self.status_label.config(text="Status: Ready to train")
@@ -1004,6 +1015,9 @@ class TrainTabMixin:
                 # Architecture: tie the input embedding with the output head
                 # (legacy; off by default to avoid gradient cancellation).
                 "tie_word_embeddings": bool(self.tie_var.get()),
+                # 2.18: split the batch and recompute activations when the run
+                # would not fit the memory (instead of running out of it)
+                "memory_plan": "auto",
             }
         except ValueError:
             messagebox.showerror("Params Error",
@@ -1371,9 +1385,80 @@ class TrainTabMixin:
         self.train_btn.config(state=tk.NORMAL)
         self.file_btn.config(state=tk.NORMAL)
         self.folder_btn.config(state=tk.NORMAL)
+        if getattr(self, "prepare_btn", None) is not None:
+            self.prepare_btn.config(state=tk.NORMAL)
         self.load_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED, text="🛑 Stop")
         self._set_tokenizer_buttons(tk.NORMAL)
+
+    # ---- Big data (2.18) ---------------------------------------------------
+    def prepare_dataset_gui(self):
+        """Tokenize the selected file or folder into token shards, then select them."""
+        if not self.selected_file_path:
+            messagebox.showinfo("No data", "Select a file or a folder of data first "
+                                           "(📂 Select File / 📁 Select Folder).")
+            return
+        if data_kind([self.selected_file_path]) == "shards":
+            messagebox.showinfo("Prepared already", "The selected folder is a prepared "
+                                                    "dataset: Start Training trains on it.")
+            return
+        out = filedialog.askdirectory(title="Folder for the prepared dataset (new or empty)")
+        if not out:
+            return
+        tokenizer = str(self.tokenizer_path_var.get() or "").strip() or None
+        if self.tok_var.get() != "file":
+            tokenizer = None
+        try:
+            vocab = int(self.bpe_vocab_var.get())
+            val_split = float(self.val_split_var.get())
+        except ValueError:
+            messagebox.showerror("Params Error", "BPE Vocab and Val Split must be numbers.")
+            return
+        kind = "char" if self.tok_var.get() == "char" else "bpe"
+        source = self.selected_file_path
+        self.stop_event.clear()
+        self.finish_event.clear()
+        self._train_phase = "prepare"
+        self._set_progress_bar(0.0)
+        self.status_label.config(text="Status: Preparing the dataset… ⏳ (Stop keeps what is "
+                                      "done; Prepare again continues)")
+        for button in (self.train_btn, self.file_btn, self.folder_btn, self.prepare_btn):
+            button.config(state=tk.DISABLED)
+        self._set_tokenizer_buttons(tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        started = time.time()
+        # frozen Windows builds tokenize in this process (no worker processes)
+        workers = 1 if getattr(gui_common.sys, "frozen", False) else None
+
+        def progress(info):
+            self.root.after(0, self._apply_stage, dict(info))
+
+        def run():
+            from auralite.engine.shards import prepare_dataset
+            try:
+                shards = prepare_dataset(
+                    [source], out, tokenizer=tokenizer, vocab_size=vocab, tokenizer_kind=kind,
+                    val_fraction=min(max(val_split, 0.0), 0.5), workers=workers,
+                    progress_callback=progress, stop_event=self.stop_event)
+                self.root.after(0, self._dataset_prepared, shards, time.time() - started)
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda err=err: messagebox.showerror(
+                    "Dataset Error", f"Could not prepare the dataset:\n{err}"))
+            finally:
+                self.root.after(0, self._reset_train_buttons)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _dataset_prepared(self, shards, seconds: float) -> None:
+        if getattr(shards, "stopped", False):
+            self.status_label.config(text=f"Status: Preparation stopped — {shards.describe()}; "
+                                          f"📦 Prepare Dataset again continues it")
+            return
+        self._set_progress_bar(100.0)
+        self._select_data(str(shards.folder))
+        self.status_label.config(text=f"Status: Dataset ready ✅ ({shards.describe()}) | "
+                                      f"{_fmt_duration(seconds)} — Start Training trains on it")
 
     # ---- Own tokenizer / training only the tokenizer (2.14.1) -------------
     def _set_tokenizer_buttons(self, state) -> None:

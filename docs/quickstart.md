@@ -5,11 +5,15 @@ a CUDA GPU is used automatically when present.
 
 ## 1. Install
 
+From PyPI (2.18.0 on): `pip install auralite-ai`, with the extras below as
+`pip install "auralite-ai[serve]"`. In a clone:
+
 ```bash
 pip install -e .                 # core: torch + numpy            (training, generation, GUI)
 pip install -e '.[serve]'        # + FastAPI/uvicorn              (OpenAI-compatible server)
 pip install -e '.[hf]'           # + transformers, peft           (Hugging Face models, LoRA)
 pip install -e '.[qlora]'        # + bitsandbytes                 (4-/8-bit QLoRA; not macOS)
+pip install -e '.[data]'         # + datasets, pyarrow, zstandard (big data, 2.18: see below)
 pip install -e '.[test]'         # + pytest, hypothesis, httpx    (running the test suite)
 # .gguf models: prebuilt llama.cpp wheel — never a 10-minute source build
 pip install -e '.[gguf]' --only-binary llama-cpp-python \
@@ -137,6 +141,23 @@ computer would train (Windows and Linux can be mixed; same AuraLite and torch
 versions; allow Python through the firewall on private networks). The GUI
 has the same in the training tab's *Cluster* row. Details:
 [training.md](training.md) § 12.
+
+### Big data and big models (2.18)
+
+```bash
+auralite data prepare corpus/ --out data/corpus --vocab-size 8192     # once: token shards on disk
+auralite data prepare hf:HuggingFaceFW/fineweb-edu:sample-10BT --out data/fineweb \
+    --tokenizer hf:HuggingFaceTB/SmolLM2-135M --max-tokens 2000000000   # a Hub dataset, streamed
+auralite plan --preset 125m --memory 8GB                               # what fits
+auralite train --data data/corpus --preset 125m --memory-plan auto --max-tokens 500000000 \
+    --autosave run.pt --eval-every 500 --model big.pt
+auralite train --data data/corpus --resume run.pt --continue-run --model big.pt   # after a stop
+```
+
+Data of any size trains from disk (text over 256 MB is prepared by `train`
+itself); the memory plan splits a batch that would not fit, and a stopped or
+crashed run continues exactly. Details and measurements:
+[training.md](training.md) § 20.
 
 ### Your own image generator (model types: 2.14.2)
 

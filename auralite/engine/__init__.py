@@ -38,6 +38,25 @@ for _name in dir(_legacy):
 # `_legacy` (which still re-exports everything it used to define).
 from .dataset import PagedDataset, write_tokens_memmap  # noqa: E402
 
+# 2.18: big datasets (token shards) and big models (presets, memory plans)
+from .dataset import ShardedDataset  # noqa: E402
+from .losses import linear_cross_entropy  # noqa: E402
+from .shards import (  # noqa: E402
+    TextSources,
+    TokenShards,
+    download_hf_tokenizer,
+    is_dataset_folder,
+    prepare_dataset,
+)
+from .sizing import (  # noqa: E402
+    MODEL_PRESETS,
+    available_memory,
+    count_parameters,
+    estimate_training_memory,
+    plan_training,
+    preset_params,
+)
+
 # Same for the llama.cpp backends: `GGUFModelProxy` travels through `_legacy`
 # (name compatibility), the server runtime and its helpers are imported here.
 from .logging_utils import (  # noqa: E402

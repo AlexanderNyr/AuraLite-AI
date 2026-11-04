@@ -3,7 +3,7 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.17.0-orange)
+![Version](https://img.shields.io/badge/version-2.18.0-orange)
 ![Coverage](https://img.shields.io/badge/coverage-86%25-green)
 
 [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
@@ -13,7 +13,8 @@
 ## ⚡ Quickstart
 
 ```bash
-pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.17.0'   # Python 3.11–3.14; wheels: GitHub Releases (PyPI once published); in a clone: pip install -e '.[serve]'
+pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.18.0'
 auralite train --text corpus.txt --model model.pt
 auralite generate --model model.pt --prompt "Once upon a time" --length 80
 auralite serve --model model.pt      # OpenAI-compatible API on http://127.0.0.1:8000
@@ -33,6 +34,11 @@ auralite lora apply --base model.pt --adapter adapter.pt --merge --out chat2.pt 
 auralite distill --teacher teacher.gguf --prompts questions.txt --out chats.jsonl  # a teacher's dialogs (2.16)
 auralite train --data pairs.jsonl --resume chat.pt --method dpo --model dpo.pt     # DPO / SimPO (2.16)
 auralite chat --model chat.pt --json-schema person.json --prompt "Anna, 34, Riga"  # valid JSON (2.17)
+auralite data prepare corpus/ --out data/corpus --vocab-size 8192    # big data: token shards on disk (2.18)
+auralite data prepare hf:HuggingFaceFW/fineweb-edu:sample-10BT --tokenizer hf:HuggingFaceTB/SmolLM2-135M --max-tokens 2000000000 --out data/fineweb
+auralite plan --preset 350m --memory 16GB                            # will it fit? (2.18)
+auralite train --data data/fineweb --preset 125m --max-tokens 2000000000 --memory-plan auto --autosave run.pt --model big.pt
+auralite train --data data/fineweb --resume run.pt --continue-run --model big.pt   # after a crash or a stop (2.18)
 auralite-gui                         # desktop app: train, chat, quantize, evaluate, export
 ```
 
@@ -231,7 +237,7 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 auralite-gui
 | [docs/quickstart.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
 | [docs/faq.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
 | [docs/engine.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/engine.md) | inside the native engine: decode loop, KV cache, sampling, speculative decoding, MoE, BPE pre-tokenizer, context length, the 2.13 compute thread, batched decoding (2.14), JSON mode, JSON schemas and tool calls (2.17) — with measured numbers |
-| [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) | the training loop: what an epoch is, how validation is measured (honestly since 2.13), early stopping, speed, choosing a tokenizer, your own tokenizer and tokenizer-only training (2.14.1), the default recipe and how a run ends (Stop, Ctrl+C, time limits), folders of documents and chat fine-tuning on dialogs (2.15), the prompt's weight, LoRA on every layer, adapter files and chat-eval, dialogs from a teacher model, DPO and SimPO (2.16) — with measured numbers |
+| [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) | the training loop: what an epoch is, how validation is measured (honestly since 2.13), early stopping, speed, choosing a tokenizer, your own tokenizer and tokenizer-only training (2.14.1), the default recipe and how a run ends (Stop, Ctrl+C, time limits), folders of documents and chat fine-tuning on dialogs (2.15), the prompt's weight, LoRA on every layer, adapter files and chat-eval, dialogs from a teacher model, DPO and SimPO (2.16), big data and big models: token shards, Hugging Face datasets, model presets, memory plans, the loss in chunks, runs that continue exactly after a stop (2.18) — with measured numbers |
 | [docs/image.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/image.md) | the image generator: speed, schedule/EMA fixes, validation, DPM-Solver++, classes and guidance — with measured 2.9 → 2.10 numbers; 2.14.2: flow matching, the GAN, the patch-SWD quality score and the progress stages, measured on MNIST |
 | [docs/quantization.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md) | every method (dynamic/static INT8, QAT, GPTQ, AWQ, HQQ, half), what it actually buys, GGUF paths |
 | [docs/releasing.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/releasing.md) | for maintainers: tag → verified GitHub Release, GHCR image and (opt-in, tokenless) PyPI upload |
@@ -252,12 +258,19 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 auralite-gui
 - **NVIDIA GPU** (optional). No CUDA Toolkit is needed — only the driver: on Linux the default `torch` wheel from PyPI already contains CUDA; on Windows pick the CUDA build on [pytorch.org](https://pytorch.org/get-started/locally/).
 
 ### Install
+From PyPI (2.18.0 on) — the same extras as below:
+```bash
+pip install auralite-ai                 # core: torch, numpy, matplotlib (training, generation, GUI)
+pip install "auralite-ai[serve,data]"   # + the server, + big datasets (Hugging Face, Parquet, .zst)
+```
+From a clone:
 ```bash
 git clone https://github.com/AlexanderNyr/AuraLite-AI.git && cd AuraLite-AI
 pip install -e .              # core: torch, numpy, matplotlib (training, generation, GUI)
 pip install -e '.[serve]'     # + OpenAI/Ollama-compatible server (FastAPI, uvicorn)
 pip install -e '.[hf]'        # + Hugging Face models and LoRA fine-tuning (transformers, peft)
 pip install -e '.[qlora]'     # + 4-/8-bit QLoRA loading (bitsandbytes; not on macOS)
+pip install -e '.[data]'      # + big datasets: Hugging Face datasets, Parquet, .zst, Rust tokenizers (2.18)
 pip install -e '.[test]'      # + the test suite
 ```
 `pip install -r requirements.txt` installs the same core dependencies without installing the package (enough for `python gui_app.py` from the checkout). An installed AuraLite adds two commands: `auralite` (CLI, also `python -m auralite`) and `auralite-gui` (desktop app, also `python -m auralite.gui`).

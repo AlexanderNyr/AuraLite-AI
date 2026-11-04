@@ -1,3 +1,132 @@
+# 📦 v2.18.0 — big data and big models: token shards, Hugging Face datasets, memory plans, exact resumption
+
+Training data no longer has to fit in memory, and a big model no longer has
+to be guessed into it. `auralite data prepare` tokenizes files, folders,
+compressed and Parquet files and **Hugging Face datasets streamed from the
+Hub** into token shards on disk — in parallel worker processes, with bounded
+memory, and continuing after a stop to exactly the same shards — and
+training reads its batches from them. Raw data over 256 MB is prepared by
+`auralite train` itself, once. Model **presets** from 25M to 2.4B parameters,
+a **memory estimate and plan** (`auralite plan`, `--memory-plan auto`), the
+**loss in chunks** of tokens (no full logits tensor; also faster) and
+gradient checkpointing for loaded models make big models fit; `max_tokens`,
+periodic validation, timed autosaves and **`--continue-run`** — a stopped or
+crashed run goes on to the same last bit — make long runs practical. Fixed:
+continued training of a Muon model kept the learning rate of its checkpoint.
+Details: [docs/training.md § 20](docs/training.md#20-big-data-and-big-models-218).
+
+**What changed for existing users**
+
+| | 2.18.0 | 2.17.0 |
+|---|---|---|
+| `train --data` with more than 256 MB of text, compressed / Parquet files, `hf:` | tokenized into shards on disk first (once, reused) | read into memory (16 MiB of RAM per MiB of text) |
+| a folder with `auralite_dataset.json` | trains from the shards with their tokenizer, 1 epoch by default | — |
+| `continue_training` of a Muon model | follows the new run's schedule | kept the learning rate saved in the checkpoint |
+| loss with ≥ 2**24 logits per batch | in chunks of tokens (same loss, less memory, faster) | full logits |
+| `load_model` of a `.pt` | tensors mapped from the file; a big file's optimizer state read only when training continues | everything read into memory |
+| `.pt` checkpoints | also hold `run_state` (where a run stands) | — |
+| GUI training | `memory_plan="auto"`: a batch that does not fit is split | ran out of memory |
+
+Small runs are unchanged: their windows, order and loss path are bit for bit
+those of 2.17.
+
+**Token shards** (`auralite/engine/shards.py`, `auralite/_tokenize_worker.py`)
+
+- `prepare_dataset(sources, out_dir, ...)` / `auralite data prepare`:
+  sources are files, folders, globs (text, `.jsonl`, `.json`, `.parquet`;
+  `.gz`, `.bz2`, `.xz`, `.zst`) and `hf:NAME[:CONFIG][@SPLIT]`; records give
+  `--text-field`; dialog records, broken lines and non-UTF-8 files are
+  skipped and counted. The tokenizer: a file, a checkpoint, `hf:MODEL`
+  (`download_hf_tokenizer`, `HF_TOKEN` for gated models) or a new BPE fitted
+  on ~8M characters sampled from all over the data.
+- Worker processes (spawn) that import no torch (~55 MB each); with the
+  `tokenizers` package a Hugging Face tokenizer runs in Rust once it encodes
+  a sample to AuraLite's ids. Bounded memory: 293 MB for 60 MB of text,
+  303 MB for 180 MB.
+- `uint16` / `uint32` shards of 134M tokens, the manifest
+  `auralite_dataset.json` (tokenizer fingerprint, shards, read position of
+  every source, statistics), committed every 30 s: a stopped or crashed
+  preparation continues to identical shards. Documents end with the
+  end-of-text token or a blank line; the validation split is a hash of each
+  unit's place (1 %, at most 10M tokens).
+- `TokenShards` (`load_training_data(folder)`), `TextSources` (raw data that
+  `train()` prepares into `$AURALITE_HOME/datasets/<hash>` or `shards_dir`,
+  at most `prepare_max_tokens` / `max_tokens`), `find_prepared`,
+  `auralite data info`.
+- `ShardedDataset`: windows of memory-mapped shard files (at most 128 open),
+  never across two files; `permute_indices`, the keyed permutation an epoch
+  of more than 2**24 windows uses instead of a `randperm` list;
+  `WindowBatches.skip_batches`.
+
+**Training** (`auralite/engine/trainer.py`)
+
+- `train()` takes `TokenShards` and `TextSources`; a prepared dataset trains
+  with its tokenizer for one epoch, without early stopping unless asked;
+  without a validation split it holds out the end of its tokens.
+- `max_tokens`, `eval_every_steps` (the summary's `evaluations`),
+  `autosave_every_minutes`.
+- `continue_run`: checkpoints saved during a run hold `run_state` (position,
+  counters, random state, data identity, parameters, the schedule's decay);
+  continuing gives the uninterrupted run's weights to the last bit.
+- `loss_chunk_tokens` (`losses.py`: `linear_cross_entropy`, `ChunkedLoss`;
+  `ModernTransformer.forward(return_hidden=True)`).
+- `memory_plan` ("warn" default, "auto", "off"): the estimate in the log, a
+  warning, or micro-batches with gradient accumulation and checkpointing.
+- `use_gradient_checkpointing` also for a continued model
+  (`ModernTransformer.set_gradient_checkpointing`); the best epoch of a model
+  over 256 MB waits in a temporary file; DDP all-reduces once per optimizer
+  step with gradient accumulation (`no_sync`); the progress and ETA follow
+  `max_steps` / `max_tokens`.
+
+**Big models** (`auralite/engine/sizing.py`): `MODEL_PRESETS`,
+`count_parameters` (exact), `estimate_training_memory`, `plan_training`,
+`available_memory`; `auralite plan`; `train --preset`; the GUI's *Big*
+presets.
+
+**Loading** (`_legacy.py`, `safe_io.py`): `safe_torch_load(mmap=True)`; a
+checkpoint of 256 MB or more (`AURALITE_LAZY_STATE_MB`) keeps its optimizer
+state on disk until training continues (and checks the file did not change).
+
+**Fixed**
+
+- `_ChainedOptimizers.param_groups` (Muon + AdamW) was a list made once;
+  restoring the optimizer replaced the groups, so the learning-rate schedule
+  of a continued Muon run set the rate of groups no optimizer read, and the
+  run trained at the rate saved in its checkpoint (2.6–2.17; Muon is the
+  default since 2.12).
+
+**CLI**: `auralite data prepare|info`, `auralite plan`, `train --preset
+--max-tokens --eval-every --memory-plan --autosave --autosave-steps
+--autosave-minutes --continue-run --stream --shards-dir --text-field
+--hf-config --hf-split`; `--tokenizer hf:MODEL`.
+
+**GUI**: *📦 Prepare Dataset*, the *Big* presets, compressed and Parquet files
+in the file dialog, `memory_plan="auto"`.
+
+**Install**: the `data` extra (`datasets`, `pyarrow`, `zstandard`,
+`tokenizers`); the core needs none of them.
+
+**Measured** (docs/training.md § 20; 2 vCPU, 2 GB)
+
+| | 2.18.0 | 2.17.0 |
+|---|---|---|
+| prepare 60 MB of text, BPE 8,192 | 1 worker 7.1 MB/s, 2 workers 9.5 MB/s (180 MB: 14.2 MB/s), identical shards | — (in memory: 16 MiB of RAM per MiB) |
+| memory while preparing 60 / 180 MB | 293 / 303 MB (workers ~55 MB each) | — |
+| FineWeb-Edu from the Hub (SmolLM2 tokenizer, Rust) | 4,000 documents, 4.24M tokens in 11.4 s | — |
+| 15.5M model, 1M FineWeb tokens, 16 windows × 256 a step, 2 GB | warned, then `--memory-plan auto`: 4 × 4 accumulation, val loss 10.8 → 6.37 (1.99 bits/byte) in 16 min | out of memory |
+| that run continued from its step-240 autosave | identical final model, tensor for tensor | — |
+| Muon model: 3 epochs, then `continue_training` 2 | LR 0.004 → 0.02 → 0.004 as planned, 2.078 bits/byte | LR stuck at 0.004, 2.166 bits/byte |
+| loss, 2,048 tokens × 32,000 vocabulary (d 256), forward + backward | 687 ms, one chunk of logits | 728 ms, three to four full copies |
+| load a 338 MB checkpoint (120 MB of weights) | +279 MB peak, +159 MB after, 1.2 s | +495 MB, +399 MB, 1.4 s |
+| saved activations, 8 layers, 4 × 256 tokens, gradient checkpointing | 314 MB → 20 MB | the same (new models only) |
+
+The memory estimate of whole training steps was within −8 % to +17 % of the
+measured peak in five runs; the two runs it said would not fit were killed.
+
+**Tests**: `tests/test_bigdata_v218.py` (50 cases; 54 mutations of the new
+code, all caught); the optional formats run in the `optional-deps` CI job,
+where a skip is a failure.
+
 # 📦 v2.17.0 — JSON mode, JSON schemas and tool calls on the server
 
 The server now answers OpenAI's `response_format` (`json_object`,

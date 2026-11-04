@@ -18,7 +18,10 @@ runs train for every epoch asked for, can weigh the prompt, LoRA adapts every
 linear layer and saves to a file of its own, and `auralite chat-eval`
 measures a chat model (§ 16); a teacher model writes dialogs to fine-tune on
 (`auralite distill`, § 17), and preference pairs train a chat model with DPO
-or SimPO (§ 18).
+or SimPO (§ 18). Since 2.18 data of any size trains from token shards on disk
+(Hugging Face datasets streamed too), big models get presets and a memory
+plan, the loss of a big vocabulary runs in chunks, and a stopped run
+continues exactly where it stopped (§ 20).
 
 ## 1. An epoch is one pass over the text
 
@@ -1444,3 +1447,231 @@ docs/engine.md § 9 setup and `continue_training=True` for the extension. Sectio
 used `engine.train` with the parameters in the tables above and
 `max_steps=1500`. The loss on the entire held-out split was then computed over
 all of its non-overlapping 64-token windows.
+
+## 20. Big data and big models (2.18)
+
+Up to 2.17 the training text lived in memory: tokenizing it took about
+16 MiB of RAM per MiB of text (§ 4; `corpus_cache="mmap"` a quarter of
+that), so a few hundred megabytes were the limit of an 8 GB computer, and the
+loss of a big vocabulary held three full copies of the logits. 2.18 trains on
+data of any size from disk, prepared once, and plans the memory of a big
+model before it runs.
+
+### 20.1 Preparing a dataset
+
+`auralite data prepare` reads the data as a stream, tokenizes it and writes
+the token ids to files on disk, *token shards*:
+
+```bash
+auralite data prepare corpus/ --out data/corpus --vocab-size 8192
+auralite data prepare dump.jsonl.zst "wiki/*.txt.gz" --out data/mix \
+    --tokenizer hf:HuggingFaceTB/SmolLM2-135M
+auralite data prepare hf:HuggingFaceFW/fineweb-edu:sample-10BT --out data/fineweb \
+    --tokenizer hf:HuggingFaceTB/SmolLM2-135M --max-tokens 2000000000
+auralite data info data/fineweb
+```
+
+* **Sources**: files, folders and globs of text (`.txt`, `.md`, …), JSON
+  Lines, JSON and Parquet, each also compressed (`.gz`, `.bz2`, `.xz`;
+  `.zst` with Python 3.14 or the `zstandard` package; Parquet needs
+  `pyarrow`), and Hugging Face datasets, `hf:NAME[:CONFIG][@SPLIT]`,
+  streamed by the `datasets` package — nothing is downloaded whole.
+  `pip install "auralite-ai[data]"` installs all of them. Records give their
+  `--text-field` (default `text`); dialog records and broken lines are
+  skipped and counted, as are files that are not UTF-8.
+* **Tokenizer**: a tokenizer file or checkpoint, `hf:MODEL` (the model's
+  `tokenizer.json`, downloaded once; gated models need `HF_TOKEN`), or a new
+  BPE (`--vocab-size`, default 8192) fitted on about 8 million characters drawn
+  from all over the data. It is saved in the folder as `tokenizer.json`.
+* **Documents** end with the tokenizer's end-of-text token
+  (`<|endoftext|>`, `</s>`, …) or, without one, a blank line, as `train()`
+  joins documents (`--separator`). Token ids are stored as `uint16` when the
+  vocabulary has at most 65,536 tokens, else `uint32`, in files of 134
+  million tokens.
+* **Validation**: a unit of text — a record, or a part of about a megabyte of
+  a text file, cut after a line break — goes to the validation split with
+  probability `--val-fraction` (default 1 %), decided by a hash of its place,
+  so the same data always splits alike; at most `--val-max-tokens` (10M).
+* **Memory** is bounded by the work in flight, whatever the size of the data:
+  the main process needed 293 MB for 60 MB of text and 303 MB for 180 MB;
+  each worker process about 55 MB (it imports no torch).
+* **Stop and continue**: the manifest (`auralite_dataset.json`) records
+  every 30 seconds how far each source was read. Ctrl+C, the GUI's Stop, a
+  crash: the same command continues, to exactly the same shards — tested
+  with 22 interruptions of one run. A finished dataset is reused; other
+  settings for the same folder are refused (`--overwrite`).
+* **Speed** (2 vCPU; a 60 MB and a 180 MB corpus of tinyshakespeare
+  paragraphs, BPE 8,192; Qwen2.5's 151,665-token tokenizer on 12 MB):
+
+| tokenizer | workers | MB/s | tokens/s |
+|---|---|---|---|
+| AuraLite BPE 8,192 | 1 | 7.1 | 1.9 M |
+| AuraLite BPE 8,192 | 2 | 9.5 (60 MB), 14.2 (180 MB) | 2.5 M, 3.8 M |
+| Qwen2.5 `tokenizer.json`, AuraLite's own | 2 | 1.0 | 0.30 M |
+| Qwen2.5 `tokenizer.json`, the `tokenizers` package | (threads) | 1.6 | 0.45 M |
+| SmolLM2, FineWeb-Edu streamed from the Hub | (threads) | 1.7 (4,000 documents in 11.4 s) | 0.37 M |
+
+  The shards of one and two workers are identical. With the `tokenizers`
+  package installed (the `data` extra) a Hugging Face tokenizer runs in Rust,
+  on all cores, once a sample of the data encodes to the same ids as
+  AuraLite's own (`--no-fast` turns it off; it needs more memory: about 1 GB
+  with the FineWeb stream). Streaming a Hugging Face dataset holds the
+  `datasets` package's buffers too: 1.1 GB in all for the FineWeb run.
+
+### 20.2 Training on shards
+
+```bash
+auralite train --data data/fineweb --preset 125m --max-tokens 2000000000 \
+    --memory-plan auto --eval-every 500 --autosave run.pt --model big.pt
+```
+
+A prepared folder trains with its own tokenizer (a continued model must
+have the same one), for **one epoch** unless `epochs` is given, and without
+early stopping unless `early_stopping_patience` is given. Batches read their
+windows from the memory-mapped shard files; a window never spans two files.
+A small dataset whose documents all drew the training lot validates on the
+last `val_split` of its tokens. Above 2**24 windows (a 100 GB dataset has
+billions) an epoch's order is a keyed pseudo-random permutation computed
+batch by batch instead of a list of 8 bytes per window.
+
+Raw data needs no separate step: `auralite train --data big_corpus/` with
+more than 256 MB of text (`AURALITE_STREAM_THRESHOLD_MB`), compressed or
+Parquet files or `hf:` datasets prepares the shards first, in a folder under
+`~/.auralite/datasets` named after the data and the tokenizer (`--shards-dir`
+chooses), which the next run — and a continued model — reuses; at most
+`max_tokens` tokens of an `hf:` dataset. Dialogs and preference pairs are
+read in memory as before. In the GUI, *📦 Prepare Dataset* does the same for
+the selected file or folder; the prepared folder can then be selected like
+any other.
+
+A real run: 4,000 FineWeb-Edu documents (4.24M tokens, SmolLM2's tokenizer),
+a 15.5M-parameter model (`d_model` 256, 4 layers, the 49,152-token vocabulary
+tied), windows of 256 tokens, 16 per step, 1M tokens, on 2 vCPU with 2 GB of
+memory: the validation loss fell from 10.8 to 7.29 after 40 steps, 6.68 after 120
+and **6.37 (1.99 bits per byte) after 245 steps**, in 16 minutes at 1,044
+tokens/s, the process at 1.06 GB (the estimate: 0.80 GB for training on top
+of the 0.25 GB of the framework and the data). The same run continued from
+its step-240 autosave (`--continue-run`) ended with a model identical to the
+uninterrupted one, tensor for tensor.
+
+### 20.3 Long runs
+
+* `max_tokens` (`--max-tokens`) is a budget in training tokens: it sets
+  `max_steps`, and without `epochs` the passes over the data it needs.
+* `eval_every_steps` (`--eval-every`) also validates every N optimizer steps;
+  the summary lists them under `evaluations` (step, tokens, loss, bits per
+  byte).
+* `autosave_every_minutes` (`--autosave PATH`, every 30 minutes unless
+  `--autosave-steps` / `--autosave-minutes`).
+* **Continue a run exactly**: every `.pt` checkpoint saved during a run (the
+  autosaves, and the model saved after a stop) holds the run's position —
+  epoch, batch, counters, the random state of the step, the data's identity,
+  the run's parameters. `auralite train --data SAME --resume run.pt
+  --continue-run` (API: `load_model`, then `train(data, {"continue_training":
+  True, "continue_run": True})`) goes on as if the run had never stopped:
+  the same order of batches, learning-rate schedule and evaluations. A run
+  stopped after 30 of 280 steps (Muon, dropout 0.1, gradient accumulation 2,
+  periodic validation) and continued ended with the **same weights to the
+  last bit** as the uninterrupted run, on token shards and on a text alike.
+  Only where and how often it saves, reports and validates, its time budget
+  and `memory_plan` may change; a finished run, other data or a checkpoint
+  holding the best epoch's weights are refused.
+* **Fixed**: `continue_training` of a model trained with Muon (the default
+  since 2.12) kept the learning rate saved in its checkpoint whatever the
+  schedule said — the scheduler set the rate of parameter groups that
+  restoring the optimizer had replaced. 3 epochs on 300,000 characters of
+  tinyshakespeare, then 2 more with `continue_training`: in 2.17 the Muon
+  optimizer used 0.004 — the rate at the end of the first run — for every
+  step of the second; now it follows the new run's warmup, plateau at 0.02
+  and decay, and the validation loss after the continuation is 4.0 % lower
+  in bits per byte (2.078 against 2.166; the first run 2.287 in both).
+
+### 20.4 Big models
+
+**Presets** (`--preset`, `auralite plan --list`; the GUI's *Big* presets):
+
+| preset | `d_model` | layers | heads (kv) | `d_ff` | parameters, 32,000 tokens |
+|---|---|---|---|---|---|
+| 25m | 256 | 8 | 4 (2) | 768 | 22.7M |
+| 45m | 384 | 12 | 6 (2) | 1,024 | 43.5M |
+| 125m | 768 | 12 | 12 (4) | 2,048 | 124.7M |
+| 350m | 1,024 | 24 | 16 (4) | 2,816 | 336.1M |
+| 700m | 1,536 | 24 | 16 (4) | 4,096 | 693.0M |
+| 1.2b | 2,048 | 24 | 16 (4) | 5,632 | 1.21B |
+| 2.4b | 2,560 | 32 | 20 (4) | 6,912 | 2.37B |
+
+**Memory**: `auralite plan --preset 350m --memory 16GB --batch-size 32` adds
+up what a step holds — weights, gradients, optimizer state (Muon: one value
+per hidden weight, AdamW: two), activations, logits — and finds the
+micro-batch, gradient accumulation and checkpointing that fit:
+
+```
+model: 336.1M parameters (d_model 1024, 24 layers, vocab 32,000); windows of 1024 tokens, batch 32
+  total           63.2 GB (loss in chunks)
+fits as: batch_size 4, accumulation_steps 8 (about 12.1 GB)
+```
+
+Every run logs the same estimate and warns when it is more than is free;
+`memory_plan="auto"` (`--memory-plan auto`, the GUI's default) applies the
+plan — the same tokens per optimizer step, so the same training. The
+activation constants were measured on autograd's saved tensors; whole
+training steps peaked within −8 % to +17 % of the estimate in five CPU runs,
+and the two runs it said would not fit were the two the system killed.
+The FineWeb run above with 16 windows a step was killed at 1.3 GB after the
+warning; with `--memory-plan auto` it ran as 4 windows × 4 accumulation
+steps.
+
+**The loss in chunks**: the output layer and the cross-entropy are computed
+a chunk of tokens at a time (`loss_chunk_tokens`, default "auto": once a
+batch has 2**24 logits), with the gradients accumulated in the forward
+pass, so one chunk's logits exist instead of three to four full copies. The
+loss and gradients equal the usual ones (float32: within 1e-6), and it was
+faster too:
+
+| tokens × vocabulary (`d_model`) | usual | chunks |
+|---|---|---|
+| 2,048 × 8,192 (128) | 139 ms | 122 ms |
+| 4,096 × 8,192 (256) | 396 ms | 338 ms |
+| 2,048 × 32,000 (256) | 728 ms | 687 ms |
+| 1,024 × 49,152 (256) | 606 ms | 568 ms |
+
+(forward and backward of the loss alone, 2 threads). Default small runs
+(32 × 64 tokens × 512) stay on the usual path, bit for bit as before.
+
+**Gradient checkpointing** (`use_gradient_checkpointing`, now also for a
+continued model) keeps only each block's input: the saved activations of an
+8-layer model fell from 314 MB to 20 MB per batch (4 × 256 tokens), for about
+a third more compute (§ 4).
+
+**Loading**: `load_model` maps a checkpoint's tensors from the file instead
+of reading them into a second copy, and a checkpoint of 256 MB or more
+(`AURALITE_LAZY_STATE_MB`) keeps its optimizer state — twice the weights with
+AdamW — on disk until training continues: for a 338 MB checkpoint of a
+31M-parameter model (120 MB of weights) the memory grew by 279 MB at most
+and 159 MB after the load, against 495 MB and 399 MB in 2.17, and the load
+took 1.2 s instead of 1.4 s. A big model's best epoch waits in a temporary
+file, not in a copy in memory.
+
+### 20.5 Not yet
+
+Pretrained Hugging Face models (Llama, Qwen, Mistral) imported into the
+native engine, QLoRA without bitsandbytes and the export back to Hugging
+Face are the next part. Token shards train on one computer (a cluster run
+reads a text).
+
+### 20.6 Reproduce
+
+```bash
+python ~/probes/m_corpus.py big/c60 20 3                 # 60 MB of tinyshakespeare paragraphs
+auralite data prepare big/c60 --out big/ds60 --tokenizer bpe8k.json --workers 1   # and --workers 2
+auralite data prepare hf:HuggingFaceFW/fineweb-edu:sample-10BT --out big/fw \
+    --tokenizer hf:HuggingFaceTB/SmolLM2-135M --max-documents 4000 --val-fraction 0.02
+auralite train --data big/fw --params fw.json --max-tokens 1000000 --eval-every 40 \
+    --memory-plan auto --autosave fw_auto.pt --autosave-steps 80 --model fw.pt
+pytest tests/test_bigdata_v218.py
+```
+
+(`fw.json`: `{"d_model": 256, "n_heads": 4, "n_kv_heads": 2, "n_layers": 4,
+"d_ff": 704, "seq_length": 256, "batch_size": 16, "seed": 0, "dropout": 0.0,
+"tie_word_embeddings": true}`; `bpe8k.json` from `auralite tokenizer train`
+or the folder of a first `data prepare`.)

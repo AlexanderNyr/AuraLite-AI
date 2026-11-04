@@ -203,7 +203,8 @@ class LoRAMixin:
             self.default_chat_template = str(data["chat_template"])
         # The optimizer state of the base model does not fit the new parameters.
         for name in ("_resume_optimizer_state", "_resume_scheduler_state",
-                     "_resume_scaler_state", "optimizer", "scheduler", "scaler"):
+                     "_resume_scaler_state", "_resume_optimizer_file", "_resume_run_state",
+                     "_run_state", "optimizer", "scheduler", "scaler"):
             if hasattr(self, name):
                 setattr(self, name, None)
         info = {"adapters": len(model.lora_pairs()), "new_rows": vocab - have, "merged": False}

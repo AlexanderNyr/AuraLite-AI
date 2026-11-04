@@ -9,10 +9,20 @@ through ``AuraLiteEngine`` as before.
 (several documents, validated on whole held-out documents) and a
 :class:`~auralite.engine.dialogs.DialogSet` (chat fine-tuning: the loss
 learns the assistant's replies only).
+
+2.18: big data and big models — :class:`~auralite.engine.shards.TokenShards`
+(prepared token files, read from disk as batches need them) and
+:class:`~auralite.engine.shards.TextSources` (raw data too big for the memory,
+tokenized into shards first), ``max_tokens``, ``eval_every_steps``, exact
+resumption of a run (``continue_run``), the loss in chunks of tokens
+(``loss_chunk_tokens``), memory estimates and plans (``memory_plan``).
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import itertools
+import json
 import math
 import os
 import tempfile
@@ -33,7 +43,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from auralite.engine import cluster as _cluster
 from auralite.engine import compute_thread as _compute
 from auralite.engine import dialogs as _dialogs
+from auralite.engine import shards as _shards
+from auralite.engine import sizing as _sizing
 from auralite.engine.corpus import TextCorpus
+from auralite.engine.losses import AUTO_MIN_VALUES, ChunkedLoss, auto_chunk_tokens
+from auralite.engine.shards import TextSources, TokenShards
 from auralite.engine.dataset import (
     IGNORE_INDEX,
     CharDataset,
@@ -88,7 +102,8 @@ _SetupStopped = SetupStopped
 #: puts them back, so the model in memory stays usable (2.14.1).
 _SETUP_STATE = ("tokenizer", "vocab_size", "model", "optimizer", "optimizer_name", "scheduler",
                 "scaler", "params_used", "backend", "gguf_path", "hf_path",
-                "default_chat_template", "last_val_loss", "last_val_bpb", "_ddp_model")
+                "default_chat_template", "last_val_loss", "last_val_bpb", "_ddp_model",
+                "_run_state", "_resume_run_state")
 
 
 class _ReplyLoss(nn.Module):
@@ -158,6 +173,70 @@ def _zero_rows(grad: torch.Tensor, rows: int) -> torch.Tensor:
     grad = grad.clone()
     grad[:rows] = 0
     return grad
+
+
+#: A model whose weights take more than this keeps the best epoch's weights in
+#: a temporary file instead of a copy in memory (2.18).
+_BEST_IN_MEMORY_BYTES = 256 << 20
+
+#: memory_plan="auto" plans for this share of the free memory (2.18).
+_MEMORY_MARGIN = 0.85
+
+#: What ``run_state`` must agree on for ``continue_run`` (2.18).
+_RUN_KEYS = ("seq_length", "batch_size", "accumulation_steps", "sample_stride")
+
+
+class _AnyEvent:
+    """``is_set()`` of several events: a stop and a finish both stop a preparation."""
+
+    def __init__(self, *events: Any):
+        self.events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)
+
+
+def _run_data_id(shards: TokenShards | None, text: str) -> dict:
+    """What a run trained on, so that ``continue_run`` can check it is the same data."""
+    if shards is not None:
+        return {"kind": "shards", "dataset_id": shards.dataset_id,
+                "train_tokens": shards.train_tokens}
+    return {"kind": "text", "chars": len(text), "sha256": _tok_io.text_sha256(text)}
+
+
+def _decay_state(scheduler: Any) -> dict | None:
+    """A decay begun early (a finish), which the scheduler's own state leaves out (2.12)."""
+    start = getattr(scheduler, "decay_from", None)
+    if start is None:
+        return None
+    return {"decay_from": int(start),
+            "decay_from_mult": getattr(scheduler, "decay_from_mult", None),
+            "decay_from_lrs": [float(x) for x in getattr(scheduler, "decay_from_lrs", []) or []]}
+
+
+def _restore_decay(scheduler: Any, state: dict | None) -> None:
+    if not state:
+        return
+    scheduler.decay_from = int(state["decay_from"])
+    if state.get("decay_from_mult") is not None and hasattr(scheduler, "decay_from_mult"):
+        scheduler.decay_from_mult = float(state["decay_from_mult"])
+    if state.get("decay_from_lrs") and hasattr(scheduler, "decay_from_lrs"):
+        scheduler.decay_from_lrs = [float(x) for x in state["decay_from_lrs"]]
+
+
+def _json_safe(value: Any) -> bool:
+    """True for a value a checkpoint can keep as plain JSON (a run's parameters)."""
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _remove_quietly(path: str | None) -> None:
+    if path:
+        with contextlib.suppress(OSError):
+            os.remove(path)
 
 
 def _lora_param_groups(model: nn.Module, weight_decay: float, frozen_rows: bool) -> list[dict]:
@@ -262,13 +341,15 @@ class TrainerMixin:
     # ---- Validation ----------------------------------------------------
     @torch.no_grad()
     def _evaluate(self, loader, criterion, max_batches: int | None = None,
-                  on_batch: Callable[[int, int], None] | None = None) -> float | None:
+                  on_batch: Callable[[int, int], None] | None = None,
+                  chunked: ChunkedLoss | None = None) -> float | None:
         """Mean per-token cross-entropy on `loader`, or None if it is empty.
 
         Batches are weighted by their token count (2.8 averaged batch means, so a
         short last batch counted as much as a full one). ``on_batch(done,
         total)`` follows the batches (2.14.1, the progress bar). 2.15: only
         targets that are not ``IGNORE_INDEX`` count (dialogs: the replies).
+        2.18: with `chunked` the head and the loss run in chunks of tokens.
         """
         self.model.eval()
         total, count = 0.0, 0
@@ -281,8 +362,13 @@ class TrainerMixin:
                     break
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
-                out = self.model(xb)
-                loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
+                if chunked is not None:
+                    hidden = self.model(xb, return_hidden=True)
+                    loss = chunked(hidden.reshape(-1, hidden.size(-1)),
+                                   cast(Any, self.model).head.weight, yb.reshape(-1))
+                else:
+                    out = self.model(xb)
+                    loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
                 # 2.15: dialogs learn only some targets; plain text learns all
                 learned = int((yb != IGNORE_INDEX).sum())
                 total += loss.item() * learned
@@ -387,7 +473,8 @@ class TrainerMixin:
                     f"{passes:.1f} times; dropout above {AUTO_DROPOUT_MAX_PASSES})")
         return chosen
 
-    def train(self, training_text: str | TextCorpus | DialogSet | PreferenceSet, params: dict,
+    def train(self, training_text: str | TextCorpus | DialogSet | PreferenceSet | TokenShards
+              | TextSources, params: dict,
               progress_callback=None, stop_event=None, finish_event=None, tokenizer=None):
         """Train (or continue training) the model.
 
@@ -416,6 +503,29 @@ class TrainerMixin:
 
         `tokenizer` (2.14.1): train a new model with this tokenizer instead
         of building one (see also the ``tokenizer_path`` parameter).
+
+        2.18, big data: :class:`~auralite.engine.shards.TokenShards` (a folder
+        of ``auralite data prepare``) trains from the files on disk, with the
+        dataset's tokenizer, for one epoch unless ``epochs`` is given, without
+        early stopping unless ``early_stopping_patience`` is given;
+        :class:`~auralite.engine.shards.TextSources` (raw data too big for the
+        memory, compressed or Parquet files, Hugging Face datasets) is first
+        tokenized into shards in ``shards_dir`` (default: a folder under
+        ``$AURALITE_HOME/datasets`` that later runs reuse), at most
+        ``prepare_max_tokens`` tokens (default ``max_tokens``). Long runs:
+        ``max_tokens`` (a budget in training tokens), ``eval_every_steps``
+        (validation every N optimizer steps too, in the summary's
+        ``evaluations``), ``autosave_every_minutes``; checkpoints saved during
+        a run carry its position, and ``continue_run=True`` (with
+        ``continue_training``, after ``load_model`` of such a checkpoint)
+        continues that run exactly where it stopped: the same data order,
+        schedule and counters. Big models: ``loss_chunk_tokens`` ("auto": the
+        output layer and the loss in chunks of tokens once a batch has 2**26
+        logits; 0 off; N tokens per chunk), ``memory_plan`` ("warn": log the
+        estimated memory and warn when it is more than is free; "auto": also
+        split the batch into micro-batches with gradient accumulation and turn
+        on gradient checkpointing as needed; "off"), and
+        ``use_gradient_checkpointing`` for a continued model too.
 
         2.16: a :class:`~auralite.engine.preference.PreferenceSet` (pairs of a
         prompt, a chosen and a rejected reply) trains the chat model in memory
@@ -577,7 +687,12 @@ class TrainerMixin:
         # 2.15: changes to the model in memory that a stop before the first
         # step takes back (new token rows, LoRA adapters), newest last
         self._setup_undo: list[Callable[[], Any]] = []
+        self._best_tmp_file: str | None = None
         try:
+            if isinstance(training_text, TextSources):
+                # 2.18: data too big for the memory is tokenized into shards first
+                training_text = self._prepare_text_sources(
+                    training_text, params, progress_callback, stop_event, finish_event, tokenizer)
             training_text, params, corpus_info = self._resolve_training_data(training_text,
                                                                              params)
             with _compute.run_inline():
@@ -626,6 +741,8 @@ class TrainerMixin:
             # Success, Ctrl+C/stop_event and exceptions alike: never leave the
             # anonymous corpus memmap behind (see `_release_corpus_tempfile`).
             self._release_corpus_tempfile()
+            _remove_quietly(self._best_tmp_file)          # 2.18: best weights on disk
+            self._best_tmp_file = None
             self._setup_undo = []
             # 2.16: the hooks that kept a LoRA run off the base model's token
             # rows go with the run (a later full fine-tune trains every row)
@@ -635,7 +752,8 @@ class TrainerMixin:
             _compute.release_caller_pool()
 
     def _resolve_training_data(self, data: Any, params: dict
-                               ) -> tuple[str | DialogSet | PreferenceSet, dict, dict]:
+                               ) -> tuple[str | DialogSet | PreferenceSet | TokenShards, dict,
+                                          dict]:
         """``(text or dialogs, params, corpus info)`` for `train` (2.15).
 
         A :class:`TextCorpus` becomes its training text; when it holds whole
@@ -660,6 +778,13 @@ class TrainerMixin:
             raise ValueError(f"method {method!r} trains on preference pairs (records with a "
                              f"prompt, a chosen and a rejected reply), not on "
                              f"{'dialogs' if isinstance(data, DialogSet) else 'text'}")
+        if isinstance(data, TokenShards):
+            # 2.18: prepared token shards, read from disk
+            if int(params.get("cluster_workers") or 0) > 0 \
+                    or getattr(self, "_cluster", None) is not None:
+                raise ValueError("token shards train on one computer: train without "
+                                 "cluster_workers")
+            return data, params, {"documents": data.documents, "dataset": str(data.folder)}
         if isinstance(data, DialogSet):
             if int(params.get("cluster_workers") or 0) > 0 \
                     or getattr(self, "_cluster", None) is not None:
@@ -682,8 +807,191 @@ class TrainerMixin:
             return text, params, info
         if not isinstance(data, str):
             raise TypeError(f"train() takes a text, a TextCorpus or a DialogSet (2.16: or a "
-                            f"PreferenceSet), not {type(data).__name__}")
+                            f"PreferenceSet; 2.18: TokenShards or TextSources), not "
+                            f"{type(data).__name__}")
         return data, params, {}
+
+    # ---- Long runs and big models (2.18) --------------------------------
+    #: Parameters a continued run may change: where and how often it saves,
+    #: reports and validates, and its time budget.
+    _RUN_OVERRIDES = ("autosave_every", "autosave_every_steps", "autosave_every_minutes",
+                      "autosave_path", "progress_every_batches", "progress_every_seconds",
+                      "time_budget_s", "eval_every_steps", "memory_plan")
+
+    def _continue_run_params(self, params: dict, dialogs: bool) -> tuple[dict, dict]:
+        """``(the run's parameters, its state)`` for ``continue_run``."""
+        state = getattr(self, "_resume_run_state", None)
+        if not isinstance(state, dict) or not isinstance(state.get("params"), dict):
+            raise ValueError("continue_run continues a run from a checkpoint saved during it "
+                             "(autosave_every_steps, autosave_every_minutes, or the model saved "
+                             "after a stop): load that checkpoint first")
+        if dialogs:
+            raise ValueError("continue_run is for text and token shards (a dialog run starts "
+                             "anew)")
+        if state.get("finished"):
+            raise ValueError("the run in this checkpoint has finished: train on without "
+                             "continue_run (continue_training)")
+        if state.get("restored_best"):
+            raise ValueError("this checkpoint holds the best epoch's weights, not the run's "
+                             "last ones: continue from an autosave of the run")
+        merged = dict(state["params"])
+        changed = sorted(key for key, value in params.items()
+                         if key not in self._RUN_OVERRIDES
+                         and key not in ("continue_run", "continue_training")
+                         and key in merged and merged[key] != value)
+        if changed:
+            logger.warning(f"[AuraLite] continue_run keeps the run's own {', '.join(changed)}")
+        for key in self._RUN_OVERRIDES:
+            if key in params:
+                merged[key] = params[key]
+        # what the run's memory plan chose (its micro-batches, accumulation,
+        # checkpointing, loss chunks) is the run's own too
+        for key, saved in (("batch_size", "batch_size"),
+                           ("accumulation_steps", "accumulation_steps"),
+                           ("loss_chunk_tokens", "chunk_tokens"),
+                           ("use_gradient_checkpointing", "gradient_checkpointing")):
+            if state.get(saved) is not None:
+                merged[key] = state[saved]
+        merged.update(continue_training=True, continue_run=True)
+        self._resume_run_state = None
+        return merged, state
+
+    def _memory_plan(self, native: Any, mode: str, micro: int, accumulation: int,
+                     seq_length: int, *, amp: str, optimizer: str, lora_rank: int,
+                     chunk_tokens: int, auto_chunk: bool, run_fixed: bool
+                     ) -> tuple[dict | None, int, int, int]:
+        """``(estimate, micro-batch, accumulation, chunk tokens)``: log what the run
+        needs in memory; with `mode` "auto" fit the batch and checkpointing to it."""
+        try:
+            dims: dict[str, Any] = dict(
+                d_model=int(native.d_model), n_layers=int(native.n_layers),
+                n_heads=int(native.n_heads), d_ff=int(native.d_ff),
+                vocab_size=int(native.head.out_features), n_kv_heads=native.n_kv_heads,
+                tie_word_embeddings=bool(native.tie_word_embeddings),
+                optimizer="muon" if optimizer == "muon" else "adamw", amp=amp,
+                lora_rank=lora_rank, dropout=float(getattr(native, "dropout", 0) or 0),
+                device=self.device.type, use_moe=bool(getattr(native, "use_moe", False)),
+                num_experts=int(getattr(native, "num_experts", 4) or 4))
+        except (AttributeError, TypeError, ValueError):
+            return None, micro, accumulation, chunk_tokens
+        chunked = None if auto_chunk else bool(chunk_tokens)
+        checkpointing = bool(getattr(native, "use_gradient_checkpointing", False))
+        free = _sizing.available_memory(self.device.type)
+        estimate = _sizing.estimate_training_memory(
+            batch_size=micro, seq_length=seq_length, gradient_checkpointing=checkpointing,
+            chunked_loss=chunked, **dims)
+        # the framework and the weights are in memory already: the run needs the rest
+        held = estimate["overhead"] + estimate["weights"]
+        budget = int(_MEMORY_MARGIN * free) + held if free else 0
+        if mode == "auto" and free and not run_fixed and estimate["total"] > budget:
+            plan = _sizing.plan_training(budget, batch_size=micro * accumulation,
+                                         seq_length=seq_length, chunked_loss=chunked, **dims)
+            if plan["fits"]:
+                micro, accumulation = plan["micro_batch"], plan["accumulation_steps"]
+                if plan["gradient_checkpointing"] and not checkpointing \
+                        and hasattr(native, "set_gradient_checkpointing"):
+                    native.set_gradient_checkpointing(True)
+                    self._setup_undo.append(lambda m=native: m.set_gradient_checkpointing(False))
+                estimate = plan["estimate"]
+                logger.info(f"[AuraLite] memory_plan=auto: batches of {micro} windows x "
+                            f"{accumulation} accumulation steps"
+                            + (", gradient checkpointing" if plan["gradient_checkpointing"]
+                               else "") + f" fit the {_sizing.format_bytes(free)} free")
+            else:
+                logger.warning("[AuraLite] WARNING: memory_plan=auto found no batch that fits "
+                               f"the {_sizing.format_bytes(free)} free: a smaller model, LoRA "
+                               "or a GPU")
+        if auto_chunk and estimate["chunked_loss"] and not chunk_tokens:
+            chunk_tokens = auto_chunk_tokens(dims["vocab_size"])
+        parts = ", ".join(f"{name} {_sizing.format_bytes(estimate[name])}" for name in
+                          ("weights", "gradients", "optimizer", "activations", "logits"))
+        need = estimate["total"] - held
+        logger.info(f"[AuraLite] Memory: training needs about "
+                    f"{_sizing.format_bytes(need + estimate['weights'])} ({parts})"
+                    + (f"; {_sizing.format_bytes(free)} free" if free else ""))
+        if free and need > free and mode != "auto":
+            logger.warning(f"[AuraLite] WARNING: the run may need more memory than is free "
+                           f"({_sizing.format_bytes(need)} more > "
+                           f"{_sizing.format_bytes(free)}): memory_plan=\"auto\" (CLI: "
+                           f"--memory-plan auto) splits the batch and turns on gradient "
+                           f"checkpointing as needed")
+        return estimate, micro, accumulation, chunk_tokens
+
+    # ---- Big raw data (2.18) -------------------------------------------
+    def _prepare_text_sources(self, sources: TextSources, params: dict, progress_callback: Any,
+                              stop_event: Any, finish_event: Any, tokenizer: Any
+                              ) -> TokenShards:
+        """Tokenize `sources` into token shards (once; later runs reuse them)."""
+        resuming = bool(params.get("continue_training") and self.model is not None
+                        and self.tokenizer is not None)
+        if resuming:
+            tok = self.tokenizer
+        elif tokenizer is not None:
+            tok = tokenizer
+        elif params.get("tokenizer_path"):
+            tok = _shards.resolve_tokenizer(params["tokenizer_path"])
+        else:
+            tok = None
+        kind = str(params.get("tokenizer", DEFAULT_RECIPE["tokenizer"]))
+        vocab = int(params.get("bpe_vocab_size", DEFAULT_RECIPE["bpe_vocab_size"]))
+        pretokenizer = str(params.get("bpe_pretokenizer", "gpt"))
+        val_fraction = float(params.get("val_split", DEFAULT_RECIPE["val_split"]) or 0.0)
+        limit = params.get("prepare_max_tokens") or params.get("max_tokens") or None
+        settings = {"tokenizer": (_shards.tokenizer_fingerprint(tok) if tok is not None else
+                                  [kind, vocab, pretokenizer]),
+                    "val": val_fraction, "limit": limit}
+        if not params.get("shards_dir") and tok is not None:
+            # a dataset prepared before with this tokenizer (the first run of a model)
+            found = _shards.find_prepared(sources.sources, tok, text_field=sources.text_field,
+                                          hf_config=sources.hf_config,
+                                          hf_split=sources.hf_split, val_fraction=val_fraction,
+                                          max_tokens=int(limit) if limit else None)
+            if found is not None:
+                logger.info(f"[AuraLite] {sources.describe()}: reusing the token shards in "
+                            f"{found.folder}")
+                return found
+        folder = params.get("shards_dir") or str(self._default_shards_dir(sources, settings))
+        if limit is None and any(str(s).lower().startswith("hf:") for s in sources.sources):
+            logger.warning("[AuraLite] WARNING: no max_tokens or prepare_max_tokens: the whole "
+                           "Hugging Face dataset is prepared, which can take very long")
+        logger.info(f"[AuraLite] {sources.describe()}: tokenizing it into token shards in "
+                    f"{folder} (once: later runs reuse them)")
+        epochs = int(params.get("epochs", 1) or 1)
+        started = time.time()
+
+        def emit(info: dict) -> None:
+            share = float(info.get("stage_percent") or 0.0) / 100.0
+            self._invoke_progress(progress_callback, 0, epochs, 0.0, None, info={
+                "phase": "setup", "percent": 2.0 * share, "elapsed": time.time() - started,
+                "is_epoch_end": False, "batch": 0, "batches": 0, **info})
+
+        shards = _shards.prepare_dataset(
+            sources.sources, folder, tokenizer=tok, vocab_size=vocab, tokenizer_kind=kind,
+            pretokenizer=pretokenizer, val_fraction=val_fraction, text_field=sources.text_field,
+            hf_config=sources.hf_config, hf_split=sources.hf_split,
+            max_tokens=int(limit) if limit else None,
+            progress_callback=emit if progress_callback is not None else None,
+            stop_event=_AnyEvent(stop_event, finish_event),
+            progress_every_s=float(params.get("progress_every_seconds", 0.5) or 0.5))
+        if shards.stopped:
+            raise _SetupStopped("prepare")
+        return shards
+
+    @staticmethod
+    def _default_shards_dir(sources: TextSources, settings: dict) -> Path:
+        """``$AURALITE_HOME/datasets/<hash of the data and the settings>``."""
+        items: list[Any] = []
+        for item in sources.sources:
+            name = os.fspath(item)
+            if name.lower().startswith("hf:"):
+                items.append([name, sources.hf_config, sources.hf_split, sources.text_field])
+                continue
+            for path in _shards.stream_files(name):
+                stat = os.stat(path)
+                items.append([os.path.abspath(path), stat.st_size, stat.st_mtime_ns])
+        key = hashlib.sha256(json.dumps([items, settings], sort_keys=True,
+                                        default=str).encode("utf-8")).hexdigest()[:16]
+        return _shards.auralite_home() / "datasets" / key
 
     # ---- Only the tokenizer (2.14.1) -----------------------------------
     def train_tokenizer(self, text: str | TextCorpus, vocab_size: int | None = None, *,
@@ -709,6 +1017,18 @@ class TrainerMixin:
         """
         split = DEFAULT_RECIPE["val_split"] if val_split is None else float(val_split)
         fit_chars = None
+        if isinstance(text, TokenShards):
+            raise ValueError("a prepared dataset has its tokenizer already (it was tokenized "
+                             "with it)")
+        if isinstance(text, TextSources):
+            # 2.18: big raw data: fitted on a sample drawn from all over it
+            tok, info = _shards.train_sample_tokenizer(
+                text.sources, vocab_size=int(vocab_size or DEFAULT_RECIPE["bpe_vocab_size"]),
+                kind=kind, pretokenizer=pretokenizer, text_field=text.text_field)
+            self.last_tokenizer_info = info
+            if path:
+                _tok_io.save_tokenizer(tok, path, training=info)
+            return tok
         if isinstance(text, TextCorpus):
             text, fit_chars = text.layout(split)
         tok, info = _tok_io.train_tokenizer(
@@ -787,7 +1107,7 @@ class TrainerMixin:
             self._corpus_cache_path = None
         logger.debug(f"[AuraLite] removed temporary corpus memmap {path}")
 
-    def _train_impl(self, training_text: str | DialogSet, params: dict,
+    def _train_impl(self, training_text: str | DialogSet | TokenShards, params: dict,
                     progress_callback=None, stop_event=None, finish_event=None,
                     tokenizer=None, corpus_info: dict | None = None):
         """Body of :meth:`train`, split out so its temp files are released on every exit."""
@@ -795,8 +1115,16 @@ class TrainerMixin:
         dialogs: DialogSet | None = None
         if isinstance(training_text, DialogSet):
             dialogs, training_text = training_text, ""
+        shards: TokenShards | None = None
+        if isinstance(training_text, TokenShards):
+            shards, training_text = training_text, ""      # 2.18: token files on disk
         if not isinstance(getattr(self, "_setup_undo", None), list):
             self._setup_undo = []          # called without train()
+        # 2.18: continuing an interrupted run takes that run's own parameters
+        run_state_in: dict | None = None
+        if params.get("continue_run"):
+            params, run_state_in = self._continue_run_params(params, dialogs is not None)
+        self._run_state = None
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
             raise ValueError(
@@ -831,7 +1159,7 @@ class TrainerMixin:
         # the measurements behind each value are in docs/training.md § 8.
         recipe = DEFAULT_RECIPE
         lr         = params.get("lr", recipe["lr"])
-        epochs     = params.get("epochs", 100)
+        epochs     = params.get("epochs", 1 if shards is not None else 100)
         batch_size = params.get("batch_size", recipe["batch_size"])
         dropout    = params.get("dropout", recipe["dropout"])
         # 2.14: "auto" builds the model with dropout and switches it off once
@@ -869,7 +1197,8 @@ class TrainerMixin:
         patience = params.get("early_stopping_patience")
         patience_given = patience is not None and not is_auto(patience)
         if not patience_given:
-            patience = 0 if dialogs is not None else recipe["early_stopping_patience"]
+            patience = (0 if dialogs is not None or shards is not None
+                        else recipe["early_stopping_patience"])
         early_stopping_patience = max(0, int(patience or 0))
         if dialogs is not None and not patience_given:
             logger.info("[AuraLite] Dialogs: early stopping is off (set "
@@ -894,6 +1223,14 @@ class TrainerMixin:
             raise ValueError(f"lora_embeddings must be 'new' or 'all', got {lora_embeddings!r}")
         resume_training_state = params.get("resume_training_state", True)
         use_ddp      = params.get("use_ddp", False)
+        # 2.18: long runs and big models
+        max_tokens = max(0, int(params.get("max_tokens", 0) or 0))
+        eval_every_steps = max(0, int(params.get("eval_every_steps", 0) or 0))
+        autosave_every_minutes = max(0.0, float(params.get("autosave_every_minutes", 0) or 0))
+        memory_plan = str(params.get("memory_plan", "warn") or "warn").strip().lower()
+        if memory_plan not in ("off", "warn", "auto"):
+            raise ValueError(f"memory_plan must be 'off', 'warn' or 'auto', got {memory_plan!r}")
+        loss_chunk_tokens = params.get("loss_chunk_tokens", "auto")
         # 2.14: a run on several computers (cluster.py): DDP over gloo on the
         # CPU, the main computer (rank 0) decides when to stop.
         cluster = getattr(self, "_cluster", None)
@@ -965,7 +1302,7 @@ class TrainerMixin:
         # ---- Reproducibility (v2.6.2) --------------------------------
         # Seed torch/numpy BEFORE the tokenizer trains, the model initializes
         # and the DataLoader starts shuffling so a full run can be replayed.
-        if seed is not None:
+        if seed is not None and run_state_in is None:
             torch.manual_seed(int(seed))
             np.random.seed(int(seed))
             logger.info(f"[AuraLite] Seed set: {seed} (torch & numpy RNG)")
@@ -977,6 +1314,14 @@ class TrainerMixin:
 
         resuming = bool(continue_training and self.model is not None
                         and self.tokenizer is not None)
+        if run_state_in is not None:
+            if not resuming:
+                raise ValueError("continue_run needs the run's checkpoint loaded first "
+                                 "(load_model) and continue_training=True")
+            data_id = _run_data_id(shards, training_text)
+            if run_state_in.get("data") != data_id:
+                raise ValueError("continue_run: this is not the data the run trained on (the "
+                                 "same text or prepared dataset is needed)")
 
         optimizer_state_to_restore = None
         scheduler_state_to_restore = None
@@ -986,6 +1331,9 @@ class TrainerMixin:
                 optimizer_state_to_restore = self.optimizer.state_dict()
             elif self._resume_optimizer_state is not None:
                 optimizer_state_to_restore = self._resume_optimizer_state
+            elif getattr(self, "_resume_optimizer_file", None):
+                # 2.18: a big checkpoint's optimizer state is read only now
+                optimizer_state_to_restore = cast(Any, self)._resume_optimizer_from_file()
 
             if self.scheduler is not None:
                 scheduler_state_to_restore = self.scheduler.state_dict()
@@ -1133,7 +1481,33 @@ class TrainerMixin:
         elif not resuming and (tok_kind == "bpe" or tokenizer_path or tokenizer is not None) \
                 and val_split > 0:
             fit_chars = validation_split_point(training_text, val_split)
-        if not resuming and cluster is not None and not cluster.is_main:
+        if run_state_in is not None and run_state_in.get("fit_chars") is not None:
+            fit_chars = int(run_state_in["fit_chars"])     # 2.18: the run's own split
+        if shards is not None:
+            # 2.18: a prepared dataset holds its tokenizer; the model must use it
+            if resuming:
+                if _shards.tokenizer_fingerprint(self.tokenizer) != shards.tokenizer_fingerprint:
+                    raise ValueError("this dataset was tokenized with another tokenizer than "
+                                     "the model's: prepare it with the model's tokenizer "
+                                     "(auralite data prepare ... --tokenizer MODEL.pt)")
+                _setup_progress("Continued training — the dataset uses the model's tokenizer",
+                                0.15)
+            else:
+                if tokenizer is not None or tokenizer_path:
+                    given = tokenizer if tokenizer is not None else \
+                        _shards.resolve_tokenizer(tokenizer_path)
+                    if _shards.tokenizer_fingerprint(given) != shards.tokenizer_fingerprint:
+                        raise ValueError("the given tokenizer is not the one this dataset was "
+                                         "tokenized with (a prepared dataset trains with its "
+                                         "own tokenizer)")
+                self.tokenizer = shards.tokenizer
+                self.vocab_size = self.tokenizer.vocab_size
+                tokenizer_source = "dataset"
+                _setup_progress(
+                    f"Tokenizer of the dataset: {_tok_io.describe_tokenizer(self.tokenizer)}",
+                    0.25, stage={"stage": "tokenizer", "stage_label": "Tokenizer ready",
+                                 "stage_percent": 100.0})
+        elif not resuming and cluster is not None and not cluster.is_main:
             _setup_progress("Receiving the tokenizer from the main computer…", 0.08,
                             stage={"stage": "tokenizer", "stage_label": "Receiving the tokenizer"})
             self.tokenizer = tokenizer_from_dict(cluster.broadcast_json(None))
@@ -1333,6 +1707,12 @@ class TrainerMixin:
                 logger.info(f"[AuraLite] LoRA rank {int(lora_rank)} on the continued model "
                             f"({lora_targets}: {', '.join(lora_names)}; a fresh optimizer)")
         native_model: Any = getattr(self.model, "module", self.model)
+        if resuming and "use_gradient_checkpointing" in params \
+                and hasattr(native_model, "set_gradient_checkpointing"):
+            # 2.18: also for a loaded model (it was a constructor argument only)
+            was = bool(getattr(native_model, "use_gradient_checkpointing", False))
+            native_model.set_gradient_checkpointing(bool(params["use_gradient_checkpointing"]))
+            self._setup_undo.append(lambda m=native_model, w=was: m.set_gradient_checkpointing(w))
         frozen_rows = 0            # 2.16: LoRA on dialogs, embedding rows that stay as they are
         if dialogs is not None and getattr(native_model, "lora_adapters", None):
             # The template's markers may be new tokens: with LoRA the token
@@ -1558,6 +1938,21 @@ class TrainerMixin:
                            for t in seq_targets]
                 encoded = torch.tensor(ids, dtype=torch.long)
                 dialog_targets = torch.tensor(targets, dtype=torch.long)
+        elif shards is not None:
+            # 2.18: the windows are read from the shard files as batches need them
+            if use_mmap:
+                logger.info("[AuraLite] Token shards are read from disk already (corpus_cache "
+                            "does not apply)")
+                use_mmap = False
+            shard_train, shard_val, shard_val_tokens = shards.windows(
+                int(seq_length), stride=sample_stride, val_split=float(val_split or 0.0))
+            fit_tokens = shards.train_tokens + shards.val_tokens - shard_val_tokens
+            total_tokens = shards.train_tokens + shards.val_tokens
+            logger.info(f"[AuraLite] {shards.describe()} ({shards.folder})")
+            if not shards.complete:
+                logger.warning("[AuraLite] WARNING: the preparation of this dataset did not "
+                               "finish: training on what was prepared (run the preparation "
+                               "again to complete it)")
         elif use_mmap:
             from auralite.engine.dataset import write_tokens_memmap
             cache_path = params.get("corpus_cache_path")
@@ -1596,8 +1991,9 @@ class TrainerMixin:
             logger.info(f"[AuraLite] Tokenized corpus once into {len(encoded):,} tokens "
                         f"({encoded_bytes / (1024 * 1024):.2f} MiB LongTensor in RAM).")
         if packed is None:
-            token_count = total_tokens if use_mmap else len(cast(torch.Tensor, encoded))
-        per_token = len(training_text) / max(1, token_count)
+            token_count = (total_tokens if use_mmap or shards is not None
+                           else len(cast(torch.Tensor, encoded)))
+        per_token = (shards.chars if shards is not None else len(training_text)) / max(1, token_count)
         _setup_progress(
             f"Dialogs tokenized: {token_count:,} tokens, {learned_tokens:,} of them to learn"
             if dialogs is not None else
@@ -1629,6 +2025,9 @@ class TrainerMixin:
         # 2.15: dialogs validate on held-out dialogs only (none: no validation)
         if packed is not None:                 # 2.16: windows of whole dialogs
             n_train_tokens = split_at = fit_tokens       # the dialogs' tokens, as 2.15
+        elif shards is not None:               # 2.18: the dataset's own validation split
+            n_train_tokens = split_at = fit_tokens
+            total_tokens = fit_tokens + shard_val_tokens
         elif val_split > 0 and (dialogs is None or val_dialogs):
             if total_tokens < min_train_tokens + min_val_tokens:
                 logger.warning(f"[AuraLite] WARNING: text has only {total_tokens} tokens after "
@@ -1666,6 +2065,11 @@ class TrainerMixin:
         net = cast(nn.Module, self.model)      # the module being trained (typed)
         if packed is not None:
             dataset = packed[0]
+        elif shards is not None:
+            dataset = shard_train
+            if dataset is None:
+                raise ValueError("Training text is too short for the chosen Context Window "
+                                 "(seq_length): no shard of the dataset holds a window")
         elif use_mmap:
             from auralite.engine.dataset import PagedDataset
             assert corpus_file is not None
@@ -1684,7 +2088,9 @@ class TrainerMixin:
         # DataLoader workers: a batch is one indexing op (~0.02 ms), while worker
         # processes cost start-up time, IPC per batch and — with spawn on
         # Windows — a pickled copy of the whole corpus per worker.
-        if seed is not None:
+        if run_state_in is not None:
+            loader_seed = int(run_state_in["loader_seed"])     # 2.18: the run's own order
+        elif seed is not None:
             loader_seed = int(seed)
         elif ddp_active:
             loader_seed = 0                    # every rank must draw the same order
@@ -1695,6 +2101,29 @@ class TrainerMixin:
             rank_batch = max(1, round(batch_size / cluster.world_size))
             logger.info(f"[AuraLite] Cluster: batch {rank_batch * cluster.world_size} = "
                         f"{rank_batch} windows on each of {cluster.world_size} computers")
+        # 2.18: what the run needs in memory, and (memory_plan="auto") a plan that fits
+        memory_estimate: dict | None = None
+        chunk_tokens = 0
+        vocab_rows = int(getattr(getattr(native_model, "head", None), "out_features", 0) or 0)
+        if not (is_auto(loss_chunk_tokens) or loss_chunk_tokens is None):
+            chunk_tokens = max(0, int(loss_chunk_tokens))
+        if memory_plan != "off" and hasattr(native_model, "n_layers") and cluster is None:
+            memory_estimate, rank_batch, accumulation_steps, chunk_tokens = self._memory_plan(
+                native_model, memory_plan, rank_batch, accumulation_steps, int(seq_length),
+                amp=amp_dtype if use_amp else "none", optimizer=optimizer_name,
+                lora_rank=int(lora_rank or 0) or int(getattr(native_model, "lora_rank", 0) or 0),
+                chunk_tokens=chunk_tokens, auto_chunk=is_auto(loss_chunk_tokens)
+                or loss_chunk_tokens is None, run_fixed=run_state_in is not None)
+            batch_size = rank_batch
+        elif (is_auto(loss_chunk_tokens) or loss_chunk_tokens is None) and vocab_rows \
+                and rank_batch * int(seq_length) * vocab_rows >= AUTO_MIN_VALUES:
+            chunk_tokens = auto_chunk_tokens(vocab_rows)
+        chunked: ChunkedLoss | None = None
+        if chunk_tokens and hasattr(native_model, "head"):
+            chunked = ChunkedLoss(prompt_loss_weight if dialogs is not None else 0.0,
+                                  chunk_tokens=chunk_tokens, compute_dtype=amp_t if use_amp else None)
+            logger.info(f"[AuraLite] Loss: the output layer in chunks of {chunk_tokens:,} tokens "
+                        f"(a batch has {rank_batch * int(seq_length) * vocab_rows:,} logits)")
         loader = WindowBatches(
             dataset, rank_batch, shuffle=True, seed=loader_seed,
             rank=dist.get_rank() if ddp_active else 0,
@@ -1709,6 +2138,8 @@ class TrainerMixin:
         val_loader = None
         if packed is not None:
             val_ds = packed[1]
+        elif shards is not None:
+            val_ds = shard_val
         elif use_mmap:
             assert corpus_file is not None
             val_ds = (PagedDataset(corpus_file, seq_length, offset=split_at,
@@ -1747,11 +2178,20 @@ class TrainerMixin:
         # accumulation_steps=N the schedule only reached 1/N of its length:
         # WSD never decayed and cosine stopped at a high LR.
         opt_steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
+        step_batch = rank_batch * (cluster.world_size if cluster is not None else 1)
+        tokens_per_opt_step = step_batch * seq_length * accumulation_steps
+        if max_tokens:
+            # 2.18: a budget in training tokens; without `epochs` the run takes
+            # the passes over the data the budget needs
+            budget_steps = max(1, math.ceil(max_tokens / tokens_per_opt_step))
+            max_steps = min(max_steps, budget_steps) if max_steps else budget_steps
+            if "epochs" not in params:
+                epochs = max(1, math.ceil(budget_steps / max(1, opt_steps_per_epoch)))
+            logger.info(f"[AuraLite] max_tokens={max_tokens:,}: {budget_steps:,} optimizer steps "
+                        f"of {tokens_per_opt_step:,} tokens")
         total_steps  = epochs * opt_steps_per_epoch
         if max_steps:
             total_steps = min(total_steps, max_steps)
-        step_batch = rank_batch * (cluster.world_size if cluster is not None else 1)
-        tokens_per_opt_step = step_batch * seq_length * accumulation_steps
         if dropout_auto:
             # The epochs and max_steps bound the plan; a time budget can only
             # shorten it, and is looked at again once the step time is known.
@@ -1779,13 +2219,17 @@ class TrainerMixin:
         if scheduler_state_to_restore is not None:
             try:
                 self.scheduler.load_state_dict(scheduler_state_to_restore)
+                if run_state_in is not None:
+                    # 2.18: a decay the run had begun (a finish) goes on
+                    _restore_decay(self.scheduler, run_state_in.get("decay"))
                 # If we continue beyond the original planned run, extend the
                 # cosine schedule so it does not instantly collapse at the old
-                # max_steps boundary.
-                self.scheduler.max_steps = max(
-                    self.scheduler.max_steps,
-                    self.scheduler.step_count + total_steps,
-                )
+                # max_steps boundary. 2.18: a continued run keeps its plan.
+                if run_state_in is None:
+                    self.scheduler.max_steps = max(
+                        self.scheduler.max_steps,
+                        self.scheduler.step_count + total_steps,
+                    )
                 logger.info("[AuraLite] Restored scheduler state.")
             except Exception as e:
                 logger.warning(f"[AuraLite] WARNING: could not restore scheduler state: {e}")
@@ -1795,9 +2239,10 @@ class TrainerMixin:
         # missing C compiler / Triton, or a backend that resolves to None) only
         # surface on the FIRST forward call. So we must wrap a trial forward pass,
         # not just the compile() call, and fall back to eager mode on ANY failure.
-        train_model = self.model
+        # Any: the model, its torch.compile wrapper or (below) its DDP wrapper
+        train_model: Any = self.model
         if use_compile:
-            compiled = None
+            compiled: Any = None
             _setup_progress("Compiling the model with torch.compile (the first step takes a "
                             "while)…", 0.80, stage={"stage": "compile",
                                                     "stage_label": "Compiling the model"})
@@ -1814,7 +2259,8 @@ class TrainerMixin:
                 probe = torch.zeros((min(batch_size, len(dataset)), seq_length),
                                     dtype=torch.long, device=self.device)
                 with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
-                    probe_out = compiled(probe)
+                    probe_out = (compiled(probe, return_hidden=True) if chunked is not None
+                                 else compiled(probe))
                 probe_out.float().mean().backward()
                 net.zero_grad(set_to_none=True)
                 train_model = compiled
@@ -1923,21 +2369,129 @@ class TrainerMixin:
         weigh_tokens = dialogs is not None and accumulation_steps > 1
         best_val = None
         best_epoch = None
-        best_state = None
+        best_state: Any = None
         epochs_without_gain = 0
         epochs_completed = 0
         tokens_seen = 0
         last_train_loss = None
         stop_reason = None
+        # 2.18: the run's position, saved with every checkpoint (continue_run)
+        start_epoch, start_batch, start_loss = 0, 0, 0.0
+        evaluations: list[dict] = []
+        head_weight: Any = getattr(getattr(native_model, "head", None), "weight", None)
+        best_on_disk = sum(p.numel() * p.element_size()
+                           for p in net.parameters()) > _BEST_IN_MEMORY_BYTES
+        run_params = {key: value for key, value in params.items()
+                      if key not in ("continue_run", "continue_training")
+                      and _json_safe(value)}
+        run_data = (_run_data_id(shards, training_text) if dialogs is None
+                    else {"kind": "dialogs"})
+        if run_state_in is not None:
+            start_epoch = int(run_state_in.get("epoch", 0))
+            start_batch = int(run_state_in.get("batch", 0))
+            start_loss = float(run_state_in.get("running_loss", 0.0))
+            run_opt_steps = int(run_state_in.get("run_opt_steps", 0))
+            completed_batches_total = int(run_state_in.get("completed_batches", 0))
+            tokens_seen = int(run_state_in.get("tokens_seen", 0))
+            best_val = run_state_in.get("best_val")
+            best_epoch = run_state_in.get("best_epoch")
+            epochs_without_gain = int(run_state_in.get("epochs_without_gain", 0))
+            epochs_completed = start_epoch
+            last_train_loss = run_state_in.get("last_train_loss")
+            evaluations = list(run_state_in.get("evaluations") or [])
+            train_t0 -= float(run_state_in.get("elapsed", 0.0))
+            ctl.start_time = train_t0
+            ctl.load_state_dict(run_state_in.get("control") or {})
+            run_params = dict(run_state_in.get("params") or run_params)
+            rng = run_state_in.get("rng") or {}
+            if isinstance(rng.get("torch"), torch.Tensor):
+                torch.set_rng_state(rng["torch"])
+            if rng.get("cuda") is not None and torch.cuda.is_available():
+                with contextlib.suppress(RuntimeError, ValueError):
+                    torch.cuda.set_rng_state_all(rng["cuda"])
+            logger.info(f"[AuraLite] Continuing the run at epoch {start_epoch + 1}/{epochs}, "
+                        f"batch {start_batch:,}/{n_loader_batches:,} (optimizer step "
+                        f"{run_opt_steps:,}, {tokens_seen:,} tokens so far)")
 
-        for epoch in range(epochs):
+        def snapshot(epoch_now: int, batch_done: int, running: float,
+                     finished: bool = False) -> None:
+            """The run's position after an optimizer step (2.18, ``continue_run``)."""
+            self._run_state = {
+                "version": 1, "data": run_data, "params": run_params,
+                "loader_seed": loader_seed, "epochs": epochs, "max_steps": max_steps,
+                "total_steps": total_steps, "epoch": epoch_now, "batch": batch_done,
+                "running_loss": running, "run_opt_steps": run_opt_steps,
+                "completed_batches": completed_batches_total, "tokens_seen": tokens_seen,
+                "best_val": best_val, "best_epoch": best_epoch,
+                "epochs_without_gain": epochs_without_gain, "last_train_loss": last_train_loss,
+                "elapsed": time.time() - train_t0, "control": ctl.state_dict(),
+                "evaluations": evaluations[-1000:], "finished": finished,
+                "decay": _decay_state(self.scheduler), "fit_chars": int(fit_chars),
+                # the random state of this step: dropout of the next batch
+                "rng": {"torch": torch.get_rng_state(),
+                        "cuda": (torch.cuda.get_rng_state_all()
+                                 if torch.cuda.is_available() else None)},
+                "seq_length": int(seq_length), "batch_size": int(rank_batch),
+                "accumulation_steps": int(accumulation_steps),
+                "sample_stride": int(sample_stride), "chunk_tokens": int(chunk_tokens),
+                "gradient_checkpointing": bool(getattr(native_model,
+                                                       "use_gradient_checkpointing", False))}
+
+        last_autosave_t = time.time()
+
+        def after_opt_step(epoch_now: int, batch_done: int, running: float) -> None:
+            """After an optimizer step: a validation, the run's position, autosaves (2.18)."""
+            nonlocal last_autosave_t
+            if eval_every_steps and val_loader is not None and \
+                    run_opt_steps % eval_every_steps == 0:
+                eval_t0 = time.time()
+                loss_now = self._evaluate(val_loader, criterion, chunked=chunked)
+                ctl.note_validation(time.time() - eval_t0)
+                if loss_now is not None:
+                    self.last_val_loss = loss_now
+                    self.last_val_bpb = _bpb(loss_now)
+                    evaluations.append({"step": int(self.scheduler.step_count),
+                                        "tokens": int(tokens_seen), "val_loss": float(loss_now),
+                                        "val_bpb": self.last_val_bpb})
+                    bpb = f" ({self.last_val_bpb:.4f} bits/byte)" if self.last_val_bpb else ""
+                    logger.info(f"[AuraLite] Step {self.scheduler.step_count:,} "
+                                f"({tokens_seen:,} tokens): val loss {loss_now:.4f}{bpb}")
+                    if report_rank_ok:
+                        self._invoke_progress(
+                            progress_callback, epoch_now + 1, epochs,
+                            running / max(1, batch_done), loss_now,
+                            info={"phase": "val", "message": f"Step {self.scheduler.step_count:,}"
+                                  f": val loss {loss_now:.4f}", "val_loss": loss_now,
+                                  "val_bpb": self.last_val_bpb, "global_step":
+                                  completed_batches_total, "total_steps": total_opt_steps,
+                                  "batch": batch_done, "batches": n_loader_batches,
+                                  "elapsed": time.time() - train_t0, "is_epoch_end": False})
+            # the position after the validation, so an autosave of this step has it
+            if dialogs is None:
+                snapshot(epoch_now, batch_done, running)
+            rank_ok = not ddp_active or dist.get_rank() == 0
+            due_steps = bool(autosave_every_steps
+                             and self.scheduler.step_count % autosave_every_steps == 0)
+            due_time = bool(autosave_every_minutes
+                            and time.time() - last_autosave_t >= 60.0 * autosave_every_minutes)
+            if (due_steps or due_time) and rank_ok:
+                try:
+                    self.save_model(autosave_path)
+                    last_autosave_t = time.time()
+                except Exception as e:
+                    logger.warning("step autosave failed: %s", e)
+
+        for epoch in range(start_epoch, epochs):
             if stop_event and stop_event.is_set():
                 stop_reason = "stopped"
                 break
             loader.set_epoch(epoch)
+            first_batch = start_batch if epoch == start_epoch else 0
+            if first_batch:
+                loader.skip_batches(first_batch)    # 2.18: where the run stopped
 
-            running_loss   = 0.0
-            seen_batches   = 0
+            running_loss   = start_loss if epoch == start_epoch else 0.0
+            seen_batches   = first_batch
             stopped_mid    = False
             epoch_t0       = time.time()
             last_report_t  = 0.0
@@ -1947,7 +2501,7 @@ class TrainerMixin:
             batches: Any = (_token_weighted_batches(loader, accumulation_steps,
                                                     prompt_loss_weight)
                             if weigh_tokens else ((xb, yb, None) for xb, yb in loader))
-            for batch_idx, (xb, yb, token_factor) in enumerate(batches):
+            for batch_idx, (xb, yb, token_factor) in enumerate(batches, start=first_batch):
                 if cluster is not None:
                     sync_with_main()
                 if stop_event and stop_event.is_set():
@@ -1961,23 +2515,37 @@ class TrainerMixin:
                 if batch_idx % accumulation_steps == 0:
                     self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
-                    output = train_model(xb)                      # (B, T, vocab)
-                    loss   = criterion(
-                        output.reshape(-1, output.size(-1)),      # (B·T, vocab)
-                        yb.reshape(-1),                           # (B·T,)
-                    )
-                    if token_factor is not None:
-                        loss = loss * token_factor
-                    base_model = train_model.module if hasattr(train_model, "module") else train_model
-                    aux_loss = base_model.get_aux_loss() if hasattr(base_model, "get_aux_loss") else None
-                    if aux_loss is not None:
-                        loss = loss + aux_loss
-                    loss = loss / accumulation_steps  # normalize loss
+                # 2.18: DDP all-reduces once per optimizer step, not per micro-batch
+                stepping = ((batch_idx + 1) % accumulation_steps == 0
+                            or batch_idx + 1 >= n_loader_batches)
+                sync = (contextlib.nullcontext() if stepping or not ddp_active
+                        or accumulation_steps == 1 or not hasattr(train_model, "no_sync")
+                        else train_model.no_sync())
+                with sync:
+                    with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
+                        if chunked is not None:
+                            # 2.18: the head and the loss in chunks of tokens
+                            hidden = train_model(xb, return_hidden=True)  # (B, T, d_model)
+                            loss = chunked(hidden.reshape(-1, hidden.size(-1)), head_weight,
+                                           yb.reshape(-1))
+                        else:
+                            output = train_model(xb)                      # (B, T, vocab)
+                            loss   = criterion(
+                                output.reshape(-1, output.size(-1)),      # (B·T, vocab)
+                                yb.reshape(-1),                           # (B·T,)
+                            )
+                        if token_factor is not None:
+                            loss = loss * token_factor
+                        base_model = train_model.module if hasattr(train_model, "module") else train_model
+                        aux_loss = base_model.get_aux_loss() if hasattr(base_model, "get_aux_loss") else None
+                        if aux_loss is not None:
+                            loss = loss + aux_loss
+                        loss = loss / accumulation_steps  # normalize loss
 
-                self.scaler.scale(loss).backward()
+                    self.scaler.scale(loss).backward()
 
                 # Only step optimizer after accumulation
+                stepped = False
                 if (batch_idx + 1) % accumulation_steps == 0:
                     self._scaler_unscale_optimizer()
                     nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
@@ -1985,16 +2553,14 @@ class TrainerMixin:
                     self.scaler.update()
                     self.scheduler.step()
                     run_opt_steps += 1
-                    if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
-                        try:
-                            self.save_model(autosave_path)
-                        except Exception as e:
-                            logger.warning("step autosave failed: %s", e)
+                    stepped = True
 
                 running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
                 completed_batches_total += 1
                 tokens_seen += yb.numel()
+                if stepped:
+                    after_opt_step(epoch, batch_idx + 1, running_loss)
                 if (max_steps and run_opt_steps >= max_steps) or ctl.after_step(run_opt_steps):
                     budget_done = True
                 if (dropout_auto and time_budget_s and dropout > 0.0
@@ -2021,15 +2587,23 @@ class TrainerMixin:
                         last_report_t = now
                         avg_loss = running_loss / max(1, seen_batches)
                         epoch_frac = seen_batches / float(n_loader_batches)
-                        # overall percent across all epochs
-                        overall_frac = ctl.fraction((epoch + epoch_frac) / float(max(1, epochs)))
+                        # overall percent across all epochs (2.18: or of max_steps /
+                        # max_tokens, when that ends the run first)
+                        planned = (epoch + epoch_frac) / float(max(1, epochs))
+                        if max_steps and max_steps < epochs * opt_steps_per_epoch:
+                            planned = run_opt_steps / float(max_steps)
+                        overall_frac = ctl.fraction(planned)
                         elapsed = now - train_t0
                         epoch_elapsed = now - epoch_t0
                         # speed from this epoch so far
-                        sps = (seen_batches / epoch_elapsed) if epoch_elapsed > 0 else 0.0
+                        sps = (((seen_batches - first_batch) / epoch_elapsed)
+                               if epoch_elapsed > 0 else 0.0)
                         tps = sps * tokens_per_batch
                         # ETA: remaining batches in this epoch + future epochs
                         remain_batches = (n_loader_batches - seen_batches) +                             max(0, epochs - epoch - 1) * n_loader_batches
+                        if max_steps:
+                            remain_batches = min(remain_batches, max(
+                                0, (max_steps - run_opt_steps) * accumulation_steps))
                         eta = ctl.eta_seconds((remain_batches / sps) if sps > 0 else None)
                         cur_lr = self.scheduler.get_lr() if self.scheduler else lr
                         self._invoke_progress(
@@ -2098,18 +2672,15 @@ class TrainerMixin:
                 break
 
             # Handle remaining accumulated gradients
-            if seen_batches > 0 and not budget_done and (batch_idx + 1) % accumulation_steps != 0:
+            if seen_batches > first_batch and not budget_done \
+                    and (batch_idx + 1) % accumulation_steps != 0:
                 self._scaler_unscale_optimizer()
                 nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 self._scaler_step_optimizer()
                 self.scaler.update()
                 self.scheduler.step()
                 run_opt_steps += 1
-                if autosave_every_steps and self.scheduler.step_count % autosave_every_steps == 0 and (not ddp_active or dist.get_rank() == 0):
-                    try:
-                        self.save_model(autosave_path)
-                    except Exception as e:
-                        logger.warning("step autosave failed: %s", e)
+                after_opt_step(epoch, seen_batches, running_loss)
 
             val_loss = None
             if val_loader is not None:
@@ -2159,7 +2730,8 @@ class TrainerMixin:
                                      validating: Any = validating) -> None:
                         validating.update(done, total, step="batches", unit="batches")
                     val_hook = on_val_batch
-                val_loss = self._evaluate(val_loader, criterion, on_batch=val_hook)
+                val_loss = self._evaluate(val_loader, criterion, on_batch=val_hook,
+                                          chunked=chunked)
                 val_seconds = time.time() - val_t0
                 if cluster is not None:
                     val_seconds = cluster.broadcast_floats([val_seconds])[0]
@@ -2169,12 +2741,23 @@ class TrainerMixin:
                 if val_loss is not None:
                     if best_val is None or val_loss < best_val:
                         best_val, best_epoch, epochs_without_gain = val_loss, epoch + 1, 0
-                        if restore_best_weights:
+                        if restore_best_weights and best_on_disk:
+                            # 2.18: a big model's best weights wait in a file
+                            if self._best_tmp_file is None:
+                                self._best_tmp_file = str(Path(tempfile.gettempdir()) / (
+                                    f"auralite_best_{uuid4().hex}.pt"))
+                            torch.save(net.state_dict(), self._best_tmp_file)
+                            best_state = self._best_tmp_file
+                        elif restore_best_weights:
                             best_state = {k: v.detach().clone()
                                           for k, v in net.state_dict().items()}
                     else:
                         epochs_without_gain += 1
             epochs_completed = epoch + 1
+            if seen_batches:
+                last_train_loss = running_loss / seen_batches
+            if dialogs is None:
+                snapshot(epoch + 1, 0, 0.0)          # 2.18: the next epoch starts here
 
             if autosave_every and (epoch + 1) % autosave_every == 0 and (not ddp_active or dist.get_rank() == 0):
                 try:
@@ -2236,12 +2819,19 @@ class TrainerMixin:
         restored = False
         if (restore_best_weights and best_state is not None
                 and (best_epoch != epochs_completed or stop_reason == "stopped")):
+            if isinstance(best_state, str):           # 2.18: kept in a file
+                best_state = torch.load(best_state, map_location=self.device, weights_only=True)
             net.load_state_dict(best_state)
             self.last_val_loss = best_val
             self.last_val_bpb = _bpb(best_val)
             restored = True
             logger.info(f"[AuraLite] Restored the weights of epoch {best_epoch} "
                         f"(best validation loss {best_val:.4f}).")
+        run_state_now = getattr(self, "_run_state", None)
+        if dialogs is None and isinstance(run_state_now, dict):
+            # 2.18: a stopped run can be continued; one that ended cannot
+            self._run_state = dict(run_state_now, finished=stop_reason != "stopped",
+                                   restored_best=restored)
         elapsed = time.time() - train_t0
         if cluster is not None:           # tokens of every computer
             tokens_seen = int(cluster.allreduce_sum([float(tokens_seen)])[0])
@@ -2279,6 +2869,16 @@ class TrainerMixin:
             "dropout_planned_passes": dropout_passes,
             "cluster_size": cluster.world_size if cluster is not None else 1,
             "seconds": elapsed,
+            # 2.18
+            "max_tokens": max_tokens or None,
+            "evaluations": list(evaluations),
+            "chunked_loss": chunked is not None,
+            "gradient_checkpointing": bool(getattr(native_model, "use_gradient_checkpointing",
+                                                   False)),
+            "memory_estimate": memory_estimate["total"] if memory_estimate else None,
+            "batch_size": int(rank_batch),
+            "accumulation_steps": int(accumulation_steps),
+            "continued_run": run_state_in is not None,
         }
         if corpus_info:                    # 2.15: a TextCorpus
             self.last_train_summary.update(corpus_info)

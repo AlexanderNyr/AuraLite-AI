@@ -115,8 +115,14 @@ workers. On a laptop, `torch_threads=4` can be *faster* than
 
 ## 7. Training is slow / memory-hungry
 
-- Use `--mmap` for large corpora (§ quickstart): the RAM path allocates ~16 MiB
-  per 1 MiB of text just to tokenise.
+- Large corpora: since 2.18 text over 256 MB (and compressed, Parquet and
+  `hf:` data) is tokenized once into token shards on disk and trained from
+  there, in constant memory — or prepare it yourself with `auralite data
+  prepare` ([training.md](training.md) § 20). The in-memory path allocates
+  ~16 MiB per 1 MiB of text just to tokenise (`--mmap` a quarter of that).
+- A big model: `auralite plan --preset 350m --memory 16GB` says what fits, and
+  `--memory-plan auto` (the GUI's default) splits a batch that would not;
+  a big vocabulary's loss runs in chunks by itself (§ 20).
 - `use_gradient_checkpointing=True` trades speed for activation memory: a step
   was 36 % slower for 230 MB less peak memory per 16 sequences at the *Medium*
   preset's shape ([training.md](training.md) § 4).
@@ -351,3 +357,19 @@ follow (`type`, `properties`, `required`, `items`, `enum`, `const`, `anyOf`,
 lengths, `$ref`) are supported; `pattern`, `minimum` and the like are refused
 with an error rather than ignored. See [engine.md](engine.md) § 12 and
 [quickstart.md](quickstart.md) § 4.
+
+## 18. My corpus is 20 GB / I want to train on FineWeb. Will it fit?
+
+Since 2.18, the data needs disk, not memory. `auralite data prepare` reads
+files, folders, compressed and Parquet files or a Hugging Face dataset
+(`hf:HuggingFaceFW/fineweb-edu:sample-10BT`) as a stream, tokenizes it in
+parallel and writes token shards — about 2 bytes per token with a vocabulary
+up to 65,536 (4 above) — and `auralite train --data FOLDER` reads its batches
+from them. Memory stays flat (300 MB for 60 MB or 180 MB of text in our
+measurement); a stopped preparation continues where it stopped. What limits
+you then is the model: `auralite plan` estimates its memory, and
+`--max-tokens`, `--autosave` and `--continue-run` make a run of days
+practical — a crash costs the steps since the last autosave, nothing more.
+On a CPU, expect about a thousand tokens per second for a 15M-parameter
+model (2 vCPU): a billion tokens is a GPU's job. See
+[training.md](training.md) § 20.

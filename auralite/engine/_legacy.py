@@ -132,6 +132,28 @@ from auralite.engine.sampling import SamplingParams  # noqa: E402,F401
 from auralite.engine.scheduler import CosineWarmupScheduler, WSDScheduler  # noqa: E402,F401
 from auralite.engine.recipe import DEFAULT_RECIPE  # noqa: E402
 from auralite.engine.train_control import TrainControl  # noqa: E402
+
+
+def _lazy_optimizer_bytes() -> int:
+    """A checkpoint at least this big keeps its optimizer state on disk after
+    `load_model` until training continues (2.18; ``AURALITE_LAZY_STATE_MB``)."""
+    try:
+        return int(float(os.environ.get("AURALITE_LAZY_STATE_MB", "256")) * (1 << 20))
+    except ValueError:
+        return 256 << 20
+
+
+def _in_memory(value: Any) -> Any:
+    """`value` with its tensors copied into memory, off a memory-mapped file (2.18)."""
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _in_memory(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_in_memory(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_in_memory(item) for item in value)
+    return value
 from auralite.engine import compute_thread as _compute  # noqa: E402
 from auralite.engine.optimizers import (  # noqa: E402,F401
     Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
@@ -437,6 +459,11 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_optimizer_state = None
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
+        # 2.18: a big checkpoint's optimizer state, read when training continues;
+        # where a run stands (saved with checkpoints, for continue_run)
+        self._resume_optimizer_file: tuple[str, int, int] | None = None
+        self._resume_run_state: dict | None = None
+        self._run_state: dict | None = None
 
         # DDP (DistributedDataParallel) support — v2.3
         self.is_distributed = False
@@ -958,6 +985,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             self._resume_optimizer_state = None
             self._resume_scheduler_state = None
             self._resume_scaler_state = None
+            self._resume_optimizer_file = None
+            self._resume_run_state = self._run_state = None
             logger.info("[AuraLite] Using a llama.cpp server backend at %s (n_ctx=%s)",
                         model.base_url, model.max_seq_len)
             return
@@ -997,6 +1026,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_optimizer_state = None
         self._resume_scheduler_state = None
         self._resume_scaler_state = None
+        self._resume_optimizer_file = None
+        self._resume_run_state = self._run_state = None
         chat = ", chat=on" if use_chat_completion else ""
         logger.info(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
                     f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
@@ -1720,6 +1751,10 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         }
         # 2.16: where the adapters sit and their scale (2.15 files: FFN)
         checkpoint.update(self._lora_config_entry())
+        # 2.18: where a run stands (continue_run picks it up)
+        run_state = getattr(self, "_run_state", None)
+        if isinstance(run_state, dict) and include_optimizer:
+            checkpoint["run_state"] = run_state
         # Atomic write: save next to the target and os.replace() it in place, so
         # an interrupted save (Ctrl+C, out of disk) can never leave a truncated,
         # unloadable checkpoint at `path`.
@@ -1788,8 +1823,12 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         }
         return _save_safetensors_checkpoint(path, tensors, self._checkpoint_metadata())
 
-    def _read_checkpoint(self, path: str, allow_unsafe: bool = False) -> dict:
-        """Read a `.pt` / `.safetensors` checkpoint into a unified dict."""
+    def _read_checkpoint(self, path: str, allow_unsafe: bool = False,
+                         mmap: bool = False) -> dict:
+        """Read a `.pt` / `.safetensors` checkpoint into a unified dict.
+
+        2.18: ``mmap=True`` maps a `.pt` file's tensors instead of reading them.
+        """
         if str(path).lower().endswith(".safetensors"):
             checkpoint = _load_safetensors_checkpoint(path)
             checkpoint.setdefault("optimizer_state", None)
@@ -1797,7 +1836,31 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             checkpoint.setdefault("scaler_state", None)
             checkpoint.setdefault("rng_state", None)
             return checkpoint
-        return _safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe)
+        return _safe_torch_load(path, map_location=self.device, allow_unsafe=allow_unsafe,
+                                mmap=mmap)
+
+    def _resume_optimizer_from_file(self) -> Any:
+        """The optimizer state of the loaded checkpoint, read now (2.18).
+
+        A big checkpoint's optimizer state (twice the weights with AdamW) is
+        not kept in memory after `load_model`: generation does not need it.
+        It is read from the file when training continues, if the file is
+        still the one that was loaded.
+        """
+        source = getattr(self, "_resume_optimizer_file", None)
+        if not source:
+            return None
+        path, size, mtime = source
+        try:
+            stat = os.stat(path)
+        except OSError:
+            stat = None
+        if stat is None or (stat.st_size, stat.st_mtime_ns) != (size, mtime):
+            logger.warning("[AuraLite] WARNING: %s changed since it was loaded: a fresh "
+                           "optimizer state", path)
+            return None
+        state = self._read_checkpoint(path, mmap=True).get("optimizer_state")
+        return _in_memory(state)
 
     def load_model(self, path: str, cpu_quantize: bool | str | None = None,
                    allow_unsafe: bool = False):
@@ -1841,7 +1904,8 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self.gguf_path = None
         self.hf_path = None
         self._ddp_model = None
-        checkpoint = self._read_checkpoint(path, allow_unsafe=allow_unsafe)
+        # 2.18: tensors mapped from the file, not read into a second copy
+        checkpoint = self._read_checkpoint(path, allow_unsafe=allow_unsafe, mmap=True)
 
         ckpt_version = int(checkpoint.get("checkpoint_version", 1))
         if ckpt_version >= 2:
@@ -1915,10 +1979,23 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self.model.eval()
 
         # Stash training state so a later `continue_training=True` call can
-        # resume optimizer / scheduler / scaler state as well.
-        self._resume_optimizer_state = checkpoint.get("optimizer_state")
-        self._resume_scheduler_state = checkpoint.get("scheduler_state")
-        self._resume_scaler_state = checkpoint.get("scaler_state")
+        # resume optimizer / scheduler / scaler state as well. 2.18: a big
+        # file's optimizer state stays on disk until training continues.
+        optimizer_state = checkpoint.get("optimizer_state")
+        self._resume_optimizer_file = None
+        if optimizer_state is not None and not str(path).lower().endswith(".safetensors") \
+                and os.path.getsize(path) >= _lazy_optimizer_bytes():
+            stat = os.stat(path)
+            self._resume_optimizer_file = (os.path.abspath(path), stat.st_size, stat.st_mtime_ns)
+            optimizer_state = None
+        self._resume_optimizer_state = _in_memory(optimizer_state)
+        self._resume_scheduler_state = _in_memory(checkpoint.get("scheduler_state"))
+        self._resume_scaler_state = _in_memory(checkpoint.get("scaler_state"))
+        run_state = checkpoint.get("run_state")
+        # (copied off the file: a tensor left mapped keeps the file open, and
+        # Windows then refuses to save over it)
+        self._resume_run_state = _in_memory(run_state) if isinstance(run_state, dict) else None
+        self._run_state = self._resume_run_state
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
