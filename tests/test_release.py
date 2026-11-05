@@ -465,6 +465,25 @@ def test_every_safetensors_test_runs_in_the_optional_deps_job():
     assert not missing, f"optional-deps does not run {missing}"
 
 
+def test_studio_job_runs_the_qt_suite_without_skipping():
+    """2.19: the Qt window's tests skip without PySide6, so a job must install it
+    (the `studio` extra) and refuse the skip - on Linux and on Windows."""
+    job = WORKFLOWS["ci.yml"]["jobs"]["studio"]
+    assert job["env"]["AURALITE_REQUIRE_INTEGRATIONS"] == "1"
+    assert job["env"]["QT_QPA_PLATFORM"] == "offscreen"
+    assert set(job["strategy"]["matrix"]["os"]) == {"ubuntu-latest", "windows-latest"}
+    joined = "\n".join(str(step.get("run", "")) for step in job["steps"])
+    assert ".[test,studio]" in joined and "libxkbcommon0" in joined
+    assert "tests/test_studio_qt.py" in joined
+    source = (REPO_ROOT / "tests" / "test_studio_qt.py").read_text(encoding="utf-8")
+    assert 'require("PySide6.QtWidgets")' in source
+    import tomllib
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = project["project"]
+    assert project["optional-dependencies"]["studio"] == ["PySide6-Essentials>=6.6"]
+    assert project["gui-scripts"]["auralite-studio"] == "auralite.studio.app:main"
+
+
 def test_docker_job_runs_the_image_it_builds():
     job = WORKFLOWS["ci.yml"]["jobs"]["docker"]
     assert job["needs"] == ["lint"]                  # no longer waits for every test leg

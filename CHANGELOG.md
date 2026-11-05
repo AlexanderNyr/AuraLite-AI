@@ -1,3 +1,135 @@
+# 📦 v2.19.0 — AuraLite Studio: a desktop app on Qt 6 with separate Fine-tune and Train tabs, a setup wizard and recommendations for your computer
+
+AuraLite gets a desktop app built as a product: **AuraLite Studio**
+(`auralite-studio`, `pip install "auralite-ai[studio]"`, Qt 6 through PySide6).
+Fine-tuning a ready model and training a new one from scratch have **tabs of
+their own**, next to Start, Chat, Export and Log. The Studio **looks at the
+computer** — memory, processor (AVX / AVX2 / AVX-512), GPU, free disk, a
+one-second speed test — and **recommends the base model, the method and the
+settings** that fit it, with the memory and the time a run will take; a **setup
+wizard** fills the tab in and can start the run. Data is **checked before
+anything trains**, errors are **explained with what to try**, everything lands in
+a **log file**. The classic interface (`auralite-gui`, tkinter) stays as it was.
+`auralite doctor` gives the same recommendation in a terminal. Guide:
+[docs/studio.md](docs/studio.md).
+
+**What changed for existing users**
+
+| | 2.19.0 | 2.18.1 |
+|---|---|---|
+| desktop apps | AuraLite Studio (`auralite-studio`, Qt 6, the `studio` extra) and the classic GUI (`auralite-gui`, unchanged) | the classic GUI |
+| fine-tuning in a GUI | the Studio's Fine-tune tab: base (catalog, `hf:ORG/NAME`, folder, `.pt`, the model in memory), data, QLoRA / LoRA / every weight, DPO / SimPO, teacher dialogs, adapters | spread over the classic GUI's Train and Model tabs |
+| `auralite doctor` | the computer, the models that fit, the `auralite train` command (`--write-params`) | — |
+| `auralite studio` | opens AuraLite Studio | — |
+| package description | "Train, fine-tune and run language models on your own PC…" | "Educational yet deployable LLM framework…" |
+
+Nothing else changed: the engine, the checkpoints, the CLI's other commands and
+the classic GUI work as in 2.18.1.
+
+**AuraLite Studio** (`auralite/studio/qt/`)
+
+- **Start**: this computer, what fits it ("Recommended to fine-tune: …, about
+  1.4 GB of memory, ~52 tokens/s, ~1 h 36 min for 1,000 dialogs"), recent
+  models, and three ways in: fine-tune a ready model, train a new one, open a
+  model. The speed test runs once by itself (1 s) and is remembered.
+- **Fine-tune**: the base from a catalog of 15 models — SmolLM2 135M to Qwen3
+  8B, each marked *fits*, *tight* or *too big* for this computer, the
+  recommended one starred, with its license, download size and languages —, any
+  Llama / Mistral / Qwen2 / Qwen3 by name or folder, a `.pt` file or the model in
+  memory; the data with a live report; QLoRA, LoRA or every weight with the rank
+  and 8-bit AdamW; passes, window, time limit, chat template, preference
+  objective (DPO / SimPO / SFT); an estimate of the memory and the time for the
+  method chosen; advanced settings folded away; dialogs written by a teacher model
+  (with a judge); merge, save and load the LoRA adapters. The base is downloaded
+  and converted with progress, then the run starts.
+- **Train**: a new model, its size chosen from the presets for the memory, the
+  data (at most 4 parameters per token) and the time; tokenizer, window, a time
+  limit (the run finishes well when it is up), early stopping.
+- A **run panel** on both: start, *Finish* (a learning-rate cooldown, the model
+  is kept), *Stop now*, the progress bar with the stage before training
+  (download, conversion, tokenizer), speed and time left, and a live loss chart
+  (training and validation).
+- **Chat**: replies as they are written, system prompt, temperature, maximum
+  tokens, template; a 4-bit model is flagged as slow with what to do; the chat
+  saves as a `.jsonl` dialog.
+- **Export**: GGUF (F16 / Q8_0 / BF16 / F32), a Hugging Face folder or an
+  AuraLite checkpoint, with the Ollama recipe.
+- **Log**: everything AuraLite reports, live; the file
+  (`$AURALITE_HOME/logs/studio.log`, 2 MB × 4) also keeps every error's
+  traceback.
+- **Setup wizard**: goal → this computer → your data → the model (a table of
+  every model with method, memory, fits, time and license) → the plan; it fills
+  the tab and can start. It opens by itself the first time.
+- Menu: open / save / recent models, dark theme, the wizard, the speed test, the
+  classic interface, the AuraLite and log folders, the guide, *Check for
+  updates* (PyPI, nothing installed by itself), *About*. Status bar: device,
+  model (origin, size, 4-bit, LoRA, not saved), RAM. Quitting with a run going
+  or an unsaved model asks first.
+- One job at a time (training, an import, an export, a reply); every long job
+  runs on a worker thread, the window never freezes.
+- Without PySide6, `auralite-studio` says how to install it (a message box when
+  started without a console); on a processor without SSE4.2 / POPCNT, which Qt
+  6.10+ needs, it names the PySide6 to install instead of letting Qt abort.
+
+**The toolkit-free core** (`auralite/studio/`, used by `auralite doctor` too)
+
+- `hardware.py`: `detect_hardware()` (Linux, Windows and macOS without extra
+  packages; `psutil` when installed), `measure_gflops()`, `process_memory()`;
+  a GPU too old for the installed PyTorch is reported and training stays on the
+  processor.
+- `catalog.py`: the 15 base models with the dimensions of their `config.json`
+  (parameter counts within 1 % of the published ones), licenses (Qwen2.5 3B:
+  research license, no commercial use; Llama: gated), download sizes.
+- `advisor.py`: `recommend_finetune()` / `recommend_pretrain()`. The memory is
+  `sizing.estimate_training_memory` (QLoRA: NF4 blocks plus float32 embeddings);
+  a run up to 15 % over the budget is *tight* (2.18.1's Qwen2.5-0.5B run,
+  estimated 1.6 GB, peaked at 1.48 GB of 1.98). The budget leaves the system
+  1.5 GB or a fifth on Windows, 450 MB or a tenth elsewhere. The speed is 45 % of
+  the measured matrix product over 4 × parameters per token with LoRA (6 × with
+  checkpointing or every weight, QLoRA 5 % slower) — calibrated on 2.18.1's runs.
+  The choice: the largest model that fits and finishes overnight; models that
+  need no license acceptance, allow commercial use and export to GGUF first;
+  multilingual ones for data that is not in English (with a warning when none
+  fits).
+- `datacheck.py`: `inspect_data()` reads the data the way training will and
+  reports the kind, records, estimated tokens, the script (Latin, Cyrillic, CJK),
+  a long record, skipped records with the first one's location, and warnings (too
+  few dialogs, pairs before SFT, text vs dialogs).
+- `recipes.py`: `FineTuneSettings` / `TrainSettings` → `finetune_params()` /
+  `pretrain_params()`, checked by `validate_params`, with plain-words
+  `SettingsError`s.
+- `errors.py`: `explain_error()` — out of memory (CPU and CUDA, also when
+  wrapped), gated models, no connection, a full disk, permissions, missing
+  optional packages (with the extra to install), data formats, unsupported
+  models, settings.
+- `progress.py`, `logs.py`, `settings.py` (`$AURALITE_HOME/studio.json`,
+  forgiving reads, never a token), `updates.py`.
+
+**CLI**: `auralite doctor [--data PATH] [--goal finetune|pretrain] [--hours H]
+[--no-speed] [--write-params FILE] [--json]`; `auralite studio`.
+
+**Packaging**: the `studio` extra (`PySide6-Essentials>=6.6`), the
+`auralite-studio` gui script, classifiers for the desktop (End Users/Desktop,
+Win32, Qt), a product description and keywords. `scripts/smoke_installed_wheel.py`
+requires the Studio's modules in the wheel.
+
+**CI**: a `studio` job on Ubuntu and Windows installs the `studio` extra and runs
+the Qt suite offscreen, where a missing PySide6 fails instead of skipping.
+
+**Docs**: docs/studio.md (new), README, quickstart, FAQ § 20–21, ARCHITECTURE.
+
+**Measured** (2 vCPU, 2 GB, offscreen): the Studio downloaded
+SmolLM2-135M-Instruct, fine-tuned it with QLoRA (20 steps on 2,000 arithmetic
+dialogs, memory plan 2 × 4 windows) in 2 min 57 s with download and conversion,
+answered in the trained format, exported a 145 MB Q8_0 GGUF in 1.4 s; peak RAM
+1.42 GB. Qwen3-0.6B imports in 4 bits (0.85 GB, 35 s) and chats.
+
+**Tests**: `tests/test_studio_core.py` (no Qt: hardware, catalog, advisor, data
+check, recipes, errors, progress, settings, updates, logs, `auralite doctor`, the
+start-up check) and `tests/test_studio_qt.py` (offscreen: the window, the tabs,
+a QLoRA fine-tune of a tiny model with a chat reply, a GGUF export and a save,
+training from scratch, the wizard, the dark theme, the log, closing).
+
 # 📦 v2.18.1 — Hugging Face models in AuraLite's engine: import, QLoRA without bitsandbytes, 8-bit AdamW, export to Hugging Face and GGUF
 
 Pretrained models now come into AuraLite's own engine. `auralite import

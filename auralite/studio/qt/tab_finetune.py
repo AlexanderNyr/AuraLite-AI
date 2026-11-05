@@ -1,0 +1,806 @@
+"""The Fine-tune tab: a pretrained or own model learns from your dialogs or texts (2.19).
+
+Everything for models that already exist lives here: the base (a model of the
+catalog, any Hugging Face Llama / Mistral / Qwen, a folder, a ``.pt`` file or
+the model in memory), the method (QLoRA, LoRA, every weight), dialogs,
+preference pairs (DPO / SimPO) or plain text, dialogs written by a teacher
+model, and the LoRA adapters.
+"""
+from __future__ import annotations
+
+import os
+import time
+from typing import TYPE_CHECKING, Any
+
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
+
+from ..advisor import ModelFit, Recommendation, recommend_finetune
+from ..catalog import CATALOG, BaseModel, find_model
+from ..datacheck import DataReport
+from ..hardware import format_gb
+from ..progress import format_duration, summary_text
+from ..recipes import FineTuneSettings, SettingsError, finetune_params
+from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, confirm,
+                     heading, hint, inform, show_error, training_callback)
+from .widgets import DataPicker, RunPanel
+
+if TYPE_CHECKING:
+    from .window import MainWindow
+
+SOURCES = ("catalog", "hub", "file", "memory")
+METHODS = (("qlora", "QLoRA: a 4-bit base + small adapters (least memory)"),
+           ("lora", "LoRA: small adapters on the full-precision base"),
+           ("full", "Every weight (most memory; for small models)"))
+OBJECTIVES = (("auto", "DPO (recommended)"), ("simpo", "SimPO"),
+              ("sft", "SFT on the chosen replies"))
+TEMPLATES = (("", "The model's own"), ("chatml", "ChatML"), ("llama3", "Llama 3"),
+             ("gemma", "Gemma"), ("phi", "Phi"))
+JUDGES = (("none", "none"), ("exact", "exact answer"), ("contains", "contains the answer"),
+          ("number", "same number"), ("teacher", "the teacher judges"))
+
+
+class FineTuneTab(QWidget):
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self.studio = window
+        self.job: Job | None = None
+        self.distill_job: Job | None = None
+        self.recommendation: Recommendation | None = None
+        self._base_chosen = False
+        self._method_chosen = False
+        self._user_tuned = False           # the user changed epochs / window / optimizer
+        self._applying = False
+        self._started = 0.0
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.addWidget(heading("Fine-tune a model"))
+        layout.addWidget(hint("A ready model learns to answer your way from your dialogs - or "
+                              "your style and knowledge from texts. Only small adapters train "
+                              "(LoRA), so a PC is enough."))
+
+        # ---- 1. base model
+        base_box = QGroupBox("1. Base model")
+        grid = QGridLayout(base_box)
+        self.source_group = QButtonGroup(self)
+        self.source_buttons: dict[str, QRadioButton] = {}
+        labels = {"catalog": "From the list:", "hub": "Hugging Face name or folder:",
+                  "file": "My model file (.pt):", "memory": "The model in memory:"}
+        for row_index, key in enumerate(SOURCES):
+            button = QRadioButton(labels[key])
+            self.source_group.addButton(button)
+            self.source_buttons[key] = button
+            grid.addWidget(button, row_index, 0)
+        self.catalog = QComboBox()
+        for model in CATALOG:
+            self.catalog.addItem(f"{model.name} - {model.size_label}", model.repo)
+        grid.addWidget(self.catalog, 0, 1, 1, 2)
+        self.hub = QLineEdit()
+        self.hub.setPlaceholderText("hf:ORG/NAME (Llama, Mistral, Qwen2 / Qwen2.5, Qwen3) or a "
+                                    "downloaded folder")
+        self.hub_folder = QPushButton("Folder…")
+        grid.addWidget(self.hub, 1, 1)
+        grid.addWidget(self.hub_folder, 1, 2)
+        self.file = QLineEdit()
+        self.file.setPlaceholderText("An AuraLite checkpoint: a model you trained or imported")
+        self.file_button = QPushButton("File…")
+        grid.addWidget(self.file, 2, 1)
+        grid.addWidget(self.file_button, 2, 2)
+        self.memory_label = hint("none")
+        grid.addWidget(self.memory_label, 3, 1, 1, 2)
+        self.base_info = hint("")
+        grid.addWidget(self.base_info, 4, 0, 1, 3)
+        grid.setColumnStretch(1, 1)
+        self.source_buttons["catalog"].setChecked(True)
+        layout.addWidget(base_box)
+
+        # ---- 2. data
+        data_box = QGroupBox("2. Your data")
+        data_layout = QVBoxLayout(data_box)
+        self.data = DataPicker("finetune", window.settings.last_data_dir)
+        data_layout.addWidget(self.data)
+        data_layout.addWidget(hint("Dialogs: a .jsonl file, one {\"messages\": [{\"role\": "
+                                   "\"user\", ...}, {\"role\": \"assistant\", ...}]} per line "
+                                   "(ShareGPT, Alpaca and prompt/completion records work too). "
+                                   "Preference pairs: prompt, chosen, rejected."))
+        layout.addWidget(data_box)
+
+        # ---- 3. method and training
+        how_box = QGroupBox("3. How to train")
+        how = QFormLayout(how_box)
+        self.method_group = QButtonGroup(self)
+        self.method_buttons: dict[str, QRadioButton] = {}
+        methods = QVBoxLayout()
+        for key, label in METHODS:
+            button = QRadioButton(label)
+            self.method_group.addButton(button)
+            self.method_buttons[key] = button
+            methods.addWidget(button)
+        self.method_buttons["qlora"].setChecked(True)
+        how.addRow("Method:", methods)
+        self.rank = QSpinBox()
+        self.rank.setRange(1, 512)
+        self.rank.setValue(16)
+        self.rank.setToolTip("The adapters' size: 8-16 for style and format, 32-64 for more "
+                             "new knowledge")
+        self.adam8 = QCheckBox("8-bit AdamW (a quarter of the optimizer's memory)")
+        self.adam8.setChecked(True)
+        rank_row = QHBoxLayout()
+        rank_row.addWidget(self.rank)
+        rank_row.addWidget(self.adam8, 1)
+        how.addRow("LoRA rank:", rank_row)
+        self.epochs = QSpinBox()
+        self.epochs.setRange(1, 100)
+        self.epochs.setValue(2)
+        how.addRow("Passes over the data:", self.epochs)
+        self.seq = QSpinBox()
+        self.seq.setRange(64, 32768)
+        self.seq.setSingleStep(128)
+        self.seq.setValue(512)
+        self.seq.setToolTip("The longest piece of a dialog the model sees at once; longer "
+                            "dialogs are split at turns")
+        how.addRow("Window (tokens):", self.seq)
+        self.time_limit = QSpinBox()
+        self.time_limit.setRange(0, 100_000)
+        self.time_limit.setSuffix(" min")
+        self.time_limit.setSpecialValueText("no limit")
+        how.addRow("Time limit:", self.time_limit)
+        self.objective = QComboBox()
+        for key, label in OBJECTIVES:
+            self.objective.addItem(label, key)
+        self.objective_label = QLabel("Preference pairs:")
+        how.addRow(self.objective_label, self.objective)
+        self.how_form = how
+        self.template = QComboBox()
+        for key, label in TEMPLATES:
+            self.template.addItem(label, key)
+        how.addRow("Chat template:", self.template)
+        self.estimate = hint("")
+        how.addRow("", self.estimate)
+
+        self.advanced = Collapsible("Advanced settings")
+        adv = QFormLayout()
+        self.lora_lr = QLineEdit("0.001")
+        adv.addRow("LoRA learning rate:", self.lora_lr)
+        self.full_lr = QLineEdit("3e-5")
+        adv.addRow("Learning rate (every weight):", self.full_lr)
+        self.batch = QSpinBox()
+        self.batch.setRange(1, 1024)
+        self.batch.setValue(8)
+        adv.addRow("Windows per step (batch):", self.batch)
+        self.prompt_weight = QLineEdit("auto")
+        self.prompt_weight.setToolTip("How much the prompt counts in the loss: 0 = only the "
+                                      "replies, auto = 0.1 (0 with LoRA)")
+        adv.addRow("Prompt weight:", self.prompt_weight)
+        self.pack = QCheckBox("Whole dialogs per window")
+        self.pack.setChecked(True)
+        adv.addRow("", self.pack)
+        self.val_split = QDoubleSpinBox()
+        self.val_split.setRange(0.01, 0.5)
+        self.val_split.setSingleStep(0.01)
+        self.val_split.setValue(0.05)
+        adv.addRow("Held out for validation:", self.val_split)
+        self.memory_plan = QCheckBox("Fit the memory automatically (memory plan)")
+        self.memory_plan.setChecked(True)
+        adv.addRow("", self.memory_plan)
+        self.max_steps = QSpinBox()
+        self.max_steps.setRange(0, 10_000_000)
+        self.max_steps.setSpecialValueText("no limit")
+        adv.addRow("Steps (at most):", self.max_steps)
+        self.advanced.body_layout.addLayout(adv)
+        how.addRow(self.advanced)
+        layout.addWidget(how_box)
+
+        # ---- teacher
+        self.teacher_box = Collapsible("No dialogs yet? Let a bigger model write them (teacher)")
+        teacher = QFormLayout()
+        self.teacher = QLineEdit()
+        self.teacher.setPlaceholderText("A .gguf / .pt file, a model folder, http://host:port of "
+                                        "a llama.cpp server - or empty: the model in memory")
+        self.teacher_button = QPushButton("File…")
+        teacher_row = QHBoxLayout()
+        teacher_row.addWidget(self.teacher, 1)
+        teacher_row.addWidget(self.teacher_button)
+        teacher.addRow("Teacher:", teacher_row)
+        self.prompts = QLineEdit()
+        self.prompts.setPlaceholderText("Questions: one per line (.txt), or a .jsonl of prompts")
+        self.prompts_button = QPushButton("File…")
+        prompts_row = QHBoxLayout()
+        prompts_row.addWidget(self.prompts, 1)
+        prompts_row.addWidget(self.prompts_button)
+        teacher.addRow("Questions:", prompts_row)
+        self.samples = QSpinBox()
+        self.samples.setRange(1, 16)
+        self.judge = QComboBox()
+        for key, label in JUDGES:
+            self.judge.addItem(label, key)
+        judge_row = QHBoxLayout()
+        judge_row.addWidget(self.samples)
+        judge_row.addWidget(QLabel("Judge:"))
+        judge_row.addWidget(self.judge, 1)
+        teacher.addRow("Answers per question:", judge_row)
+        self.system = QLineEdit()
+        self.system.setPlaceholderText("Optional instructions for the teacher (system prompt)")
+        teacher.addRow("System prompt:", self.system)
+        self.max_answer = QSpinBox()
+        self.max_answer.setRange(16, 8192)
+        self.max_answer.setValue(256)
+        self.keep_cut = QCheckBox("Keep answers cut at this length")
+        answer_row = QHBoxLayout()
+        answer_row.addWidget(self.max_answer)
+        answer_row.addWidget(self.keep_cut, 1)
+        teacher.addRow("Longest answer (tokens):", answer_row)
+        self.distill_button = QPushButton("Write the dialogs…")
+        self.distill_stop = QPushButton("Stop")
+        self.distill_stop.setEnabled(False)
+        self.distill_status = hint("A judge keeps only right answers and also writes preference "
+                                   "pairs; a stopped run continues where it stopped.")
+        distill_row = QHBoxLayout()
+        distill_row.addWidget(self.distill_button)
+        distill_row.addWidget(self.distill_stop)
+        distill_row.addWidget(self.distill_status, 1)
+        teacher.addRow(distill_row)
+        self.teacher_box.body_layout.addLayout(teacher)
+        layout.addWidget(self.teacher_box)
+
+        # ---- run
+        self.panel = RunPanel("Start fine-tuning")
+        layout.addWidget(self.panel)
+        after = QHBoxLayout()
+        self.save_button = QPushButton("Save the model…")
+        self.chat_button = QPushButton("Chat with it")
+        self.export_button = QPushButton("Export…")
+        self.merge_button = QPushButton("Merge the adapters")
+        self.merge_button.setToolTip("Write the LoRA adapters into the weights: faster replies, "
+                                     "no further LoRA training on them")
+        self.save_adapter_button = QPushButton("Save the adapters…")
+        self.load_adapter_button = QPushButton("Load adapters…")
+        for button in (self.save_button, self.chat_button, self.export_button, self.merge_button,
+                       self.save_adapter_button, self.load_adapter_button):
+            after.addWidget(button)
+        after.addStretch(1)
+        layout.addLayout(after)
+        layout.addStretch(1)
+
+        # ---- signals
+        self.catalog.currentIndexChanged.connect(self._base_changed)
+        self.catalog.activated.connect(lambda _i: self._choose_base())
+        for button in self.source_buttons.values():
+            button.toggled.connect(self._base_changed)
+            button.clicked.connect(lambda _c=False: setattr(self, "_base_chosen", True))
+        self.hub.textEdited.connect(lambda _t: self._choose_base("hub"))
+        self.file.textEdited.connect(lambda _t: self._choose_base("file"))
+        self.hub_folder.clicked.connect(self._pick_hub_folder)
+        self.file_button.clicked.connect(self._pick_file)
+        for button in self.method_buttons.values():
+            button.toggled.connect(self._method_toggled)
+            button.clicked.connect(lambda _c=False: setattr(self, "_method_chosen", True))
+        self.epochs.valueChanged.connect(self._tuned)
+        self.seq.valueChanged.connect(self._tuned)
+        self.adam8.toggled.connect(self._tuned)
+        self.data.changed.connect(self._data_changed)
+        self.panel.start_clicked.connect(self.start)
+        self.panel.finish_clicked.connect(self.finish)
+        self.panel.stop_clicked.connect(self.stop)
+        self.teacher_button.clicked.connect(self._pick_teacher)
+        self.prompts_button.clicked.connect(self._pick_prompts)
+        self.distill_button.clicked.connect(self.start_distill)
+        self.distill_stop.clicked.connect(self._stop_distill)
+        self.save_button.clicked.connect(window.save_model_dialog)
+        self.chat_button.clicked.connect(lambda: window.goto("chat"))
+        self.export_button.clicked.connect(lambda: window.goto("export"))
+        self.merge_button.clicked.connect(self.merge_adapters)
+        self.save_adapter_button.clicked.connect(self.save_adapters)
+        self.load_adapter_button.clicked.connect(self.load_adapters)
+        window.hardware_changed.connect(lambda _hw: self._update_estimates())
+        window.model_changed.connect(self._model_changed)
+        compact_spins(self)
+        self._model_changed()
+        self._data_changed(None)
+
+    def _pairs(self) -> bool:
+        report = self.data.report
+        return report is not None and report.kind == "preferences"
+
+    # ---- the base ----------------------------------------------------------
+    def source(self) -> str:
+        for key, button in self.source_buttons.items():
+            if button.isChecked():
+                return key
+        return "catalog"
+
+    def _choose_base(self, source: str = "catalog") -> None:
+        self._base_chosen = True
+        self.source_buttons[source].setChecked(True)
+
+    def selected_model(self) -> BaseModel | None:
+        if self.source() == "catalog":
+            return find_model(str(self.catalog.currentData()))
+        if self.source() == "hub":
+            return find_model(self.hub.text())
+        return None
+
+    def base_spec(self) -> str:
+        """What to import or load: ``hf:...``, a folder, a ``.pt`` path, or "" (in memory)."""
+        source = self.source()
+        if source == "catalog":
+            return f"hf:{self.catalog.currentData()}"
+        if source == "hub":
+            text = self.hub.text().strip()
+            if text and not os.path.exists(text) and not text.lower().startswith("hf:") \
+                    and "/" in text:
+                text = "hf:" + text
+            return text
+        if source == "file":
+            return self.file.text().strip()
+        return ""
+
+    def _pick_hub_folder(self) -> None:
+        path = ask_dir(self, "Choose a downloaded Hugging Face model folder")
+        if path:
+            self.hub.setText(path)
+            self._choose_base("hub")
+
+    def _pick_file(self) -> None:
+        path = ask_open(self, "Choose an AuraLite model", "AuraLite models (*.pt);;All files (*)",
+                        self.studio.settings.last_model_dir)
+        if path:
+            self.file.setText(path)
+            self._choose_base("file")
+
+    def _base_changed(self, *_args: Any) -> None:
+        fit = self._fit_of(self.selected_model())
+        lines = []
+        if fit is not None:
+            m = fit.model
+            note = m.note[:1].upper() + m.note[1:]
+            lines.append(f"{m.name}: {m.size_label} parameters, {m.license}"
+                         + (" (no commercial use)" if not m.commercial else "")
+                         + f", download {m.download_gb:.1f} GB. {note}.")
+            lines.append(fit.line())
+            lines += [f"Note: {n}" for n in fit.notes]
+        elif self.source() == "memory":
+            lines.append("Fine-tunes the model that is loaded now.")
+        elif self.source() == "file":
+            lines.append("Loads the file, then fine-tunes it.")
+        self.base_info.setText("\n".join(lines))
+        self._update_estimate_line()
+
+    def _fit_of(self, model: BaseModel | None) -> ModelFit | None:
+        if model is None or self.recommendation is None:
+            return None
+        return next((f for f in self.recommendation.options if f.model.repo == model.repo), None)
+
+    def _method_toggled(self, checked: bool) -> None:
+        if checked:
+            method = self.method()
+            self.rank.setEnabled(method != "full")
+            self.lora_lr.setEnabled(method != "full")
+            self.full_lr.setEnabled(method == "full")
+            self._update_estimate_line()
+
+    def _tuned(self, *_args: Any) -> None:
+        if not self._applying:
+            self._user_tuned = True
+
+    def method(self) -> str:
+        for key, button in self.method_buttons.items():
+            if button.isChecked():
+                return key
+        return "qlora"
+
+    # ---- estimates -------------------------------------------------------------
+    def _data_changed(self, report: DataReport | None) -> None:
+        pairs = report is not None and report.kind == "preferences"
+        self.how_form.setRowVisible(self.objective, pairs)
+        if report is not None and report.paths and os.path.exists(report.paths[0]):
+            self.studio.settings.last_data_dir = os.path.dirname(os.path.abspath(
+                report.paths[0]))
+        self._update_estimates()
+
+    def _update_estimates(self) -> None:
+        hw = self.studio.hardware
+        if hw is None:
+            return
+        report = self.data.report if self.data.report is not None and self.data.report.ok \
+            else None
+        self.recommendation = rec = recommend_finetune(hw, report)
+        for i, fit in enumerate(rec.options):
+            mark = "  ★ recommended" if rec.choice is fit else ""
+            verdict = "fits" if fit.fits else ("tight" if fit.tight else "too big")
+            self.catalog.setItemText(i, f"{fit.model.name} - {fit.model.size_label} · "
+                                        f"{verdict}{mark}")
+        if rec.choice is not None:
+            if not self._base_chosen:
+                index = self.catalog.findData(rec.choice.model.repo)
+                self.catalog.blockSignals(True)
+                self.catalog.setCurrentIndex(index)
+                self.catalog.blockSignals(False)
+            self._applying = True
+            try:
+                if not self._method_chosen:
+                    self.method_buttons[rec.choice.method].setChecked(True)
+                if not self._user_tuned:
+                    s = rec.settings
+                    self.epochs.setValue(int(s.get("epochs", self.epochs.value())))
+                    self.seq.setValue(int(s.get("seq_length", self.seq.value())))
+                    self.adam8.setChecked(s.get("optimizer") == "adamw8bit")
+            finally:
+                self._applying = False
+        self._base_changed()
+
+    def _update_estimate_line(self) -> None:
+        model = self.selected_model()
+        rec = self.recommendation
+        if model is None or rec is None:
+            self.estimate.setText("")
+            return
+        from ..advisor import estimate_finetune
+        tokens = rec.options[0].tokens if rec.options else 0
+        fit = estimate_finetune(model, self.method(), rec.hardware,
+                                seq_length=int(self.seq.value()), tokens=tokens,
+                                budget=rec.budget)
+        verdict = ("fits" if fit.fits else "tight: close other programs" if fit.tight
+                   else "too big for this computer's memory")
+        time_text = (f", about {format_duration(fit.hours * 3600)} for {fit.tokens:,} tokens"
+                     if fit.hours is not None else "")
+        self.estimate.setText(f"Estimate: ~{format_gb(fit.memory)} of memory ({verdict})"
+                              f"{time_text}")
+
+    def _model_changed(self) -> None:
+        engine = self.studio.engine
+        has_model = engine.model is not None
+        self.source_buttons["memory"].setEnabled(has_model)
+        self.memory_label.setText(self.studio.model_description() if has_model else
+                                  "none - choose one above")
+        busy = self.job is not None
+        has_lora = has_model and bool(getattr(engine, "has_lora", lambda: False)())
+        for button in (self.save_button, self.chat_button, self.export_button):
+            button.setEnabled(has_model and not busy)
+        self.merge_button.setEnabled(has_lora and not busy)
+        self.save_adapter_button.setEnabled(has_lora and not busy)
+        self.load_adapter_button.setEnabled(has_model and not busy)
+
+    # ---- settings ----------------------------------------------------------------
+    def settings(self) -> FineTuneSettings:
+        """The form as :class:`FineTuneSettings` (SettingsError for an unreadable number)."""
+        def number(edit: QLineEdit, name: str) -> float:
+            try:
+                return float(edit.text().strip())
+            except ValueError as err:
+                raise SettingsError(f"{name} must be a number (like 0.001)") from err
+
+        weight_text = self.prompt_weight.text().strip().lower()
+        if weight_text in ("", "auto"):
+            weight = None
+        else:
+            try:
+                weight = float(weight_text)
+            except ValueError as err:
+                raise SettingsError("the prompt weight is a number from 0 to 1, or auto") from err
+        method = self.method()
+        return FineTuneSettings(
+            method=method, lora_rank=int(self.rank.value()),
+            lora_lr=number(self.lora_lr, "the LoRA learning rate") if method != "full" else None,
+            lr=number(self.full_lr, "the learning rate") if method == "full" else 3e-5,
+            optimizer="adamw8bit" if self.adam8.isChecked() else "adamw",
+            epochs=int(self.epochs.value()), max_steps=int(self.max_steps.value()),
+            time_limit_min=float(self.time_limit.value()), seq_length=int(self.seq.value()),
+            batch_size=int(self.batch.value()), chat_template=str(self.template.currentData()),
+            prompt_weight=weight, pack_dialogs=self.pack.isChecked(),
+            objective=str(self.objective.currentData()) if self._pairs() else "auto",
+            val_split=float(self.val_split.value()),
+            memory_plan="auto" if self.memory_plan.isChecked() else "off")
+
+    def apply_plan(self, plan: dict[str, Any]) -> None:
+        """Fill the form from the wizard's plan."""
+        settings = dict(plan.get("settings") or {})
+        base = str(plan.get("base") or settings.get("base") or "")
+        model = find_model(base)
+        if model is not None:
+            self.catalog.setCurrentIndex(self.catalog.findData(model.repo))
+            self._choose_base("catalog")
+        elif base.endswith(".pt"):
+            self.file.setText(base)
+            self._choose_base("file")
+        elif base:
+            self.hub.setText(base)
+            self._choose_base("hub")
+        method = settings.get("method")
+        if method in self.method_buttons:
+            self.method_buttons[method].setChecked(True)
+            self._method_chosen = True
+        for key, widget in (("epochs", self.epochs), ("seq_length", self.seq),
+                            ("lora_rank", self.rank), ("batch_size", self.batch)):
+            if settings.get(key):
+                widget.setValue(int(settings[key]))
+        if "optimizer" in settings:
+            self.adam8.setChecked(settings["optimizer"] == "adamw8bit")
+        if plan.get("data"):
+            self.data.set_path(str(plan["data"]))
+
+    # ---- running ---------------------------------------------------------------------
+    def start(self) -> None:
+        report = self.data.report
+        if report is None or not report.for_finetune:
+            problem = (report.problems[0] if report is not None and report.problems else
+                       "choose dialogs, preference pairs or a text to fine-tune on"
+                       if report is None or report.ok else
+                       f"{report.kind_label} trains a new model (the Train tab)")
+            show_error(self, SettingsError(problem))
+            return
+        try:
+            settings = self.settings()
+            params = finetune_params(settings, report.kind)
+        except SettingsError as err:
+            show_error(self, err)
+            return
+        source = self.source()
+        spec = self.base_spec()
+        engine = self.studio.engine
+        if source == "memory" and engine.model is None:
+            show_error(self, SettingsError("there is no model in memory: choose a base model"))
+            return
+        if source != "memory" and not spec:
+            show_error(self, SettingsError("choose the base model: a name, a folder or a file"))
+            return
+        if source == "file" and not os.path.isfile(spec):
+            show_error(self, FileNotFoundError(f"not found: {spec}"))
+            return
+        if source != "memory" and not self.studio.confirm_replace_model(
+                "The base model replaces the one in memory."):
+            return
+        if not self.studio.begin("fine-tuning"):
+            return
+        paths = list(report.paths)
+        method = settings.method
+
+        def work(job: Job) -> Any:
+            from auralite.engine import PreferenceSet, load_training_data
+            if source in ("catalog", "hub"):
+                job.progress.emit(("stage", f"Getting {spec}…", 0.0))
+
+                def import_progress(info: dict) -> None:
+                    job.progress.emit(("import", dict(info)))
+
+                engine.import_hf_model(spec, quantize="nf4" if method == "qlora" else None,
+                                       progress_callback=import_progress,
+                                       stop_event=job.stop_event)
+                job.progress.emit(("loaded", spec))
+            elif source == "file":
+                job.progress.emit(("stage", f"Loading {os.path.basename(spec)}…", None))
+                engine.load_model(spec)
+                job.progress.emit(("loaded", spec))
+            if job.stop_event.is_set():
+                return {"stopped_during": "loading the base model"}
+            job.progress.emit(("stage", "Reading the data…", None))
+            data = load_training_data(paths)
+            if isinstance(data, PreferenceSet) and settings.objective == "sft":
+                data = data.as_dialogs()
+            return engine.train(data, params, progress_callback=training_callback(job),
+                                stop_event=job.stop_event, finish_event=job.finish_event)
+
+        self.job = Job("fine-tune", work, self)
+        self.job.progress.connect(self._progress)
+        self.job.finished.connect(self._finished)
+        self.job.failed.connect(self._failed)
+        self._started = time.time()
+        self.panel.begin("Starting…")
+        self._model_changed()
+        self.job.start()
+
+    def _progress(self, event: tuple) -> None:
+        kind = event[0]
+        if kind == "train":
+            self.panel.show_progress(event[1])
+        elif kind == "import":
+            info = event[1]
+            if info.get("stage") == "download":
+                done, total = int(info.get("all_bytes") or 0), int(info.get("all_total") or 0)
+                percent = 100.0 * done / total if total else None
+                self.panel.show_stage(f"Downloading {info.get('file', '')}: "
+                                      f"{done / 1e6:,.0f} of {total / 1e6:,.0f} MB", percent)
+            elif info.get("stage") == "convert":
+                done, total = int(info.get("done") or 0), int(info.get("total") or 0)
+                self.panel.show_stage(f"Converting the weights: {done}/{total}",
+                                      100.0 * done / total if total else None)
+        elif kind == "loaded":
+            self.studio.model_loaded(str(event[1]))
+        else:
+            self.panel.show_stage(event[1], event[2])
+
+    def _finished(self, summary: Any) -> None:
+        stopped = self.job is not None and self.job.stop_event.is_set()
+        self.job = None
+        self.panel.end(summary_text(summary, time.time() - self._started, stopped))
+        self.studio.model_trained("fine-tuned")
+        self.studio.end(model_dirty=True)
+        self._model_changed()
+
+    def _failed(self, exc: BaseException) -> None:
+        self.job = None
+        self.panel.end("The fine-tuning failed - see the message.")
+        self.studio.end(model_dirty=self.studio.engine.model is not None)
+        self._model_changed()
+        self.studio.report_error(exc, "fine-tuning")
+
+    def finish(self) -> None:
+        if self.job is not None:
+            self.job.finish_event.set()
+
+    def stop(self) -> None:
+        if self.job is not None:
+            self.job.stop_event.set()
+            self.panel.status.setText("Stopping at the next step…")
+
+    # ---- adapters -----------------------------------------------------------------------
+    def merge_adapters(self) -> None:
+        engine = self.studio.engine
+        native = getattr(engine.model, "module", engine.model)
+        try:
+            from auralite.engine.nf4 import nf4_layers
+            quantized = bool(nf4_layers(native))
+        except Exception:
+            quantized = False
+        if quantized:
+            need = int(native.count_parameters()) * 4
+            if not confirm(self, "Merge into full precision?",
+                           f"The base is stored in 4 bits. Merged, every weight is a float32 "
+                           f"one: about {format_gb(need)} of memory and a bigger file, but "
+                           f"fast replies. Save the adapters first to keep the small "
+                           f"version.\n\nMerge now?"):
+                return
+        try:
+            merged = engine.merge_lora()
+        except Exception as err:
+            self.studio.report_error(err, "merging the adapters")
+            return
+        self.studio.end(model_dirty=True)
+        self._model_changed()
+        inform(self, "Adapters merged", f"{merged} adapter layers were written into the weights.")
+
+    def save_adapters(self) -> None:
+        path = ask_save(self, "Save the LoRA adapters", "LoRA adapters (*.pt)",
+                        os.path.join(self.studio.settings.last_model_dir, "adapter.pt"))
+        if not path:
+            return
+        try:
+            info = self.studio.engine.save_adapter(path)
+        except Exception as err:
+            self.studio.report_error(err, "saving the adapters")
+            return
+        inform(self, "Adapters saved", f"Saved to {path}\n"
+                                       f"({int(info.get('bytes', 0) or 0) / 1e6:,.1f} MB)")
+
+    def load_adapters(self) -> None:
+        path = ask_open(self, "Load LoRA adapters", "LoRA adapters (*.pt);;All files (*)",
+                        self.studio.settings.last_model_dir)
+        if not path:
+            return
+        try:
+            self.studio.engine.load_adapter(path)
+        except Exception as err:
+            self.studio.report_error(err, "loading the adapters")
+            return
+        self.studio.end(model_dirty=True)
+        self._model_changed()
+
+    # ---- teacher dialogs ------------------------------------------------------------------
+    def _pick_teacher(self) -> None:
+        path = ask_open(self, "Choose the teacher model",
+                        "Models (*.gguf *.pt);;All files (*)", self.studio.settings.last_model_dir)
+        if path:
+            self.teacher.setText(path)
+
+    def _pick_prompts(self) -> None:
+        path = ask_open(self, "Choose the questions", "Questions (*.txt *.jsonl *.json);;"
+                                                     "All files (*)",
+                        self.studio.settings.last_data_dir)
+        if path:
+            self.prompts.setText(path)
+
+    def start_distill(self) -> None:
+        from auralite.engine.distill import EngineTeacher, distill_dialogs, load_teacher, \
+            read_prompts
+        prompts_path = self.prompts.text().strip()
+        teacher_spec = self.teacher.text().strip()
+        engine = self.studio.engine
+        if not prompts_path or not os.path.isfile(prompts_path):
+            show_error(self, SettingsError("choose a file of questions: one per line (.txt), "
+                                           "or a .jsonl of prompts or dialogs"))
+            return
+        if not teacher_spec and engine.model is None:
+            show_error(self, SettingsError("choose a teacher model, or load one to use the model "
+                                           "in memory"))
+            return
+        try:
+            prompts, _skipped = read_prompts(prompts_path)
+        except (OSError, ValueError) as err:
+            self.studio.report_error(err, "reading the questions")
+            return
+        if not prompts:
+            show_error(self, SettingsError(f"no questions in {prompts_path}"))
+            return
+        stem = os.path.splitext(prompts_path)[0]
+        out = ask_save(self, "Save the dialogs as", "Dialogs (*.jsonl)", stem + "_dialogs.jsonl")
+        if not out:
+            return
+        judge = str(self.judge.currentData())
+        judge_value = None if judge == "none" else judge
+        pairs = os.path.splitext(out)[0] + "_pairs.jsonl" if judge_value else None
+        if not teacher_spec and not self.studio.begin("writing dialogs"):
+            return
+        settings = {"samples": int(self.samples.value()), "judge": judge_value,
+                    "system": self.system.text().strip() or None,
+                    "max_tokens": int(self.max_answer.value()),
+                    "keep_truncated": self.keep_cut.isChecked()}
+
+        def work(job: Job) -> Any:
+            teacher = (EngineTeacher(engine, name="model in memory") if not teacher_spec
+                       else load_teacher(teacher_spec))
+
+            def progress(info: dict) -> None:
+                job.progress.emit(dict(info))
+
+            return distill_dialogs(teacher, prompts, out, pairs_path=pairs,
+                                   prompts_file=prompts_path, on_progress=progress,
+                                   stop_event=job.stop_event, **settings)
+
+        self.distill_job = Job("teacher", work, self)
+        self.distill_job.progress.connect(self._distill_progress)
+        self.distill_job.finished.connect(lambda meta: self._distill_done(meta, out,
+                                                                          not teacher_spec))
+        self.distill_job.failed.connect(lambda exc: self._distill_failed(exc, not teacher_spec))
+        self.distill_button.setEnabled(False)
+        self.distill_stop.setEnabled(True)
+        self.distill_status.setText("Loading the teacher…")
+        self.distill_job.start()
+
+    def _distill_progress(self, info: dict) -> None:
+        eta = info.get("eta_seconds")
+        self.distill_status.setText(
+            f"{int(info.get('done', 0)):,}/{int(info.get('total', 0)):,} questions · "
+            f"{int(info.get('kept', 0)):,} dialogs"
+            + (f" · about {format_duration(float(eta))} left" if eta else ""))
+
+    def _distill_done(self, meta: dict, out: str, used_memory: bool) -> None:
+        self.distill_job = None
+        self.distill_button.setEnabled(True)
+        self.distill_stop.setEnabled(False)
+        if used_memory:
+            self.studio.end(model_dirty=False)
+        records = int(((meta.get("files") or {}).get("dialogs") or {}).get("records", 0))
+        text = f"Saved {records:,} dialogs to {os.path.basename(out)}"
+        counts = meta.get("counts") or {}
+        if not records and counts.get("replies"):
+            reasons = []
+            if counts.get("truncated"):
+                reasons.append(f"{counts['truncated']} cut at the length limit (the teacher did "
+                               f"not end them: a chat model, a longer limit or «keep answers "
+                               f"cut» helps)")
+            if counts.get("empty"):
+                reasons.append(f"{counts['empty']} empty")
+            if counts.get("rejected"):
+                reasons.append(f"{counts['rejected']} rejected by the judge")
+            text = "No dialog kept: " + "; ".join(reasons or ["no usable answer"])
+        if meta.get("stopped"):
+            text += " - stopped; write again with the same file to continue"
+        self.distill_status.setText(text)
+        if records:
+            self.data.set_path(out)
+
+    def _distill_failed(self, exc: BaseException, used_memory: bool) -> None:
+        self.distill_job = None
+        self.distill_button.setEnabled(True)
+        self.distill_stop.setEnabled(False)
+        self.distill_status.setText("Failed - see the message.")
+        if used_memory:
+            self.studio.end(model_dirty=False)
+        self.studio.report_error(exc, "writing the dialogs")
+
+    def _stop_distill(self) -> None:
+        if self.distill_job is not None:
+            self.distill_job.stop_event.set()
+            self.distill_status.setText("Stopping after this question…")

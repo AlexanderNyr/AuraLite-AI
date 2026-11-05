@@ -391,3 +391,28 @@ model up to ~1.5B overnight; bigger models want a GPU. Chatting with the
 4-bit model itself is slow on a CPU (every weight is decoded for every
 token): merge the adapters or export to GGUF first. See
 [training.md](training.md) § 21.
+
+## 20. Which app should I use: AuraLite Studio or the classic GUI?
+
+AuraLite Studio (2.19, `auralite-studio`, `pip install "auralite-ai[studio]"`)
+is the one to start with: separate tabs for fine-tuning a ready model and for
+training a new one, a wizard, recommendations sized to your computer, data
+checked before training, errors explained, a log file. The classic GUI
+(`auralite-gui`, tkinter, no extra package) stays as it was and still has what
+the Studio does not have yet — the image generator, quantization, evaluation,
+the transformers backend. Both use the same engine and the same checkpoints.
+Qt 6.10+ (the Studio) needs a processor with SSE4.2 (every Intel Core since
+2008, AMD since 2011); on an older one the Studio says which PySide6 to install,
+and the classic GUI runs anyway. See [studio.md](studio.md).
+
+## 21. How does AuraLite know what my computer can train?
+
+`auralite doctor` (and the Studio's Start tab) reads the memory, the processor
+(cores, AVX / AVX2 / AVX-512), the GPU and the free disk, and times a matrix
+product for one second with the threads training uses. The memory of a run is
+AuraLite's own estimate (within about 20 % of measured peaks); the speed is a
+share of the measured product (about 45 % on a CPU, calibrated on the 2.18.1
+runs: Qwen2.5-0.5B with QLoRA at 39 tokens/s on 2 cores). It recommends the
+largest model that fits and fine-tunes 1,000 dialogs overnight — a multilingual
+one (Qwen) when the data is not in English. Times are estimates: the run's
+progress line shows the real speed after the first steps.

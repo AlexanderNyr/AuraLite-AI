@@ -21,6 +21,8 @@
     auralite lora apply --base base.pt --adapter adapter.pt --out chat.pt [--merge]
     auralite distill --teacher teacher.gguf --prompts prompts.txt --out chats.jsonl
     auralite train   --data prefs.jsonl --resume chat.pt --method dpo --model dpo.pt
+    auralite doctor  [--data dialogs.jsonl] [--goal finetune|pretrain] [--write-params plan.json]
+    auralite studio                     (2.19: the desktop app on Qt 6; pip install "auralite-ai[studio]")
 
 2.14.1: `auralite train --tokenizer FILE` trains with your own tokenizer: a file
 of `auralite tokenizer train`, a Hugging Face tokenizer.json (BPE), GPT-2
@@ -2213,6 +2215,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_image_sampling_flags(p)
     p.add_argument("--json", action="store_true", help="print the result as one JSON line")
     p.set_defaults(func=cmd_image_eval)
+
+    # 2.19: what this computer can train, and the desktop app
+    p = sub.add_parser("doctor", help="check this computer and recommend a model and settings "
+                                      "for training on it")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--data", nargs="+", metavar="PATH",
+                   help="the training data: sizes the model and the time estimate to it")
+    p.add_argument("--goal", choices=["finetune", "pretrain"], default="finetune",
+                   help="fine-tune a pretrained model (default) or train one from scratch")
+    p.add_argument("--hours", type=float, default=8.0, metavar="H",
+                   help="how long a run may take (default 8: overnight)")
+    p.add_argument("--no-speed", action="store_true",
+                   help="skip the 1-second speed test (time estimates are then rough)")
+    p.add_argument("--write-params", metavar="FILE",
+                   help="write the recommended settings as a --params JSON file for "
+                        "auralite train")
+    p.add_argument("--json", action="store_true", help="print everything as JSON")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("studio", help="open AuraLite Studio, the desktop app (needs PySide6: "
+                                      "pip install \"auralite-ai[studio]\")")
+    _add_common_flags(p, suppress_defaults=True)
+    p.set_defaults(func=cmd_studio)
     return parser
 
 
@@ -2234,6 +2259,134 @@ def _add_image_sampling_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--truncation", type=float, default=0.0,
                    help="GAN: resample latent values beyond this magnitude (e.g. 1.5: cleaner, "
                         "less varied images; default 0 = off)")
+
+
+def _optional_packages() -> dict[str, str]:
+    """Installed optional packages and their versions ("" = not installed)."""
+    from importlib import metadata
+    found = {}
+    for module, dist in (("transformers", "transformers"), ("peft", "peft"),
+                         ("llama_cpp", "llama-cpp-python"), ("PySide6", "PySide6-Essentials"),
+                         ("onnx", "onnx"), ("fastapi", "fastapi"), ("datasets", "datasets")):
+        version = ""
+        for name in (dist, "PySide6") if module == "PySide6" else (dist,):
+            try:
+                version = metadata.version(name)
+                break
+            except metadata.PackageNotFoundError:
+                continue
+        found[module] = version
+    return found
+
+
+def _doctor_command(rec, data: list[str], params_file: str) -> list[str]:
+    """`auralite` commands that run the recommendation."""
+    data_text = " ".join(data) if data else "DIALOGS.jsonl"
+    params = f" --params {params_file}" if params_file else ""
+    if rec.goal == "pretrain":
+        preset = rec.settings.get("preset", "25m")
+        minutes = int(rec.settings.get("time_limit_min", 480))
+        return [f"auralite train --data {data_text} --preset {preset} --time-budget {minutes}m "
+                f"--memory-plan auto{params} --model my-model.pt"]
+    choice = rec.choice
+    if choice is None:
+        return []
+    quantize = " --quantize nf4" if choice.method == "qlora" else ""
+    optimizer = " --optimizer adamw8bit" if rec.settings.get("optimizer") == "adamw8bit" else ""
+    lora = "" if choice.method == "full" else f" --lora {rec.settings.get('lora_rank', 16)}"
+    pack = " --pack-dialogs" if rec.settings.get("pack_dialogs") else ""
+    return [f"auralite train --data {data_text} --resume {choice.model.spec}{quantize}{lora}"
+            f"{optimizer}{pack} --memory-plan auto{params} --model my-chat-model.pt",
+            "auralite chat --model my-chat-model.pt",
+            "auralite export --model my-chat-model.pt --format gguf --out my-chat-model.gguf"]
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """2.19: the computer, the data, the model and settings that fit, the commands to run."""
+    import platform
+
+    import torch
+
+    from auralite import __version__
+    from auralite.studio import (detect_hardware, inspect_data, measure_gflops,
+                                 recommend_finetune, recommend_pretrain)
+    hw = detect_hardware()
+    if not args.no_speed:
+        hw.gflops = measure_gflops(hw.accelerator if hw.accelerator != "cpu" else "cpu")
+    report = inspect_data(args.data) if args.data else None
+    if args.goal == "pretrain":
+        rec = recommend_pretrain(hw, report, max_hours=args.hours)
+    else:
+        rec = recommend_finetune(hw, report, max_hours=args.hours)
+    params: dict = {}
+    if rec.goal == "finetune" and rec.choice is not None:
+        s = rec.settings
+        params = {"epochs": s["epochs"], "seq_length": s["seq_length"],
+                  "batch_size": s["batch_size"], "val_split": s["val_split"]}
+        if rec.choice.method != "full":
+            params["lora_lr"] = s["lora_lr"]
+        else:
+            params["lr"] = s["lr"]
+    elif rec.goal == "pretrain":
+        params = {"epochs": rec.settings["epochs"], "bpe_vocab_size":
+                  rec.settings["bpe_vocab_size"]}
+    if args.write_params and params:
+        with open(args.write_params, "w", encoding="utf-8") as f:
+            json.dump(params, f, indent=1)
+    commands = _doctor_command(rec, list(args.data or []), args.write_params or "")
+    packages = _optional_packages()
+    if args.json:
+        out = {"version": __version__, "python": platform.python_version(),
+               "torch": torch.__version__, "hardware": hw.to_dict(), "packages": packages,
+               "goal": rec.goal, "budget": rec.budget, "settings": rec.settings,
+               "params": params, "commands": commands, "warnings": rec.warnings,
+               "data": None if report is None else {
+                   "kind": report.kind, "records": report.records, "tokens": report.tokens,
+                   "script": report.script, "problems": report.problems,
+                   "warnings": report.warnings}}
+        if rec.goal == "finetune":
+            out["choice"] = None if rec.choice is None else rec.choice.model.repo
+            out["options"] = [{"repo": f.model.repo, "method": f.method, "memory": f.memory,
+                               "fits": f.fits, "tight": f.tight,
+                               "tokens_per_second": f.tokens_per_second, "hours": f.hours}
+                              for f in rec.options]
+        else:
+            out["choice"] = rec.preset.preset if rec.preset is not None else None
+        print(json.dumps(out, indent=1))
+        return 0
+    print(f"AuraLite {__version__} - Python {platform.python_version()}, "
+          f"PyTorch {torch.__version__}")
+    for line in hw.summary_lines():
+        print(line)
+    print("Optional: " + ", ".join(f"{name} {version or '-'}"
+                                   for name, version in packages.items()))
+    print()
+    if report is not None:
+        for line in report.summary_lines():
+            print(line)
+        print()
+    for line in rec.lines():
+        print(line)
+    if rec.goal == "finetune":
+        usable = [f for f in rec.options if f.usable]
+        if usable:
+            print("\nModels that fit:")
+            for fit in usable:
+                print("  " + fit.line())
+    if params and args.write_params:
+        print(f"\nSettings written to {args.write_params}")
+    if commands:
+        print("\nTo run it:")
+        for command in commands:
+            print("  " + command)
+    print("\nOr in the desktop app: auralite studio")
+    return 0
+
+
+def cmd_studio(args: argparse.Namespace) -> int:
+    """2.19: AuraLite Studio, the desktop app on Qt 6."""
+    from auralite.studio.app import main as studio_main
+    return studio_main([])
 
 
 def main(argv: list[str] | None = None) -> int:

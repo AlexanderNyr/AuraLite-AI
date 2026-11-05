@@ -51,7 +51,10 @@ EXPECTED_TOP_LEVEL = {"auralite"}
 #: the server.
 REQUIRED_MODULES = {"auralite.cli", "auralite.engine", "auralite.image_engine",
                     "auralite.gui.app", "auralite.server.openai_server",
-                    "auralite.agent", "auralite.quantization", "auralite.export"}
+                    "auralite.agent", "auralite.quantization", "auralite.export",
+                    # 2.19: AuraLite Studio - its toolkit-free core and the window
+                    "auralite.studio", "auralite.studio.app", "auralite.studio.advisor",
+                    "auralite.studio.qt.window"}
 
 #: Pre-2.7 top-level names. They must not be importable from an installed
 #: AuraLite: on PyPI they would collide with other distributions.
@@ -67,7 +70,9 @@ OPTIONAL_SYSTEM_MODULES = {"tkinter", "_tkinter"}
 OPTIONAL_DEPENDENCIES = {"fastapi", "uvicorn", "starlette", "pydantic", "httpx", "transformers",
                          "peft", "accelerate", "bitsandbytes", "llama_cpp", "onnx", "onnxruntime",
                          "onnxscript", "safetensors", "lm_eval", "sentence_transformers", "faiss",
-                         "torchao", "tiktoken", "sentencepiece", "vllm"}
+                         "torchao", "tiktoken", "sentencepiece", "vllm",
+                         # 2.19: the `studio` extra (AuraLite Studio's window)
+                         "PySide6", "shiboken6"}
 
 
 def _inside(path: str | os.PathLike | None, root: pathlib.Path) -> bool:

@@ -6,22 +6,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.18.1"
-description = "Educational yet deployable LLM framework with native training, quantization, RAG, and serving"
+version = "2.19.0"
+description = "Train, fine-tune and run language models on your own PC: native engine, QLoRA, GGUF and Hugging Face export, a desktop app (AuraLite Studio) and an OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "AuraLite AI contributors"}]
-keywords = ["llm", "transformer", "pytorch", "education", "training", "quantization",
-            "torch-export", "onnx", "openai-api", "gguf"]
+keywords = ["llm", "transformer", "pytorch", "education", "training", "fine-tuning", "qlora",
+            "quantization", "torch-export", "onnx", "openai-api", "gguf", "desktop-app"]
 # Keep the Python list in sync with the CI test matrix (tests/test_release.py
 # checks it). No "License ::" classifier: with an SPDX `license` string (PEP 639)
 # setuptools rejects license classifiers.
 classifiers = [
   "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Environment :: Win32 (MS Windows)",
+  "Environment :: X11 Applications :: Qt",
   "Intended Audience :: Developers",
   "Intended Audience :: Education",
+  "Intended Audience :: End Users/Desktop",
   "Intended Audience :: Science/Research",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
@@ -52,6 +56,9 @@ auralite = "auralite.cli:main"
 [project.gui-scripts]
 # Windows: starts without a console window. Same as `python -m auralite.gui`.
 auralite-gui = "auralite.gui.app:main"
+# 2.19: AuraLite Studio, the desktop app on Qt 6 (the `studio` extra installs PySide6).
+# Same as `python -m auralite.studio` and `auralite studio`.
+auralite-studio = "auralite.studio.app:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "pytest-cov>=4", "hypothesis>=6", "pytest-benchmark>=4",
@@ -100,7 +107,11 @@ qlora = ["auralite-ai[hf]", "bitsandbytes>=0.43; platform_system != 'Darwin'"]
 # files (Python 3.14 reads .zst itself), and the Rust tokenizers package for
 # Hugging Face tokenizer.json files (checked to give AuraLite's ids, then used)
 data = ["datasets>=2.18", "pyarrow>=14", "zstandard>=0.22", "tokenizers>=0.15"]
-dev = ["auralite-ai[test,lint,full,serve,rag,data]"]
+# 2.19: AuraLite Studio, the desktop app (Qt 6, LGPL). PySide6-Essentials is the
+# Widgets part of Qt for Python; Qt 6.10+ needs an x86-64-v2 processor (SSE4.2 + POPCNT:
+# Intel since 2008 / Nehalem, AMD since 2011 / Bulldozer).
+studio = ["PySide6-Essentials>=6.6"]
+dev = ["auralite-ai[test,lint,full,serve,rag,data,studio]"]
 
 [tool.setuptools.packages.find]
 # 2.7.0: one import package. The flat layout installed 16 top-level names

@@ -3,18 +3,30 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.18.1-orange)
+![Version](https://img.shields.io/badge/version-2.19.0-orange)
 ![Coverage](https://img.shields.io/badge/coverage-86%25-green)
 
-[Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
+[Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
 
-**AuraLite AI** is a lightweight, educational Large Language Model (LLM) implemented using **PyTorch**. It is designed to demonstrate the inner workings of the Transformer architecture (the foundation of models like GPT-4) in a way that is accessible and runnable on consumer hardware.
+**AuraLite AI** trains, fine-tunes and runs language models on your own computer — from a desktop app, **AuraLite Studio**, or the command line. Fine-tune Qwen, Llama, Mistral or SmolLM2 on your dialogs with QLoRA, even on a 4-core CPU without a GPU; grow a small model of your own from your texts; chat with the result and export it to llama.cpp, Ollama, LM Studio or transformers, or serve it with an OpenAI-compatible API. Everything runs locally in plain **PyTorch**, and every part of the engine is readable code — the Transformer architecture behind models like GPT-4, from tokenizer to sampler, open to look into.
+
+**AuraLite Studio (2.19)** checks the computer and recommends a model and settings that fit it, reads your data before anything trains, runs training with a live chart, and explains errors with what to try. Fine-tuning and training from scratch have their own tabs; a wizard sets everything up:
+
+```bash
+pip install "auralite-ai[studio]"    # AuraLite + PySide6 (Qt 6)
+auralite-studio                      # Start · Train · Fine-tune · Chat · Export · Log
+```
+
+![AuraLite Studio: the Fine-tune tab](https://raw.githubusercontent.com/AlexanderNyr/AuraLite-AI/main/docs/images/studio-finetune.png)
+
+Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md). The classic interface (`auralite-gui`, tkinter) is still there.
 
 ## ⚡ Quickstart
 
 ```bash
 pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
-# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.18.1'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.19.0'
+auralite doctor --data chats.jsonl   # what this computer can train, with the command to run it (2.19)
 auralite train --text corpus.txt --model model.pt
 auralite generate --model model.pt --prompt "Once upon a time" --length 80
 auralite serve --model model.pt      # OpenAI-compatible API on http://127.0.0.1:8000
@@ -42,7 +54,8 @@ auralite train --data data/fineweb --resume run.pt --continue-run --model big.pt
 auralite import hf:HuggingFaceTB/SmolLM2-135M-Instruct --out smol.pt    # Llama / Mistral / Qwen2 / Qwen3 into AuraLite (2.18.1)
 auralite train --data chats.jsonl --resume hf:Qwen/Qwen2.5-0.5B-Instruct --quantize nf4 --lora 16 --memory-plan auto --model qwen-chat.pt   # QLoRA, also on a CPU
 auralite export --model qwen-chat.pt --format gguf --quant q8_0 --out qwen-chat.gguf   # llama.cpp / Ollama (or --format hf)
-auralite-gui                         # desktop app: train, chat, quantize, evaluate, export
+auralite-studio                      # AuraLite Studio, the desktop app (pip install "auralite-ai[studio]", 2.19)
+auralite-gui                         # the classic desktop app: also images, quantization, evaluation
 ```
 
 ```python
@@ -54,9 +67,9 @@ print(engine.generate("Once upon a time", length=80))
 ```
 
 Everything lives in one package, `auralite` (`auralite.engine`, `auralite.server`,
-`auralite.quantization`, `auralite.export`, …). Extras: `[serve]` server, `[hf]`
-Hugging Face + LoRA, `[export]` ONNX, `[torchao]` future-proof INT8, `[gguf]`
-llama.cpp — see *Installation* below.
+`auralite.studio`, `auralite.quantization`, `auralite.export`, …). Extras: `[studio]`
+AuraLite Studio (Qt 6), `[serve]` server, `[hf]` Hugging Face + LoRA, `[export]` ONNX,
+`[torchao]` future-proof INT8, `[gguf]` llama.cpp — see *Installation* below.
 
 
 ## ⚡ v2.6 Modern Training Stack
@@ -141,6 +154,7 @@ AURALITE_MODEL=auralite-v24.pt uvicorn auralite.server.openai_server:app --host 
 ```
 
 ## 🚀 Key Features
+- **🖥️ AuraLite Studio, the desktop app (2.19)**: a Qt 6 app (`auralite-studio`) with its own tabs for **fine-tuning** ready models and **training** new ones, plus Chat, Export and a live log. It measures the computer (memory, processor, GPU, a one-second speed test) and recommends the base model, the method (QLoRA, LoRA, every weight) and the settings that fit it — with the memory and the time a run will take, multilingual models for data that is not in English; a setup wizard fills everything in. Data is checked before anything trains (kind, size, script, skipped records, too few examples), errors come with what to try (out of memory, gated models, no connection, data formats) and land in a log file. `auralite doctor` gives the same recommendation in a terminal. Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md).
 - **🤗 Pretrained models in AuraLite's own engine (2.18.1)**: `auralite import hf:ORG/NAME` reads Llama (2/3/3.1/3.2), Mistral, Qwen2/2.5 and Qwen3 checkpoints into a native model — no transformers — with logits bit-identical to transformers (SmolLM2-135M), downloads that resume and are checked against the Hub's sha256. **QLoRA without bitsandbytes** (`--quantize nf4`: 4-bit NormalFloat weights with double quantization, LoRA adapters on top) runs on any CPU PyTorch runs on, AVX-only ones included, and on GPUs; **8-bit AdamW** (`--optimizer adamw8bit`) keeps a quarter of AdamW's optimizer memory. The result exports back as a **Hugging Face folder** (transformers 4.46 and 5.x load it, same logits) or a **GGUF file** for llama.cpp, Ollama and LM Studio (F16/Q8_0/BF16/F32, the tokenizer and chat template included). Measured runs and honest CPU speeds for 0.5B–8B models: [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) § 21.
 - **🧩 JSON mode, structured outputs and tools (2.17)**: the server speaks OpenAI's `response_format` (`json_object`, `json_schema`) and `tools` / `tool_choice`, and Ollama's `format` and `tools` — the official `openai` client works as is, `client.chat.completions.parse` with a Pydantic model and `pydantic_function_tool` included ([examples/openai_structured.py](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/examples/openai_structured.py)). A native model writes the answer under a JSON grammar (constrained decoding) that also keeps room for the shortest valid ending: **every answer parses and follows the schema**, even from an untrained model (200 of 200 per case, where 0 of 50 parsed without the grammar), at no measurable cost in speed. GGUF models get the schema as a llama.cpp grammar; Qwen2.5-0.5B called the right tool or answered in text in 12 of 16 prompts. From Python: `engine.generate_json(messages, schema)`, `engine.chat_with_tools(messages, tools)` ([docs/engine.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/engine.md) § 12).
 - **💬 Chat fine-tuning (2.15)**: a `.jsonl` file of dialogs (OpenAI `messages`, ShareGPT, Alpaca or prompt/completion records) fine-tunes the model in memory, a checkpoint (`--resume`, optionally with `--lora`) or a new model into a chat model. The dialogs are written with the chat template exactly as `generate_chat` prompts (ChatML by default), the loss learns only the assistant's replies and the marker that ends them, and the markers become special tokens — so the model answers in the template and **stops by itself** (300 of 300 replies in the measured runs, [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) § 15). Training data can also be **several files, folders and globs**: documents are joined with blank lines and validated on whole held-out documents, and one file trains exactly as before (§ 14). **2.16:** dialog runs train for every epoch asked for and learn the prompt with a small weight (0.1) — 86 % exact replies on the benchmark (2.15: 76 % and 64 % on two of the three seeds) — LoRA adapts every linear layer at ten times the learning rate (73 % instead of 57 %), merges into the weights and saves to a file of its own (`--save-adapter`, `auralite lora`), and `auralite chat-eval` measures a chat model on held-out dialogs (§ 16). `auralite distill` has a teacher model (a GGUF file, a llama.cpp server, a Hugging Face model or an AuraLite checkpoint) answer your questions and writes its replies as dialogs — an interrupted run resumes, the teacher's license goes into the metadata (§ 17) — and preference pairs train a chat model with **DPO** (DPO-Positive by default) or **SimPO**: on the arithmetic benchmark the chat models' own mistakes, as pairs, raised their exact answers from 67.5 % to 74.7 % (three seeds, § 18).
@@ -239,6 +253,7 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 auralite-gui
 | File | Contents |
 |---|---|
 | [docs/quickstart.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
+| [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) | AuraLite Studio, the desktop app (2.19): the tabs, the wizard, which model fits your computer, what to do when something goes wrong |
 | [docs/faq.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
 | [docs/engine.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/engine.md) | inside the native engine: decode loop, KV cache, sampling, speculative decoding, MoE, BPE pre-tokenizer, context length, the 2.13 compute thread, batched decoding (2.14), JSON mode, JSON schemas and tool calls (2.17) — with measured numbers |
 | [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) | the training loop: what an epoch is, how validation is measured (honestly since 2.13), early stopping, speed, choosing a tokenizer, your own tokenizer and tokenizer-only training (2.14.1), the default recipe and how a run ends (Stop, Ctrl+C, time limits), folders of documents and chat fine-tuning on dialogs (2.15), the prompt's weight, LoRA on every layer, adapter files and chat-eval, dialogs from a teacher model, DPO and SimPO (2.16), big data and big models: token shards, Hugging Face datasets, model presets, memory plans, the loss in chunks, runs that continue exactly after a stop (2.18), Hugging Face models imported into the engine, QLoRA, 8-bit AdamW and export to Hugging Face and GGUF (2.18.1) — with measured numbers |

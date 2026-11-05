@@ -3,6 +3,17 @@
 Five minutes from a corpus file to a served model. Everything below runs on CPU;
 a CUDA GPU is used automatically when present.
 
+**The quickest way in (2.19): AuraLite Studio**, the desktop app —
+
+```bash
+pip install "auralite-ai[studio]"
+auralite-studio
+```
+
+— looks at your computer, recommends a model and settings that fit it and walks
+you through fine-tuning or training ([docs/studio.md](studio.md)). The rest of
+this page is the same with the command line and Python.
+
 ## 1. Install
 
 From PyPI (2.18.0 on): `pip install auralite-ai`, with the extras below as
@@ -11,6 +22,7 @@ From PyPI (2.18.0 on): `pip install auralite-ai`, with the extras below as
 ```bash
 pip install -e .                 # core: torch + numpy            (training, generation, GUI)
 pip install -e '.[serve]'        # + FastAPI/uvicorn              (OpenAI-compatible server)
+pip install -e '.[studio]'       # + PySide6 (Qt 6)               (AuraLite Studio, 2.19)
 pip install -e '.[hf]'           # + transformers, peft           (Hugging Face models, LoRA)
 pip install -e '.[qlora]'        # + bitsandbytes                 (4-/8-bit QLoRA; not macOS)
 pip install -e '.[data]'         # + datasets, pyarrow, zstandard (big data, 2.18: see below)
@@ -268,8 +280,13 @@ and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or
 ## 5. GUI
 
 ```bash
-auralite-gui          # installed; from a source checkout: python gui_app.py
+auralite-studio       # AuraLite Studio (Qt 6, 2.19): pip install "auralite-ai[studio]"
+auralite-gui          # the classic GUI (tkinter); from a source checkout: python gui_app.py
+auralite doctor       # the Studio's recommendation in a terminal (--data FILE sizes it)
 ```
+
+AuraLite Studio has separate tabs for training a new model and fine-tuning a
+ready one, a setup wizard, Chat, Export and a log ([docs/studio.md](studio.md)).
 
 The GUI covers training (text, and images: diffusion, flow matching or a GAN), generation, chat with
 attention/token-frequency plots, model management, quantization, evaluation and

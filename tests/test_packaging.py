@@ -110,7 +110,10 @@ def test_entry_points_target_the_package():
     scripts = PYPROJECT["project"]["scripts"]
     gui_scripts = PYPROJECT["project"]["gui-scripts"]
     assert scripts == {"auralite": "auralite.cli:main"}
-    assert gui_scripts == {"auralite-gui": "auralite.gui.app:main"}
+    assert gui_scripts == {"auralite-gui": "auralite.gui.app:main",
+                           # 2.19: AuraLite Studio (Qt 6); starts without PySide6 too and
+                           # says how to install it
+                           "auralite-studio": "auralite.studio.app:main"}
     for target in (*scripts.values(), *gui_scripts.values()):
         module_name, _, attr = target.partition(":")
         if module_name.startswith("auralite.gui"):
@@ -289,6 +292,7 @@ def test_wheel_metadata_entry_points_and_license(built_wheel):
     assert "auralite = auralite.cli:main" in entry_points
     assert "[gui_scripts]" in entry_points
     assert "auralite-gui = auralite.gui.app:main" in entry_points
+    assert "auralite-studio = auralite.studio.app:main" in entry_points
     meta = built_wheel.read(f"{dist_info}/METADATA").decode()
     assert "License-Expression: Apache-2.0" in meta
     assert f"{dist_info}/licenses/LICENSE" in names
