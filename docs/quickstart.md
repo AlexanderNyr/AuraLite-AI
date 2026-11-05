@@ -283,6 +283,7 @@ and point AuraLite at it (`AURALITE_LLAMA_SERVER_URL=http://127.0.0.1:8080`, or
 auralite-studio       # AuraLite Studio (Qt 6, 2.19): pip install "auralite-ai[studio]"
 auralite-gui          # the classic GUI (tkinter); from a source checkout: python gui_app.py
 auralite doctor       # the Studio's recommendation in a terminal (--data FILE sizes it)
+auralite doctor --studio   # does the Studio's window start here? (what it found, and why not)
 ```
 
 AuraLite Studio has separate tabs for training a new model and fine-tuning a

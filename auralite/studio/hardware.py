@@ -177,8 +177,40 @@ def _windows_feature(feature: int) -> bool:
         return False
 
 
-def _simd(cpuinfo: str) -> tuple[str, bool | None]:
-    """The widest vector instructions and whether the CPU is x86-64-v2 (SSE4.2 + POPCNT)."""
+#: IsProcessorFeaturePresent knows SSE4.2, AVX, AVX2 and AVX-512 (38-41) from Windows 10
+#: 2004 (build 19041) on; older Windows answers "no" for each of them, on any processor.
+WINDOWS_FEATURES_BUILD = 19041
+
+
+def _windows_build() -> int:
+    """Windows' build number (19045 = Windows 10 22H2); 0 elsewhere."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        return int(sys.getwindowsversion().build)
+    except Exception:
+        return 0
+
+
+def _numpy_cpu_features() -> dict[str, bool]:
+    """The processor's features as NumPy read them with CPUID for its own dispatch
+    (``{}`` when NumPy cannot say). Works on every system, every Windows version."""
+    import importlib
+    for name in ("numpy._core._multiarray_umath", "numpy.core._multiarray_umath"):
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            continue
+        features = getattr(module, "__cpu_features__", None)
+        if isinstance(features, dict) and features:
+            return {str(key): bool(value) for key, value in features.items()}
+    return {}
+
+
+def _simd(cpuinfo: str, *, system: str = "") -> tuple[str, bool | None]:
+    """The widest vector instructions and whether the CPU is x86-64-v2 (SSE4.2 + POPCNT);
+    ``None`` for the second when nothing can tell."""
+    system = system or sys.platform
     machine = platform.machine().lower()
     if machine in ("arm64", "aarch64") or machine.startswith("arm"):
         return "NEON", None
@@ -191,14 +223,23 @@ def _simd(cpuinfo: str) -> tuple[str, bool | None]:
             if flag in flags:
                 return name, v2
         return "basic", v2
-    if sys.platform == "win32":
-        # PF_AVX512F 41, PF_AVX2 40, PF_AVX 39, PF_SSE4_2 38 (Windows 10 SDK)
+    features = _numpy_cpu_features()
+    if "SSE2" in features:                                 # NumPy's CPUID, on x86
+        v2 = features.get("SSE42", False) and features.get("POPCNT", False)
+        for name, key in (("AVX512", "AVX512F"), ("AVX2", "AVX2"), ("AVX", "AVX"),
+                          ("SSE4.2", "SSE42")):
+            if features.get(key):
+                return name, v2
+        return "basic", v2
+    if system == "win32" and _windows_build() >= WINDOWS_FEATURES_BUILD:
+        # PF_AVX512F 41, PF_AVX2 40, PF_AVX 39, PF_SSE4_2 38. No POPCNT flag: every
+        # processor with SSE4.2 has it.
         v2 = _windows_feature(38)
         for name, feature in (("AVX512", 41), ("AVX2", 40), ("AVX", 39), ("SSE4.2", 38)):
             if _windows_feature(feature):
                 return name, v2
         return "basic", v2
-    if sys.platform == "darwin":
+    if system == "darwin":
         for name, key in (("AVX512", "hw.optional.avx512f"), ("AVX2", "hw.optional.avx2_0"),
                           ("AVX", "hw.optional.avx1_0"), ("SSE4.2", "hw.optional.sse4_2")):
             if _sysctl(key) == "1":
@@ -331,8 +372,9 @@ def detect_hardware(*, gflops: float | None = None) -> Hardware:
     if simd in ("SSE4.2", "basic") and accelerator == "cpu":
         hw.notes.append("no AVX: training works, but several times slower than on a CPU with AVX2")
     if v2 is False:
-        hw.notes.append("no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9 or older here "
-                        "(Qt 6.10+ needs an x86-64-v2 processor); the classic GUI works")
+        hw.notes.append("no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9.3 here "
+                        "(Qt 6.10+ needs an x86-64-v2 processor; pip install "
+                        "\"PySide6-Essentials<6.10\"); the classic GUI works")
     return hw
 
 

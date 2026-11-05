@@ -18,7 +18,8 @@ from typing import Any
 
 from .hardware import auralite_home
 
-__all__ = ["install_excepthooks", "log_dir", "log_path", "setup_logging"]
+__all__ = ["faults_path", "install_excepthooks", "log_dir", "log_path", "output_path",
+           "setup_logging", "tail"]
 
 _FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 _handlers: dict[str, logging.Handler] = {}
@@ -31,6 +32,30 @@ def log_dir() -> Path:
 
 def log_path(app: str = "studio") -> Path:
     return log_dir() / f"{app}.log"
+
+
+def output_path(app: str = "studio") -> Path:
+    """What the app printed, when it was started without a console (``<app>-output.log``)."""
+    return log_dir() / f"{app}-output.log"
+
+
+def faults_path(app: str = "studio") -> Path:
+    """Python's stack at a crash inside Qt or PyTorch (``<app>-faults.log``, faulthandler)."""
+    return log_dir() / f"{app}-faults.log"
+
+
+def tail(path: Path, lines: int = 12, *, limit: int = 64 << 10) -> list[str]:
+    """The last `lines` non-empty lines of a text file ([] when it cannot be read)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            data = f.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    return [line.rstrip() for line in text.splitlines() if line.strip()][-lines:]
 
 
 def setup_logging(app: str = "studio", *, level: int = logging.INFO) -> Path:

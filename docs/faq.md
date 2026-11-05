@@ -405,6 +405,14 @@ Qt 6.10+ (the Studio) needs a processor with SSE4.2 (every Intel Core since
 2008, AMD since 2011); on an older one the Studio says which PySide6 to install,
 and the classic GUI runs anyway. See [studio.md](studio.md).
 
+If the Studio does not start, it says why (since 2.19.1) in a message box and in
+`~/.auralite/logs/`; `auralite doctor --studio` checks it in a fresh process and
+prints what it found ([studio.md](studio.md#if-the-studio-does-not-start)). On
+Windows, `[WinError 1114] … c10.dll` means an old Microsoft C++ runtime: install
+the latest Visual C++ Redistributable and PySide6 6.9.3 or newer. No
+`auralite-studio` command after an update from a folder (`git pull`)? Install
+it again there: `pip install -e ".[studio]"`.
+
 ## 21. How does AuraLite know what my computer can train?
 
 `auralite doctor` (and the Studio's Start tab) reads the memory, the processor

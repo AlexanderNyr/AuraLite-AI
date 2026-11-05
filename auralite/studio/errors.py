@@ -35,7 +35,7 @@ class FriendlyError:
     message: str
     hints: list[str] = field(default_factory=list)
     kind: str = "unknown"      # memory, network, gated, not_found, data, settings, disk,
-    #                            permission, missing_package, model, stopped, unknown
+    #                            permission, missing_package, library, model, stopped, unknown
     details: str = ""          # the traceback, for the log
 
     def text(self) -> str:
@@ -67,6 +67,45 @@ def _is_memory(exc: BaseException) -> bool:
                                    "failed to allocate"))
 
 
+#: Windows' loader errors: module not found, procedure not found, wrong architecture,
+#: an initialization routine that failed.
+_DLL_ERRORS = (126, 127, 193, 1114)
+VC_REDIST = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+
+
+def _is_library(exc: BaseException) -> bool:
+    """A DLL or shared library that would not load."""
+    if not isinstance(exc, (OSError, ImportError)):
+        return False
+    if getattr(exc, "winerror", None) in _DLL_ERRORS:
+        return True
+    text = str(exc).lower()
+    return ("dll load failed" in text or "dll initialization routine failed" in text
+            or ("error loading" in text and ".dll" in text)
+            or "cannot open shared object file" in text)
+
+
+def _library_hints(text: str) -> list[str]:
+    low = text.lower()
+    if "shared object" in low:                              # Linux
+        if any(s in low for s in ("xkbcommon", "libegl", "fontconfig", "libdbus", "qt6",
+                                  "pyside")):
+            return ["Install what Qt needs: sudo apt install libxkbcommon0 libegl1 "
+                    "libfontconfig1 libdbus-1-3 (Debian / Ubuntu)"]
+        return ["Install the system package that has this library, then start AuraLite "
+                "again"]
+    hints = [f"Install the latest Microsoft Visual C++ Redistributable (x64) - {VC_REDIST} "
+             f"- then start AuraLite again"]
+    if any(s in low for s in ("qt", "pyside", "shiboken")):
+        hints += ['Update Qt for Python: pip install -U "PySide6-Essentials>=6.9.3"',
+                  "Qt 6 needs Windows 10 (version 1809) or newer"]
+    elif any(s in low for s in ("torch", "c10.dll")):
+        hints += ['Update Qt for Python, whose old runtime can stop PyTorch from loading: '
+                  'pip install -U "PySide6-Essentials>=6.9.3"',
+                  "Or reinstall PyTorch: pip install --force-reinstall torch"]
+    return hints
+
+
 def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
     """A :class:`FriendlyError` for `exc`; `action` (``"training"``, ``"the import"``) names
     what failed in the generic title."""
@@ -83,6 +122,10 @@ def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
         return make("Not enough memory",
                     "The computer ran out of memory" + (f" during {action}" if action else "")
                     + ".", list(_MEMORY_HINTS), "memory")
+    for e in chain:
+        if _is_library(e):
+            return make("A library would not load", str(e).strip() or message,
+                        _library_hints(str(e)), "library")
     for e in chain:
         if isinstance(e, ModuleNotFoundError) and e.name:
             top = e.name.split(".")[0]

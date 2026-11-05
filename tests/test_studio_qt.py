@@ -510,3 +510,28 @@ def test_closing_asks_about_an_unsaved_model(studio, qapp, dialogs):
     dialogs["answers"]["confirm"] = True
     assert studio.close()
     studio.engine.model = None
+
+
+# ----------------------------------------------------------------------
+#  The start a user makes
+# ----------------------------------------------------------------------
+def test_a_fresh_process_builds_the_window(tmp_path, monkeypatch, capsys):
+    """`auralite doctor --studio`: a new process starts the Studio the way a user does -
+    through `main()`: on Windows the C++ runtime first, then Qt, then PyTorch. In this
+    process the modules were imported in whatever order the tests ran; on Windows Qt's
+    order is what PyTorch 2.9+ could not survive."""
+    from auralite import cli
+    monkeypatch.setenv("AURALITE_HOME", str(tmp_path))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    assert cli.main(["doctor", "--no-speed", "--studio", "--json"]) == 0
+    check = json.loads(capsys.readouterr().out)["studio"]["check"]
+    assert check["code"] == 0 and check["result"] == "the window starts", check["output"]
+    output = check["output"]
+    assert "RESULT: OK - the window was built in" in output
+    assert "Qt platform: offscreen" in output and "PyTorch: " in output
+    assert "  Installed: " in output                    # 2.19.1: the package pip knows
+    assert "Window: Start, Train, Fine-tune, Chat, Export, Log" in output
+    assert "SSE4.2 + POPCNT: " in output
+    if os.name == "nt":
+        assert "Visual C++ runtime (msvcp140.dll): system 14." in output
+    assert not (tmp_path / "studio.json").exists()          # it changes no settings

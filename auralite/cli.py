@@ -22,6 +22,7 @@
     auralite distill --teacher teacher.gguf --prompts prompts.txt --out chats.jsonl
     auralite train   --data prefs.jsonl --resume chat.pt --method dpo --model dpo.pt
     auralite doctor  [--data dialogs.jsonl] [--goal finetune|pretrain] [--write-params plan.json]
+                     [--studio]   (2.19.1: also check that AuraLite Studio's window starts)
     auralite studio                     (2.19: the desktop app on Qt 6; pip install "auralite-ai[studio]")
 
 2.14.1: `auralite train --tokenizer FILE` trains with your own tokenizer: a file
@@ -2232,10 +2233,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write the recommended settings as a --params JSON file for "
                         "auralite train")
     p.add_argument("--json", action="store_true", help="print everything as JSON")
+    p.add_argument("--studio", action="store_true",
+                   help="also check that AuraLite Studio's window starts here (a fresh "
+                        "process builds it without showing it; exit code 1 if it fails)")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("studio", help="open AuraLite Studio, the desktop app (needs PySide6: "
-                                      "pip install \"auralite-ai[studio]\")")
+                                      "pip install \"auralite-ai[studio]\"; "
+                                      "auralite doctor --studio checks it)")
     _add_common_flags(p, suppress_defaults=True)
     p.set_defaults(func=cmd_studio)
     return parser
@@ -2277,6 +2282,37 @@ def _optional_packages() -> dict[str, str]:
                 continue
         found[module] = version
     return found
+
+
+def _studio_check(timeout: float = 300.0) -> tuple[int | None, str]:
+    """2.19.1: ``python -m auralite.studio --self-test`` in a fresh process: its exit code
+    (None: it did not finish) and what it printed. A crash inside Qt or PyTorch ends that
+    process, not this one."""
+    import subprocess
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    try:
+        proc = subprocess.run([sys.executable, "-m", "auralite.studio", "--self-test"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout, env=env, check=False)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        return None, out.decode("utf-8", "replace") + f"\n(no answer after {timeout:.0f} s)"
+    except OSError as exc:
+        return None, str(exc)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def _studio_verdict(code: int | None) -> str:
+    from auralite.studio.app import _ending
+    if code == 0:
+        return "the window starts"
+    if code == 2:
+        return "it cannot start here (see above)"
+    if code == 1:
+        return "it failed (see above)"
+    if code is None:
+        return "the check did not finish"
+    return f"it crashed ({_ending(code)})"
 
 
 def _doctor_command(rec, data: list[str], params_file: str) -> list[str]:
@@ -2335,9 +2371,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             json.dump(params, f, indent=1)
     commands = _doctor_command(rec, list(args.data or []), args.write_params or "")
     packages = _optional_packages()
+    from auralite.studio.app import installation
+    installed, stale = installation()
+    studio: dict = {"pyside6": packages.get("PySide6", ""), "installed": installed,
+                    "install_problem": stale}
+    if args.studio:
+        code, output = _studio_check()
+        studio["check"] = {"code": code, "result": _studio_verdict(code), "output": output}
+    status = 1 if args.studio and studio["check"]["code"] != 0 else 0
     if args.json:
         out = {"version": __version__, "python": platform.python_version(),
                "torch": torch.__version__, "hardware": hw.to_dict(), "packages": packages,
+               "studio": studio,
                "goal": rec.goal, "budget": rec.budget, "settings": rec.settings,
                "params": params, "commands": commands, "warnings": rec.warnings,
                "data": None if report is None else {
@@ -2353,13 +2398,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             out["choice"] = rec.preset.preset if rec.preset is not None else None
         print(json.dumps(out, indent=1))
-        return 0
+        return status
     print(f"AuraLite {__version__} - Python {platform.python_version()}, "
           f"PyTorch {torch.__version__}")
     for line in hw.summary_lines():
         print(line)
     print("Optional: " + ", ".join(f"{name} {version or '-'}"
                                    for name, version in packages.items()))
+    if "check" in studio:
+        print("\nAuraLite Studio, checked in a fresh process "
+              "(python -m auralite.studio --self-test):")
+        for line in studio["check"]["output"].rstrip().splitlines():
+            print("    " + line)
+        print(f"  => {studio['check']['result']}")
+    elif studio["pyside6"]:
+        print(f"Studio: PySide6 {studio['pyside6']} - `auralite doctor --studio` checks that "
+              f"its window starts")
+    else:
+        from auralite.studio.app import install_command
+        print(f"Studio: needs PySide6 - {install_command()}")
+    if stale and "check" not in studio:           # the self-test's output names it already
+        print(f"  ! {stale}")
     print()
     if report is not None:
         for line in report.summary_lines():
@@ -2380,7 +2439,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for command in commands:
             print("  " + command)
     print("\nOr in the desktop app: auralite studio")
-    return 0
+    return status
 
 
 def cmd_studio(args: argparse.Namespace) -> int:

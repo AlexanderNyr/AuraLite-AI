@@ -9,8 +9,13 @@ Studio's start-up check.
 from __future__ import annotations
 
 import errno
+import io
 import json
 import logging
+import os
+import platform
+import struct
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -418,6 +423,23 @@ def test_errors_are_explained_with_something_to_try():
     assert kind(FileNotFoundError("model.pt")) == "not_found"
     assert kind(OSError(errno.ENOSPC, "No space left on device")) == "disk"
     assert kind(KeyboardInterrupt()) == "stopped"
+    # libraries that would not load (Windows' loader, Linux's), with what fixes them
+    torch_dll = explain_error(OSError(
+        '[WinError 1114] A dynamic link library (DLL) initialization routine failed. Error '
+        'loading "C:\\py\\Lib\\site-packages\\torch\\lib\\c10.dll" or one of its '
+        'dependencies.'))
+    assert torch_dll.kind == "library" and "vc_redist.x64.exe" in torch_dll.hints[0]
+    assert any('PySide6-Essentials>=6.9.3' in hint for hint in torch_dll.hints)
+    assert any("force-reinstall torch" in hint for hint in torch_dll.hints)
+    qt_dll = explain_error(ImportError("DLL load failed while importing QtCore: The specified "
+                                       "procedure could not be found."))
+    assert qt_dll.kind == "library" and any("Windows 10" in hint for hint in qt_dll.hints)
+    assert not any("torch" in hint for hint in qt_dll.hints)
+    linux = explain_error(ImportError("libxkbcommon.so.0: cannot open shared object file: No "
+                                      "such file or directory"))
+    assert linux.kind == "library" and "libxkbcommon0" in linux.hints[0]
+    assert kind(ImportError("libfoo.so.3: cannot open shared object file")) == "library"
+    assert kind(ImportError("cannot import name 'x' from 'y'")) == "unknown"
     try:
         try:
             raise MemoryError()
@@ -553,23 +575,420 @@ def test_doctor_recommends_and_writes_the_params(tmp_path, capsys):
     assert "Recommended: a" in text and "auralite train --data DIALOGS.jsonl --preset" in text
 
 
-def test_studio_explains_what_it_needs(monkeypatch):
+def test_studio_explains_what_it_needs(monkeypatch, tmp_path):
     from auralite.studio import app
+    from auralite.studio.logs import remove_logging
+    monkeypatch.setenv("AURALITE_HOME", str(tmp_path))
     monkeypatch.setitem(sys.modules, "PySide6", None)            # not installed
-    assert 'pip install "auralite-ai[studio]"' in app.qt_problem()
+    monkeypatch.setattr(app, "_qt_version", lambda: "")
+    text = app.qt_problem()
+    # the command installs into this very Python, whatever PyPI's AuraLite has
+    assert app.install_command() in text and '"PySide6-Essentials>=6.9.3"' in text
+    monkeypatch.setattr(app, "_qt_version", lambda: "6.12.0")    # installed, does not load
+    with pytest.raises(ImportError):
+        app.qt_problem()
     monkeypatch.delitem(sys.modules, "PySide6")
     pytest.importorskip("PySide6")
-    monkeypatch.setattr(app, "_qt_version", lambda: "6.12.0")
     monkeypatch.setattr("auralite.studio.hardware._simd", lambda _info: ("SSE4.1", False))
     assert "PySide6-Essentials<6.10" in app.qt_problem()
     monkeypatch.setattr(app, "_qt_version", lambda: "6.10.0")
     assert "PySide6-Essentials<6.10" in app.qt_problem()
     monkeypatch.setattr(app, "_qt_version", lambda: "6.9.3")
     assert app.qt_problem() == ""
+    monkeypatch.setattr(app, "_qt_version", lambda: "6.12.0")    # nothing can tell: start
+    monkeypatch.setattr("auralite.studio.hardware._simd", lambda _info: ("", None))
+    assert app.qt_problem() == ""
     told = []
     monkeypatch.setattr(app, "qt_problem", lambda: "needs Qt")
     monkeypatch.setattr(app, "_tell", told.append)
-    assert app.main([]) == 2 and told == ["needs Qt"]
+    try:
+        assert app.main([]) == 2 and told == ["needs Qt"]
+    finally:
+        remove_logging("studio")
+
+
+def test_install_command_names_this_python(monkeypatch, tmp_path):
+    from auralite.studio import app
+    folder = tmp_path / "Python 3.12"
+    folder.mkdir()
+    (folder / "python.exe").write_bytes(b"")
+    monkeypatch.setattr(sys, "executable", str(folder / "pythonw.exe"))   # no console
+    assert app.install_command() == (f'"{folder / "python.exe"}" -m pip install '
+                                     f'"PySide6-Essentials>=6.9.3"')
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    assert app.install_command("x<1", upgrade=True) == '/usr/bin/python3 -m pip install -U "x<1"'
+
+
+def test_installation_notices_an_install_older_than_the_code(monkeypatch):
+    """2.19.1: an install from a folder made before 2.19 keeps its old metadata - no
+    `auralite-studio` command, no `studio` extra (pip then only warns)."""
+    import types
+
+    from auralite import __version__
+    from auralite.studio import app
+
+    def installed(version, *commands):
+        dist = types.SimpleNamespace(version=version, entry_points=[
+            types.SimpleNamespace(name=name) for name in ("auralite", *commands)])
+        monkeypatch.setattr(app, "_installed", lambda: dist)
+
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(app, "_source_folder", lambda: "/src/AuraLite AI")
+    installed(__version__, "auralite-gui", "auralite-studio")
+    assert app.installation() == (f"auralite-ai {__version__}, the code in /src/AuraLite AI", "")
+    installed("2.18.1", "auralite-gui")                       # `pip install -e .` in 2.18.1
+    text, problem = app.installation()
+    assert text == "auralite-ai 2.18.1, the code in /src/AuraLite AI"
+    assert problem == (f"the installed package is 2.18.1 but the code is {__version__}, and it "
+                       f"has no auralite-studio command. Install it again: /usr/bin/python3 "
+                       f'-m pip install -e "/src/AuraLite AI[studio]"')
+    installed("2.19.0", "auralite-gui", "auralite-studio")   # the command, an older version
+    monkeypatch.setattr(app, "_source_folder", lambda: "")    # installed from PyPI
+    text, problem = app.installation()
+    assert text == "auralite-ai 2.19.0" and "auralite-studio command" not in problem
+    assert problem == (f"the installed package is 2.19.0 but the code is {__version__}. Install "
+                       f'it again: /usr/bin/python3 -m pip install -U "auralite-ai[studio]"')
+    installed(__version__, "auralite-gui")                    # this version, yet no command
+    assert app.installation()[1].startswith(f"the installed package is {__version__} but the "
+                                            f"code is {__version__}, and it has no auralite-")
+
+    monkeypatch.setattr(app, "_installed", lambda: None)      # a source tree, not installed
+    text, problem = app.installation()
+    assert text.startswith("not installed, the code is in ") and problem == ""
+    monkeypatch.undo()
+    folder = app._source_folder()                             # the tests run from the clone
+    assert folder and os.path.isfile(os.path.join(folder, "auralite", "studio", "app.py"))
+
+
+def test_self_test_names_an_install_older_than_the_code(monkeypatch, capsys):
+    from auralite.studio import app
+    stale = "the installed package is 2.18.1 but the code is 2.19.1. Install it again: x"
+    monkeypatch.setattr(app, "installation", lambda: ("auralite-ai 2.18.1", stale))
+    monkeypatch.setattr(app, "qt_problem", lambda: "AuraLite Studio needs PySide6 (Qt 6).")
+    assert app.self_test() == 2                                # stops before Qt
+    out = capsys.readouterr().out
+    assert f"\n  Installed: auralite-ai 2.18.1\n  ! {stale}\n" in out
+    assert out.rstrip().endswith("RESULT: AuraLite Studio cannot start here (see above)")
+
+
+def test_the_install_counts_not_the_egg_info_in_the_source_folder(monkeypatch, tmp_path):
+    """setuptools leaves `auralite_ai.egg-info` in the source folder at every build. Run
+    from that folder, importlib finds it first - and it would hide an older install."""
+    from auralite.studio import app
+    source, site = tmp_path / "AuraLite-AI", tmp_path / "site-packages"
+    for folder, name, version in ((source, "auralite_ai.egg-info", "2.19.1"),
+                                  (site, "auralite_ai-2.18.1.dist-info", "2.18.1")):
+        (folder / name).mkdir(parents=True)
+        (folder / name / ("PKG-INFO" if name.endswith("egg-info") else "METADATA")).write_text(
+            f"Metadata-Version: 2.1\nName: auralite-ai\nVersion: {version}\n", encoding="utf-8")
+    monkeypatch.setattr(app, "_source_folder", lambda: str(source.resolve()))
+    monkeypatch.setattr(sys, "path", [str(source), str(site)])
+    assert app._installed().version == "2.18.1"               # the install, not the build
+    monkeypatch.setattr(sys, "path", [str(source)])           # `setup.py develop`: only that
+    assert app._installed().version == "2.19.1"
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    assert app._installed() is None
+
+
+def test_a_failed_start_is_logged_and_shown(monkeypatch, tmp_path):
+    from auralite.studio import app
+    from auralite.studio.logs import remove_logging
+    monkeypatch.setenv("AURALITE_HOME", str(tmp_path))
+    shown: list[str] = []
+    monkeypatch.setattr(app, "_message_box", lambda title, text: shown.append(text))
+    monkeypatch.setattr(app, "_enable_faulthandler", lambda: None)
+    printed = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", printed)       # not a terminal: the box shows too
+
+    def broken() -> str:
+        raise OSError('[WinError 1114] A dynamic link library (DLL) initialization routine '
+                      'failed. Error loading "C:\\py\\torch\\lib\\c10.dll" or one of its '
+                      'dependencies.')
+    monkeypatch.setattr(app, "qt_problem", broken)
+    try:
+        assert app.main([]) == 1
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        log = (tmp_path / "logs" / "studio.log").read_text(encoding="utf-8")
+    finally:
+        remove_logging("studio")
+    assert "could not start" in log and "Traceback" in log and "WinError 1114" in log
+    assert len(shown) == 1 and shown[0].startswith("A library would not load")
+    assert "vc_redist.x64.exe" in shown[0] and "PySide6-Essentials>=6.9.3" in shown[0]
+    assert f"The details are in {tmp_path / 'logs' / 'studio.log'}" in shown[0]
+    assert shown[0] in printed.getvalue()
+    unknown = app.failure_text(ValueError("strange"))
+    assert "Starting AuraLite Studio failed" in unknown and "strange" in unknown
+    assert "auralite doctor --studio" in unknown and "python -m auralite.studio" in unknown
+
+
+def test_the_runtime_is_prepared_before_qt_is_imported(monkeypatch, tmp_path):
+    """Windows: the newest msvcp140.dll must be loaded before PySide6 loads its own."""
+    from auralite.studio import app, msvc_runtime
+    from auralite.studio.logs import remove_logging
+    monkeypatch.setenv("AURALITE_HOME", str(tmp_path))
+    monkeypatch.setattr(app, "_enable_faulthandler", lambda: None)
+    order: list[str] = []
+    monkeypatch.setattr(msvc_runtime, "prepare_runtime", lambda: order.append("runtime"))
+    monkeypatch.setattr(app, "qt_problem", lambda: order.append("qt") or "no Qt here")
+    monkeypatch.setattr(app, "_tell", lambda message: order.append("told"))
+    try:
+        assert app.main([]) == 2
+    finally:
+        remove_logging("studio")
+    assert order == ["runtime", "qt", "told"]
+
+
+@pytest.mark.parametrize("child, result, expected", [
+    ("import sys; print('closed'); sys.exit(0)", 0, None),
+    ("import sys; sys.exit(2)", 2, None),              # it told the user itself
+    ("import os, sys; print('Incompatible processor. This Qt build requires the following "
+     "features:'); print('    sse4.2 popcnt'); sys.stdout.flush(); os._exit(3)", 3,
+     "PySide6-Essentials<6.10"),
+    ("import os, sys; print('[WinError 1114] A dynamic link library (DLL) initialization "
+     "routine failed.'); sys.stdout.flush(); os._exit(-1073741819)", 3, "vc_redist.x64.exe"),
+])
+def test_started_without_a_console_a_crash_is_shown(monkeypatch, tmp_path, child, result,
+                                                    expected):
+    """`auralite-studio` on Windows runs under pythonw: no stderr at all. The app runs as a
+    child process; a crash nobody reported is shown with its last output."""
+    from auralite.studio import app
+    monkeypatch.setenv("AURALITE_HOME", str(tmp_path))
+    monkeypatch.delenv("QT_FORCE_STDERR_LOGGING", raising=False)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "studio-faults.log").write_text("File \"old.py\", line 1\n",
+                                                         encoding="utf-8")
+    shown: list[str] = []
+    monkeypatch.setattr(app, "_message_box", lambda title, text: shown.append(text))
+    commands: list[list[str]] = []
+
+    def command(argv: list[str]) -> list[str]:
+        commands.append(argv)
+        return [sys.executable, "-c", "import os; assert os.environ['QT_FORCE_STDERR_LOGGING']"
+                " == '1' and os.environ['PYTHONIOENCODING']\n" + child]
+    monkeypatch.setattr(app, "_child_command", command)
+    monkeypatch.setattr(sys, "stderr", None)
+    assert app.main(["--x"]) == result
+    assert commands == [["--x"]]
+    if expected is None:
+        assert shown == []
+        return
+    assert len(shown) == 1
+    text = shown[0]
+    assert text.startswith("AuraLite Studio stopped unexpectedly (")
+    assert expected in text and f"The logs are in {tmp_path / 'logs'}" in text
+    assert "Its last output:" in text and "old.py" not in text   # not an earlier run's
+    assert (tmp_path / "logs" / "studio-output.log").read_text(encoding="utf-8").strip()
+
+
+def test_the_child_of_a_console_less_start_opens_the_window(monkeypatch):
+    from auralite.studio import app
+    started: list[list[str]] = []
+    monkeypatch.setattr(app, "_start", lambda argv: started.append(argv) or 0)
+    monkeypatch.setattr(app, "_watch", lambda argv: pytest.fail("watched twice"))
+    monkeypatch.setattr(sys, "stderr", None)
+    assert app.main([app.CHILD, "--x"]) == 0 and started[-1][1:] == ["--x"]
+
+
+def test_how_a_process_ended_in_words():
+    from auralite.studio.app import _ending
+    assert _ending(0xC0000005) == "exit code 0xC0000005: access violation"
+    assert _ending(-1073741819) == "exit code 0xC0000005: access violation"     # signed
+    assert _ending(3) == "exit code 3: aborted" and _ending(7) == "exit code 7"
+    assert _ending(-11) == "signal SIGSEGV" and _ending(-100) == "signal 100"
+    assert _ending(0xC0000409).startswith("exit code 0xC0000409: fast fail")
+
+
+def test_crash_messages_name_the_known_causes(tmp_path):
+    from auralite.studio.app import crash_text
+    output, faults = tmp_path / "out.log", tmp_path / "faults.log"
+    output.write_text("qt.qpa.plugin: Could not find the Qt platform plugin \"windows\"\n\n"
+                      "This application failed to start because no Qt platform plugin could "
+                      "be initialized.\n", encoding="utf-8")
+    faults.write_text("Windows fatal exception: access violation\n\n"
+                      '  File "window.py", line 9 in run\n', encoding="utf-8")
+    text = crash_text(0xC0000409, 2.4, output, faults)
+    assert "(exit code 0xC0000409: fast fail" in text and "after 2 s" in text
+    assert "QT_PLUGIN_PATH" in text and "-m pip install -U" in text
+    assert "Where it stopped:" in text and "window.py" in text
+    output.write_text("", encoding="utf-8")
+    faults.unlink()
+    bare = crash_text(-11, 0.2, output, faults)
+    assert "Its last output" not in bare and "Where it stopped" not in bare
+    assert "QT_PLUGIN_PATH" not in bare and "vc_redist" not in bare
+    assert "python -m auralite.studio" in bare
+
+
+def test_log_tail_reads_the_end(tmp_path):
+    from auralite.studio.logs import tail
+    path = tmp_path / "out.log"
+    path.write_text("\n".join(f"line {i}" for i in range(5000)) + "\n\n  \n",
+                    encoding="utf-8")
+    assert tail(path, 3) == ["line 4997", "line 4998", "line 4999"]
+    assert tail(path, 2, limit=40) == ["line 4998", "line 4999"]
+    assert 2 <= len(tail(path, 50, limit=40)) < 5            # only the end is read
+    assert tail(tmp_path / "missing.log") == []
+
+
+def test_a_crash_leaves_the_stack_in_the_faults_log(tmp_path):
+    if not hasattr(__import__("faulthandler"), "_sigsegv"):
+        pytest.skip("this Python has no faulthandler._sigsegv")
+    code = ("import os, sys\n"
+            "os.environ['AURALITE_HOME'] = sys.argv[1]\n"
+            "from auralite.studio import app\n"
+            "app._enable_faulthandler()\n"
+            "def open_the_window():\n"
+            "    import faulthandler\n"
+            "    faulthandler._sigsegv()\n"
+            "open_the_window()\n")
+    proc = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True,
+                          timeout=120, check=False)
+    assert proc.returncode != 0
+    text = (tmp_path / "logs" / "studio-faults.log").read_text(encoding="utf-8")
+    assert "open_the_window" in text, text
+
+
+def _fake_dll(path, version: tuple[int, int, int, int]) -> None:
+    a, b, c, d = version
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"MZ" + bytes(98) + struct.pack("<I", 0xFEEF04BD) + bytes(8)
+                     + struct.pack("<IIII", 0xFEEF04BD, 0x00010000, (a << 16) | b,
+                                   (c << 16) | d) + bytes(40))
+
+
+def test_the_newest_visual_cpp_runtime_is_loaded_first(tmp_path, monkeypatch):
+    """PyTorch 2.9+ cannot use msvcp140 older than 14.40, which PySide6 before 6.9.3 brings
+    and loads first: the Studio loads the newest copy before Qt and PyTorch."""
+    from auralite.studio import msvc_runtime as rt
+    system, qt, shiboken = tmp_path / "System32", tmp_path / "PySide6", tmp_path / "shiboken6"
+    _fake_dll(system / rt.DLL, (14, 40, 33810, 0))
+    _fake_dll(shiboken / rt.DLL, (14, 39, 33520, 0))
+    _fake_dll(qt / rt.DLL, (14, 39, 33520, 0))
+    assert rt.file_version(system / rt.DLL) == (14, 40, 33810, 0)
+    assert rt.file_version(tmp_path / "missing.dll") is None
+    (tmp_path / "plain.dll").write_bytes(b"MZ" + struct.pack("<I", 0xFEEF04BD) + bytes(30))
+    assert rt.file_version(tmp_path / "plain.dll") is None          # no version record
+    monkeypatch.setattr(rt, "_package_dir", {"PySide6": qt, "shiboken6": shiboken}.get)
+    copies = rt.runtime_copies(system)
+    assert [(c.origin, c.text) for c in copies] == [
+        ("system", "14.40.33810.0"), ("shiboken6", "14.39.33520.0"), ("PySide6", "14.39.33520.0")]
+    best = rt.choose_runtime(copies)
+    assert best is not None and best.origin == "system"             # Qt's copy is too old
+    _fake_dll(shiboken / rt.DLL, (14, 44, 35211, 0))
+    _fake_dll(qt / rt.DLL, (14, 44, 35211, 0))
+    best = rt.choose_runtime(rt.runtime_copies(system))
+    assert best is not None and best.origin == "shiboken6" and best.text == "14.44.35211.0"
+    assert best.version[:2] >= rt.TORCH_NEEDS
+    _fake_dll(system / rt.DLL, (14, 44, 35211, 0))                   # a tie: Windows' own
+    best = rt.choose_runtime(rt.runtime_copies(system))
+    assert best is not None and best.origin == "system"
+    assert rt.choose_runtime(copies, loaded="C:\\Windows\\System32\\msvcp140.dll") is None
+    assert rt.choose_runtime([]) is None
+    (qt / rt.DLL).unlink()
+    assert [c.origin for c in rt.runtime_copies(system)] == ["system", "shiboken6"]
+    if sys.platform != "win32":
+        assert rt.prepare_runtime() is None and rt.loaded_runtime() == ""
+
+
+def test_package_folders_are_found_without_importing_them():
+    from auralite.studio.msvc_runtime import _package_dir
+    found = _package_dir("json")
+    assert found is not None and (found / "__init__.py").is_file()
+    assert _package_dir("auralite_no_such_package") is None
+    assert _package_dir("os") is None                                 # a module, no folder
+
+
+def test_old_windows_is_not_mistaken_for_an_old_processor(monkeypatch):
+    """IsProcessorFeaturePresent knows SSE4.2 / AVX only from Windows 10 2004 on: before
+    that it says "no" on any processor - which stopped the Studio on Windows 10 LTSC."""
+    from auralite.studio import hardware
+    if platform.machine().lower() not in ("x86_64", "amd64", "i386", "i686"):
+        pytest.skip("x86 feature names")
+    asked: list[int] = []
+    monkeypatch.setattr(hardware, "_windows_feature", lambda f: asked.append(f) or f in (38, 39))
+    monkeypatch.setattr(hardware, "_numpy_cpu_features", lambda: {})
+    monkeypatch.setitem(sys.modules, "torch", None)                  # no fallback either
+    monkeypatch.setattr(hardware, "_windows_build", lambda: 17763)  # Windows 10 LTSC 2019
+    assert hardware._simd("", system="win32") == ("", None) and asked == []
+    monkeypatch.setattr(hardware, "_windows_build", lambda: 19045)  # Windows 10 22H2
+    assert hardware._simd("", system="win32") == ("AVX", True) and 38 in asked
+    # NumPy's CPUID answers first, on any Windows
+    monkeypatch.setattr(hardware, "_windows_build", lambda: 17763)
+    monkeypatch.setattr(hardware, "_numpy_cpu_features", lambda: {
+        "SSE2": True, "SSE41": True, "POPCNT": True, "SSE42": True, "AVX": True, "AVX2": False})
+    assert hardware._simd("", system="win32") == ("AVX", True)      # the i5-2400
+    monkeypatch.setattr(hardware, "_numpy_cpu_features", lambda: {"SSE2": True, "SSE41": True})
+    assert hardware._simd("", system="win32") == ("basic", False)
+    monkeypatch.setattr(hardware, "_numpy_cpu_features", lambda: {
+        "SSE2": True, "SSE42": True, "POPCNT": False})
+    assert hardware._simd("", system="win32") == ("SSE4.2", False)
+    monkeypatch.undo()
+    features = hardware._numpy_cpu_features()
+    assert features.get("SSE2") is True                              # the real CPUID
+    assert hardware._simd("", system="win32")[1] == bool(features.get("SSE42")
+                                                         and features.get("POPCNT"))
+
+
+def test_doctor_runs_the_studio_check_in_a_fresh_process(monkeypatch, capsys):
+    from auralite import cli
+    monkeypatch.setattr(cli, "_studio_check", lambda timeout=300.0: (
+        -11, "AuraLite Studio self-test: ...\n  Qt: PySide6 6.12.0\n"))
+    assert cli.main(["doctor", "--no-speed", "--studio"]) == 1
+    text = capsys.readouterr().out
+    assert "checked in a fresh process" in text and "    AuraLite Studio self-test" in text
+    assert "=> it crashed (signal SIGSEGV)" in text
+    monkeypatch.setattr(cli, "_studio_check", lambda timeout=300.0: (0, "RESULT: OK\n"))
+    assert cli.main(["doctor", "--no-speed", "--studio", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["studio"]["check"] == {"code": 0, "result": "the window starts",
+                                      "output": "RESULT: OK\n"}
+    assert cli._studio_verdict(2).startswith("it cannot start here")
+    assert cli._studio_verdict(1).startswith("it failed")
+    assert cli._studio_verdict(None) == "the check did not finish"
+    assert cli.main(["doctor", "--no-speed"]) == 0
+    text = capsys.readouterr().out
+    assert "auralite doctor --studio" in text or "Studio: needs PySide6" in text
+    # 2.19.1: an install older than the code is named, with the command that renews it
+    stale = "the installed package is 2.18.1 but the code is 2.19.1. Install it again: x"
+    monkeypatch.setattr("auralite.studio.app.installation",
+                        lambda: ("auralite-ai 2.18.1", stale))
+    assert cli.main(["doctor", "--no-speed"]) == 0
+    assert f"\n  ! {stale}\n" in capsys.readouterr().out
+    assert cli.main(["doctor", "--no-speed", "--json"]) == 0
+    studio = json.loads(capsys.readouterr().out)["studio"]
+    assert studio["installed"] == "auralite-ai 2.18.1" and studio["install_problem"] == stale
+    assert cli.main(["doctor", "--no-speed", "--studio"]) == 0   # the self-test names it
+    assert f"  ! {stale}" not in capsys.readouterr().out
+
+
+def test_self_test_explains_a_qt_that_does_not_load(tmp_path):
+    """A fresh process, as `auralite doctor --studio` runs it, with a PySide6 whose DLLs
+    do not load."""
+    fake = tmp_path / "fake" / "PySide6"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text(
+        'raise ImportError("DLL load failed while importing QtCore: The specified procedure '
+        'could not be found.")\n', encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        [str(tmp_path / "fake"), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep),
+        AURALITE_HOME=str(tmp_path / "home"), PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, "-m", "auralite.studio", "--self-test"],
+                          capture_output=True, text=True, encoding="utf-8", env=env,
+                          timeout=180, check=False)
+    from importlib import metadata
+    try:
+        metadata.version("PySide6-Essentials")
+        installed = True
+    except metadata.PackageNotFoundError:
+        installed = False
+    assert "  Installed: " in proc.stdout
+    if installed:                          # installed, but it does not load: a library
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "A library would not load" in proc.stdout and "RESULT: FAILED" in proc.stdout
+        assert "vc_redist.x64.exe" in proc.stdout and "Traceback" in proc.stdout
+    else:
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "needs PySide6" in proc.stdout and "cannot start here" in proc.stdout
 
 
 def test_reference_size_is_a_thousand_dialogs():

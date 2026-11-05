@@ -475,12 +475,15 @@ def test_studio_job_runs_the_qt_suite_without_skipping():
     joined = "\n".join(str(step.get("run", "")) for step in job["steps"])
     assert ".[test,studio]" in joined and "libxkbcommon0" in joined
     assert "tests/test_studio_qt.py" in joined
+    # the start a user makes, in a fresh process (Qt before PyTorch), on Windows too
+    assert "python -m auralite.studio --self-test" in joined
+    assert "auralite doctor --no-speed --studio" in joined
     source = (REPO_ROOT / "tests" / "test_studio_qt.py").read_text(encoding="utf-8")
     assert 'require("PySide6.QtWidgets")' in source
     import tomllib
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = project["project"]
-    assert project["optional-dependencies"]["studio"] == ["PySide6-Essentials>=6.6"]
+    assert project["optional-dependencies"]["studio"] == ["PySide6-Essentials>=6.9.3"]
     assert project["gui-scripts"]["auralite-studio"] == "auralite.studio.app:main"
 
 

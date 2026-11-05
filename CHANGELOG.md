@@ -1,3 +1,96 @@
+# 📦 v2.19.1 — AuraLite Studio never fails to start in silence: errors in a message box and a log, the C++ runtime PyTorch needs on Windows, `auralite doctor --studio`
+
+On Windows `auralite-studio` runs under pythonw, which has no console and no
+stderr at all, and 2.19.0 lost whatever stopped it before its window appeared —
+a missing PySide6, a library that would not load, a crash inside Qt: nothing
+showed up and nothing was logged. Now every start-up error is written to
+`logs/studio.log` with its traceback and shown in a message box that needs no
+Qt; without a console the app runs as a watched child process, so even a crash
+inside Qt or PyTorch is reported, with how the process ended and its last lines.
+Fixed on the way: on Windows, PyTorch 2.9 and newer failed with `[WinError 1114]
+… c10.dll` behind a PySide6 older than 6.9.3, whose C++ runtime is older than
+PyTorch needs (the Studio now loads the newest copy on the computer first, and
+the `studio` extra requires PySide6 6.9.3); on Windows 10 before version 2004
+the processor check took every processor for one without SSE4.2. `auralite
+doctor --studio` starts the Studio in a fresh process and prints what it found —
+an install older than its code too, the kind that has no `auralite-studio`
+command. Details: [docs/studio.md § If the Studio does not
+start](docs/studio.md#if-the-studio-does-not-start).
+
+**What changed for existing users**
+
+| | 2.19.1 | 2.19.0 |
+|---|---|---|
+| an error while the Studio starts | in `logs/studio.log` with its traceback and in a message box (Windows' own, or tkinter's), with or without a console | printed to the console — lost under `auralite-studio` on Windows (pythonw has no stderr) |
+| `auralite-studio` without a console | the app runs as a child process (`logs/studio-output.log`, faulthandler's stack in `logs/studio-faults.log`); a crash is shown with how it ended (access violation, abort, …), its last lines and what to do | one process; a crash inside Qt or PyTorch ends it without a word |
+| `msvcp140.dll` on Windows | the newest copy on the computer (Windows', shiboken6's, PySide6's), loaded before Qt and PyTorch | the copy Qt loads first: PySide6 before 6.9.3 brings 14.29 / 14.39, and PyTorch 2.9+ then fails with `WinError 1114` |
+| the `studio` extra | `PySide6-Essentials>=6.9.3` | `PySide6-Essentials>=6.6` |
+| without PySide6 | names `<this Python> -m pip install "PySide6-Essentials>=6.9.3"` | names `pip install "auralite-ai[studio]"`, which installs nothing over an install from a folder made before 2.19 |
+| SSE4.2 / POPCNT on Windows 10 before 2004 | read from CPUID (through NumPy) | *no* on every processor: with Qt 6.10+ the Studio refused to start |
+| `auralite doctor` | `--studio`: the self-test in a fresh process, exit code 1 when the window does not start; names an install older than the code | — |
+| errors explained | also libraries that would not load (`WinError` 126 / 127 / 193 / 1114, *DLL load failed*, missing Linux libraries), with what to install | — |
+
+Nothing else changes: models, checkpoints, the other commands, the server and
+the classic GUI work as in 2.19.0.
+
+**Start-up** (`auralite/studio/app.py`)
+
+- `main()`: without a console (pythonw: no `sys.stderr`) the app starts itself
+  again as a child process (`--studio-child`, no console window,
+  `PYTHONIOENCODING=utf-8`, `QT_FORCE_STDERR_LOGGING=1` — Qt without a console
+  logs to the debugger) with its output in `logs/studio-output.log`. Exit codes
+  0, 1, 2 and 130 mean the child has told the user itself; anything else is a
+  crash: a message box with how the process ended (Windows' NTSTATUS names,
+  signals elsewhere), its last lines and a hint (an incompatible processor, a
+  missing platform plugin, a DLL).
+- The start: the log first, then faulthandler (`logs/studio-faults.log`), the
+  C++ runtime, the Qt check, the window. Every exception is logged with its
+  traceback and shown by `failure_text()`: what it means, what to do, where the
+  log is.
+- `qt_problem()`: a PySide6 that is installed but does not load raises its
+  `ImportError` (a library problem) instead of being taken for a missing one;
+  `install_command()` names this very Python (`python.exe`, not `pythonw.exe`).
+- `self_test()` (`python -m auralite.studio --self-test`): the system, the
+  installed package, on Windows the `msvcp140.dll` copies and the one loaded
+  first, Qt and its platform, the window's tabs, PyTorch, the processor, then
+  `RESULT: OK` with the time, or why not.
+- `installation()`: an install from a folder (`pip install -e .`) keeps the
+  metadata of its day — one made before 2.19 has neither the `auralite-studio`
+  command nor the `studio` extra. The self-test and `auralite doctor` name the
+  command that installs it again.
+
+**Windows' C++ runtime** (`auralite/studio/msvc_runtime.py`, new): the
+`msvcp140.dll` copies with their file versions; `prepare_runtime()` loads the
+newest before Qt and PyTorch. Windows reuses a loaded DLL of the same name for
+the whole process, and PyTorch 2.9+ needs 14.40 or newer
+(pytorch/pytorch#166628).
+
+**The processor** (`hardware.py`): without `/proc/cpuinfo`, SSE4.2, POPCNT and
+AVX come from CPUID through NumPy; `IsProcessorFeaturePresent` is asked only
+from Windows 10 2004 (build 19041) on — before that it answers *no* to SSE4.2
+and AVX on any processor.
+
+**Errors** (`errors.py`): libraries that would not load — `WinError` 126, 127,
+193, 1114, *DLL load failed*, *cannot open shared object file* — with the
+Visual C++ Redistributable, the PySide6 or the Linux package to install.
+
+**Logs** (`logs.py`): `output_path()`, `faults_path()`, `tail()`.
+
+**CLI**: `auralite doctor --studio`: the self-test in a fresh process (a crash
+there does not end the doctor), exit code 1 when the window does not start;
+`"studio"` in `--json` has the check, the installed package and its problem.
+
+**Packaging**: the `studio` extra requires `PySide6-Essentials>=6.9.3` (older
+wheels bring `msvcp140` 14.29 / 14.39; 6.9.3 is also the last Qt for
+processors without SSE4.2).
+
+**CI**: the `studio` job, on Ubuntu and Windows, also starts the Studio through
+its own start in fresh processes: `python -m auralite.studio --self-test`,
+`auralite doctor --no-speed --studio`.
+
+**Docs**: docs/studio.md (*If the Studio does not start*, an install from a
+clone), FAQ § 20, quickstart, README, ARCHITECTURE.
+
 # 📦 v2.19.0 — AuraLite Studio: a desktop app on Qt 6 with separate Fine-tune and Train tabs, a setup wizard and recommendations for your computer
 
 AuraLite gets a desktop app built as a product: **AuraLite Studio**

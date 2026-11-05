@@ -254,7 +254,13 @@ jobs:
         run: |
           python -c "import PySide6; print('PySide6', PySide6.__version__)"
           pytest tests/test_studio_qt.py tests/test_studio_core.py -q --tb=short -rs
-          auralite doctor --no-speed
+      - name: AuraLite Studio starts the way a user starts it
+        # 2.19.1: a fresh process goes through the app's own start - main(), the C++
+        # runtime it loads first on Windows, the Qt check, then the window and PyTorch -
+        # which the suite's tests, calling the parts one by one, never take.
+        run: |
+          python -m auralite.studio --self-test
+          auralite doctor --no-speed --studio
 
   integrations:
     # v2.6.6: transformers/peft and llama.cpp for real. Everything else talks to

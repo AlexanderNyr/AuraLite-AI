@@ -23,16 +23,23 @@ pip install "auralite-ai[studio]"    # AuraLite + PySide6 (Qt 6 for Python)
 auralite-studio                      # or: auralite studio, python -m auralite.studio
 ```
 
+From a clone of the repository it is `pip install -e ".[studio]"` in its folder —
+run it again after updating from an AuraLite older than 2.19, whose install has no
+`auralite-studio` command yet.
+
 On Windows `auralite-studio` starts without a console window (a shortcut can point
 at `Scripts\auralite-studio.exe` of your Python or virtual environment). Without
-PySide6 the command says how to install it instead of failing.
+PySide6 the command says how to install it instead of failing, and nothing else
+that stops it passes in silence either: see [If the Studio does not
+start](#if-the-studio-does-not-start).
 
-**Requirements.** Python 3.11–3.14, Windows 10+, Linux or macOS. Qt 6.10 and newer
-need a processor with SSE4.2 and POPCNT (x86-64-v2): every Intel Core since 2008
-(Nehalem; the i5-2400 and i3-2100 qualify) and AMD since 2011 (Bulldozer). On an
-older processor the Studio says so and how to install the last Qt that runs there
-(`pip install "PySide6-Essentials<6.10"`); the classic interface works anywhere.
-AVX2 is not needed: training uses what the processor has.
+**Requirements.** Python 3.11–3.14, Windows 10 (1809) or newer, Linux or macOS;
+PySide6 6.9.3 or newer (the `studio` extra). Qt 6.10 and newer need a processor
+with SSE4.2 and POPCNT (x86-64-v2): every Intel Core since 2008 (Nehalem; the
+i5-2400 and i3-2100 qualify) and AMD since 2011 (Bulldozer). On an older processor
+the Studio says so and how to install the last Qt that runs there
+(`pip install "PySide6-Essentials<6.10"`, which gives 6.9.3); the classic interface
+works anywhere. AVX2 is not needed: training uses what the processor has.
 
 ## The tabs
 
@@ -117,9 +124,42 @@ data cannot be used* (the formats), a missing optional package (the `pip install
 command). The details go to the log: *Tools → Open the log folder*
 (`~/.auralite/logs/studio.log`, rolled over at 2 MB).
 
+## If the Studio does not start
+
+Since 2.19.1 whatever stops the Studio is shown in a message box — also when
+`auralite-studio` runs without a console — and written to `~/.auralite/logs/`:
+
+- `studio.log` — the app's log, with every error's traceback;
+- `studio-output.log` — what it printed, when it was started without a console;
+- `studio-faults.log` — Python's stack, if the process crashed inside Qt or
+  PyTorch (the message box then says how it ended and shows the last lines).
+
+`auralite doctor --studio` checks it in a fresh process — Python, the installed
+package, Qt, on Windows the Visual C++ runtime, PyTorch, the processor —, builds
+the window without showing it and prints what it found: `RESULT: OK` when the
+window starts. If it says something else, that output is what an issue needs.
+`python -m auralite.studio` starts the Studio in a console, where everything is
+printed.
+
+| What it says | What to do |
+|---|---|
+| `auralite-studio` *is not recognized as a command*, pip warns *auralite-ai 2.18.1 does not provide the extra 'studio'*, or `auralite doctor` says *the installed package is … but the code is …* | AuraLite was installed before 2.19 — an install from a folder (`pip install -e .`) keeps the metadata of its day. Install it again: `pip install -e ".[studio]"` in that folder, or `pip install -U "auralite-ai[studio]"` |
+| *needs PySide6* | the command it shows — `python -m pip install "PySide6-Essentials>=6.9.3"` with the very Python AuraLite runs on |
+| *no SSE4.2 / POPCNT*, or Qt's *Incompatible processor* | `pip install "PySide6-Essentials<6.10"` (Qt 6.9.3, the last for such processors) |
+| *A library would not load*: `[WinError 1114] … c10.dll`, *DLL load failed* | install the latest [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe), then `pip install -U "PySide6-Essentials>=6.9.3"` |
+| *Could not find the Qt platform plugin "windows"* | `pip install --force-reinstall PySide6-Essentials`; remove a `QT_PLUGIN_PATH` variable another program set |
+| *DLL load failed while importing QtCore* on Windows 7 or 8.1 | Qt 6 needs Windows 10: use the classic interface (`auralite-gui`) |
+
+Why `WinError 1114`: PyTorch 2.9 and newer need Microsoft's C++ runtime
+(`msvcp140.dll`) 14.40 or newer on Windows, PySide6 before 6.9.3 brings an older
+copy, and the copy loaded first serves the whole process. The Studio loads the
+newest copy on the computer before Qt and PyTorch, and the `studio` extra installs
+PySide6 6.9.3 or newer.
+
 ## Files
 
 Everything lives in `~/.auralite` (`AURALITE_HOME`): downloaded models (`hf/`),
 the Studio's settings (`studio.json`: theme, recent models, the last speed test —
-never a token), logs (`logs/`). *Help → Check for updates* asks PyPI for a newer
+never a token), logs (`logs/`: `studio.log`, `studio-output.log`,
+`studio-faults.log`). *Help → Check for updates* asks PyPI for a newer
 version; nothing is installed by itself.
