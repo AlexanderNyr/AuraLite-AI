@@ -29,6 +29,8 @@ from .tab_start import StartTab
 from .tab_train import TrainTab
 from .theme import apply_theme, icon_pixmap
 
+log = logging.getLogger("auralite.studio")
+
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
               ("chat", "Chat"), ("export", "Export"), ("library", "Library"), ("log", "Log"))
@@ -69,6 +71,7 @@ class MainWindow(QMainWindow):
         self.save_on_close = save_on_close
         self.auto_speed_test = auto_speed_test
         self._jobs: list[Job] = []
+        self.bench_job: Job | None = None                   # 2.22: Tools -> Benchmark
         self.version = __version__
         self.setWindowTitle(f"AuraLite Studio {__version__}")
         self.setWindowIcon(studio_icon())
@@ -157,6 +160,8 @@ class MainWindow(QMainWindow):
         tools = bar.addMenu("&Tools")
         self._action(tools, "Setup wizard…", lambda: self.open_wizard("finetune"), "Ctrl+N")
         self._action(tools, "Speed test", self.run_speed_test)
+        # 2.22: auralite bench in the window
+        self.bench_action = self._action(tools, "Benchmark…", self.run_benchmark)
         self._action(tools, "Library: runs, models, datasets", lambda: self.goto("library"),
                      "Ctrl+L")
         tools.addSeparator()
@@ -233,6 +238,65 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.statusBar().showMessage(f"Speed test: {gflops:,.0f} GFLOP/s", 6000)
         self.hardware_changed.emit(self.hardware)
+
+    def run_benchmark(self) -> None:
+        """2.22: *Tools -> Benchmark*: ``auralite bench`` - how fast this computer trains and
+        writes three sizes of a new model; the report goes to ~/.auralite/bench. While it
+        runs the menu item stops it."""
+        from auralite import bench
+        if self.bench_job is not None:
+            self.bench_job.stop_event.set()
+            self.statusBar().showMessage("Stopping the benchmark…")
+            return
+        sizes = list(bench.SIZES)
+        minutes = bench.estimated_minutes(sizes, bench.DEFAULT_SECONDS)
+        if not confirm(self, "Benchmark",
+                       f"Measure how fast this computer trains and writes: three sizes of a "
+                       f"new model ({', '.join(sizes)}), a minute of training each - about "
+                       f"{minutes:,.0f} minutes, offline. Close other programs: they slow it "
+                       f"down. The report (Markdown and JSON) goes to "
+                       f"{bench.default_folder()}.\n\nTools -> Stop the benchmark ends it."):
+            return
+        if not self.begin("benchmark"):
+            return
+
+        def work(job: Job) -> Any:
+            report = bench.run_bench(sizes=sizes, progress=job.progress.emit,
+                                     stop=job.stop_event)
+            return report, bench.save_report(report)
+
+        job = Job("benchmark", work, self)
+        job.progress.connect(self._bench_progress)
+        job.finished.connect(self._benchmarked)
+        job.failed.connect(self._bench_failed)
+        self.bench_job = job
+        self.bench_action.setText("Stop the benchmark")
+        job.start()
+
+    def _bench_progress(self, line: Any) -> None:
+        text = str(line).strip()
+        self.statusBar().showMessage(f"Benchmark: {text}")
+        log.info("[AuraLite] bench: %s", text)
+
+    def _bench_over(self) -> None:
+        self.bench_job = None
+        self.bench_action.setText("Benchmark…")
+        self.statusBar().clearMessage()
+        self.end()
+
+    def _benchmarked(self, result: Any) -> None:
+        from auralite import bench
+        report, (md, _js) = result
+        self._bench_over()
+        inform(self, "Benchmark", "\n".join(bench.summary_lines(report))
+               + f"\n\nThe report, a table for an article or a README: {md}")
+
+    def _bench_failed(self, exc: BaseException) -> None:
+        self._bench_over()
+        if isinstance(exc, InterruptedError):
+            self.statusBar().showMessage("The benchmark was stopped", 6000)
+            return
+        self.report_error(exc, "benchmark")
 
     def _run_background(self, name: str, fn: Any, done: Any) -> Job:
         job = Job(name, fn, self)

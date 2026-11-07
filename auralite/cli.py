@@ -1179,6 +1179,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
     history: list[dict] = []
     if args.system:
         history.append({"role": "system", "content": args.system})
+    if not args.template and engine.continues_text():
+        # 2.21.3: a model of plain text has never seen a chat template
+        from auralite import bundle
+        print("note: this model was trained on plain text, not on dialogs: it continues "
+              "text and knows no chat template, so its replies may begin mid-word and run "
+              "on. To write on from a prompt: "
+              + bundle.console_command("generate", "--model", args.model, "--prompt", "...")
+              + "; to chat, train it on dialogs", file=sys.stderr)
 
     def _respond(user_text: str) -> None:
         history.append({"role": "user", "content": user_text})
@@ -2357,6 +2365,34 @@ def build_parser() -> argparse.ArgumentParser:
                         "`>` would garble letters outside ASCII)")
     p.set_defaults(func=cmd_doctor)
 
+    # 2.22: the benchmark
+    p = sub.add_parser("bench", help="measure this computer for AuraLite: how fast three sizes "
+                                     "of a new model train and write - offline, a few minutes")
+    _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--quick", action="store_true",
+                   help="two sizes, 15 s each: a check that it all runs (about a minute)")
+    p.add_argument("--sizes", metavar="LIST",
+                   help="the sizes, comma-separated: tiny (0.9M parameters), small (7M), "
+                        "medium (19M); default: all three")
+    p.add_argument("--seconds", type=float, metavar="S",
+                   help="seconds of training per size (default 60)")
+    p.add_argument("--data", metavar="FILE",
+                   help="train on this text file instead of the built-in text (the report "
+                        "then says how long one pass over it takes)")
+    p.add_argument("--finetune", nargs="?", const="hf:Qwen/Qwen2.5-0.5B-Instruct",
+                   metavar="MODEL",
+                   help="also fine-tune a ready model with LoRA (default "
+                        "hf:Qwen/Qwen2.5-0.5B-Instruct: about 1 GB, downloaded once)")
+    p.add_argument("--method", choices=["lora", "qlora"],
+                   help="how --finetune trains (default: QLoRA below 8 GB of memory, else LoRA)")
+    p.add_argument("--threads", type=int, metavar="N", help="training threads (default: AuraLite's)")
+    p.add_argument("--out", metavar="FOLDER",
+                   help="where to write bench-<processor>-<date>.md and .json (default "
+                        "~/.auralite/bench)")
+    p.add_argument("--json", action="store_true", help="print the report as JSON")
+    p.add_argument("--child", metavar="SPEC", help=argparse.SUPPRESS)   # one stage, alone
+    p.set_defaults(func=cmd_bench)
+
     # 2.20: the run library
     p = sub.add_parser("runs", help="the run library: every training run, its curve and "
                                     "files; compare runs, continue a stopped one")
@@ -2477,13 +2513,17 @@ def _studio_verdict(code: int | None) -> str:
 
 
 def _doctor_command(rec, data: list[str], params_file: str) -> list[str]:
-    """`auralite` commands that run the recommendation."""
-    data_text = " ".join(data) if data else "DIALOGS.jsonl"
-    params = f" --params {params_file}" if params_file else ""
+    """`auralite` commands that run the recommendation. 2.21.3: in the app they begin with
+    its console program as a console runs it - ``.\\auralite.exe`` (bundle.console_command;
+    2.21.2 said so in every hint but these) - and a path with spaces is in quotes."""
+    from auralite import bundle
+    cli = bundle.console_command()
+    data_text = bundle.quoted(list(data)) if data else "DIALOGS.jsonl"
+    params = f" --params {bundle.quoted([params_file])}" if params_file else ""
     if rec.goal == "pretrain":
         preset = rec.settings.get("preset", "25m")
         minutes = int(rec.settings.get("time_limit_min", 480))
-        return [f"auralite train --data {data_text} --preset {preset} --time-budget {minutes}m "
+        return [f"{cli} train --data {data_text} --preset {preset} --time-budget {minutes}m "
                 f"--memory-plan auto{params} --model my-model.pt"]
     choice = rec.choice
     if choice is None:
@@ -2492,10 +2532,10 @@ def _doctor_command(rec, data: list[str], params_file: str) -> list[str]:
     optimizer = " --optimizer adamw8bit" if rec.settings.get("optimizer") == "adamw8bit" else ""
     lora = "" if choice.method == "full" else f" --lora {rec.settings.get('lora_rank', 16)}"
     pack = " --pack-dialogs" if rec.settings.get("pack_dialogs") else ""
-    return [f"auralite train --data {data_text} --resume {choice.model.spec}{quantize}{lora}"
+    return [f"{cli} train --data {data_text} --resume {choice.model.spec}{quantize}{lora}"
             f"{optimizer}{pack} --memory-plan auto{params} --model my-chat-model.pt",
-            "auralite chat --model my-chat-model.pt",
-            "auralite export --model my-chat-model.pt --format gguf --out my-chat-model.gguf"]
+            f"{cli} chat --model my-chat-model.pt",
+            f"{cli} export --model my-chat-model.pt --format gguf --out my-chat-model.gguf"]
 
 
 class _Tee:
@@ -2512,6 +2552,58 @@ class _Tee:
     def flush(self) -> None:
         for stream in self.streams:
             stream.flush()
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """2.22: ``auralite bench`` - this computer's numbers for training and writing."""
+    import threading
+
+    from auralite import bench
+    if args.child:                      # a stage in a process of its own (bench._run_child)
+        logging.getLogger("auralite").setLevel(logging.WARNING)
+        return bench.child_main(args.child)
+    if args.sizes:
+        sizes = [s.strip() for s in str(args.sizes).split(",") if s.strip()]
+    else:
+        sizes = list(bench.QUICK["sizes"] if args.quick else bench.SIZES)
+    seconds = float(args.seconds or (bench.QUICK["seconds"] if args.quick
+                                     else bench.DEFAULT_SECONDS))
+    tokens = int(bench.QUICK["generate_tokens"] if args.quick else bench.GENERATE_TOKENS)
+    quiet = bool(getattr(args, "quiet", False))
+    minutes = bench.estimated_minutes(sizes, seconds, finetune=bool(args.finetune))
+    if not quiet:
+        print(f"AuraLite bench: {', '.join(sizes)} - {seconds:g} s of training each"
+              + (f", then fine-tuning {args.finetune}" if args.finetune else "")
+              + f"; about {max(1.0, minutes):,.0f} min. Other programs slow it down: close "
+              "what you can.", file=sys.stderr, flush=True)
+
+    def progress(line: str) -> None:
+        if not quiet:
+            print(line, file=sys.stderr, flush=True)
+
+    # the stages train in child processes (bench --child), whose engine lines stay there
+    stop = threading.Event()
+    try:
+        report = bench.run_bench(sizes=sizes, seconds=seconds, generate_tokens=tokens,
+                                 data=args.data, finetune=args.finetune,
+                                 method=args.method or "", threads=args.threads,
+                                 progress=progress, stop=stop)
+    except bench.BenchError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, InterruptedError):
+        stop.set()
+        print("stopped: no report", file=sys.stderr)
+        return 130
+    md, js = bench.save_report(report, args.out)
+    if args.json:
+        print(json.dumps(report, indent=1, ensure_ascii=False))
+        print(f"saved: {md} and {js.name}", file=sys.stderr)
+        return 0
+    print(bench.to_markdown(report))
+    print(f"Saved: {md}")
+    print(f"       {js}")
+    return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

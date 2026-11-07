@@ -290,7 +290,13 @@ class RunPanel(QWidget):
         if percent is not None:
             self.bar.setValue(int(round(max(0.0, min(100.0, percent)) * 10)))
 
-    def end(self, text: str) -> None:
+    def end(self, text: str, complete: bool = False) -> None:
+        """The run is over; `complete` when it ended by itself (2.21.3): the bar shows 100 %
+        and the chart the whole run (ProgressTracker.complete)."""
+        if complete:
+            self.tracker.complete()
+            self.bar.setValue(1000)
+            self.chart.set_points(self.tracker.losses, self.tracker.val_losses)
         self.status.setText(text)
         self.set_running(False)
 

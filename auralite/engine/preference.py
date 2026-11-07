@@ -670,6 +670,7 @@ class PreferenceTrainerMixin:
         engine._resume_scheduler_state = None
         engine._resume_optimizer_file = None           # 2.18
         engine._resume_run_state = engine._run_state = None
+        engine.trained_on = "dialogs"        # 2.21.3: pairs of replies in the chat template
         report = {
             "method": method, "beta": beta, "gamma": gamma if method == "simpo" else None,
             "sft_weight": sft_weight, "positive": positive, "lr": rate, "lora": lora,

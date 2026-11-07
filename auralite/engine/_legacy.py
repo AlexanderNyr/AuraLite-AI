@@ -155,6 +155,19 @@ def _in_memory(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_in_memory(item) for item in value)
     return value
+
+
+def _trained_on(saved: Any, run_state: Any) -> str | None:
+    """2.21.3: what a checkpoint's model learned to write: its ``trained_on``, else (files
+    of 2.18 to 2.21.2) the kind of data of the run it kept to continue - "dialogs", or
+    "text" (prepared token files are text too); None when neither tells."""
+    if saved in ("text", "dialogs"):
+        return str(saved)
+    data = run_state.get("data") if isinstance(run_state, dict) else None
+    kind = data.get("kind") if isinstance(data, dict) else None
+    return {"dialogs": "dialogs", "text": "text", "shards": "text"}.get(str(kind))
+
+
 from auralite.engine import compute_thread as _compute  # noqa: E402
 from auralite.engine.optimizers import (  # noqa: E402,F401
     Muon, _ChainedOptimizers, _muon_adjust_lr, _newton_schulz_ortho,
@@ -468,6 +481,10 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_optimizer_file: tuple[str, int, int] | None = None
         self._resume_run_state: dict | None = None
         self._run_state: dict | None = None
+        #: 2.21.3: what the model in memory learned to write - "dialogs" (in its chat
+        #: template), "text" (plain text, which it continues) or None (unknown: a
+        #: checkpoint of an older version, a model from elsewhere); see continues_text()
+        self.trained_on: str | None = None
 
         # DDP (DistributedDataParallel) support — v2.3
         self.is_distributed = False
@@ -518,6 +535,18 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
 
     def is_hf_model(self) -> bool:
         return self.backend == "huggingface" or isinstance(self.model, HuggingFaceProxy)
+
+    def continues_text(self) -> bool:
+        """2.21.3: whether the model in memory is AuraLite's own, trained on plain text only:
+        it writes on from a prompt and has never seen a chat template - wrapped in one
+        (ChatML: ``<|im_start|>user``) its replies begin mid-word and run to the token limit.
+        False for models trained on dialogs, imported, GGUF or transformers models, and
+        when it is not known (checkpoints of older versions that kept no run)."""
+        if self.model is None or self.is_gguf_model() or self.is_hf_model():
+            return False
+        if getattr(self, "hf_source", None):
+            return False
+        return getattr(self, "trained_on", None) == "text"
 
     # ===================================================================
     #  Chat / Instruction Mode (NEW v2.3)
@@ -991,6 +1020,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             self._resume_scaler_state = None
             self._resume_optimizer_file = None
             self._resume_run_state = self._run_state = None
+            self.trained_on = None
             logger.info("[AuraLite] Using a llama.cpp server backend at %s (n_ctx=%s)",
                         model.base_url, model.max_seq_len)
             return
@@ -1032,6 +1062,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_scaler_state = None
         self._resume_optimizer_file = None
         self._resume_run_state = self._run_state = None
+        self.trained_on = None
         chat = ", chat=on" if use_chat_completion else ""
         logger.info(f"[AuraLite] Loaded GGUF model: {Path(path).name} "
                     f"(ctx={n_ctx}, threads={n_threads}, gpu_layers={n_gpu_layers}, "
@@ -1759,6 +1790,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         }
         # 2.16: where the adapters sit and their scale (2.15 files: FFN)
         checkpoint.update(self._lora_config_entry())
+        checkpoint.update(self._trained_on_entry())         # 2.21.3
         # 2.18: where a run stands (continue_run picks it up)
         run_state = getattr(self, "_run_state", None)
         if isinstance(run_state, dict) and include_optimizer:
@@ -1812,7 +1844,13 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
             "checkpoint_version": 3,
             # 2.16: where LoRA adapters sit and their scale
             **self._lora_config_entry(),
+            **self._trained_on_entry(),                     # 2.21.3
         }
+
+    def _trained_on_entry(self) -> dict:
+        """2.21.3: ``{"trained_on": "text" | "dialogs"}`` when it is known."""
+        trained = getattr(self, "trained_on", None)
+        return {"trained_on": trained} if trained in ("text", "dialogs") else {}
 
     def _v2181_entries(self) -> dict:
         """Checkpoint entries of 2.18.1, present only when they say something.
@@ -2023,6 +2061,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         # Windows then refuses to save over it)
         self._resume_run_state = _in_memory(run_state) if isinstance(run_state, dict) else None
         self._run_state = self._resume_run_state
+        self.trained_on = _trained_on(checkpoint.get("trained_on"), run_state)    # 2.21.3
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
@@ -2094,6 +2133,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_scaler_state = None
         self._resume_optimizer_file = None
         self._resume_run_state = self._run_state = None
+        self.trained_on = None
         _compute.release_caller_pool()
         return dict(result.info)
 
@@ -2124,6 +2164,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         self._resume_scaler_state = None
         self._resume_optimizer_file = None
         self._resume_run_state = self._run_state = None
+        self.trained_on = None
         import gc
         import sys
         gc.collect()

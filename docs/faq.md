@@ -465,3 +465,31 @@ AuraLite is installed with pip too, it runs that one: an older version has no
 auralite-ai`). Since 2.21.2 `.\auralite.exe doctor` says when `auralite` alone
 runs another AuraLite. To save the report, use `--out report.txt` rather than
 PowerShell's `>`, which garbles letters outside ASCII.
+
+## 25. My model trained from scratch answers nonsense in the chat
+
+A model trained on plain text has learned to continue text, not to answer: it has
+never seen a dialog, nor the markers a chat template wraps messages in. Since
+2.21.3 the Studio's Chat tab knows such a model and continues what you type (the
+*Template* list: *auto*, or *continue the text*); with the command line use
+`auralite generate --model my-model.pt --prompt "..."` (`auralite chat` says so).
+To get a model that answers, train or fine-tune it on dialogs (`.jsonl`) — on a
+CPU, fine-tuning a ready model such as Qwen2.5 0.5B or SmolLM2 135M on your
+dialogs gets there much sooner than a model of your own.
+
+How well it continues depends on how much text it read. A 7M-parameter model needs
+millions of tokens — megabytes of text; on a single story (some 100 KB) it learns
+the story by heart within minutes: the training loss keeps falling, validation
+stops improving and early stopping ends the run, and what it writes reads like the
+story only in snatches. The Train tab says when the text is small for the size and
+about how much it needs. Whole books in plain UTF-8 text work best: public-domain
+literature, your notes, documentation.
+
+## 26. How fast is my computer for AuraLite?
+
+`auralite bench` (2.22; in the Windows app `.\auralite.exe bench`, in the Studio *Tools →
+Benchmark…*) measures it in about five minutes, offline: three sizes of a new model (0.9M,
+7M and 19M parameters) trained for a minute each — training tokens per second, tokens in
+a night, the memory each run takes — and how fast each writes. `--finetune` adds a LoRA
+fine-tune of Qwen2.5 0.5B. The report is a Markdown table and JSON in `~/.auralite/bench`.
+See [benchmark.md](benchmark.md).

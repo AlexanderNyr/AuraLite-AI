@@ -105,7 +105,7 @@ _SetupStopped = SetupStopped
 _SETUP_STATE = ("tokenizer", "vocab_size", "model", "optimizer", "optimizer_name", "scheduler",
                 "scaler", "params_used", "backend", "gguf_path", "hf_path",
                 "default_chat_template", "last_val_loss", "last_val_bpb", "_ddp_model",
-                "_run_state", "_resume_run_state")
+                "_run_state", "_resume_run_state", "trained_on")
 
 
 class _ReplyLoss(nn.Module):
@@ -181,8 +181,12 @@ def _zero_rows(grad: torch.Tensor, rows: int) -> torch.Tensor:
 #: a temporary file instead of a copy in memory (2.18).
 _BEST_IN_MEMORY_BYTES = 256 << 20
 
-#: memory_plan="auto" plans for this share of the free memory (2.18).
-_MEMORY_MARGIN = 0.85
+#: memory_plan="auto" plans for this share of the free memory (2.18; 2.22: 0.7, was 0.85).
+#: The estimate matches what a run takes (``auralite bench`` measures both: 0.48 GB used
+#: against 0.49 GB estimated for 7M parameters), but the free memory the system reports
+#: counts pages it would rather keep - PyTorch's own libraries among them. On a computer
+#: with 2 GB a 7M run planned for 85 % of 1.1 GB free was killed for want of memory.
+_MEMORY_MARGIN = 0.7
 
 #: What ``run_state`` must agree on for ``continue_run`` (2.18).
 _RUN_KEYS = ("seq_length", "batch_size", "accumulation_steps", "sample_stride")
@@ -1762,6 +1766,9 @@ class TrainerMixin:
 
             # a new model comes from no Hugging Face checkpoint (2.18.1)
             self.hf_source = None
+            # 2.21.3: what it learns to write - dialogs in their template, or plain text
+            # it continues (the Studio's Chat tab chats in a template only with dialogs)
+            self.trained_on = "dialogs" if dialogs is not None else "text"
             # LoRA setup (must happen before DDP wrapping so the adapters are tracked)
             if lora_rank > 0:
                 self.model.enable_lora(rank=lora_rank, targets=lora_targets,
@@ -2931,9 +2938,12 @@ class TrainerMixin:
                         "batches": n_loader_batches,
                         "global_step": completed_batches_total,
                         "total_steps": total_opt_steps,
-                        # 100 % when the run ends here (2.21.2)
-                        "percent": (100.0 if budget_done or epoch + 1 >= epochs
-                                    else run_percent(epoch + 1)),
+                        # 100 % when the run's plan ends here - its epochs, max_steps or
+                        # time (2.21.2); early stopping and Finish end it where it stands
+                        # (2.21.3: 100 % drew the last losses flat out to the chart's end)
+                        "percent": (100.0 if epoch + 1 >= epochs or (
+                            budget_done and ctl.stop_reason in (None, "time_budget"))
+                            else run_percent(epoch + 1)),
                         "epoch_percent": 100.0,
                         "lr": self.scheduler.get_lr() if self.scheduler else lr,
                         "batches_per_sec": (n_loader_batches / epoch_dur) if epoch_dur > 0 else 0.0,
@@ -2985,6 +2995,10 @@ class TrainerMixin:
             # (2.20: dialog runs alike)
             self._run_state = dict(run_state_now, finished=stop_reason != "stopped",
                                    restored_best=restored)
+        if resuming:
+            # 2.21.3: a model that has learned dialogs goes on chatting in their template
+            self.trained_on = ("dialogs" if dialogs is not None
+                               or getattr(self, "trained_on", None) == "dialogs" else "text")
         elapsed = time.time() - train_t0
         if cluster is not None:           # tokens of every computer
             tokens_seen = int(cluster.allreduce_sum([float(tokens_seen)])[0])

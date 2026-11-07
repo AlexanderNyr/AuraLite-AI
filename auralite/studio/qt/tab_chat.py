@@ -16,6 +16,9 @@ from .common import Job, ask_save, heading, hint, primary, show_error
 if TYPE_CHECKING:
     from .window import MainWindow
 
+#: 2.21.3: the Template list's entry that writes on from the message instead of chatting
+TEXT_MODE = "text"
+
 
 class _EnterSends(QObject):
     """Enter sends the message; Shift+Enter starts a new line."""
@@ -60,6 +63,12 @@ class ChatTab(QWidget):
                               "chat in llama.cpp, Ollama or LM Studio.")
         self.slow_hint.setVisible(False)
         layout.addWidget(self.slow_hint)
+        # 2.21.3: a model trained on plain text continues text (text_mode, TEXT_MODE)
+        self.text_hint = hint("This model learned plain text, not dialogs: it continues what "
+                              "you write instead of answering - type the start of a text. To "
+                              "chat, train or fine-tune a model on dialogs (.jsonl).")
+        self.text_hint.setVisible(False)
+        layout.addWidget(self.text_hint)
 
         settings = QHBoxLayout()
         self.system = QLineEdit()
@@ -80,9 +89,14 @@ class ChatTab(QWidget):
         settings.addWidget(QLabel("Template:"))
         self.template = QComboBox()
         self.template.addItem("auto", "")
+        self.template.addItem("continue the text", TEXT_MODE)
         from auralite.engine import CHAT_TEMPLATES
         for name in CHAT_TEMPLATES:
             self.template.addItem(name, name)
+        self.template.setToolTip("How messages reach the model: auto - its own chat template, "
+                                 "or text it continues for a model trained on plain text; "
+                                 "continue the text - the message is the start of a text the "
+                                 "model writes on; or a chat template by name")
         settings.addWidget(self.template)
         layout.addLayout(settings)
 
@@ -118,6 +132,7 @@ class ChatTab(QWidget):
         self.open_button.clicked.connect(window.open_model_dialog)
         window.model_changed.connect(self._model_changed)
         window.busy_changed.connect(lambda _busy: self._update_buttons())
+        self.template.currentIndexChanged.connect(lambda _i: self._update_mode())
         self._model_changed()
         self.render()
 
@@ -135,7 +150,34 @@ class ChatTab(QWidget):
             except Exception:
                 quantized = False
         self.slow_hint.setVisible(quantized)
+        self._update_mode()
         self._update_buttons()
+
+    def text_mode(self) -> bool:
+        """2.21.3: whether a message is the start of a text the model writes on: "continue
+        the text" chosen, or "auto" with a model trained on plain text only (it has never
+        seen a chat template: wrapped in ChatML its replies began mid-word and ran to the
+        token limit)."""
+        choice = str(self.template.currentData() or "")
+        if choice == TEXT_MODE:
+            return True
+        engine = self.studio.engine
+        if choice or engine.model is None:
+            return False
+        try:
+            return bool(engine.continues_text())
+        except Exception:
+            return False
+
+    def _update_mode(self) -> None:
+        text = self.text_mode()
+        self.text_hint.setVisible(text and self.studio.engine.model is not None)
+        self.system.setEnabled(not text)
+        self.input.setPlaceholderText(
+            "Write the start of a text - the model continues it; Enter sends" if text else
+            "Write a message - Enter sends, Shift+Enter starts a new line")
+        if not self.messages and self.job is None:
+            self.render()
 
     def _update_buttons(self) -> None:
         chatting = self.job is not None
@@ -164,9 +206,19 @@ class ChatTab(QWidget):
                    "temperature": float(self.temperature.value()),
                    "chat_template": str(self.template.currentData()) or None,
                    "system_prompt": self.system.text().strip() or None}
+        text_mode = self.text_mode()
 
         def work(job: Job) -> Any:
-            for piece in engine.generate_chat_streaming(history, **options):
+            if text_mode:
+                # 2.21.3: the message is the start of a text; the model writes on from it
+                # (each message starts anew: the model knows no turns), at the chat's
+                # sampling settings
+                pieces = engine.generate_streaming(
+                    text, length=options["max_new_tokens"], temperature=options["temperature"],
+                    top_k=40, top_p=0.9, repetition_penalty=1.1)
+            else:
+                pieces = engine.generate_chat_streaming(history, **options)
+            for piece in pieces:
                 if job.stop_event.is_set():
                     break
                 job.progress.emit(str(piece))
@@ -197,7 +249,8 @@ class ChatTab(QWidget):
         self.timer.stop()
         stopped = self.job is not None and self.job.stop_event.is_set()
         self.job = None
-        reply = self.reply.strip()
+        # 2.21.3: a reply cut at the token limit inside a letter's bytes ends in U+FFFD
+        reply = self.reply.strip().rstrip("\ufffd").rstrip()
         if reply or not stopped:
             self.messages.append({"role": "assistant",
                                   "content": reply + (" …" if stopped else "")})
@@ -256,7 +309,9 @@ class ChatTab(QWidget):
             else "#323944"
         parts = [f"<div style='color:{text_color}'>"]
         if not self.messages and not self.job:
-            parts.append("<p style='color:gray'>Ask something to see how the model answers. "
+            parts.append("<p style='color:gray'>Type the start of a text: the model writes on "
+                         "from it.</p>" if self.text_mode() else
+                         "<p style='color:gray'>Ask something to see how the model answers. "
                          "Fine-tuned models answer in the style of their dialogs.</p>")
         shown = list(self.messages)
         if self.job is not None:

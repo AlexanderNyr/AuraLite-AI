@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.21.2-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.21.2-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.22.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.22.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -62,17 +62,27 @@ it with `.\` in front, for example:
 
 ```powershell
 .\auralite.exe doctor --studio
+.\auralite.exe bench
 .\auralite.exe runs
 .\auralite.exe train --data notes.txt --preset 25m --model my-model.pt
-.\auralite.exe chat --model my-model.pt
+.\auralite.exe generate --model my-model.pt --prompt "Once upon a time"
 ```
+
+`.\auralite.exe bench` (2.22) measures how fast this computer trains and writes - three
+sizes of a new model, a minute each - and writes the table to
+`%USERPROFILE%\.auralite\bench\` ([benchmark.md](benchmark.md)).
+
+A model trained on plain text such as `notes.txt` continues text: `generate`
+writes on from a prompt, and so does the Studio's Chat tab (*continue the text*,
+2.21.3). `chat` is for models trained or fine-tuned on dialogs (`.jsonl`).
 
 The `.\` matters in PowerShell, the console Windows opens by default: it runs
 nothing from the current folder by its name alone. It looks for `auralite.exe` on
 PATH instead — and if AuraLite is installed with pip as well, that one runs,
 perhaps an older version that answers `invalid choice: 'doctor'`. cmd takes both
 forms. `.\auralite.exe doctor` says when `auralite` alone would run another
-AuraLite (2.21.2).
+AuraLite (2.21.2), and the commands it suggests begin with `.\auralite.exe`
+(2.21.3).
 
 For a report to attach to an issue, let the command write the file:
 `.\auralite.exe doctor --studio --out report.txt` (UTF-8). PowerShell's `>` would
@@ -152,7 +162,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.21.2-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.22.0-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins

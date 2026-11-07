@@ -122,6 +122,8 @@ class LoRAMixin:
             "embedding_rows": embedding_rows, "head_rows": head_rows,
             "tokenizer": self.tokenizer.to_dict() if self.tokenizer is not None else None,
             "chat_template": self.default_chat_template,
+            # 2.21.3: what the adapted model learned to write ("dialogs" / "text")
+            "trained_on": getattr(self, "trained_on", None),
             "base_sha256": base_fingerprint(model, rows_from),
             "auralite_version": __version__,
         }
@@ -201,6 +203,8 @@ class LoRAMixin:
         self.vocab_size = vocab
         if data.get("chat_template"):
             self.default_chat_template = str(data["chat_template"])
+        if data.get("trained_on") in ("text", "dialogs"):           # 2.21.3
+            self.trained_on = str(data["trained_on"])
         # The optimizer state of the base model does not fit the new parameters.
         for name in ("_resume_optimizer_state", "_resume_scheduler_state",
                      "_resume_scaler_state", "_resume_optimizer_file", "_resume_run_state",

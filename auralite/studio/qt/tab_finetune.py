@@ -23,7 +23,7 @@ from ..catalog import CATALOG, BaseModel, find_model
 from ..datacheck import DataReport
 from ..hardware import format_gb
 from ..library import remember_dataset, remember_model
-from ..progress import format_duration, summary_text
+from ..progress import ended_by_itself, format_duration, summary_text
 from ..recipes import FineTuneSettings, SettingsError, finetune_params
 from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, confirm,
                      heading, hint, inform, run_training, show_error)
@@ -741,7 +741,7 @@ class FineTuneTab(QWidget):
         if run is not None and saved:
             text += (" Saved in the library: it can continue from there."
                      if run.continue_state()[0] else " Saved in the library.")
-        self.panel.end(text)
+        self.panel.end(text, complete=ended_by_itself(summary, stopped))
         self.studio.end(model_dirty=not saved and self.studio.engine.model is not None)
         self._model_changed()
         self.studio.runs_changed.emit()

@@ -12,11 +12,12 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout
 
 from auralite import runs as runlib
 
-from ..advisor import Recommendation, preset_label, recommend_pretrain
+from ..advisor import (Recommendation, preset_label, recommend_pretrain, size_text,
+                       small_text_note)
 from ..datacheck import DataReport
 from ..hardware import format_gb
 from ..library import remember_dataset
-from ..progress import summary_text
+from ..progress import ended_by_itself, summary_text
 from ..recipes import SettingsError, TrainSettings, pretrain_params
 from .common import Collapsible, Job, compact_spins, heading, hint, run_training, show_error
 from .widgets import DataPicker, RunPanel
@@ -58,8 +59,13 @@ class TrainTab(QWidget):
         for name in self.presets:
             self.size.addItem(name, name)
         self.size_info = hint("")
+        # 2.21.3: when the text is small for the size (advisor.small_text_note)
+        self.size_note = hint("")
+        self.size_note.setStyleSheet("color: #b9770e")
+        self.size_note.setVisible(False)
         form.addRow("Model size:", self.size)
         form.addRow("", self.size_info)
+        form.addRow("", self.size_note)
         self.tokenizer = QComboBox()
         self.tokenizer.addItem("BPE - pieces of words (recommended)", "bpe")
         self.tokenizer.addItem("Characters", "char")
@@ -175,6 +181,7 @@ class TrainTab(QWidget):
         hw = self.studio.hardware
         if hw is None:
             self.size_info.setText("")
+            self.size_note.setVisible(False)
             return
         report = self.data.report if self.data.report is not None and self.data.report.ok \
             else None
@@ -210,6 +217,20 @@ class TrainTab(QWidget):
                          else f"one pass over the text ~{fit.epoch_hours:,.1f} h")
         self.size_info.setText(", ".join(parts) + ("" if rec.measured else
                                                    " (rough until the speed test runs)"))
+        note = small_text_note(fit, rec.data)
+        self.size_note.setText(f"Note: {note}" if note else "")
+        self.size_note.setVisible(bool(note))
+
+    def run_base_label(self, preset: str) -> str:
+        """2.21.3: what a run's name calls the new model - its real size, as the list of
+        sizes shows it: "a new 7M model" ("Train a new 7M model on noch.txt"). The preset's
+        name is its size with a vocabulary of 32,000 ("25m"), which the status bar showed
+        beside "7M parameters"."""
+        rec = self.recommendation
+        fit = next((p for p in (rec.presets if rec is not None else []) if p.preset == preset),
+                   None)
+        return runlib.base_label("", "train", size_text(fit.params) if fit is not None
+                                 else preset)
 
     def _model_changed(self) -> None:
         has_model = self.studio.engine.model is not None
@@ -308,7 +329,7 @@ class TrainTab(QWidget):
         # 2.20: the run goes into the library, with a checkpoint every 10 minutes
         record = {"kind": "train", "method": "new", "params": params,
                   "settings": settings.to_dict(), "hardware": self.studio.run_hardware(),
-                  "base": {"spec": "", "label": runlib.base_label("", "train", settings.preset)},
+                  "base": {"spec": "", "label": self.run_base_label(settings.preset)},
                   "data": {"paths": paths, "kind": report.kind, "records": report.records,
                            "tokens": report.tokens, "bytes": report.bytes}}
 
@@ -386,7 +407,7 @@ class TrainTab(QWidget):
         if run is not None and saved:
             text += (" Saved in the library: it can continue from there."
                      if run.continue_state()[0] else " Saved in the library.")
-        self.panel.end(text)
+        self.panel.end(text, complete=ended_by_itself(summary, stopped))
         self.studio.end(model_dirty=not saved)
         self._model_changed()
         self.studio.runs_changed.emit()

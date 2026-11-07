@@ -114,6 +114,20 @@ class ProgressTracker:
         self.last = view
         return view
 
+    def complete(self) -> None:
+        """2.21.3: the run has ended by itself - its epochs, its time, early stopping, Finish:
+        100 %, and the chart's points spread over the whole width, the run's end at its right
+        edge. An early stop ends a run at a share of what its limits allowed (12 minutes of
+        90, 14 %): 2.21.2 reported 100 % for it, which drew its last losses as flat lines
+        from there out to the chart's end. A stopped run keeps its points where they are."""
+        end = max([x for x, _ in self.losses] + [x for x, _ in self.val_losses] + [0.0])
+        if 0.0 < end < 100.0:
+            scale = 100.0 / end
+            self.losses = [(min(100.0, x * scale), y) for x, y in self.losses]
+            self.val_losses = [(min(100.0, x * scale), y) for x, y in self.val_losses]
+        self.last.percent = 100.0
+        self.last.eta_seconds = None
+
 
 def _epoch_text(current: int, total: int, phase: str) -> str:
     # the engine passes the epoch in progress (1-based), or the epochs done at an epoch's end
@@ -136,6 +150,14 @@ def _stage_text(info: dict) -> str:
     if eta is not None and done < total:
         parts.append(f"about {format_duration(eta)} left")
     return " · ".join(p for p in parts if p)
+
+
+def ended_by_itself(summary: dict | None, stopped: bool = False) -> bool:
+    """2.21.3: whether a run ended by itself - its epochs, its time, early stopping or Finish
+    - rather than by Stop or before its first step (the bar then shows 100 %)."""
+    summary = summary if isinstance(summary, dict) else {}
+    return not (stopped or summary.get("stopped_during")
+                or summary.get("stop_reason") == "stopped")
 
 
 def summary_text(summary: dict | None, seconds: float, stopped: bool = False) -> str:

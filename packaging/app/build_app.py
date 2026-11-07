@@ -48,7 +48,7 @@ SPEC = HERE / "auralite_app.spec"
 REQUIREMENTS = HERE / "requirements.txt"
 #: The longest path inside the zip, its top folder included, that still unzips everywhere:
 #: Windows allows 260 characters, and a deep destination such as
-#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.21.2-windows-x64\ takes about 90.
+#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.22.0-windows-x64\ takes about 90.
 PATH_BUDGET = 160
 #: The distributions the app runs with (their dependencies follow); their licenses ship.
 RUNTIME_ROOTS = ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "safetensors",
@@ -402,6 +402,7 @@ Program Files); your models, runs, logs and settings are kept in {home}
     {run} doctor --studio              check this computer and that the Studio starts
     {run} doctor --studio --out r.txt  the same, and the report in r.txt (for an issue)
     {run} runs                         the run library
+    {run} bench                        how fast this computer trains (a few minutes)
     {run} train --help                 train from the command line
 
 Update: download the new zip from

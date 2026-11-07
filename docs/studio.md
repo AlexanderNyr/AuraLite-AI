@@ -55,7 +55,7 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | **Start** | this computer (memory, processor, GPU, disk, a one-second speed test), the model that fits it best, recent models, and the three ways in: fine-tune a ready model, train a new one, open a model |
 | **Train** | a new model from scratch, from your texts: the size (sized to the memory and the data), the tokenizer, the window, a time limit |
 | **Fine-tune** | everything for models that already exist: the base, your data, the method (QLoRA, LoRA, every weight), dialogs written by a teacher model, the LoRA adapters |
-| **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog |
+| **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog. A model trained on plain text continues what you write (*continue the text*, 2.21.3) |
 | **Export** | a GGUF file (llama.cpp, Ollama, LM Studio), a Hugging Face folder (transformers, vLLM) or an AuraLite checkpoint |
 | **Library** (2.20) | every run with its curve, settings, results and files — continue a stopped or interrupted one, compare runs, evaluate a chat model; the models and datasets on the disk and the room they take |
 | **Log** | everything AuraLite reports while it works; the log file keeps it |
@@ -99,6 +99,28 @@ llama.cpp server, a model folder or checkpoint — or the model in memory) answe
 file of questions; with a judge it keeps only right answers and also writes
 preference pairs. The dialogs become the data of the next run.
 
+## Chatting with a model you trained from scratch (2.21.3)
+
+A model trained on plain text — a story, your notes — has learned to write on from
+where a text stops. It has never seen a dialog, nor the markers a chat template
+wraps messages in (ChatML: `<|im_start|>user`), so a chat with it went nowhere:
+its replies began in the middle of a word and ran to the token limit. The Chat
+tab knows such a model and lets it **continue the text**: what you type is the
+start of a text, and the reply is what the model writes after it (each message
+starts anew; the system prompt has no part in it). The *Template* list says
+*auto* for this — the model's own template, or continuing the text for a model of
+plain text; *continue the text* forces it for any model, a template by name
+forces that template. To get a model that answers, train or fine-tune it on
+dialogs (`.jsonl`) — `auralite chat` says the same in a note.
+
+What such a model writes depends on how much text it read. One story of about
+85,000 characters (some 30,000 tokens) teaches a 7M-parameter model its words and
+turns of phrase within minutes, then it learns the story by heart: validation
+stops improving, early stopping keeps its best point, and what it writes reads
+like the story only in snatches. The Train tab says so under the size when the
+text is small for it, with how much text of the kind the size needs (about four
+parameters per token: some 9 MB of such text for 7M parameters).
+
 ## Which model fits your computer
 
 The Studio estimates the memory of a run with AuraLite's own estimate (within
@@ -117,6 +139,11 @@ is not in English, a multilingual model (Qwen). Measured on a 2-core CPU
 | GPU with 12–24 GB | Qwen2.5 7B, QLoRA | under 1 h (not measured) |
 
 (The two PCs assume 70 and 150 GFLOP/s; the Studio measures yours.)
+
+**How fast is it really?** *Tools → Benchmark…* (2.22) trains three sizes of a new model
+for a minute each and times how they write — the same as `auralite bench`; the report, a
+Markdown table and JSON, goes to `~/.auralite/bench` ([benchmark.md](benchmark.md)). While
+it runs, the menu item stops it.
 
 The same check without the window: `auralite doctor [--data dialogs.jsonl]` prints
 the computer, the models that fit and the `auralite train` command;

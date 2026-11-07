@@ -3,7 +3,7 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.21.2-orange)
+![Version](https://img.shields.io/badge/version-2.22.0-orange)
 ![Coverage](https://img.shields.io/badge/coverage-88%25-green)
 
 [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [Windows app](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
@@ -27,8 +27,9 @@ Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/do
 
 ```bash
 pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
-# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.21.2'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.22.0'
 auralite doctor --data chats.jsonl   # what this computer can train, with the command to run it (2.19)
+auralite bench                       # how fast it trains and writes: a table in ~5 minutes (2.22)
 auralite train --text corpus.txt --model model.pt
 auralite generate --model model.pt --prompt "Once upon a time" --length 80
 auralite serve --model model.pt      # OpenAI-compatible API on http://127.0.0.1:8000
@@ -259,6 +260,7 @@ AURALITE_AGENT_MAX_ITERATIONS=12 AURALITE_AGENT_TOOL_TIMEOUT=30 auralite-gui
 |---|---|
 | [docs/quickstart.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) | install → train → generate → serve → GUI, in five minutes |
 | [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) | AuraLite Studio, the desktop app (2.19): the tabs, the wizard, which model fits your computer, the Library of runs, models and datasets (2.20), what to do when something goes wrong |
+| [docs/benchmark.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/benchmark.md) | `auralite bench` (2.22): how fast a computer trains three sizes of a new model and how fast they write, the memory each takes against the estimate, an optional LoRA fine-tune - a Markdown table and JSON, offline, in a few minutes |
 | [docs/faq.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) | "why isn't it faster?": how to measure, `torch.compile` prefill-vs-decode, KV-cache dtypes, quantization expectations, corpora |
 | [docs/engine.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/engine.md) | inside the native engine: decode loop, KV cache, sampling, speculative decoding, MoE, BPE pre-tokenizer, context length, the 2.13 compute thread, batched decoding (2.14), JSON mode, JSON schemas and tool calls (2.17) — with measured numbers |
 | [docs/training.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/training.md) | the training loop: what an epoch is, how validation is measured (honestly since 2.13), early stopping, speed, choosing a tokenizer, your own tokenizer and tokenizer-only training (2.14.1), the default recipe and how a run ends (Stop, Ctrl+C, time limits), folders of documents and chat fine-tuning on dialogs (2.15), the prompt's weight, LoRA on every layer, adapter files and chat-eval, dialogs from a teacher model, DPO and SimPO (2.16), big data and big models: token shards, Hugging Face datasets, model presets, memory plans, the loss in chunks, runs that continue exactly after a stop (2.18), Hugging Face models imported into the engine, QLoRA, 8-bit AdamW and export to Hugging Face and GGUF (2.18.1) — with measured numbers |

@@ -785,7 +785,8 @@ def test_the_entry_scripts_turn_worker_processes_into_workers_first():
 
 def test_the_smoke_test_checks_what_a_user_meets():
     smoke = _load("smoke_app")
-    assert smoke.STEPS == ("version", "doctor", "selftest", "start", "train", "workers")
+    assert smoke.STEPS == ("version", "doctor", "selftest", "start", "train", "workers",
+                           "bench")                                  # 2.22: bench --quick
     assert smoke.SMOKE_ENV == "AURALITE_STUDIO_SMOKE_SECONDS"
     assert " " in smoke.ODD_FOLDER and not smoke.ODD_FOLDER.isascii()
     for name in smoke.STEPS:

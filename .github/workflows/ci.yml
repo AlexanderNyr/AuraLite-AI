@@ -197,6 +197,7 @@ jobs:
                  tests/test_improvements_v265.py tests/test_hf_integration.py \
                  tests/test_learning_sanity.py tests/test_image_v210.py \
                  tests/test_image_v2142.py "tests/test_gui_tab_flows.py::TestImageTab" \
+                 "tests/test_studio_v2213.py::test_a_safetensors_file_keeps_what_its_model_learned" \
                  -q --tb=short -rs
       - name: Big data with its optional packages (2.18)
         # Parquet, .zst files and the Rust tokenizers package: without the `data`

@@ -406,7 +406,8 @@ def test_train_a_new_model_then_open_it_again(studio, tmp_path, qapp, dialogs):
     # 2.20: the new model is the result of a run of the library
     assert studio.engine.model is not None and not studio.model_dirty
     assert tab.save_button.isEnabled() and tab.panel.status.text()
-    assert studio.model_description().startswith("Train a new 25m model on corpus.txt ·")
+    # 2.21.3: the run's name gives the model's real size, not the preset's name ("25m")
+    assert studio.model_description().startswith("Train a new 7M model on corpus.txt ·")
     path = tmp_path / "new.pt"
     studio.engine.save_model(str(path))
     studio.model_dirty = True

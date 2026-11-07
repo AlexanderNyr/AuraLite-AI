@@ -1,7 +1,7 @@
 """Check a built AuraLite app the way a user meets it (2.21) - CI runs it after every build.
 
-    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.21.2-windows-x64.zip
-    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.21.2
+    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.22.0-windows-x64.zip
+    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.22.0
 
 A zip is unzipped first, into a folder whose path has a space and letters outside ASCII.
 Everything runs as under a Windows user name in Russian (2.21.1): the app's data
@@ -48,7 +48,7 @@ ODD_FOLDER = "AuraLite \u0442\u0435\u0441\u0442"
 USER_FOLDER = "\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c"
 SMOKE_ENV = "AURALITE_STUDIO_SMOKE_SECONDS"
 SMOKE_SECONDS = 8
-STEPS = ("version", "doctor", "selftest", "start", "train", "workers")
+STEPS = ("version", "doctor", "selftest", "start", "train", "workers", "bench")
 WINDOWS = sys.platform == "win32"
 #: How much of a failed check's output its annotation keeps (the end of it).
 ANNOTATION_LINES = 60
@@ -233,6 +233,17 @@ class Smoke:
             else []
         ok = code == 0 and len(files) >= 2 and "tokenizing in 2 worker processes" in out
         return ok, f"{out}\n--- files: {', '.join(files) or 'none'}"
+
+    def step_bench(self) -> tuple[bool, str]:
+        """2.22: `auralite bench --quick` - a model trains and writes, and the report (Markdown
+        and JSON) is written under the user's folder."""
+        out_dir = self.files / "bench"
+        code, out = self.run([str(self.cli), "bench", "--quick", "--sizes", "tiny", "--seconds",
+                              "3", "--out", str(out_dir)])
+        reports = sorted(p.name for p in out_dir.glob("bench-*")) if out_dir.is_dir() else []
+        ok = (code == 0 and len(reports) == 2 and "| tiny: 4 layers x 128 | 0.9M |" in out
+              and "Saved: " in out)
+        return ok, f"{out}\n--- reports: {', '.join(reports) or 'none'}"
 
     def check(self, steps: list[str]) -> bool:
         for name in steps:

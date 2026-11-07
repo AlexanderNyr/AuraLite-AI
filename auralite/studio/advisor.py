@@ -22,7 +22,8 @@ from .hardware import Hardware, format_gb
 
 __all__ = ["EFFICIENCY", "ModelFit", "PresetFit", "Recommendation", "estimate_finetune",
            "memory_budget", "preset_label", "recommend_finetune", "recommend_pretrain",
-           "suggested_epochs", "suggested_seq_length", "tokens_per_second"]
+           "size_text", "small_text_note", "suggested_epochs", "suggested_seq_length",
+           "tokens_per_second"]
 
 #: Training's share of the measured matrix-product speed (CPU; calibrated, see above).
 EFFICIENCY = 0.45
@@ -154,18 +155,49 @@ class PresetFit:
     epoch_hours: float | None        # one pass over the data (None: no data / unknown)
 
 
+#: Parameters per token of training text beyond which a model from scratch mostly learns
+#: the text by heart (recommend_pretrain's limit; early stopping and dropout handle up to it).
+PARAMS_PER_TOKEN = 4
+
+
+def small_text_note(fit: PresetFit, data: DataReport | None) -> str:
+    """2.21.3: a note when the training text is small for a from-scratch size - more than
+    :data:`PARAMS_PER_TOKEN` parameters per token, which even the smallest size has for a
+    story: "" otherwise. A field test on a PC from 2011 trained 7M parameters on one story
+    (85,000 characters, about 28,000 tokens): validation stopped improving within 12
+    minutes, training loss 2.8 against 4.5, and the model wrote Gogol-like gibberish. The
+    note says how much text of the kind the size needs."""
+    if data is None or not data.ok or data.kind not in ("text", "big", "shards") \
+            or data.tokens <= 0 or fit.params <= PARAMS_PER_TOKEN * data.tokens:
+        return ""
+    need = fit.params / PARAMS_PER_TOKEN
+    per_token = data.bytes / data.tokens if data.bytes else 4.0
+    megabytes = max(1, round(need * per_token / 1e6))
+    return (f"the text is small for this size: about {data.tokens:,} tokens for "
+            f"{size_text(fit.params)} parameters. The model learns it by heart within minutes "
+            f"and then stops improving (early stopping keeps its best point), and what it "
+            f"writes reads like the text only in snatches. Text of this kind that the size can "
+            f"learn from: about {megabytes:,} MB - several books, not one story")
+
+
+def size_text(params: float) -> str:
+    """A model's size as the Studio writes it: "0.8M", "7M", "85M", "1.2B" (2.21.3)."""
+    millions = float(params) / 1e6
+    if millions >= 1000:
+        return f"{millions / 1000:,.1f}B"
+    return f"{millions:,.1f}M" if millions < 1 else f"{millions:,.0f}M"
+
+
 def preset_label(fit: PresetFit) -> str:
     """2.21.2: a from-scratch size as the Studio lists it - its parameters with the chosen
     vocabulary and its shape, "7M parameters - 8 layers, width 256". The preset's name is
     its size with a large vocabulary: beside the real count it read as a second size that
     contradicts it ("25m: 7M parameters"); the Studio shows it as the tooltip."""
     from auralite.engine.sizing import MODEL_PRESETS
-    millions = fit.params / 1e6
-    size = f"{millions:,.1f}M" if millions < 1 else f"{millions:,.0f}M"
     dims = MODEL_PRESETS.get(fit.preset) or {}
     shape = f" - {dims['n_layers']} layers, width {dims['d_model']}" \
         if "n_layers" in dims and "d_model" in dims else ""
-    return f"{size} parameters{shape}"
+    return f"{size_text(fit.params)} parameters{shape}"
 
 
 @dataclass
@@ -203,8 +235,8 @@ class Recommendation:
                            + ("; gated: accept it on huggingface.co" if c.model.gated else ""))
         elif self.preset is not None:
             p = self.preset
-            out.append(f"Recommended: a {p.preset} model from scratch "
-                       f"({p.params / 1e6:,.0f}M parameters), memory ~{format_gb(p.memory)}"
+            out.append(f"Recommended: a {size_text(p.params)} model from scratch "
+                       f"(preset {p.preset}), memory ~{format_gb(p.memory)}"
                        + (f", ~{p.tokens_per_second:,.0f} tokens/s"
                           if p.tokens_per_second else ""))
             if p.epoch_hours is not None:
@@ -403,6 +435,8 @@ def recommend_pretrain(hw: Hardware, data: DataReport | None = None, *,
                             f"more memory")
     if not tokens:
         rec.warnings.append("choose the training text to size the model to it")
+    elif small_text_note(choice, data):
+        rec.warnings.append(small_text_note(choice, data))           # 2.21.3
     rec.settings = {"preset": choice.preset, "time_limit_min": int(max_hours * 60),
                     "epochs": 100, "memory_plan": "auto", "bpe_vocab_size": vocab}
     return rec

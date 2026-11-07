@@ -1,3 +1,164 @@
+# 📦 v2.22.0 — `auralite bench`: a computer's numbers for training and writing in one command; the memory plan keeps a margin
+
+- **`auralite bench`** (and *Tools → Benchmark…* in the Studio) measures in a few minutes,
+  offline, what a computer does for AuraLite: the processor and a one-second speed test,
+  then three sizes of a new model — 0.9M, 7M and 19M parameters — each trained for a
+  minute on a built-in text with the Studio's settings (BPE 512, a window of 256 tokens,
+  Muon): training tokens per second, the tokens a night of training reads, the memory the
+  run took against the estimate the memory plan works with, and how fast each writes.
+  `--finetune` adds a LoRA fine-tune of a ready model (Qwen2.5 0.5B by default, downloaded
+  once); `--data FILE` trains on your text and adds how long one pass over it takes. The
+  result is a Markdown table for an article or a README and the same numbers as JSON, in
+  `~/.auralite/bench/bench-<processor>-<date>.md` / `.json`.
+- Every size runs in a process of its own: its memory is measured alone, and a size that
+  runs out of memory is reported as "out of memory" while the others go on. The Studio's
+  process does not keep the gigabyte a benchmark takes.
+- **The memory plan keeps a margin.** `memory_plan="auto"` (the Studio's default) planned
+  a run for 85 % of the free memory; on a computer with 2 GB the Studio's 7M run (batches
+  of 16 windows) was killed for want of memory. The benchmark measures both numbers: a run
+  takes about a quarter more than the estimate (0.62 GB against 0.49 GB for 7M parameters
+  in a fresh process), and the free memory the system reports counts pages it would rather
+  keep. The plan uses 70 % now: the same run takes batches of 8 × 4 steps and goes through.
+  Computers with room to spare are not affected — the plan only splits a batch that does
+  not fit.
+
+**What changed for existing users**
+
+| | 2.22.0 | 2.21.3 |
+|---|---|---|
+| `auralite bench` | new: three sizes of a new model, training and writing speed, memory; `--finetune`, `--data`, `--quick` | — |
+| the Studio's Tools menu | *Benchmark…* (stops the benchmark while it runs) | — |
+| `memory_plan="auto"` | plans for 70 % of the free memory | 85 % |
+| the app's README.txt and its check | `.\auralite.exe bench`; the check runs `bench --quick` (7 steps) | 6 steps |
+
+Nothing else changes: models, checkpoints, the other commands and the Studio's tabs work
+as in 2.21.3. A run whose batch fit before still fits; one that was split may be split
+into smaller batches of the same total (the same steps, a little slower).
+
+**The benchmark** (`auralite/bench.py`, new): `run_bench()` (the report as a dict),
+`to_markdown()`, `summary_lines()`, `save_report()`, `file_stem()`, `bench_text()` (the
+built-in text: sentences from a fixed list of words and a fixed seed), `SIZES`. A stage in
+a child process is `auralite bench --child SPEC` (`child_main()`); `isolate=False` runs
+them in the calling process. Training speed counts the steps after the first one, within
+an epoch (its end can validate); memory is sampled five times a second.
+
+**The command line** (`auralite/cli.py`): `auralite bench [--quick] [--sizes LIST]
+[--seconds S] [--data FILE] [--finetune [MODEL]] [--method lora|qlora] [--threads N]
+[--out FOLDER] [--json]` — the table on stdout, progress on stderr; `python -m
+auralite.bench` is the same.
+
+**The Studio** (`auralite/studio/qt/window.py`): *Tools → Benchmark…* asks, runs the
+benchmark in the background (its stages in the status bar and the log), then shows the
+result and where the report is.
+
+**The memory plan** (`auralite/engine/trainer.py`): `_MEMORY_MARGIN` 0.85 → 0.7.
+
+**The app** (`packaging/app/build_app.py`, `smoke_app.py`): README.txt lists
+`.\auralite.exe bench`; the check's seventh step runs `bench --quick --sizes tiny` and
+looks for the table and the two report files.
+
+**Docs**: docs/benchmark.md (new: what it measures, the report, reading the numbers, an
+example), docs/faq.md § 26, docs/studio.md, docs/windows-app.md, README.
+
+**Tests**: `tests/test_bench_v2220.py` (new) — real benchmarks (in child processes and
+in-process), the report and its file names, a text of one's own, Stop, a stage that ends
+without a result, a fine-tune of a local Hugging Face model, the command line, *Tools →
+Benchmark* and its Stop, README.txt and the smoke step, the memory plan's margin.
+`tests/test_bundle_v221.py`: the smoke test's steps.
+
+# 📦 v2.21.3 — a run that stops early ends where it stood; the Chat tab continues the text of a model trained on plain text; `.\auralite.exe` in doctor's commands
+
+From a field test of 2.21.2 on a PC from 2011 (Core i5-2400, 16 GB, Windows 10): a
+new 7M-parameter model trained in the Studio on one story, 85,000 characters.
+
+- **The chart drew a run that stopped early as flat lines to the end.** The run was
+  allowed 90 minutes and 100 passes; validation stopped improving after 12½ minutes
+  and early stopping ended the run at 14 % of its plan. 2.21.2 took the end of a run
+  for 100 %: its last epoch's end jumped there, and the chart drew the last losses
+  flat from 14 % to the right edge. A run that stops early (early stopping, *Finish*,
+  *Stop*) reports the share it reached now; the Studio's bar shows 100 % when a run
+  ended by itself — not after *Stop* — and the chart spreads its points over the
+  whole width.
+- **The Chat tab wrapped a model of plain text in ChatML.** A model that has only
+  read a story has never seen `<|im_start|>user`: its replies began in the middle of
+  a word and ran on to the token limit. A checkpoint says what its model learned to
+  write now (`trained_on`: text or dialogs), and the Chat tab continues the text for
+  a model of text (*Template*: *auto*, or *continue the text* for any model): what
+  you type is the start of a text, the reply what the model writes on.
+  `auralite chat` says so and points to `auralite generate`.
+- **doctor's commands in the app said `auralite train …`**, which PowerShell finds
+  on PATH — another AuraLite, when one is installed with pip — not the app. They
+  begin with `.\auralite.exe` in the app, like 2.21.2's hints.
+- **The run was called "Train a new 25m model"** beside "7M parameters" in the
+  status bar. A new model's run and doctor's from-scratch line give its real size:
+  "Train a new 7M model on noch.txt", "Recommended: a 7M model from scratch (preset
+  25m)".
+- **A note when the text is small for the model.** The story was some 30,000 tokens
+  for 7M parameters, over 200 parameters per token: the model learned it by heart
+  (training loss 2.8, validation 4.5). The Studio warned about little text below
+  20,000 tokens only. The Train tab and `doctor --goal pretrain --data` say so past
+  4 parameters per token now, with about how much text of the kind the size needs
+  (some 9 MB for 7M parameters).
+
+**What changed for existing users**
+
+| | 2.21.3 | 2.21.2 |
+|---|---|---|
+| progress at the end of a run that stops early (early stopping, Finish) | the share it reached: of the epochs or of the time limit, whichever is further | 100 % at its last epoch's end |
+| the Studio's bar and chart when a run ends by itself | 100 %; the chart spreads its points over the width | 100 %; the last losses flat to the right edge |
+| … when *Stop* ends it | where it stood | where it stood |
+| a checkpoint (`.pt`, `.safetensors`, LoRA adapters) | `trained_on`: `"text"` or `"dialogs"` | — |
+| the Chat tab with a model trained on plain text | continues the text (*auto*; *continue the text* for any model) | ChatML |
+| `auralite chat` with such a model | a note: it continues text, `auralite generate` | — |
+| doctor's commands in the app | `.\auralite.exe train …` | `auralite train …` |
+| a new model's run in the Library | "Train a new 7M model on noch.txt" | "Train a new 25m model on noch.txt" |
+| a text small for the model's size | a note past 4 parameters per token, with the text it needs | a warning below 20,000 tokens |
+
+Nothing else changes: models, the other commands and the classic GUI work as in
+2.21.2. Older checkpoints load as before; one without `trained_on` tells it by the
+run it kept (saved with its optimizer, as the Studio and `auralite train` save),
+else it chats as before. A run's own numbers — its loss, steps and time — are the
+same; only the last point of a run that stops early moved.
+
+**Progress** (`auralite/engine/trainer.py`, `auralite/studio/progress.py`,
+`auralite/studio/qt/widgets.py`, `tab_train.py`, `tab_finetune.py`)
+
+- The epoch's end where a run ends shows 100 % only when its planned end came: its
+  last epoch, max_steps, or the time limit spent. An early stop and a finish keep
+  `run_percent`'s share.
+- `ProgressTracker.complete()` moves the points so the last sits at 100;
+  `ended_by_itself(summary, stopped)`; `RunPanel.end(text, complete=False)`.
+
+**What a model learned to write** (`auralite/engine/_legacy.py`, `trainer.py`,
+`adapters.py`, `preference.py`)
+
+- `engine.trained_on`: set when a run builds a new model (from its data: dialogs,
+  or text) and when a run continuing a model on dialogs ends; DPO and SimPO set
+  dialogs. Kept in `.pt` and `.safetensors` checkpoints and in adapters; an older
+  checkpoint's `run_state` tells it. A GGUF file, a Hugging Face import and
+  unloading clear it; Stop before the first step restores it.
+- `engine.continues_text()`: a model of AuraLite's own, trained on text only.
+
+**Chat** (`auralite/studio/qt/tab_chat.py`, `auralite/cli.py`): the template list is
+*auto*, *continue the text*, then the templates; continuing calls
+`generate_streaming` on the last message (top-k 40, top-p 0.9, repetition penalty
+1.1), the system prompt aside. A reply cut inside a letter's bytes at the token
+limit no longer ends in U+FFFD.
+
+**doctor** (`auralite/cli.py`, `auralite/studio/advisor.py`): the commands use
+`bundle.console_command()` and quote paths with spaces; `size_text(params)`;
+`small_text_note(fit, data)` with `PARAMS_PER_TOKEN = 4`.
+
+**Docs**: docs/studio.md (chatting with a model trained from scratch), docs/faq.md
+§ 25, docs/windows-app.md (`generate` for a model of text).
+
+**Tests**: `tests/test_studio_v2213.py` (new) — real runs ended by early stopping,
+Finish, their epochs and their time; the tracker and the panel; the run's name and
+the size note in the Train tab; the Chat tab continuing a model of text; what a
+model learned through `.pt`, `.safetensors`, adapters, an older checkpoint's run,
+a new model, Stop and unloading; `auralite chat`'s note; doctor's commands in the
+app and out of it.
+
 # 📦 v2.21.2 — the Studio's chart and progress bar never go back; the RAM the Studio uses on Windows; `.\auralite.exe` in every hint
 
 From the first runs of the Windows app on a PC from 2011:
