@@ -48,7 +48,7 @@ SPEC = HERE / "auralite_app.spec"
 REQUIREMENTS = HERE / "requirements.txt"
 #: The longest path inside the zip, its top folder included, that still unzips everywhere:
 #: Windows allows 260 characters, and a deep destination such as
-#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.21.0-windows-x64\ takes about 90.
+#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.21.1-windows-x64\ takes about 90.
 PATH_BUDGET = 160
 #: The distributions the app runs with (their dependencies follow); their licenses ship.
 RUNTIME_ROOTS = ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "safetensors",
@@ -60,6 +60,28 @@ ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 class BuildError(RuntimeError):
     """The build cannot go on; the message says why and what to do."""
+
+
+def utf8_output() -> None:
+    """Print UTF-8 whatever the console or pipe (2.21.1): Python on Windows writes a pipe - CI's
+    log, a `> build.log` - in the ANSI code page, so a path with Russian letters in it (a Windows
+    user name) would end the build with UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):   # a stream that cannot change: leave it
+                pass
+
+
+def github_error(title: str, message: str) -> str:
+    """The annotation a failed build leaves on a GitHub Actions run (2.21.1): its page shows it,
+    and the check run's annotations keep it - readable without signing in, unlike the log."""
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    title = escape(title).replace(":", "%3A").replace(",", "%2C")
+    return f"::error title={title}::{escape(message)}"
 
 
 # ----------------------------------------------------------------------
@@ -592,6 +614,7 @@ def _child_draw_icon(path: Path) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
     parser = argparse.ArgumentParser(description="Build the AuraLite app that needs no Python.")
     parser.add_argument("--zip", action="store_true", help="also make the release's zip")
     parser.add_argument("--check", action="store_true",
@@ -614,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
               quiet=args.quiet)
     except BuildError as err:
         print(f"\nbuild_app: {err}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(github_error("build_app.py", str(err)), flush=True)
         return 1
     return 0
 

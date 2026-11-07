@@ -9,7 +9,7 @@ install, no Python to know about.
 ## Download and start
 
 1. Open the [latest release](https://github.com/AlexanderNyr/AuraLite-AI/releases/latest)
-   and download `AuraLite-Studio-<version>-windows-x64.zip` (about 300 MB).
+   and download `AuraLite-Studio-<version>-windows-x64.zip` (about 250 MB).
 2. Unzip it — right-click → *Extract All…* — into a folder of your own: your
    Desktop, Documents, `C:\AuraLite`. Not into `C:\Program Files` (the app writes
    nothing next to itself, but Windows makes that folder awkward), and keep the
@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.21.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.21.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.21.1-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.21.1-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -139,7 +139,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.21.0-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.21.1-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins
@@ -165,7 +165,9 @@ Inside the folder:
 | `_internal\` | Python, PyTorch, Qt and AuraLite |
 
 `smoke_app.py` checks a build the way a user meets it — unzipped into a folder
-whose path has a space and Cyrillic letters: `auralite.exe --version`,
+whose path has a space and Cyrillic letters, with the app's data, temporary files and
+the files it trains on under a user name in Cyrillic letters, as `C:\Users\<name>` is
+on many Russian Windows computers (2.21.1): `auralite.exe --version`,
 `auralite.exe doctor --studio`, the Studio's own program with `--self-test`, a
 real start of `AuraLite Studio.exe` with no console that closes itself after a few
 seconds (`AURALITE_STUDIO_SMOKE_SECONDS`), a training run with `auralite.exe
@@ -173,4 +175,5 @@ train`, and `auralite.exe data prepare --workers 2` (worker processes of a froze
 program). CI's `windows-app` job builds and checks the app on every push and keeps
 the zip for a week as the run's artifact; the Release workflow builds it from the
 tag, checks it the same way and attaches it to the release
-([docs/releasing.md](releasing.md)).
+([docs/releasing.md](releasing.md)). A failed check also leaves an annotation with
+the end of its output on the run's page.

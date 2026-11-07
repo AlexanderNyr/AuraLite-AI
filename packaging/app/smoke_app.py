@@ -1,11 +1,13 @@
 """Check a built AuraLite app the way a user meets it (2.21) - CI runs it after every build.
 
-    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.21.0-windows-x64.zip
-    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.21.0
+    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.21.1-windows-x64.zip
+    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.21.1
 
-A zip is unzipped first, into a folder whose path has a space and letters outside ASCII
-(Windows user names do). Everything runs with its own AURALITE_HOME, and every check runs
-even after one has failed, so one CI run tells everything:
+A zip is unzipped first, into a folder whose path has a space and letters outside ASCII.
+Everything runs as under a Windows user name in Russian (2.21.1): the app's data
+(AURALITE_HOME), its temporary files (TEMP, TMP) and the files it trains on are in a folder
+with that name, as in C:\\Users\\<name>. Every check runs even after one has failed, so one CI
+run tells everything:
 
 1. ``version``  - ``auralite --version``: the console program starts and knows its version;
 2. ``doctor``   - ``auralite doctor --no-speed --studio``: this computer, then the Studio's
@@ -20,7 +22,9 @@ even after one has failed, so one CI run tells everything:
 6. ``workers``  - ``auralite data prepare --workers 2 --no-fast``: worker processes of a
    frozen program start the program again, and must turn into workers.
 
-Only the standard library: this runs with any Python, outside the app.
+Only the standard library: this runs with any Python, outside the app. It prints UTF-8 to any
+console or pipe, and on GitHub Actions a failed check is also an annotation of the run - with
+the end of its output, readable without signing in (the log is not).
 """
 from __future__ import annotations
 
@@ -32,16 +36,55 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
 #: A folder with a space and letters outside ASCII ("AuraLite test", the second word in
 #: Russian), where a zip is unzipped.
 ODD_FOLDER = "AuraLite \u0442\u0435\u0441\u0442"
+#: A Windows user name in Russian ("User": what many Russian Windows installs call the first
+#: account) - the app's data, temporary files and the files it trains on are under it.
+USER_FOLDER = "\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c"
 SMOKE_ENV = "AURALITE_STUDIO_SMOKE_SECONDS"
 SMOKE_SECONDS = 8
 STEPS = ("version", "doctor", "selftest", "start", "train", "workers")
 WINDOWS = sys.platform == "win32"
+#: How much of a failed check's output its annotation keeps (the end of it).
+ANNOTATION_LINES = 60
+ANNOTATION_CHARS = 6000
+
+
+def utf8_output() -> None:
+    """Print UTF-8 whatever the console or pipe. Python on Windows writes a pipe - CI's log, a
+    `> file` - in the ANSI code page, which has no Cyrillic: in 2.21.0 the first path with Russian
+    letters in it (the folder the zip is unzipped into) ended the check in its first second."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):   # a stream that cannot change: leave it
+                pass
+
+
+def on_github() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def annotation(kind: str, title: str, message: str) -> str:
+    """A GitHub Actions workflow command (``::error title=...::...``): the run's page shows it,
+    and the check run's annotations - readable without signing in, unlike the log - keep it."""
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    title = escape(title).replace(":", "%3A").replace(",", "%2C")
+    return f"::{kind} title={title}::{escape(message)}"
+
+
+def tail(text: str, lines: int = ANNOTATION_LINES, chars: int = ANNOTATION_CHARS) -> str:
+    """The end of `text`: its last `lines` lines, at most `chars` characters."""
+    kept = "\n".join(text.rstrip().splitlines()[-lines:])
+    return kept[-chars:]
 
 
 def unzip(archive: Path, target: Path) -> Path:
@@ -66,12 +109,18 @@ def _close_std() -> None:                 # Linux: what a double-click gives a W
 class Smoke:
     def __init__(self, app: Path, work: Path, platform: str):
         self.app, self.work = app, work
-        self.home = work / "home"
+        self.user = work / USER_FOLDER                  # as C:\Users\<a Russian name>
+        self.home = self.user / ".auralite"
+        self.files = self.user / "Documents"
+        self.temp = self.user / "AppData" / "Local" / "Temp"
+        for folder in (self.files, self.temp):
+            folder.mkdir(parents=True, exist_ok=True)
         self.cli = app / ("auralite.exe" if WINDOWS else "auralite")
         self.studio = app / ("AuraLite Studio.exe" if WINDOWS else "auralite-studio")
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("PYTHON", "QT_", "AURALITE_", "VIRTUAL_ENV"))}
         env["AURALITE_HOME"] = str(self.home)
+        env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(self.temp)
         if platform:
             env["QT_QPA_PLATFORM"] = platform
         self.env = env
@@ -155,7 +204,7 @@ class Smoke:
                     f"{self.log('studio-faults.log')}")
 
     def _text(self) -> Path:
-        path = self.work / "text.txt"
+        path = self.files / "text.txt"
         if not path.exists():
             line = "The quick brown fox jumps over the lazy dog. 0123456789\n"
             lines = [f"{i}: {line}" for i in range(400)]
@@ -163,11 +212,11 @@ class Smoke:
         return path
 
     def step_train(self) -> tuple[bool, str]:
-        params = self.work / "params.json"
+        params = self.files / "params.json"
         params.write_text(json.dumps({"d_model": 32, "n_heads": 4, "n_layers": 1, "d_ff": 64,
                                       "seq_length": 16, "batch_size": 8, "epochs": 1,
                                       "bpe_vocab_size": 120}), encoding="utf-8")
-        model = self.work / "model.pt"
+        model = self.files / "model.pt"
         code, out = self.run([str(self.cli), "train", "--data", str(self._text()), "--params",
                               str(params), "--model", str(model), "--quiet"])
         runs_code, runs = self.run([str(self.cli), "runs"], timeout=600)
@@ -176,7 +225,7 @@ class Smoke:
         return ok, f"{out}\n--- auralite runs:\n{runs}"
 
     def step_workers(self) -> tuple[bool, str]:
-        out_dir = self.work / "shards"
+        out_dir = self.files / "shards"
         code, out = self.run([str(self.cli), "data", "prepare", str(self._text()), "--out",
                               str(out_dir), "--workers", "2", "--no-fast", "--vocab-size",
                               "300", "--overwrite"])
@@ -201,10 +250,24 @@ class Smoke:
         print("\nThe app: " + str(self.app))
         for name, ok, seconds, _text in self.results:
             print(f"  {'PASS' if ok else 'FAIL'}  {name:9} {seconds:6.0f} s")
+        if on_github():
+            for name, ok, _seconds, text in self.results:
+                if not ok:
+                    print(annotation("error", f"smoke: {name}", tail(text)), flush=True)
         return all(ok for _name, ok, _s, _t in self.results)
 
 
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
+    try:
+        return _main(argv)
+    except Exception:                     # the check itself broke: say where, on the run's page too
+        if on_github():
+            print(annotation("error", "smoke_app.py", tail(traceback.format_exc())), flush=True)
+        raise
+
+
+def _main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(description="Check a built AuraLite app.")
     parser.add_argument("target", type=Path, help="the app's folder, or its zip")
     parser.add_argument("--only", nargs="+", choices=STEPS, help="run only these checks")

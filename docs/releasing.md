@@ -74,9 +74,12 @@ built or uploaded from a laptop.
 | `windows-app-publish` (2.21) | attaches `AuraLite-Studio-<version>-windows-x64.zip` and its `.sha256` to the GitHub Release, with signed provenance | the release or the app is missing (skipped on a dry run) |
 
 The Windows app does not hold the release back: `release`, `image` and `pypi` do
-not wait for it, so a broken Windows build fails only its two jobs. Fix it and
-re-run `windows-app` and `windows-app-publish` from the Actions page - the upload
-replaces a file of the same name (`--clobber`). To move the app to a newer PyTorch
+not wait for it, so a broken Windows build fails only its two jobs. A failed build or
+check leaves an annotation with the end of its output on the run's page (2.21.1).
+When the cause is outside the repository - a runner or a download - re-run
+`windows-app` and `windows-app-publish` from the Actions page: the upload replaces a
+file of the same name (`--clobber`). A fix in the code comes with the next patch
+release: both jobs build from the tag. To move the app to a newer PyTorch
 or Qt, change the pins in `packaging/app/requirements.txt`; CI's `windows-app` job
 tests the change on its push.
 

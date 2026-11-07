@@ -1,3 +1,56 @@
+# 📦 v2.21.1 — the Windows app reaches the release: its check runs to the end, and runs the app under a Russian Windows user name
+
+2.21.0 built the Windows app, but CI's and the Release workflow's check of it ended in
+its first second, so the Release workflow attached no zip to 2.21.0. The check
+stopped at its own first line: `smoke_app.py` prints the folder it unzips the app
+into — a name with Russian letters, on purpose — and Python on Windows writes a pipe
+(CI's log) in the ANSI code page, which has no Cyrillic: `UnicodeEncodeError`.
+Nothing of the app was checked. `smoke_app.py` and `build_app.py` now print UTF-8 to
+any console or pipe, and the check runs the app the way many of its users meet it:
+with a Windows user name in Cyrillic letters, and so `%USERPROFILE%\.auralite`, the
+temporary folder and the documents it trains on in such a folder. A failed check also
+leaves the end of its output as an annotation on the run's page.
+
+**What changed for existing users**
+
+| | 2.21.1 | 2.21.0 |
+|---|---|---|
+| `AuraLite-Studio-<version>-windows-x64.zip` in the release | attached once the check passes | not attached: the check failed on its own first line (the zip is only in CI's artifacts) |
+| `smoke_app.py`, `build_app.py` writing to a pipe or a file on Windows | UTF-8 | the ANSI code page: a path with Russian letters ended them with `UnicodeEncodeError` |
+| where the check keeps the app's data, temporary files and training files | under a folder with a Russian name, as in `C:\Users\<name>` | a folder named `home`; the runner's `TEMP` |
+| a failed check on GitHub Actions | also an annotation with the end of its output (`smoke_app.py` per check, `build_app.py`'s error) | only in the log, which needs signing in |
+
+Nothing else changes: the app's code, the Studio and the packages on PyPI are as in
+2.21.0.
+
+**`packaging/app/smoke_app.py`**
+
+- `utf8_output()` first: stdout and stderr in UTF-8 (`errors="replace"`) whatever the
+  console or pipe.
+- `USER_FOLDER`: a Windows user name in Russian (the escaped letters of "User", the
+  name many Russian Windows installs give the first account). `AURALITE_HOME` is its
+  `.auralite`, `TEMP` / `TMP` / `TMPDIR` its `AppData\Local\Temp`, and the text,
+  parameters, model and shards of the `train` and `workers` checks are in its
+  `Documents`.
+- On GitHub Actions (`GITHUB_ACTIONS=true`) every failed check prints
+  `::error title=smoke: <check>::` with the last 60 lines (at most 6,000 characters)
+  of its output, and a crash of the script prints its traceback the same way: the
+  run's page and the check run's annotations show them without signing in.
+
+**`packaging/app/build_app.py`**: `utf8_output()` as well, and on GitHub Actions a
+`BuildError` is also an annotation.
+
+**Docs**: docs/windows-app.md (what the check covers; the zip is about 250 MB, as
+2.21.0's build in CI: 242 MB), docs/releasing.md (a failed build or check leaves an
+annotation; a fix in the code comes with a patch release, since both jobs build from
+the tag).
+
+**Tests**: `tests/test_windows_app_v2211.py` (new): the check as CI's Windows runner
+runs it (a pipe in cp1252) on a zip, to its end; UTF-8 output in both scripts; the
+Russian user folder for the app's data, temporary files and training files; the
+annotations (escaping, failed checks only, GitHub Actions only, a crash of the
+script, a failed build).
+
 # 📦 v2.21.0 — AuraLite Studio, part 3: a Windows app that needs no Python; `auralite train` without pydantic; CI's coverage job green again
 
 Every release now has a Windows app: `AuraLite-Studio-2.21.0-windows-x64.zip` with

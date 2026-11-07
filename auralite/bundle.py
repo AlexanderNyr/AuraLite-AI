@@ -3,7 +3,7 @@
 ``packaging/app/build_app.py`` freezes AuraLite with PyInstaller into one folder
 that holds two programs and a note saying which build it is::
 
-    AuraLite-Studio-2.21.0/
+    AuraLite-Studio-2.21.1/
         AuraLite Studio.exe     the Studio, no console: double-click it
         auralite.exe            the ``auralite`` command, for a console
         auralite-app.json       this build: version, Python, PyTorch, Qt, date, commit
@@ -80,7 +80,7 @@ def platform_tag(system: str | None = None, machine: str | None = None) -> str:
 
 
 def zip_name(version: str, tag: str | None = None) -> str:
-    """``AuraLite-Studio-2.21.0-windows-x64.zip``: what the release attaches."""
+    """``AuraLite-Studio-2.21.1-windows-x64.zip``: what the release attaches."""
     return f"AuraLite-Studio-{version}-{tag or platform_tag()}.zip"
 
 
