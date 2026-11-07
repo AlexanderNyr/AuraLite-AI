@@ -182,7 +182,9 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
         params["optimizer"] = s.optimizer
     if float(s.time_limit_min) > 0:
         params["time_budget_s"] = 60.0 * float(s.time_limit_min)
-    if int(s.autosave_every) > 0 and s.autosave_path:
+    if int(s.autosave_every) > 0:
+        # 2.20: the Studio saves into the run's folder (runs.RunRecorder.checkpoint_params)
         params["autosave_every"] = int(s.autosave_every)
-        params["autosave_path"] = s.autosave_path
+        if s.autosave_path:
+            params["autosave_path"] = s.autosave_path
     return _check(params)

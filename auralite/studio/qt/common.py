@@ -92,6 +92,23 @@ def training_callback(job: Job, min_interval: float = 0.12) -> Callable[..., Non
     return callback
 
 
+def run_training(job: Job, engine: Any, recorder: Any, data: Any, params: dict) -> Any:
+    """``engine.train`` with the run recorded in the library (2.20): its curve,
+    its checkpoint, and at the end its model (in the run's folder) or its error.
+    Runs on the job's thread; the summary is the job's result."""
+    try:
+        summary = engine.train(data, params,
+                               progress_callback=recorder.callback(training_callback(job)),
+                               stop_event=job.stop_event, finish_event=job.finish_event)
+    except BaseException as exc:
+        recorder.fail(exc)
+        raise
+    if not (isinstance(summary, dict) and summary.get("stopped_during")):
+        job.progress.emit(("stage", "Saving the run in the library…", None))
+    recorder.save_and_finish(summary, engine)
+    return summary
+
+
 # ----------------------------------------------------------------------
 #  Dialogs
 # ----------------------------------------------------------------------

@@ -206,6 +206,47 @@ def _run_data_id(shards: TokenShards | None, text: str) -> dict:
     return {"kind": "text", "chars": len(text), "sha256": _tok_io.text_sha256(text)}
 
 
+def _dialog_data_id(count: int, text: str) -> dict:
+    """The dialogs a run trained on (2.20): their number and the text of them in
+    the run's template, training dialogs first (``continue_run`` checks it)."""
+    return {"kind": "dialogs", "dialogs": int(count), "chars": len(text),
+            "sha256": _tok_io.text_sha256(text)}
+
+
+def _check_continued_data(state: dict, data: dict | None, given: str) -> None:
+    """``continue_run`` (2.18; 2.20: dialogs too): the run's data and `data`, the
+    identity of what was given (None for dialogs: they are checked once split)."""
+    saved = state.get("data") or {}
+    if saved.get("kind") == "dialogs" and given != "dialogs":
+        raise ValueError("continue_run: the run trained on dialogs; give it the same dialogs")
+    if data is not None and saved != data:
+        raise ValueError("continue_run: this is not the data the run trained on (the same "
+                         "text or prepared dataset is needed)")
+
+
+def _check_continued_dialogs(state: dict, data: dict) -> None:
+    """``continue_run`` of a dialog run (2.20): the same dialogs, split the same way."""
+    saved = state.get("data") or {}
+    if saved == data:
+        return
+    if saved.get("kind") == "dialogs" and "sha256" not in saved:
+        raise ValueError("continue_run: this dialog run was saved by AuraLite before 2.20, "
+                         "which could not continue dialog runs; train on without continue_run "
+                         "(continue_training)")
+    raise ValueError("continue_run: these are not the dialogs the run trained on (the same "
+                     "dialogs, split the same way, are needed)")
+
+
+def _holds_every_parameter(state: Any, model: Any) -> bool:
+    """True when an optimizer state of one parameter group holds every parameter
+    of `model`: 2.7's layout. A LoRA run whose adapters alone train has one group
+    too, of the adapters only (2.20: it was taken for 2.7's and lost its moments)."""
+    groups = state.get("param_groups") if isinstance(state, dict) else None
+    if not groups:
+        return False
+    return len(groups[0].get("params", [])) == sum(1 for _ in model.parameters())
+
+
 def _decay_state(scheduler: Any) -> dict | None:
     """A decay begun early (a finish), which the scheduler's own state leaves out (2.12)."""
     start = getattr(scheduler, "decay_from", None)
@@ -719,7 +760,9 @@ class TrainerMixin:
         2.15: dialogs add ``dialogs`` to the summary (train, val, template,
         loss, learned_tokens, added_tokens, skipped records), a TextCorpus
         ``documents`` and ``val_documents``. A dialog run starts a fresh
-        optimizer and learning-rate schedule and runs on one computer.
+        optimizer and learning-rate schedule and runs on one computer (2.20:
+        unless it continues its own run with ``continue_run``, which dialog
+        runs - LoRA and QLoRA too - now support like texts and shards).
         2.16: on dialogs, validation measures the replies only (whatever the
         prompt's weight), an optimizer step averages the loss over every token
         it learns (with accumulation_steps > 1), early stopping is off unless
@@ -867,16 +910,14 @@ class TrainerMixin:
                       "autosave_path", "progress_every_batches", "progress_every_seconds",
                       "time_budget_s", "eval_every_steps", "memory_plan")
 
-    def _continue_run_params(self, params: dict, dialogs: bool) -> tuple[dict, dict]:
-        """``(the run's parameters, its state)`` for ``continue_run``."""
+    def _continue_run_params(self, params: dict) -> tuple[dict, dict]:
+        """``(the run's parameters, its state)`` for ``continue_run`` (2.18; 2.20:
+        dialog runs too, LoRA and QLoRA included)."""
         state = getattr(self, "_resume_run_state", None)
         if not isinstance(state, dict) or not isinstance(state.get("params"), dict):
             raise ValueError("continue_run continues a run from a checkpoint saved during it "
                              "(autosave_every_steps, autosave_every_minutes, or the model saved "
                              "after a stop): load that checkpoint first")
-        if dialogs:
-            raise ValueError("continue_run is for text and token shards (a dialog run starts "
-                             "anew)")
         if state.get("finished"):
             raise ValueError("the run in this checkpoint has finished: train on without "
                              "continue_run (continue_training)")
@@ -1193,7 +1234,7 @@ class TrainerMixin:
         # 2.18: continuing an interrupted run takes that run's own parameters
         run_state_in: dict | None = None
         if params.get("continue_run"):
-            params, run_state_in = self._continue_run_params(params, dialogs is not None)
+            params, run_state_in = self._continue_run_params(params)
         self._run_state = None
         # ---- Validate parameters --------------------------------------
         if self.is_gguf_model() and params.get("continue_training", False):
@@ -1390,10 +1431,9 @@ class TrainerMixin:
             if not resuming:
                 raise ValueError("continue_run needs the run's checkpoint loaded first "
                                  "(load_model) and continue_training=True")
-            data_id = _run_data_id(shards, training_text)
-            if run_state_in.get("data") != data_id:
-                raise ValueError("continue_run: this is not the data the run trained on (the "
-                                 "same text or prepared dataset is needed)")
+            _check_continued_data(run_state_in, None if dialogs is not None else
+                                  _run_data_id(shards, training_text),
+                                  "dialogs" if dialogs is not None else "text")
 
         optimizer_state_to_restore = None
         scheduler_state_to_restore = None
@@ -1432,11 +1472,13 @@ class TrainerMixin:
             if dialog_loss not in _dialogs.DIALOG_LOSSES:
                 raise ValueError(f"dialog_loss must be one of "
                                  f"{', '.join(_dialogs.DIALOG_LOSSES)}, got {dialog_loss!r}")
-            if optimizer_state_to_restore is not None or scheduler_state_to_restore is not None:
-                logger.info("[AuraLite] Dialogs: a fresh optimizer and learning-rate schedule "
-                            "(the continued model's are not restored)")
-            optimizer_state_to_restore = scheduler_state_to_restore = None
-            scaler_state_to_restore = None
+            if run_state_in is None:          # 2.20: continue_run keeps the run's own
+                if optimizer_state_to_restore is not None or \
+                        scheduler_state_to_restore is not None:
+                    logger.info("[AuraLite] Dialogs: a fresh optimizer and learning-rate "
+                                "schedule (the continued model's are not restored)")
+                optimizer_state_to_restore = scheduler_state_to_restore = None
+                scaler_state_to_restore = None
         # 2.16: the prompt's weight in the loss. Unless given ("auto"):
         # DEFAULT_PROMPT_LOSS_WEIGHT (0.1) when every weight trains, 0 with LoRA
         # adapters — 0.1 helped full fine-tuning and hurt LoRA on every seed
@@ -1525,6 +1567,7 @@ class TrainerMixin:
         train_dialogs: list[list[dict]] = []
         val_dialogs: list[list[dict]] = []
         dialog_fit_chars = 0
+        dialog_data: dict = {}
         if dialogs is not None:
             train_index, val_index = dialogs.split(val_split)
             train_dialogs = [dialogs.dialogs[i] for i in train_index]
@@ -1535,6 +1578,10 @@ class TrainerMixin:
             if val_dialogs:
                 training_text += "\n" + "\n".join(_dialogs.dialog_plain_text(d, template)
                                                   for d in val_dialogs)
+            # 2.20: what continue_run checks, before anything of the model changes
+            dialog_data = _dialog_data_id(len(train_dialogs) + len(val_dialogs), training_text)
+            if run_state_in is not None:
+                _check_continued_dialogs(run_state_in, dialog_data)
             logger.info(f"[AuraLite] Dialogs: {len(train_dialogs):,} to train on, "
                         f"{len(val_dialogs):,} held out for validation; {template} template, "
                         f"the loss learns "
@@ -1868,6 +1915,9 @@ class TrainerMixin:
             single_group_state = (
                 isinstance(optimizer_state_to_restore, dict)
                 and len(optimizer_state_to_restore.get("param_groups", [])) == 1)
+            if single_group_state and has_lora:
+                single_group_state = _holds_every_parameter(optimizer_state_to_restore,
+                                                            self.model)
             if has_lora and not single_group_state:
                 # 2.16: LoRA learns at lora_lr (default 10 × lr); the embedding
                 # and head are not decayed when only their new rows train
@@ -2467,8 +2517,12 @@ class TrainerMixin:
         run_params = {key: value for key, value in params.items()
                       if key not in ("continue_run", "continue_training")
                       and _json_safe(value)}
+        if has_lora and "lora_embeddings" not in run_params:
+            # 2.20: its default depends on the model (a 4-bit base says "new"),
+            # and a continued QLoRA run's base is 4-bit from the start
+            run_params["lora_embeddings"] = lora_embeddings
         run_data = (_run_data_id(shards, training_text) if dialogs is None
-                    else {"kind": "dialogs"})
+                    else dialog_data)
         if run_state_in is not None:
             start_epoch = int(run_state_in.get("epoch", 0))
             start_batch = int(run_state_in.get("batch", 0))
@@ -2550,8 +2604,8 @@ class TrainerMixin:
                                   "batch": batch_done, "batches": n_loader_batches,
                                   "elapsed": time.time() - train_t0, "is_epoch_end": False})
             # the position after the validation, so an autosave of this step has it
-            if dialogs is None:
-                snapshot(epoch_now, batch_done, running)
+            # (2.20: dialog runs too)
+            snapshot(epoch_now, batch_done, running)
             rank_ok = not ddp_active or dist.get_rank() == 0
             due_steps = bool(autosave_every_steps
                              and self.scheduler.step_count % autosave_every_steps == 0)
@@ -2839,8 +2893,7 @@ class TrainerMixin:
             epochs_completed = epoch + 1
             if seen_batches:
                 last_train_loss = running_loss / seen_batches
-            if dialogs is None:
-                snapshot(epoch + 1, 0, 0.0)          # 2.18: the next epoch starts here
+            snapshot(epoch + 1, 0, 0.0)              # 2.18: the next epoch starts here
 
             if autosave_every and (epoch + 1) % autosave_every == 0 and (not ddp_active or dist.get_rank() == 0):
                 try:
@@ -2911,8 +2964,9 @@ class TrainerMixin:
             logger.info(f"[AuraLite] Restored the weights of epoch {best_epoch} "
                         f"(best validation loss {best_val:.4f}).")
         run_state_now = getattr(self, "_run_state", None)
-        if dialogs is None and isinstance(run_state_now, dict):
+        if isinstance(run_state_now, dict):
             # 2.18: a stopped run can be continued; one that ended cannot
+            # (2.20: dialog runs alike)
             self._run_state = dict(run_state_now, finished=stop_reason != "stopped",
                                    restored_best=restored)
         elapsed = time.time() - train_t0

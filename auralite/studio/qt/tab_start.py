@@ -5,13 +5,15 @@ import os
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QFrame, QGridLayout, QLabel, QListWidget, QListWidgetItem,
-                               QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
+
+from auralite import runs as runlib
 
 from ..advisor import recommend_finetune
 from ..hardware import Hardware, format_gb
 from ..progress import format_duration
-from .common import heading, hint
+from .common import heading, hint, primary
 
 if TYPE_CHECKING:
     from .window import MainWindow
@@ -36,6 +38,25 @@ class StartTab(QWidget):
         layout.addWidget(hint("Train language models on your own computer: make a ready model "
                               "answer your way (fine-tuning), or grow a new one from your texts. "
                               "Nothing leaves this computer."))
+
+        # 2.20: a run that was interrupted (a crash, a power cut) continues from here
+        self.interrupted, interrupted_layout = _card()
+        self.interrupted_label = QLabel("")
+        self.interrupted_label.setWordWrap(True)
+        self.interrupted_label.setTextFormat(Qt.TextFormat.RichText)
+        interrupted_layout.addWidget(self.interrupted_label)
+        line = QHBoxLayout()
+        self.continue_interrupted = primary(QPushButton("Continue it"))
+        self.show_interrupted = QPushButton("Show in the library")
+        self.dismiss_interrupted = QPushButton("Dismiss")
+        for button in (self.continue_interrupted, self.show_interrupted,
+                       self.dismiss_interrupted):
+            line.addWidget(button)
+        line.addStretch(1)
+        interrupted_layout.addLayout(line)
+        self.interrupted.setVisible(False)
+        self.interrupted_run: runlib.Run | None = None
+        layout.addWidget(self.interrupted)
 
         grid = QGridLayout()
         grid.setSpacing(12)
@@ -90,8 +111,47 @@ class StartTab(QWidget):
         self.open_button.clicked.connect(window.open_model_dialog)
         self.speed_button.clicked.connect(window.run_speed_test)
         self.recent.itemDoubleClicked.connect(self._open_recent)
+        self.continue_interrupted.clicked.connect(self._continue_interrupted)
+        self.show_interrupted.clicked.connect(self._show_interrupted)
+        self.dismiss_interrupted.clicked.connect(self._dismiss_interrupted)
         window.hardware_changed.connect(self.show_hardware)
         self.refresh_recent()
+        self.refresh_interrupted()
+
+    # ---- an interrupted run (2.20) ---------------------------------------------------
+    def refresh_interrupted(self) -> None:
+        """Offer the newest interrupted run of this computer that can continue."""
+        runs = runlib.interrupted_runs()
+        run = self.interrupted_run = runs[0] if runs else None
+        self.interrupted.setVisible(run is not None)
+        if run is None:
+            return
+        step = run.progress.get("step")
+        saved = run.record.get("checkpoint_saved") or {}
+        text = (f"<b>A run was interrupted:</b> {_html(run.name)}"
+                + (f", at step {int(step):,}" if step else "") + ". ")
+        if saved.get("step"):
+            text += (f"Its checkpoint is from step {int(saved['step']):,} "
+                     f"({runlib.format_when(saved.get('time'))}); ")
+        text += "it continues from there exactly as it would have gone on."
+        if len(runs) > 1:
+            text += f" ({len(runs) - 1} more in the library.)"
+        self.interrupted_label.setText(text)
+
+    def _continue_interrupted(self) -> None:
+        if self.interrupted_run is not None:
+            self.studio.library_tab.continue_run(self.interrupted_run)
+
+    def _show_interrupted(self) -> None:
+        run = self.interrupted_run
+        self.studio.goto("library")
+        if run is not None:
+            self.studio.library_tab.select_run(run.id)
+
+    def _dismiss_interrupted(self) -> None:
+        if self.interrupted_run is not None:
+            runlib.update_run(self.interrupted_run, dismissed=True)
+        self.refresh_interrupted()
 
     def _choice(self, title: str, text: str) -> QPushButton:
         button = QPushButton(f"{title}\n{text}")
@@ -148,3 +208,7 @@ class StartTab(QWidget):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path:
             self.studio.open_model(str(path))
+
+
+def _html(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

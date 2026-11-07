@@ -16,14 +16,17 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBo
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
+from auralite import runs as runlib
+
 from ..advisor import ModelFit, Recommendation, recommend_finetune
 from ..catalog import CATALOG, BaseModel, find_model
 from ..datacheck import DataReport
 from ..hardware import format_gb
+from ..library import remember_dataset, remember_model
 from ..progress import format_duration, summary_text
 from ..recipes import FineTuneSettings, SettingsError, finetune_params
 from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, confirm,
-                     heading, hint, inform, show_error, training_callback)
+                     heading, hint, inform, run_training, show_error)
 from .widgets import DataPicker, RunPanel
 
 if TYPE_CHECKING:
@@ -398,6 +401,8 @@ class FineTuneTab(QWidget):
         if report is not None and report.paths and os.path.exists(report.paths[0]):
             self.studio.settings.last_data_dir = os.path.dirname(os.path.abspath(
                 report.paths[0]))
+            if report.ok:
+                remember_dataset(report.paths[0], report)     # 2.20: the library's datasets
         self._update_estimates()
 
     def _update_estimates(self) -> None:
@@ -494,20 +499,70 @@ class FineTuneTab(QWidget):
             val_split=float(self.val_split.value()),
             memory_plan="auto" if self.memory_plan.isChecked() else "off")
 
+    def set_base(self, spec: str) -> None:
+        """Choose the base: a model of the catalog, a ``.pt`` file, a Hugging Face
+        name or folder, or "" (the model in memory)."""
+        model = find_model(spec) if spec else None
+        if model is not None:
+            self.catalog.setCurrentIndex(self.catalog.findData(model.repo))
+            self._choose_base("catalog")
+        elif spec.endswith(".pt"):
+            self.file.setText(spec)
+            self._choose_base("file")
+        elif spec:
+            self.hub.setText(spec)
+            self._choose_base("hub")
+        elif self.studio.engine.model is not None:
+            self._choose_base("memory")
+
+    def apply_settings(self, s: FineTuneSettings) -> None:
+        """Fill the whole form from settings (2.20: Repeat or Train more a run)."""
+        self._applying = True
+        try:
+            if s.method in self.method_buttons:
+                self.method_buttons[s.method].setChecked(True)
+                self._method_chosen = True
+            self.rank.setValue(int(s.lora_rank))
+            if s.lora_lr:
+                self.lora_lr.setText(f"{s.lora_lr:g}")
+            self.full_lr.setText(f"{s.lr:g}")
+            self.adam8.setChecked(s.optimizer == "adamw8bit")
+            self.epochs.setValue(int(s.epochs))
+            self.max_steps.setValue(int(s.max_steps))
+            self.time_limit.setValue(int(s.time_limit_min))
+            self.seq.setValue(int(s.seq_length))
+            self.batch.setValue(int(s.batch_size))
+            index = self.template.findData(s.chat_template)
+            if index >= 0:
+                self.template.setCurrentIndex(index)
+            self.prompt_weight.setText("auto" if s.prompt_weight is None
+                                       else f"{s.prompt_weight:g}")
+            self.pack.setChecked(bool(s.pack_dialogs))
+            index = self.objective.findData(s.objective)
+            if index >= 0:
+                self.objective.setCurrentIndex(index)
+            self.val_split.setValue(float(s.val_split))
+            self.memory_plan.setChecked(s.memory_plan == "auto")
+            self._user_tuned = True              # keep them when the base or data changes
+        finally:
+            self._applying = False
+
+    def apply_run(self, run: runlib.Run, base: str | None = None) -> None:
+        """Fill the form from a run of the library (2.20): Repeat (its base) or
+        Train more (`base`: the run's result)."""
+        if run.settings:
+            self.apply_settings(FineTuneSettings.from_dict(run.settings))
+        self.set_base(str(run.base.get("spec") or "") if base is None else base)
+        paths = run.data.get("paths") or []
+        if paths:
+            self.data.set_path(str(paths[0]))
+
     def apply_plan(self, plan: dict[str, Any]) -> None:
         """Fill the form from the wizard's plan."""
         settings = dict(plan.get("settings") or {})
         base = str(plan.get("base") or settings.get("base") or "")
-        model = find_model(base)
-        if model is not None:
-            self.catalog.setCurrentIndex(self.catalog.findData(model.repo))
-            self._choose_base("catalog")
-        elif base.endswith(".pt"):
-            self.file.setText(base)
-            self._choose_base("file")
-        elif base:
-            self.hub.setText(base)
-            self._choose_base("hub")
+        if base:
+            self.set_base(base)
         method = settings.get("method")
         if method in self.method_buttons:
             self.method_buttons[method].setChecked(True)
@@ -556,9 +611,22 @@ class FineTuneTab(QWidget):
             return
         paths = list(report.paths)
         method = settings.method
+        # 2.20: the run goes into the library (a checkpoint every 10 minutes);
+        # its record is made once the base is loaded and the data read
+        base = {"spec": spec if source != "memory" else self.studio.model_path,
+                "label": runlib.base_label(spec) if source != "memory" else
+                (self.studio.model_origin or "the model in memory")}
+        record = {"base": base, "settings": settings.to_dict(),
+                  "hardware": self.studio.run_hardware(),
+                  "data": {"paths": paths, "kind": report.kind, "records": report.records,
+                           "tokens": report.tokens, "bytes": report.bytes}}
 
         def work(job: Job) -> Any:
             from auralite.engine import PreferenceSet, load_training_data
+            if source != "memory":
+                # 2.20: the old model leaves first - one model in memory, not two
+                engine.unload_model()
+                job.progress.emit(("unloaded", None))
             if source in ("catalog", "hub"):
                 job.progress.emit(("stage", f"Getting {spec}…", 0.0))
 
@@ -577,11 +645,56 @@ class FineTuneTab(QWidget):
                 return {"stopped_during": "loading the base model"}
             job.progress.emit(("stage", "Reading the data…", None))
             data = load_training_data(paths)
-            if isinstance(data, PreferenceSet) and settings.objective == "sft":
+            as_dialogs = isinstance(data, PreferenceSet) and settings.objective == "sft"
+            if as_dialogs:
                 data = data.as_dialogs()
-            return engine.train(data, params, progress_callback=training_callback(job),
-                                stop_event=job.stop_event, finish_event=job.finish_event)
+            pairs = isinstance(data, PreferenceSet)
+            data_info = dict(record["data"], options={"as_dialogs": True} if as_dialogs else {})
+            recorder = runlib.RunRecorder(
+                kind="preference" if pairs else "finetune",
+                method=str(params.get("method", "dpo")) if pairs else method,
+                params=params, **{**record, "data": data_info})
+            job.recorder = recorder                         # type: ignore[attr-defined]
+            # preference runs are short and start anew: no checkpoints for them
+            run_params = params if pairs else recorder.checkpoint_params(params)
+            return run_training(job, engine, recorder, data, run_params)
 
+        self._start_job(work)
+
+    def continue_run(self, run: runlib.Run) -> None:
+        """Continue a stopped, failed or interrupted run of the library from its
+        checkpoint, exactly where it stood (2.20)."""
+        try:
+            path = runlib.continue_point(run)
+        except ValueError as err:
+            show_error(self, SettingsError(str(err)))
+            return
+        if not self.studio.confirm_replace_model("Continuing the run loads it in place of the "
+                                                 "model in memory."):
+            return
+        if not self.studio.begin("fine-tuning"):
+            return
+        engine = self.studio.engine
+        self.studio.goto("finetune")
+
+        def work(job: Job) -> Any:
+            job.progress.emit(("stage", f"Loading {run.name}…", None))
+            engine.unload_model()
+            job.progress.emit(("unloaded", None))
+            engine.load_model(str(path))
+            job.progress.emit(("continued", run.name))
+            job.progress.emit(("stage", "Reading the data…", None))
+            data = runlib.load_run_data(run)
+            recorder = runlib.RunRecorder.resume(run)
+            job.recorder = recorder                         # type: ignore[attr-defined]
+            params: dict[str, Any] = {"continue_training": True, "continue_run": True}
+            if run.record.get("files") == "folder":
+                params = recorder.checkpoint_params(params)
+            return run_training(job, engine, recorder, data, params)
+
+        self._start_job(work)
+
+    def _start_job(self, work: Any) -> None:
         self.job = Job("fine-tune", work, self)
         self.job.progress.connect(self._progress)
         self.job.finished.connect(self._finished)
@@ -589,6 +702,7 @@ class FineTuneTab(QWidget):
         self._started = time.time()
         self.panel.begin("Starting…")
         self._model_changed()
+        self.studio.runs_changed.emit()
         self.job.start()
 
     def _progress(self, event: tuple) -> None:
@@ -608,22 +722,36 @@ class FineTuneTab(QWidget):
                                       100.0 * done / total if total else None)
         elif kind == "loaded":
             self.studio.model_loaded(str(event[1]))
+        elif kind == "continued":
+            self.studio.model_origin = str(event[1])
+            self.studio.model_changed.emit()
+        elif kind == "unloaded":
+            self.studio.model_unloaded()
         else:
             self.panel.show_stage(event[1], event[2])
 
     def _finished(self, summary: Any) -> None:
-        stopped = self.job is not None and self.job.stop_event.is_set()
-        self.job = None
-        self.panel.end(summary_text(summary, time.time() - self._started, stopped))
+        job, self.job = self.job, None
+        stopped = job is not None and job.stop_event.is_set()
+        recorder = getattr(job, "recorder", None)
         self.studio.model_trained("fine-tuned")
-        self.studio.end(model_dirty=True)
+        run = recorder.run if recorder is not None else None
+        saved = run is not None and self.studio.run_saved(run)
+        text = summary_text(summary, time.time() - self._started, stopped)
+        if run is not None and saved:
+            text += (" Saved in the library: it can continue from there."
+                     if run.continue_state()[0] else " Saved in the library.")
+        self.panel.end(text)
+        self.studio.end(model_dirty=not saved and self.studio.engine.model is not None)
         self._model_changed()
+        self.studio.runs_changed.emit()
 
     def _failed(self, exc: BaseException) -> None:
         self.job = None
         self.panel.end("The fine-tuning failed - see the message.")
         self.studio.end(model_dirty=self.studio.engine.model is not None)
         self._model_changed()
+        self.studio.runs_changed.emit()
         self.studio.report_error(exc, "fine-tuning")
 
     def finish(self) -> None:
@@ -668,6 +796,7 @@ class FineTuneTab(QWidget):
             return
         try:
             info = self.studio.engine.save_adapter(path)
+            remember_model(path, "adapter")
         except Exception as err:
             self.studio.report_error(err, "saving the adapters")
             return

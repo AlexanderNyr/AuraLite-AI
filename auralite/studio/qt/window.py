@@ -15,12 +15,14 @@ from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMenu, QScroll
 
 from ..hardware import Hardware, auralite_home, detect_hardware, format_gb, measure_gflops, \
     process_memory
+from ..library import remember_model
 from ..logs import install_excepthooks, log_dir, setup_logging
 from ..settings import StudioSettings, load_settings, save_settings
 from .common import Job, ask_open, ask_save, confirm, inform, show_error
 from .tab_chat import ChatTab
 from .tab_export import ExportTab
 from .tab_finetune import FineTuneTab
+from .tab_library import LibraryTab
 from .tab_log import LogTab
 from .tab_start import StartTab
 from .tab_train import TrainTab
@@ -28,7 +30,7 @@ from .theme import ACCENT, apply_theme
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
-              ("chat", "Chat"), ("export", "Export"), ("log", "Log"))
+              ("chat", "Chat"), ("export", "Export"), ("library", "Library"), ("log", "Log"))
 
 
 def studio_icon() -> QIcon:
@@ -60,6 +62,7 @@ class MainWindow(QMainWindow):
     model_changed = Signal()
     busy_changed = Signal(str)
     error_raised = Signal(object)
+    runs_changed = Signal()                  # 2.20: a run of the library began or ended
 
     def __init__(self, engine: Any = None, settings: StudioSettings | None = None, *,
                  detect: bool = True, capture_streams: bool = True,
@@ -92,13 +95,15 @@ class MainWindow(QMainWindow):
         self.finetune_tab = FineTuneTab(self)
         self.chat_tab = ChatTab(self)
         self.export_tab = ExportTab(self)
+        self.library_tab = LibraryTab(self)
         self.log_tab = LogTab(self)
         self.pages: dict[str, QWidget] = {"start": self.start_tab, "train": self.train_tab,
                                           "finetune": self.finetune_tab, "chat": self.chat_tab,
-                                          "export": self.export_tab, "log": self.log_tab}
+                                          "export": self.export_tab, "library": self.library_tab,
+                                          "log": self.log_tab}
         for key, title in TAB_TITLES:
             page = self.pages[key]
-            if key in ("chat", "log"):
+            if key in ("chat", "library", "log"):
                 self.tabs.addTab(page, title)
                 continue
             scroll = QScrollArea()
@@ -120,6 +125,11 @@ class MainWindow(QMainWindow):
         self.model_changed.connect(self._update_status)
         self.hardware_changed.connect(self._hardware_status)
         self.error_raised.connect(self._uncaught)
+        # 2.20: the library follows the runs; the Start tab offers an interrupted one
+        self.runs_changed.connect(self.library_tab.on_runs_changed)
+        self.runs_changed.connect(self.start_tab.refresh_interrupted)
+        self.busy_changed.connect(lambda _name: self.library_tab._update_run_buttons())
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.log_tab.attach(capture_streams)
         app = QApplication.instance()
         if isinstance(app, QApplication):
@@ -160,6 +170,8 @@ class MainWindow(QMainWindow):
         tools = bar.addMenu("&Tools")
         self._action(tools, "Setup wizard…", lambda: self.open_wizard("finetune"), "Ctrl+N")
         self._action(tools, "Speed test", self.run_speed_test)
+        self._action(tools, "Library: runs, models, datasets", lambda: self.goto("library"),
+                     "Ctrl+L")
         tools.addSeparator()
         self._action(tools, "Classic interface (tkinter)", self.open_classic)
         self._action(tools, "Open the AuraLite folder", lambda: self._open(str(auralite_home())))
@@ -252,6 +264,10 @@ class MainWindow(QMainWindow):
         index = [key for key, _ in TAB_TITLES].index(name)
         self.tabs.setCurrentIndex(index)
 
+    def _tab_changed(self, index: int) -> None:
+        if TAB_TITLES[index][0] == "library":
+            self.library_tab.refresh()
+
     def begin(self, name: str, quiet: bool = False) -> bool:
         """Claim the engine for `name` (training, an export, a reply); False when busy."""
         if self.busy:
@@ -338,7 +354,9 @@ class MainWindow(QMainWindow):
         if path:
             self.open_model(path)
 
-    def open_model(self, path: str) -> None:
+    def open_model(self, path: str, origin: str = "", then: str = "") -> None:
+        """Load a model file; `origin` names it in the status bar (2.20: a run of
+        the library), `then` is the tab to open once it is loaded."""
         if not os.path.exists(path):
             show_error(self, FileNotFoundError(f"not found: {path}"))
             return
@@ -348,16 +366,43 @@ class MainWindow(QMainWindow):
             return
         engine = self.engine
         self.statusBar().showMessage(f"Opening {os.path.basename(path)}…")
-        job = Job("open-model", lambda _job: engine.load_model(path), self)
-        job.finished.connect(lambda _r: self._opened(path))
+        def work(_job: Job) -> Any:
+            engine.unload_model()             # 2.20: one model in memory, not two
+            return engine.load_model(path)
+
+        job = Job("open-model", work, self)
+        job.finished.connect(lambda _r: self._opened(path, origin, then))
         job.failed.connect(self._open_failed)
         self._jobs.append(job)
         job.start()
 
-    def _opened(self, path: str) -> None:
+    def _opened(self, path: str, origin: str = "", then: str = "") -> None:
         self.model_loaded(path)
+        if origin:
+            self.model_origin = origin
         self.end(model_dirty=False)
-        self.statusBar().showMessage(f"Opened {path}", 6000)
+        self.statusBar().showMessage(f"Opened {origin or path}", 6000)
+        if then:
+            self.goto(then)
+
+    def import_model(self, spec: str, then: str = "") -> None:
+        """Import a Hugging Face model into memory (2.20: a download of the library,
+        which needs no network the second time)."""
+        if not self.confirm_replace_model("Importing a model replaces the one in memory."):
+            return
+        if not self.begin("importing a model"):
+            return
+        engine = self.engine
+        self.statusBar().showMessage(f"Importing {spec}…")
+        def work(_job: Job) -> Any:
+            engine.unload_model()
+            return engine.import_hf_model(spec)
+
+        job = Job("import-model", work, self)
+        job.finished.connect(lambda _r: self._opened(spec, "", then))
+        job.failed.connect(self._open_failed)
+        self._jobs.append(job)
+        job.start()
 
     def _open_failed(self, exc: BaseException) -> None:
         self.end(model_dirty=None)
@@ -377,6 +422,12 @@ class MainWindow(QMainWindow):
             self.model_path = ""
         self.model_changed.emit()
 
+    def model_unloaded(self) -> None:
+        """The engine let the model in memory go (a new one is loading)."""
+        self.model_origin = ""
+        self.model_path = ""
+        self.model_changed.emit()
+
     def model_trained(self, how: str) -> None:
         """After a run: a new model, or the base fine-tuned."""
         if how == "new":
@@ -392,6 +443,29 @@ class MainWindow(QMainWindow):
         self.settings.last_model_dir = os.path.dirname(self.model_path)
         save_settings(self.settings)
         self.start_tab.refresh_recent()
+        remember_model(self.model_path, "saved")
+
+    # ---- the run library (2.20) ------------------------------------------------------
+    def run_hardware(self) -> dict[str, Any]:
+        """This computer, as a run's record keeps it."""
+        from auralite.runs import machine_summary
+        info = machine_summary(self.engine)
+        hw = self.hardware
+        if hw is not None:
+            info.update(cpu=hw.cpu or info.get("cpu", ""), cores=hw.cores, threads=hw.threads,
+                        memory_gb=round(hw.memory_total / (1 << 30), 1) if hw.memory_total
+                        else None, accelerator=hw.accelerator, system=hw.system)
+        return info
+
+    def run_saved(self, run: Any) -> bool:
+        """After a recorded run: the model in memory is the run's result, kept in
+        the library (nothing is lost on closing). True when it was saved."""
+        path = run.result_path
+        if path is None or run.record.get("save_error"):
+            return False
+        self.model_path = str(path)
+        self.model_origin = run.name
+        return True
 
     def save_model_dialog(self) -> None:
         if self.engine.model is None:

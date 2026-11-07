@@ -566,30 +566,49 @@ def cmd_train(args: argparse.Namespace) -> int:
             params["cluster_token"] = args.cluster_token
         if args.cluster_timeout:
             params["cluster_timeout_s"] = float(args.cluster_timeout)
+    # 2.20: the run goes into the run library (auralite runs) unless --no-record
+    recorder = _record_train_run(args, data, params, engine, pairs)
     finish_event, stop_event = threading.Event(), threading.Event()
     previous = _graceful_sigint(finish_event, stop_event)
     from auralite.engine.hf_bpe import TokenizerFormatError
+    printer = None if getattr(args, "quiet", False) else _ProgressPrinter()
     try:
         summary = engine.train(
             data, params,
-            progress_callback=None if getattr(args, "quiet", False) else _ProgressPrinter(),
+            progress_callback=recorder.callback(printer) if recorder is not None else printer,
             stop_event=stop_event, finish_event=finish_event)
     except (TokenizerFormatError, FileNotFoundError, DataFormatError) as err:
+        if recorder is not None:
+            recorder.fail(err)
         print(f"error: {err}", file=sys.stderr)
         return 2
+    except BaseException as err:
+        if recorder is not None:
+            recorder.fail(err)
+        raise
     finally:
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
     if isinstance(summary, dict) and summary.get("stopped_during"):
         # 2.14.1: stopped before the first step — there is no new model
+        if recorder is not None:
+            recorder.finish(summary)
         print(f"stopped before training began ({summary['stopped_during']}); nothing was saved")
         return 130
-    engine.save_model(args.model)
+    try:
+        engine.save_model(args.model)
+    except BaseException as err:
+        if recorder is not None:
+            recorder.fail(err)
+        raise
     line = f"saved: {args.model}"
     if getattr(args, "save_adapter", None):
         info = engine.save_adapter(args.save_adapter)
         line += f" | adapter: {args.save_adapter} ({info['bytes'] / 1e6:.2f} MB)"
     summary = engine.last_train_summary or {}
+    if recorder is not None:
+        recorder.finish(summary, result=args.model,
+                        checkpoint=_cli_continue_point(args.model, params, summary))
     if summary.get("val_loss") is not None:
         line += f" | val loss {summary['val_loss']:.4f}"
         if summary.get("val_bpb") is not None:
@@ -612,7 +631,92 @@ def cmd_train(args: argparse.Namespace) -> int:
             not getattr(args, "quiet", False):
         print(f"continue this run later: auralite train --data ... --resume {args.model} "
               f"--continue-run")
+        if recorder is not None:
+            print(f"  or: auralite runs continue {recorder.id}")
+    if recorder is not None and not getattr(args, "quiet", False):
+        print(f"run: {recorder.id} (auralite runs show {recorder.id})")
     return 0
+
+
+def _data_kind(data: Any) -> str:
+    """The kind of `data` as the Studio's data check names it (2.20)."""
+    from auralite.engine import DialogSet, PreferenceSet, TextSources, TokenShards
+    if isinstance(data, DialogSet):
+        return "dialogs"
+    if isinstance(data, PreferenceSet):
+        return "preferences"
+    if isinstance(data, TokenShards):
+        return "shards"
+    if isinstance(data, TextSources):
+        return "big"
+    return "text"
+
+
+def _record_train_run(args: argparse.Namespace, data: Any, params: dict, engine: Any,
+                      pairs: bool) -> Any:
+    """2.20: a :class:`~auralite.runs.RunRecorder` for `auralite train`, or None
+    (--no-record, AURALITE_NO_RUNS=1). --continue-run of a recorded run adds a
+    session to it; a run whose files the library cannot write trains anyway."""
+    from auralite import runs as runlib
+    if getattr(args, "no_record", False) or not runlib.recording_enabled():
+        return None
+    resume = getattr(args, "resume", None)
+    try:
+        if getattr(args, "continue_run", False) and resume:
+            wanted = os.path.abspath(resume)
+            for run in runlib.list_runs():
+                if wanted in (run.record.get("checkpoint"), run.record.get("result"),
+                              run.record.get("output")) and run.status != "running":
+                    return runlib.RunRecorder.resume(run)
+        if pairs:
+            kind, method = "preference", str(params.get("method") or "dpo")
+            method = "dpo" if method == "auto" else method
+        elif resume:
+            kind = "finetune"
+            method = ("qlora" if params.get("quantize_base") == "nf4" else
+                      "lora" if params.get("lora_rank") else "full")
+        else:
+            kind, method = "train", "lora" if params.get("lora_rank") else "new"
+        run_state = getattr(engine, "_resume_run_state", None)
+        recorded = dict(params)
+        if getattr(args, "continue_run", False) and isinstance(run_state, dict):
+            recorded = dict(run_state.get("params") or {}, **params)
+        options = {"stream": {"always": True, "never": False}.get(str(args.stream or ""))
+                   if getattr(args, "stream", None) else None,
+                   "text_field": getattr(args, "text_field", None),
+                   "hf_config": getattr(args, "hf_config", None),
+                   "hf_split": getattr(args, "hf_split", None)}
+        try:
+            records = len(data)
+        except TypeError:
+            records = None
+        recorder = runlib.RunRecorder(
+            kind=kind, source="cli", name=getattr(args, "run_name", None) or "",
+            base={"spec": resume or "",
+                  "label": runlib.base_label(resume or "", kind, getattr(args, "preset", "") or "")},
+            method=method,
+            data={"paths": list(args.text), "kind": _data_kind(data), "records": records,
+                  "options": {k: v for k, v in options.items() if v is not None}},
+            params=recorded, hardware=runlib.machine_summary(engine), files="paths")
+        recorder.record["output"] = os.path.abspath(args.model)
+        if params.get("autosave_path"):
+            recorder.record["checkpoint"] = os.path.abspath(str(params["autosave_path"]))
+        recorder._write()
+        return recorder
+    except OSError as err:
+        print(f"note: the run is not recorded ({err})", file=sys.stderr)
+        return None
+
+
+def _cli_continue_point(model: str, params: dict, summary: dict) -> str | None:
+    """Where a run of `auralite train` continues from (2.20): the saved model
+    after a stop, else its autosave."""
+    if summary.get("stop_reason") == "stopped" and not summary.get("restored_best"):
+        return model
+    autosave = params.get("autosave_path")
+    if autosave and os.path.isfile(str(autosave)) and summary.get("stop_reason") == "stopped":
+        return str(autosave)
+    return None
 
 
 def cmd_data_prepare(args: argparse.Namespace) -> int:
@@ -1874,6 +1978,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="workers must give the same token (keeps runs on one network apart)")
     p.add_argument("--cluster-timeout", type=_parse_duration, metavar="DURATION",
                    help="how long to wait for the workers (default 10m)")
+    # 2.20: the run library
+    p.add_argument("--no-record", action="store_true",
+                   help="keep this run out of the run library (auralite runs; also "
+                        "AURALITE_NO_RUNS=1)")
+    p.add_argument("--run-name", metavar="NAME",
+                   help="the run's name in the run library (default: what it trains on what)")
     p.set_defaults(func=cmd_train)
 
     # 2.18: big datasets as token shards, and memory plans
@@ -2238,6 +2348,35 @@ def build_parser() -> argparse.ArgumentParser:
                         "process builds it without showing it; exit code 1 if it fails)")
     p.set_defaults(func=cmd_doctor)
 
+    # 2.20: the run library
+    p = sub.add_parser("runs", help="the run library: every training run, its curve and "
+                                    "files; compare runs, continue a stopped one")
+    p.set_defaults(func=cmd_runs, runs_command="list")
+    runs_sub = p.add_subparsers(dest="runs_command")
+    q = runs_sub.add_parser("list", help="the runs, newest first")
+    q.add_argument("--all", action="store_true", help="every run (default: the newest 30)")
+    q.add_argument("--json", action="store_true", help="as JSON")
+    q.set_defaults(func=cmd_runs)
+    q = runs_sub.add_parser("show", help="one run: settings, losses, files, how to continue")
+    q.add_argument("run", help="its id, the start of it, or last")
+    q.add_argument("--json", action="store_true", help="the whole record as JSON")
+    q.set_defaults(func=cmd_runs)
+    q = runs_sub.add_parser("compare", help="what differs between runs")
+    q.add_argument("runs", nargs="+", metavar="RUN", help="two or more runs")
+    q.add_argument("--json", action="store_true", help="as JSON (with the curves)")
+    q.set_defaults(func=cmd_runs)
+    q = runs_sub.add_parser("continue", help="continue a stopped, failed or interrupted run "
+                                             "exactly where it stood")
+    q.add_argument("run", help="its id, the start of it, or last")
+    _add_common_flags(q, suppress_defaults=True)
+    q.set_defaults(func=cmd_runs)
+    q = runs_sub.add_parser("delete", help="delete a run (or only its model files: --files)")
+    q.add_argument("run", help="its id, the start of it, or last")
+    q.add_argument("--files", action="store_true",
+                   help="delete only the model files in its folder; keep its record and curve")
+    q.add_argument("--yes", action="store_true", help="do not ask")
+    q.set_defaults(func=cmd_runs)
+
     p = sub.add_parser("studio", help="open AuraLite Studio, the desktop app (needs PySide6: "
                                       "pip install \"auralite-ai[studio]\"; "
                                       "auralite doctor --studio checks it)")
@@ -2440,6 +2579,177 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print("  " + command)
     print("\nOr in the desktop app: auralite studio")
     return status
+
+
+# ----------------------------------------------------------------------
+#  2.20: the run library (auralite runs)
+# ----------------------------------------------------------------------
+def _bytes_text(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024.0
+    return f"{n:,.1f} GB"
+
+
+def _run_dict(run: Any) -> dict:
+    ok, why = run.continue_state()
+    return {"id": run.id, "name": run.name, "status": run.status, "kind": run.kind,
+            "source": run.source, "method": run.method, "created": run.created,
+            "seconds": run.seconds, "best_val_loss": run.best_val, "val_bpb": run.val_bpb,
+            "folder": str(run.folder),
+            "result": str(run.result_path) if run.result_path else None,
+            "checkpoint": str(run.checkpoint_path) if run.checkpoint_path else None,
+            "can_continue": ok, "why_not": why}
+
+
+def _runs_list(args: argparse.Namespace) -> int:
+    from auralite import runs as runlib
+    runs = runlib.list_runs()
+    if getattr(args, "json", False):
+        print(json.dumps([_run_dict(r) for r in runs], indent=1))
+        return 0
+    root = runlib.runs_root()
+    if not runs:
+        print(f"no runs yet: auralite train and AuraLite Studio record them in {root}")
+        return 0
+    shown = runs if getattr(args, "all", False) else runs[:30]
+    print(f"{'ID':<28} {'STATUS':<12} {'KIND':<11} {'BEST VAL':>9} {'TIME':>9}  NAME")
+    for run in shown:
+        best = f"{run.best_val:.4f}" if run.best_val is not None else ""
+        print(f"{run.id:<28} {run.status:<12} {run.kind_label:<11} {best:>9} "
+              f"{runlib._duration(run.seconds):>9}  {run.name}")
+    if len(shown) < len(runs):
+        print(f"... and {len(runs) - len(shown)} older (--all)")
+    total = sum(run.disk_bytes() for run in runs)
+    print(f"{len(runs)} runs, {_bytes_text(total)} in {root}")
+    return 0
+
+
+def _runs_show(args: argparse.Namespace) -> int:
+    from auralite import runs as runlib
+    run = runlib.find_run(args.run)
+    if getattr(args, "json", False):
+        print(json.dumps({**run.record, **_run_dict(run)}, indent=1, default=str))
+        return 0
+    print(f"{run.name}  [{run.id}]")
+    for label, text in runlib.describe_run(run):
+        print(f"  {label + ':':<12} {text}")
+    for label, path, _size in run.files():
+        print(f"  {label.capitalize() + ':':<12} {path}")
+    if run.notes:
+        print(f"  {'Notes:':<12} {run.notes}")
+    print(f"  {'Folder:':<12} {run.folder}")
+    if run.continue_state()[0]:
+        print(f"\nauralite runs continue {run.id}")
+    return 0
+
+
+def _runs_compare(args: argparse.Namespace) -> int:
+    from auralite import runs as runlib
+    runs = [runlib.find_run(key) for key in args.runs]
+    table = runlib.compare_runs(runs)
+    if getattr(args, "json", False):
+        print(json.dumps(table, indent=1))
+        return 0
+    width = 26
+    label_width = max(len(label) for label, _values, _differs in table["rows"]) + 2
+    print(" " * (label_width + 2) + "".join(f"{run.id[:width - 2]:<{width}}" for run in runs))
+    for label, values, differs in table["rows"]:
+        mark = "*" if differs else " "
+        cells = "".join(f"{(v if len(v) < width - 1 else v[:width - 4] + '...'):<{width}}"
+                        for v in values)
+        print(f"{mark} {label:<{label_width}}{cells}")
+    print("\n* differs")
+    return 0
+
+
+def _runs_continue(args: argparse.Namespace) -> int:
+    from auralite import runs as runlib
+    from auralite.engine import AuraLiteEngine, DataFormatError
+    run = runlib.find_run(args.run)
+    try:
+        path = runlib.continue_point(run)
+        data = runlib.load_run_data(run)
+    except (ValueError, FileNotFoundError, DataFormatError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    quiet = getattr(args, "quiet", False)
+    if not quiet:
+        print(f"continuing {run.name} from {path}")
+    engine = AuraLiteEngine()
+    engine.load_model(str(path))
+    recorder = runlib.RunRecorder.resume(run)
+    params: dict = {"continue_training": True, "continue_run": True}
+    folder = run.record.get("files") == "folder"
+    if folder:
+        params.update(autosave_every_minutes=runlib.CHECKPOINT_MINUTES,
+                      autosave_path=str(recorder.checkpoint_path))
+    finish_event, stop_event = threading.Event(), threading.Event()
+    previous = _graceful_sigint(finish_event, stop_event)
+    try:
+        summary = engine.train(data, params,
+                               progress_callback=recorder.callback(
+                                   None if quiet else _ProgressPrinter()),
+                               stop_event=stop_event, finish_event=finish_event)
+    except ValueError as err:
+        recorder.fail(err)
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    except BaseException as err:
+        recorder.fail(err)
+        raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    if not folder and not (run.record.get("output") or run.record.get("result")):
+        recorder.record["output"] = str(path)          # nowhere else to keep it
+    done = recorder.save_and_finish(summary, engine)
+    out = done.result_path
+    reason = str(summary.get("stop_reason") or "")
+    line = f"run {done.id}: {done.status}"
+    if out is not None:
+        line += f" | saved: {out}"
+    if summary.get("val_loss") is not None:
+        line += f" | val loss {summary['val_loss']:.4f}"
+    print(line)
+    if reason == "stopped" and done.continue_state()[0] and not quiet:
+        print(f"continue it later: auralite runs continue {done.id}")
+    return 0
+
+
+def _runs_delete(args: argparse.Namespace) -> int:
+    from auralite import runs as runlib
+    run = runlib.find_run(args.run)
+    if run.status == "running":
+        print(f"error: {run.id} is training now", file=sys.stderr)
+        return 2
+    what = (f"the model files of {run.id}" if args.files else
+            f"run {run.id} ({run.name}) and its folder")
+    if not args.yes:
+        if not sys.stdin or not sys.stdin.isatty():
+            print(f"error: add --yes to delete {what}", file=sys.stderr)
+            return 2
+        answer = input(f"Delete {what}? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("nothing deleted")
+            return 1
+    freed = runlib.delete_run(run, files_only=args.files)
+    print(f"deleted {what}: {_bytes_text(freed)} freed")
+    return 0
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    """2.20: the run library: every run of auralite train and AuraLite Studio."""
+    action = getattr(args, "runs_command", None) or "list"
+    handler = {"list": _runs_list, "show": _runs_show, "compare": _runs_compare,
+               "continue": _runs_continue, "delete": _runs_delete}[action]
+    try:
+        return handler(args)
+    except (KeyError, ValueError) as err:
+        message = err.args[0] if isinstance(err, KeyError) and err.args else err
+        print(f"error: {message}", file=sys.stderr)
+        return 2
 
 
 def cmd_studio(args: argparse.Namespace) -> int:

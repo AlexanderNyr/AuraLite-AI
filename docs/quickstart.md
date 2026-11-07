@@ -284,10 +284,14 @@ auralite-studio       # AuraLite Studio (Qt 6, 2.19): pip install "auralite-ai[s
 auralite-gui          # the classic GUI (tkinter); from a source checkout: python gui_app.py
 auralite doctor       # the Studio's recommendation in a terminal (--data FILE sizes it)
 auralite doctor --studio   # does the Studio's window start here? (what it found, and why not)
+auralite runs              # every run of the Studio and of auralite train (2.20)
+auralite runs continue last   # a stopped or interrupted run, exactly where it stood
 ```
 
 AuraLite Studio has separate tabs for training a new model and fine-tuning a
-ready one, a setup wizard, Chat, Export and a log ([docs/studio.md](studio.md)).
+ready one, a setup wizard, Chat, Export, a Library of runs, models and datasets
+(2.20: compare runs, continue a stopped or interrupted one) and a log
+([docs/studio.md](studio.md)).
 
 The GUI covers training (text, and images: diffusion, flow matching or a GAN), generation, chat with
 attention/token-frequency plots, model management, quantization, evaluation and

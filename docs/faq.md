@@ -424,3 +424,18 @@ runs: Qwen2.5-0.5B with QLoRA at 39 tokens/s on 2 cores). It recommends the
 largest model that fits and fine-tunes 1,000 dialogs overnight — a multilingual
 one (Qwen) when the data is not in English. Times are estimates: the run's
 progress line shows the real speed after the first steps.
+
+## 22. My computer turned off during training. Do I have to start again?
+
+No (since 2.20). AuraLite Studio saves the run's checkpoint every 10 minutes and
+when you stop it; the next time it starts, the Start tab offers to continue the
+interrupted run — and the Library (*Tools → Library*) continues any stopped,
+failed or interrupted run. It goes on exactly where the checkpoint stood: the
+same order of batches, learning-rate schedule and counters, so it ends with the
+same weights as a run that never stopped — fine-tuning on dialogs with LoRA or
+QLoRA too. At most the last 10 minutes are trained again. In a terminal:
+`auralite runs` lists the runs, `auralite runs continue last` continues one
+(a run of `auralite train` continues from its `--autosave`, or from the model it
+saved after Ctrl+C). The data must be the same file: the run checks it. See
+[studio.md](studio.md#the-library-runs-models-datasets-220) and [training.md
+§ 22](training.md#22-the-run-library-and-continuing-any-run-220).

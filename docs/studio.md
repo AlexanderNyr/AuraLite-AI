@@ -4,7 +4,8 @@ AuraLite Studio (2.19) is the desktop app for training language models on your o
 computer: it looks at the machine, recommends a model and settings that fit it,
 checks your data before anything trains, runs the training with a live chart, lets
 you chat with the result and exports it for llama.cpp, Ollama, LM Studio or
-transformers. Nothing leaves your computer, except the download of a base model
+transformers. Since 2.20 it keeps every run in a library — with its curve,
+results and files — where a stopped or interrupted run continues where it stood. Nothing leaves your computer, except the download of a base model
 from Hugging Face.
 
 ![AuraLite Studio's Start tab: this computer and the model that fits it](images/studio-start.png)
@@ -50,6 +51,7 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | **Fine-tune** | everything for models that already exist: the base, your data, the method (QLoRA, LoRA, every weight), dialogs written by a teacher model, the LoRA adapters |
 | **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog |
 | **Export** | a GGUF file (llama.cpp, Ollama, LM Studio), a Hugging Face folder (transformers, vLLM) or an AuraLite checkpoint |
+| **Library** (2.20) | every run with its curve, settings, results and files — continue a stopped or interrupted one, compare runs, evaluate a chat model; the models and datasets on the disk and the room they take |
 | **Log** | everything AuraLite reports while it works; the log file keeps it |
 
 The **setup wizard** (*Tools → Setup wizard*, and the first time the Studio starts)
@@ -114,6 +116,69 @@ The same check without the window: `auralite doctor [--data dialogs.jsonl]` prin
 the computer, the models that fit and the `auralite train` command;
 `--write-params plan.json` writes the settings for `--params`.
 
+## The Library: runs, models, datasets (2.20)
+
+Every training run is kept: the runs of the Train and Fine-tune tabs, and of
+`auralite train` in a terminal. *Tools → Library* (Ctrl+L) opens them.
+
+**Runs.** Each run has its name (*Fine-tune SmolLM2-135M-Instruct on
+chats.jsonl* — rename it), its status, its curve (the training loss as a line,
+the validation loss as dots, by step), the base model, the method, the data, the
+settings, the losses, the steps, tokens and speed, its files and their size, and
+your notes. The status says how it ended:
+
+| status | what happened | what you can do |
+|---|---|---|
+| finished | the run ended: its epochs, its step or time budget, early stopping | *Open the result*, *Evaluate*, *Train more* (a new run from its result), *Repeat* |
+| stopped | you pressed *Stop now* (*Finish* ends a run well instead: it is then finished) | **Continue** — and the rest |
+| interrupted | the program or the computer stopped during the run: a crash, a power cut, the window closed | **Continue** from its last checkpoint |
+| failed | an error ended it (the message is kept) | **Continue** from its last checkpoint, once the cause is fixed |
+
+**Continue** goes on exactly where the run stood: the same order of batches,
+learning-rate schedule, counters and random state — a stopped and continued run
+ends with the same weights as one that never stopped (measured below). While a
+run trains, the Studio saves its checkpoint **every 10 minutes**, and when you
+stop it, into the run's folder; an interruption costs at most the last 10
+minutes. When the Studio starts after an interrupted run, the Start tab offers
+to continue it. A finished run keeps its model (`model.pt`, without the optimizer
+state: smaller) and its checkpoint is deleted — it does not continue, *Train
+more* trains its result further as a new run. Preference runs (DPO, SimPO) are
+short and start anew. Continuing needs the same data: the run checks it and says
+so if the file changed.
+
+**Compare** (select two runs or more with Ctrl+click): their curves on one chart
+and their settings and results side by side, what differs in bold.
+
+**Evaluate** (a chat model): the run's result answers up to 30 of the dialogs its
+run held out for validation — how often a reply stops by itself, how often it is
+exactly the dialog's reply, the loss of the replies — and the run keeps the
+numbers. The result is loaded for it, so you can chat with it afterwards.
+
+**Models**: downloaded models (`~/.auralite/hf`), the results of runs, and the
+models, LoRA adapters and exports (GGUF, Hugging Face folders) you saved — with
+their size. *Chat with it*, *Fine-tune it*, *Export it*, *Show in folder*,
+*Delete*: deleting a download or a run's files only frees room (a download comes
+back on the next use); deleting one of your own files asks first.
+
+**Datasets**: the data you checked or trained on (with what the check found and
+how many runs used it), and the datasets `auralite data prepare` made
+(`~/.auralite/datasets`). *Fine-tune on it*, *Train on it*, *Delete*.
+
+The top line shows the room AuraLite's own files take (runs, downloads, prepared
+data) and what is free on the disk.
+
+**The measured run** (the 2 GB, 2-vCPU test machine, offscreen):
+SmolLM2-135M-Instruct, QLoRA on 2,000 arithmetic dialogs, windows of 128 tokens,
+batches of 2, 24 steps, each run in a fresh Studio from the same random start.
+Run A trained straight through (66 s); run B was stopped at step 11 and
+continued from the Library (32 s, then 43 s): **the two models are identical —
+all 1,323 tensors, to the last bit** (training loss 0.2181 and validation loss
+0.1186 for both). The stopped run's checkpoint took 192 MB, the finished model
+181 MB (without the optimizer state); the Studio peaked at 1.4 GB.
+
+In a terminal the same library is `auralite runs` ([docs/training.md §
+22](training.md#22-the-run-library-and-continuing-any-run-220)).
+
 ## When something goes wrong
 
 Errors are explained with what to try: *not enough memory* (QLoRA and 8-bit
@@ -159,7 +224,9 @@ PySide6 6.9.3 or newer.
 ## Files
 
 Everything lives in `~/.auralite` (`AURALITE_HOME`): downloaded models (`hf/`),
-the Studio's settings (`studio.json`: theme, recent models, the last speed test —
-never a token), logs (`logs/`: `studio.log`, `studio-output.log`,
-`studio-faults.log`). *Help → Check for updates* asks PyPI for a newer
-version; nothing is installed by itself.
+the runs (`runs/<id>/`: `run.json`, `metrics.jsonl`, `checkpoint.pt`, `model.pt`),
+prepared datasets (`datasets/`), what the Library remembers (`library.json`: the
+models and data you saved, exported or checked), the Studio's settings
+(`studio.json`: theme, recent models, the last speed test — never a token), logs
+(`logs/`: `studio.log`, `studio-output.log`, `studio-faults.log`). *Help → Check
+for updates* asks PyPI for a newer version; nothing is installed by itself.

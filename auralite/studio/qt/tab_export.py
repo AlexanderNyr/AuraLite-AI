@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFormLayout, 
                                QHBoxLayout, QLineEdit, QPushButton, QRadioButton, QVBoxLayout,
                                QWidget)
 
+from ..library import remember_model
 from .common import Job, ask_dir, ask_save, heading, hint, open_path, primary
 
 if TYPE_CHECKING:
@@ -178,6 +179,7 @@ class ExportTab(QWidget):
             self.studio.model_saved(path)
             self.studio.end(model_dirty=False)
         else:
+            remember_model(path, "export", note=self.studio.model_origin)   # 2.20: the library
             self.studio.end(model_dirty=None)
         self._model_changed()
 

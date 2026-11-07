@@ -106,7 +106,7 @@ def _dialogs_file(path, n: int = 24) -> str:
 # ----------------------------------------------------------------------
 def test_window_has_its_tabs_menus_and_status(studio):
     tabs = [studio.tabs.tabText(i) for i in range(studio.tabs.count())]
-    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Export", "Log"]
+    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Export", "Library", "Log"]
     menus = [a.text() for a in studio.menuBar().actions()]
     assert menus == ["&File", "&View", "&Tools", "&Help"]
     assert studio.windowTitle().startswith("AuraLite Studio 2.")
@@ -288,8 +288,18 @@ def test_qlora_fine_tune_chat_export_and_save(studio, tmp_path, qapp, dialogs):
     assert nf4_layers(engine.model)
     assert tab.panel.start_button.isEnabled() and not tab.panel.stop_button.isEnabled()
     assert tab.panel.bar.value() > 0 and tab.panel.tracker.losses
-    assert studio.busy == "" and studio.model_dirty
-    assert "4-bit base" in studio.model_status.text() and "not saved" in studio.model_description()
+    # 2.20: the run is in the library with its result, so nothing is lost on closing
+    from auralite import runs as runlib
+    run = runlib.find_run("last")
+    assert run.kind == "finetune" and run.method == "qlora" and run.status == "finished"
+    assert run.result_path is not None and run.result_path.name == "model.pt"
+    assert run.checkpoint_path is None                   # a finished run does not continue
+    assert run.data["kind"] == "dialogs" and run.settings["method"] == "qlora"
+    assert run.params["autosave_every_minutes"] == runlib.CHECKPOINT_MINUTES
+    assert run.curve()[0] and "Saved in the library" in tab.panel.status.text()
+    assert studio.busy == "" and not studio.model_dirty and studio.model_origin == run.name
+    assert "4-bit base" in studio.model_status.text()
+    assert "not saved" not in studio.model_description()
     assert tab.merge_button.isEnabled() and tab.chat_button.isEnabled()
 
     chat = studio.chat_tab
@@ -308,7 +318,10 @@ def test_qlora_fine_tune_chat_export_and_save(studio, tmp_path, qapp, dialogs):
     export.export()
     wait(qapp, lambda: export.job is None)
     assert os.path.getsize(tmp_path / "out" / "chat.gguf") > 1000
-    assert export.result.text().startswith("Saved:") and studio.model_dirty
+    assert export.result.text().startswith("Saved:") and not studio.model_dirty
+    from auralite.studio import library
+    exported = [m for m in library.list_models() if m.kind == "export"]
+    assert [m.name for m in exported] == ["chat.gguf"]
 
     dialogs["answers"]["save"] = str(tmp_path / "chat")
     studio.save_model_dialog()
@@ -328,6 +341,22 @@ def test_qlora_fine_tune_chat_export_and_save(studio, tmp_path, qapp, dialogs):
     assert not tab.merge_button.isEnabled() and studio.model_dirty
     assert not chat.slow_hint.isVisibleTo(chat)
     assert dialogs["error"] == []
+    kinds = {m.kind for m in library.list_models()}
+    assert {"result", "export", "saved", "adapter"} <= kinds
+
+    # 2.20: the library evaluates the run's result on the dialogs it held out
+    studio.model_dirty = False
+    studio.goto("library")
+    shelf = studio.library_tab
+    assert shelf.select_run(run.id) and shelf.evaluate_button.isEnabled()
+    shelf.evaluate_selected()
+    assert studio.busy == "an evaluation"
+    wait(qapp, lambda: shelf.job is None, timeout=300)
+    assert dialogs["error"] == [], [f.text() for f in dialogs["error"]]
+    evaluation = runlib.find_run(run.id).evaluation
+    assert evaluation["dialogs"] >= 1 and 0.0 <= evaluation["stop_rate"] <= 1.0
+    assert "Evaluated on" in shelf.task_label.text() and studio.model_origin == run.name
+    assert "replies that stop" in shelf.facts.text()
 
 
 def test_a_teacher_writes_dialogs_that_become_the_data(studio, tmp_path, qapp, dialogs,
@@ -374,9 +403,10 @@ def test_train_a_new_model_then_open_it_again(studio, tmp_path, qapp, dialogs):
     tab.start()
     wait(qapp, lambda: tab.job is None, timeout=300)
     assert dialogs["error"] == [], [f.text() for f in dialogs["error"]]
-    assert studio.engine.model is not None and studio.model_dirty
+    # 2.20: the new model is the result of a run of the library
+    assert studio.engine.model is not None and not studio.model_dirty
     assert tab.save_button.isEnabled() and tab.panel.status.text()
-    assert studio.model_description().startswith("new model ·")
+    assert studio.model_description().startswith("Train a new 25m model on corpus.txt ·")
     path = tmp_path / "new.pt"
     studio.engine.save_model(str(path))
     studio.model_dirty = True
@@ -513,6 +543,219 @@ def test_closing_asks_about_an_unsaved_model(studio, qapp, dialogs):
 
 
 # ----------------------------------------------------------------------
+#  The library (2.20)
+# ----------------------------------------------------------------------
+def _library_home(home, tmp_path, monkeypatch):
+    """Two runs (a finished fine-tune with a curve, a stopped new model), a
+    download and a prepared dataset in AURALITE_HOME."""
+    from auralite import runs as runlib
+    from auralite.studio import library
+    from auralite.studio.recipes import FineTuneSettings, TrainSettings
+    monkeypatch.setattr(runlib, "METRIC_SECONDS", 0.0)
+    chats = _dialogs_file(tmp_path / "chats.jsonl")
+    text = tmp_path / "corpus.txt"
+    text.write_text(TEXT, encoding="utf-8")
+    tuned = runlib.RunRecorder(
+        kind="finetune", method="qlora",
+        base={"spec": "hf:HuggingFaceTB/SmolLM2-135M-Instruct",
+              "label": "SmolLM2-135M-Instruct"},
+        data={"paths": [chats], "kind": "dialogs", "records": 24},
+        params={"epochs": 2, "seq_length": 64, "batch_size": 4, "lora_rank": 8,
+                "optimizer": "adamw8bit"},
+        settings=FineTuneSettings(method="qlora", lora_rank=8, epochs=2, seq_length=64,
+                                  batch_size=4).to_dict())
+    callback = tuned.callback()
+    for step in range(1, 11):
+        callback(1, 2, 3.0 - 0.1 * step, None,
+                 {"phase": "train", "global_step": step, "batch": step, "lr": 1e-3})
+    callback(1, 2, 2.0, 2.2, {"phase": "val", "global_step": 10, "val_bpb": 1.1})
+    tuned.model_path.write_bytes(b"m" * 4096)
+    tuned.record["result"] = runlib.MODEL_FILE
+    tuned.finish({"stop_reason": "finished", "train_loss": 2.0, "best_val_loss": 2.2,
+                  "optimizer_steps": 10, "tokens": 2560, "seconds": 12.0})
+    new = runlib.RunRecorder(kind="train", method="new", base={"label": "a new 25m model"},
+                             data={"paths": [str(text)], "kind": "text", "records": 1},
+                             settings=TrainSettings(seq_length=32).to_dict())
+    new.checkpoint_params({"epochs": 3})
+    new.checkpoint_path.write_bytes(b"c" * 2048)
+    new.finish({"stop_reason": "stopped", "train_loss": 3.5, "optimizer_steps": 4})
+    download = home / "hf" / "HuggingFaceTB__SmolLM2-135M-Instruct" / "main"
+    download.mkdir(parents=True)
+    (download / "config.json").write_text("{}", encoding="utf-8")
+    (download / "model.safetensors").write_bytes(b"w" * 8192)
+    (download / ".auralite-complete.json").write_text('{"files": ["config.json"]}',
+                                                      encoding="utf-8")
+    prepared = home / "datasets" / "fineweb-1234"
+    prepared.mkdir(parents=True)
+    (prepared / "auralite_dataset.json").write_text(json.dumps({
+        "complete": True, "stats": {"tokens": 4_240_000},
+        "sources": [{"spec": "hf:HuggingFaceFW/fineweb-edu"}],
+        "tokenizer": {"description": "BPE, 49,152 tokens"}}), encoding="utf-8")
+    library.remember_dataset(chats)
+    return tuned.run, new.run
+
+
+def _select(table, rows) -> None:
+    table.clearSelection()
+    for row in rows:
+        table.setRangeSelected(QtWidgets.QTableWidgetSelectionRange(
+            row, 0, row, table.columnCount() - 1), True)
+
+
+def test_library_shows_runs_models_and_datasets(studio, tmp_path, qapp, monkeypatch):
+    tuned, new = _library_home(tmp_path / "home", tmp_path, monkeypatch)
+    studio.goto("library")
+    shelf = studio.library_tab
+    table = shelf.runs_table
+    assert table.rowCount() == 2 and shelf.empty_runs.isHidden()
+    names = {table.item(r, 0).text(): table.item(r, 1).text() for r in range(2)}
+    assert names == {tuned.name: "finished", new.name: "stopped"}
+    assert tuned.name == "Fine-tune SmolLM2-135M-Instruct on chats.jsonl"
+    assert shelf.select_run(tuned.id)
+    assert "QLoRA" in shelf.facts.text() and "best validation 2.2000" in shelf.facts.text()
+    assert len(shelf.chart.series[0][1]) == 10 and shelf.chart.series[0][2] == [(10.0, 2.2)]
+    assert not shelf.continue_button.isEnabled()
+    assert "finished" in shelf.continue_button.toolTip()
+    assert shelf.open_button.isEnabled() and shelf.evaluate_button.isEnabled()
+    assert shelf.more_button.isEnabled() and not shelf.compare_button.isEnabled()
+    assert shelf.select_run(new.id)
+    assert shelf.continue_button.isEnabled() and not shelf.open_button.isEnabled()
+    assert not shelf.evaluate_button.isEnabled()          # it trained on text
+    assert "it can continue where it stood" in shelf.facts.text()
+    shelf.search.setText("stopped")
+    assert table.rowCount() == 1 and table.item(0, 0).text() == new.name
+    shelf.search.clear()
+    models = {shelf.models_table.item(r, 0).text(): shelf.models_table.item(r, 1).text()
+              for r in range(shelf.models_table.rowCount())}
+    assert models == {"HuggingFaceTB/SmolLM2-135M-Instruct": "Downloaded",
+                      tuned.name: "Run result"}
+    data = {shelf.data_table.item(r, 0).text(): (shelf.data_table.item(r, 1).text(),
+                                                 shelf.data_table.item(r, 4).text())
+            for r in range(shelf.data_table.rowCount())}
+    assert data["chats.jsonl"] == ("Data file", "1")
+    assert data["corpus.txt"] == ("Data file", "1")
+    assert data["fineweb-edu"][0] == "Prepared dataset"
+    assert "AuraLite's files:" in shelf.disk_label.text()
+    assert "free on the disk" in shelf.disk_label.text()
+
+
+def test_library_compares_renames_repeats_and_deletes(studio, tmp_path, qapp, monkeypatch,
+                                                      dialogs):
+    tuned, new = _library_home(tmp_path / "home", tmp_path, monkeypatch)
+    from auralite import runs as runlib
+    studio.goto("library")
+    shelf = studio.library_tab
+    _select(shelf.runs_table, [0, 1])
+    assert len(shelf.selected_runs()) == 2 and shelf.compare_button.isEnabled()
+    shelf.compare_selected()
+    compare = shelf.compare_dialog
+    assert compare is not None and compare.isVisible()
+    labels = [compare.table.verticalHeaderItem(r).text() for r in range(compare.table.rowCount())]
+    kind = labels.index("Kind")
+    assert compare.table.item(kind, 0).font().bold()        # Fine-tune / Train differ
+    assert len(compare.chart.series) == 2
+    compare.close()
+
+    assert shelf.select_run(tuned.id)
+    shelf.name_edit.setText("My first QLoRA")
+    shelf.notes.setPlainText("good replies, stops well")
+    shelf.save_notes()
+    again = runlib.find_run(tuned.id)
+    assert again.name == "My first QLoRA" and again.notes == "good replies, stops well"
+    assert shelf.runs_table.item(0, 0).text() in ("My first QLoRA", new.name)
+
+    shelf.select_run(tuned.id)
+    shelf.repeat()                                         # its tab, filled in
+    tab = studio.finetune_tab
+    assert studio.tabs.currentIndex() == 2 and tab.method() == "qlora"
+    assert tab.rank.value() == 8 and tab.seq.value() == 64 and tab.batch.value() == 4
+    assert tab.base_spec() == "hf:HuggingFaceTB/SmolLM2-135M-Instruct"
+    wait(qapp, lambda: tab.data.report is not None)
+    assert tab.data.report.kind == "dialogs"
+    studio.goto("library")
+    shelf.select_run(tuned.id)
+    shelf.train_more()                                     # its result is the base now
+    assert tab.source() == "file" and tab.base_spec().endswith("model.pt")
+
+    studio.goto("library")
+    shelf.select_run(tuned.id)
+    shelf.delete_selected(files_only=True)
+    assert "model files" in dialogs["confirm"][-1][1]
+    kept = runlib.find_run(tuned.id)
+    assert kept.result_path is None and kept.record.get("files_deleted")
+    shelf.select_run(new.id)
+    shelf.delete_selected(files_only=False)
+    assert not new.folder.exists() and shelf.runs_table.rowCount() == 1
+
+    page = shelf.models_table
+    row = [page.item(r, 0).text() for r in range(page.rowCount())].index(
+        "HuggingFaceTB/SmolLM2-135M-Instruct")
+    page.selectRow(row)
+    assert shelf.delete_model_button.isEnabled()
+    shelf._delete(shelf.selected_model())
+    assert "downloaded again" in dialogs["confirm"][-1][1]
+    assert not (tmp_path / "home" / "hf" / "HuggingFaceTB__SmolLM2-135M-Instruct").exists()
+    assert dialogs["error"] == []
+
+
+def test_a_studio_run_is_recorded_stopped_and_continued(studio, tmp_path, qapp, dialogs):
+    """Train in the window, stop, continue from the library: one run, two sessions."""
+    from auralite import runs as runlib
+    text = tmp_path / "corpus.txt"
+    text.write_text(TEXT * 3, encoding="utf-8")
+    tab = studio.train_tab
+    tab.data.set_path(str(text))
+    wait(qapp, lambda: tab.data.report is not None)
+    tab.size.setCurrentIndex(tab.size.findData("25m"))
+    tab.tokenizer.setCurrentIndex(tab.tokenizer.findData("char"))
+    tab.seq.setValue(32)
+    tab.batch.setValue(8)
+    tab.epochs.setValue(4)
+    tab.early_stop.setChecked(False)
+    tab.start()
+    wait(qapp, lambda: len(tab.panel.tracker.losses) >= 3 or tab.job is None, timeout=300)
+    tab.stop()
+    wait(qapp, lambda: tab.job is None, timeout=300)
+    assert dialogs["error"] == [], [f.text() for f in dialogs["error"]]
+    run = runlib.find_run("last")
+    assert run.status == "stopped" and run.kind == "train" and run.source == "studio"
+    assert run.checkpoint_path is not None and run.checkpoint_path == run.result_path
+    assert run.continue_state() == (True, "")
+    assert "it can continue from there" in tab.panel.status.text()
+    assert not studio.model_dirty and studio.model_origin == run.name
+
+    studio.goto("library")
+    shelf = studio.library_tab
+    assert shelf.select_run(run.id) and shelf.continue_button.isEnabled()
+    shelf.continue_selected()
+    assert studio.busy == "training" and studio.tabs.currentIndex() == 1
+    wait(qapp, lambda: tab.job is None, timeout=300)
+    assert dialogs["error"] == [], [f.text() for f in dialogs["error"]]
+    done = runlib.find_run(run.id)
+    assert done.status == "finished" and len(done.record["sessions"]) == 2
+    assert done.summary["continued_run"] and done.summary["epochs_completed"] == 4
+    assert done.result_path is not None and done.result_path.name == "model.pt"
+    assert done.checkpoint_path is None
+    steps = [x for x, _y in done.curve()[0]]
+    assert steps == sorted(steps) and len(set(steps)) == len(steps)
+
+    # a run whose program died: the Start tab offers to continue it
+    record = dict(done.record, status="running", pid=2 ** 22 + 12345, result=None,
+                  checkpoint=runlib.CHECKPOINT_FILE)
+    if done.checkpoint_path is None:                    # (a finished run deleted it)
+        done.folder.joinpath(runlib.CHECKPOINT_FILE).write_bytes(b"x")
+    runlib._write_json(done.folder / runlib.RUN_FILE, record)
+    start = studio.start_tab
+    start.refresh_interrupted()
+    assert start.interrupted.isVisibleTo(start) and run.name in start.interrupted_label.text()
+    start._show_interrupted()
+    assert studio.tabs.currentIndex() == 5 and shelf.current_run().id == run.id
+    start._dismiss_interrupted()
+    assert not start.interrupted.isVisibleTo(start)
+    assert runlib.find_run(run.id).record["dismissed"] is True
+
+
+# ----------------------------------------------------------------------
 #  The start a user makes
 # ----------------------------------------------------------------------
 def test_a_fresh_process_builds_the_window(tmp_path, monkeypatch, capsys):
@@ -530,7 +773,7 @@ def test_a_fresh_process_builds_the_window(tmp_path, monkeypatch, capsys):
     assert "RESULT: OK - the window was built in" in output
     assert "Qt platform: offscreen" in output and "PyTorch: " in output
     assert "  Installed: " in output                    # 2.19.1: the package pip knows
-    assert "Window: Start, Train, Fine-tune, Chat, Export, Log" in output
+    assert "Window: Start, Train, Fine-tune, Chat, Export, Library, Log" in output
     assert "SSE4.2 + POPCNT: " in output
     if os.name == "nt":
         assert "Visual C++ runtime (msvcp140.dll): system 14." in output

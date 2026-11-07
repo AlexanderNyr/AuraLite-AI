@@ -394,6 +394,10 @@ def test_pretrain_params():
         pretrain_params(TrainSettings(preset="9t"), "text")
     with pytest.raises(SettingsError, match="tokenizer"):
         pretrain_params(TrainSettings(tokenizer="words"), "text")
+    # 2.20: a copy every N epochs; where it goes is the run's (its folder in the library)
+    params = pretrain_params(TrainSettings(autosave_every=2), "text")
+    assert params["autosave_every"] == 2 and "autosave_path" not in params
+    assert "autosave_every" not in pretrain_params(TrainSettings(), "text")
 
 
 # ----------------------------------------------------------------------
@@ -993,3 +997,142 @@ def test_self_test_explains_a_qt_that_does_not_load(tmp_path):
 
 def test_reference_size_is_a_thousand_dialogs():
     assert REFERENCE_TOKENS == 150_000
+
+
+# ----------------------------------------------------------------------
+#  The library: models and datasets on the disk (2.20)
+# ----------------------------------------------------------------------
+def _shelf(home, tmp_path):
+    """A download (and a tokenizer-only folder and an unfinished download), two
+    runs, remembered files and a prepared dataset (finished and not)."""
+    from auralite import runs as runlib
+    from auralite.studio import library
+    for name, files, complete in (("HuggingFaceTB__SmolLM2-135M-Instruct/main",
+                                   {"config.json": b"{}", "model.safetensors": b"w" * 5000},
+                                   True),
+                                  ("Qwen__Qwen2.5-3B-Instruct/main",
+                                   {"config.json": b"{}",
+                                    "model-00001-of-00002.safetensors.part": b"p" * 300},
+                                   False),
+                                  ("HuggingFaceTB__SmolLM2-360M/main",
+                                   {"tokenizer.json": b"{}"}, True)):
+        folder = home / "hf" / name
+        folder.mkdir(parents=True)
+        for file, data in files.items():
+            (folder / file).write_bytes(data)
+        if complete:
+            (folder / ".auralite-complete.json").write_text("{}", encoding="utf-8")
+    chats = tmp_path / "chats.jsonl"
+    chats.write_text("{}\n", encoding="utf-8")
+    done = runlib.RunRecorder(kind="finetune", data={"paths": [str(chats)], "kind": "dialogs",
+                                                     "records": 1})
+    done.model_path.write_bytes(b"m" * 3000)
+    done.record["result"] = runlib.MODEL_FILE
+    done.finish({"stop_reason": "finished", "best_val_loss": 1.25})
+    runlib.RunRecorder(kind="train", data={"paths": [str(chats)]}).fail("broken")
+    saved = tmp_path / "mine.pt"
+    saved.write_bytes(b"s" * 100)
+    library.remember_model(saved, "saved")
+    adapter = tmp_path / "adapter.pt"
+    adapter.write_bytes(b"a" * 10)
+    library.remember_model(adapter, "adapter")
+    gguf = tmp_path / "chat.gguf"
+    gguf.write_bytes(b"g" * 20)
+    library.remember_model(gguf, "export", note="SmolLM2 (fine-tuned)")
+    library.remember_model(tmp_path / "gone.pt", "saved")
+    report = DataReport(paths=[str(chats)], kind="dialogs", records=1, tokens=12, bytes=3)
+    library.remember_dataset(chats, report)
+    texts = tmp_path / "notes.txt"
+    texts.write_text("hello", encoding="utf-8")
+    library.remember_dataset(texts, DataReport(paths=[str(texts)], kind="text", records=1))
+    for name, complete in (("fineweb-1", True), ("wiki-2", False)):
+        folder = home / "datasets" / name
+        folder.mkdir(parents=True)
+        (folder / "auralite_dataset.json").write_text(json.dumps({
+            "complete": complete, "stats": {"tokens": 1000},
+            "sources": [{"spec": f"hf:Org/{name}"}],
+            "tokenizer": {"description": "BPE, 512 tokens"}}), encoding="utf-8")
+        (folder / "train_00000.bin").write_bytes(b"t" * 2000)
+    return done.run, saved, adapter, gguf, chats, texts
+
+
+def test_the_library_lists_models_and_datasets(tmp_path, monkeypatch):
+    from auralite.studio import library
+    home = tmp_path / "home"
+    monkeypatch.setenv("AURALITE_HOME", str(home))
+    run, saved, adapter, gguf, chats, texts = _shelf(home, tmp_path)
+    models = {m.name: m for m in library.list_models(recent=[str(saved), "hf:Org/Model"])}
+    assert set(models) == {"HuggingFaceTB/SmolLM2-135M-Instruct", "Qwen/Qwen2.5-3B-Instruct",
+                           run.name, "mine.pt", "adapter.pt", "chat.gguf", "gone.pt"}
+    smol = models["HuggingFaceTB/SmolLM2-135M-Instruct"]
+    assert smol.kind == "download" and smol.owned and smol.bytes >= 5000
+    assert smol.extra["spec"] == "hf:HuggingFaceTB/SmolLM2-135M-Instruct"
+    assert smol.detail == "SmolLM2 135M Instruct"
+    qwen = models["Qwen/Qwen2.5-3B-Instruct"]
+    assert "not for commercial use" in qwen.detail and "not finished" in qwen.detail
+    result = models[run.name]
+    assert result.kind == "result" and result.run_id == run.id and result.owned
+    assert "best validation loss 1.2500" in result.detail
+    assert models["mine.pt"].kind == "saved" and models["mine.pt"].remembered
+    assert models["adapter.pt"].kind_label == "LoRA adapters"
+    assert models["chat.gguf"].detail == "GGUF file - SmolLM2 (fine-tuned)"
+    assert not models["gone.pt"].exists and models["gone.pt"].detail == "not found any more"
+    data = {d.name: d for d in library.list_datasets()}
+    assert set(data) == {"chats.jsonl", "notes.txt", "fineweb-1", "wiki-2"}
+    assert data["chats.jsonl"].detail == "Dialogs, 1 dialogs, about 12 tokens"
+    assert len(data["chats.jsonl"].extra["runs"]) == 2 and data["chats.jsonl"].remembered
+    assert data["notes.txt"].detail == "Text, 1 documents"
+    assert data["fineweb-1"].kind == "shards" and data["fineweb-1"].owned
+    assert data["fineweb-1"].detail == "1,000 tokens, BPE, 512 tokens"
+    assert "not finished" in data["wiki-2"].detail
+    disk = library.disk_summary()
+    assert disk["downloads"] >= 5300 and disk["datasets"] >= 4000 and disk["runs"] >= 3000
+    assert disk["total"] == disk["downloads"] + disk["runs"] + disk["datasets"]
+    assert disk["free"] > 0
+    assert library.format_size(1536) == "1.5 KB" and library.format_size(5 << 30) == "5.0 GB"
+    assert library.format_size(150 << 20) == "150 MB" and library.format_size(12) == "12 B"
+
+
+def test_the_library_deletes_and_forgets(tmp_path, monkeypatch):
+    from auralite import runs as runlib
+    from auralite.studio import library
+    home = tmp_path / "home"
+    monkeypatch.setenv("AURALITE_HOME", str(home))
+    run, saved, _adapter, _gguf, chats, _texts = _shelf(home, tmp_path)
+    models = {m.name: m for m in library.list_models()}
+    assert library.delete_item(models["HuggingFaceTB/SmolLM2-135M-Instruct"]) >= 5000
+    assert not (home / "hf" / "HuggingFaceTB__SmolLM2-135M-Instruct").exists()
+    assert library.delete_item(models[run.name]) == 3000          # the run's files
+    kept = runlib.find_run(run.id)
+    assert kept.result_path is None and run.folder.exists() and kept.record["files_deleted"]
+    assert library.delete_item(models["mine.pt"]) == 100 and not saved.exists()
+    assert "mine.pt" not in {m.name for m in library.list_models()}
+    data = {d.name: d for d in library.list_datasets()}
+    assert library.delete_item(data["fineweb-1"]) > 2000
+    assert not (home / "datasets" / "fineweb-1").exists()
+    assert library.forget(chats) and not library.forget(chats)
+    assert chats.exists()                                         # the file stays
+    outside = library.LibraryItem(kind="download", name="x", path=str(tmp_path))
+    with pytest.raises(ValueError, match="is not under"):
+        library.delete_item(outside)
+    with pytest.raises(ValueError, match="cannot remember"):
+        library.remember_model(saved, "download")
+
+
+def test_the_library_index_is_forgiving_and_bounded(tmp_path, monkeypatch):
+    from auralite.studio import library
+    home = tmp_path / "home"
+    monkeypatch.setenv("AURALITE_HOME", str(home))
+    home.mkdir()
+    (home / "library.json").write_text("{not json", encoding="utf-8")
+    assert library.load_index() == {"models": [], "datasets": []}
+    (home / "library.json").write_text('{"models": [1, {"kind": "saved"}], "datasets": 3}',
+                                       encoding="utf-8")
+    assert library.load_index() == {"models": [], "datasets": []}
+    monkeypatch.setattr(library, "MAX_ITEMS", 3)
+    for i in range(5):
+        library.remember_model(tmp_path / f"m{i}.pt")
+    library.remember_model(tmp_path / "m2.pt")                    # to the top, once
+    paths = [os.path.basename(e["path"]) for e in library.load_index()["models"]]
+    assert paths == ["m2.pt", "m4.pt", "m3.pt"]
+    assert library.list_models() and library.list_datasets() == []

@@ -1,4 +1,5 @@
-"""The Studio's own widgets: the loss chart, the run panel and the data picker (2.19)."""
+"""The Studio's own widgets: the loss chart, the run panel and the data picker (2.19);
+the curves of runs in the library (2.20)."""
 from __future__ import annotations
 
 import os
@@ -15,6 +16,8 @@ from .common import Job, ask_dir, ask_open, hint, primary
 from .theme import ACCENT
 
 _VAL_COLOR = "#e67e22"
+#: The colors of the runs a comparison draws (2.20).
+SERIES_COLORS = (ACCENT, "#e67e22", "#1e8e3e", "#9334e6", "#d93025", "#00897b")
 
 
 class LossChart(QWidget):
@@ -98,6 +101,120 @@ class LossChart(QWidget):
             painter.drawLine(QPointF(x, area.top() + 12), QPointF(x + 14, area.top() + 12))
             painter.setPen(QPen(text, 1))
             painter.drawText(QPointF(x + 18, area.top() + 16), label)
+        painter.end()
+
+
+class CurveChart(QWidget):
+    """Loss curves of a run, or of several runs to compare them (2.20).
+
+    One run: the training loss (blue line) and the validation loss (orange
+    dots). Several: a color each, the training loss as a line and the
+    validation loss as dots on a dashed line. The x axis is the step.
+    """
+
+    def __init__(self, parent: QWidget | None = None,
+                 empty_text: str = "This run has no curve yet"):
+        super().__init__(parent)
+        self.series: list[tuple[str, list[tuple[float, float]], list[tuple[float, float]]]] = []
+        self.empty_text = empty_text
+        self.setMinimumHeight(170)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+    def set_series(self, series: list[tuple[str, list[tuple[float, float]],
+                                            list[tuple[float, float]]]]) -> None:
+        """``(name, training points, validation points)`` per run."""
+        self.series = [(str(name), list(train), list(val)) for name, train, val in series]
+        self.update()
+
+    def colors(self) -> list[tuple[str, str]]:
+        """``(training color, validation color)`` per series."""
+        if len(self.series) == 1:
+            return [(ACCENT, _VAL_COLOR)]
+        picked = [SERIES_COLORS[i % len(SERIES_COLORS)] for i in range(len(self.series))]
+        return [(color, color) for color in picked]
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        text = palette.color(palette.ColorRole.WindowText)
+        grid = QColor(text)
+        grid.setAlpha(40)
+        area = QRectF(self.rect()).adjusted(56, 12, -12, -26)
+        painter.setPen(QPen(grid, 1))
+        painter.drawRect(area)
+        points = [p for _name, train, val in self.series for p in train + val]
+        painter.setPen(QPen(text, 1))
+        if not points:
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, self.empty_text)
+            painter.end()
+            return
+        low = min(y for _x, y in points)
+        high = max(y for _x, y in points)
+        if high - low < 1e-9:
+            low, high = low - 0.5, high + 0.5
+        pad = 0.05 * (high - low)
+        low, high = low - pad, high + pad
+        right = max(x for x, _y in points) or 1.0
+
+        def point(x: float, y: float) -> QPointF:
+            px = area.left() + area.width() * max(0.0, min(right, x)) / right
+            py = area.bottom() - area.height() * (y - low) / (high - low)
+            return QPointF(px, py)
+
+        for i in range(5):
+            y = low + (high - low) * i / 4
+            p = point(0, y)
+            painter.setPen(QPen(grid, 1))
+            painter.drawLine(QPointF(area.left(), p.y()), QPointF(area.right(), p.y()))
+            painter.setPen(QPen(text, 1))
+            painter.drawText(QRectF(0, p.y() - 8, 52, 16),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{y:.3g}")
+        for x in (0.0, right / 2, right):
+            p = point(x, low)
+            painter.drawText(QRectF(p.x() - 40, area.bottom() + 3, 80, 16),
+                             Qt.AlignmentFlag.AlignCenter, f"{x:,.0f}")
+        painter.drawText(QRectF(area.left(), area.bottom() + 3, area.width() / 2 - 44, 16),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "   step")
+        for (_name, train, val), (train_color, val_color) in zip(self.series, self.colors(),
+                                                                 strict=True):
+            if train:
+                path = QPainterPath(point(*train[0]))
+                for x, y in train[1:]:
+                    path.lineTo(point(x, y))
+                painter.setPen(QPen(QColor(train_color), 2))
+                painter.drawPath(path)
+            if val:
+                pen = QPen(QColor(val_color), 1.5)
+                if len(self.series) > 1:
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                    path = QPainterPath(point(*val[0]))
+                    for x, y in val[1:]:
+                        path.lineTo(point(x, y))
+                    painter.setPen(pen)
+                    painter.drawPath(path)
+                painter.setPen(QPen(QColor(val_color), 1))
+                painter.setBrush(QColor(val_color))
+                for x, y in val:
+                    painter.drawEllipse(point(x, y), 3, 3)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+        if len(self.series) == 1:
+            legend = [("training", ACCENT)] + ([("validation", _VAL_COLOR)]
+                                               if self.series[0][2] else [])
+        else:
+            legend = [(name if len(name) <= 28 else name[:26] + "...", color)
+                      for (name, _t, _v), (color, _c) in zip(self.series, self.colors(),
+                                                             strict=True)]
+        y = area.top() + 14
+        for label, color in legend:
+            width = painter.fontMetrics().horizontalAdvance(label) + 24
+            x = area.right() - width - 6
+            painter.setPen(QPen(QColor(color), 3))
+            painter.drawLine(QPointF(x, y - 4), QPointF(x + 14, y - 4))
+            painter.setPen(QPen(text, 1))
+            painter.drawText(QPointF(x + 18, y), label)
+            y += 16
         painter.end()
 
 

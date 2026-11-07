@@ -2097,6 +2097,45 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         _compute.release_caller_pool()
         return dict(result.info)
 
+    def unload_model(self) -> None:
+        """Release the model in memory and its training state (2.20).
+
+        `load_model`, `import_hf_model` and the training of a new model build
+        the new model before they drop the old one; unloading first, once the
+        old model is no longer wanted, needs the memory of one model instead of
+        two (AuraLite Studio does it before it loads, imports or trains anew).
+        """
+        if self._compiled_inference_model is not None:
+            self.disable_inference_compile()
+        self.model = None
+        self.backend = "torch"
+        self.gguf_path = None
+        self.hf_path = None
+        self.hf_proxy = None
+        self.hf_source = None
+        self.tokenizer = None
+        self.vocab_size = 0
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+        self._ddp_model = None
+        self._resume_optimizer_state = None
+        self._resume_scheduler_state = None
+        self._resume_scaler_state = None
+        self._resume_optimizer_file = None
+        self._resume_run_state = self._run_state = None
+        import gc
+        import sys
+        gc.collect()
+        if sys.platform.startswith("linux"):
+            # glibc keeps freed memory in the process; the next run's memory
+            # plan reads what is free on the computer, so give it back
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
+
     def quantize_nf4(self, *, block_size: int = 64, double_quant: bool = True) -> int:
         """Store the attention and feed-forward weights in 4 bits (NF4) - QLoRA's base.
 

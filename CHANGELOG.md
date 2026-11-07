@@ -1,3 +1,127 @@
+# 📦 v2.20.0 — AuraLite Studio, part 2: a library of runs, models and datasets; any run continues where it stood
+
+Every training run is kept now — of the Studio's Train and Fine-tune tabs and of
+`auralite train` — with its curve, settings, results and files, in
+`~/.auralite/runs`. The Studio's new **Library** tab shows them: continue a
+stopped, failed or interrupted run exactly where it stood, compare runs (their
+curves and what differs), evaluate a chat model on the dialogs its run held
+out, train a result further, repeat a run, keep notes; and the models and
+datasets on the disk with the room they take. While a run trains the Studio
+saves its checkpoint every 10 minutes, so a crash or a power cut costs at most
+the last 10 minutes, and the Start tab offers to continue it. In a terminal the
+same library is `auralite runs` (`list`, `show`, `compare`, `continue`,
+`delete`). The engine underneath: `continue_run` now continues dialog runs too
+— LoRA and QLoRA included —, ending with the same weights as a run that never
+stopped. Details: [docs/studio.md § The
+Library](docs/studio.md#the-library-runs-models-datasets-220) and
+[docs/training.md § 22](docs/training.md#22-the-run-library-and-continuing-any-run-220).
+
+**What changed for existing users**
+
+| | 2.20.0 | 2.19.1 |
+|---|---|---|
+| a run of the Studio | recorded in the Library with its curve, settings, results and files; its model saved in the run's folder (`model.pt`), so closing the Studio loses nothing | the model only in memory until *Save* |
+| a stopped or interrupted run | continues where it stood (*Continue* in the Library, the Start tab after a crash, `auralite runs continue`), from a checkpoint saved every 10 minutes and at the stop | starts over (texts and shards could continue from the command line only) |
+| a run of `auralite train` | also recorded (`auralite runs`); `--no-record` or `AURALITE_NO_RUNS=1` keeps it out, `--run-name` names it; its files stay where `--model` / `--autosave` put them | not recorded |
+| `continue_run` of a dialog run (API, `--continue-run`) | continues exactly: every weight, LoRA, QLoRA, packed dialogs, 8-bit AdamW; other dialogs are refused | refused: *a dialog run starts anew* |
+| training a LoRA checkpoint on, when only its adapters trained | the Adam moments carry over | lost, with *could not restore optimizer state* |
+| loading, importing or training a new model in the Studio | the old model is let go first (`unload_model`): the memory of one model | both models in memory for a moment — a second QLoRA run in a row could be killed on a small computer |
+| the Studio's tabs | Start, Train, Fine-tune, Chat, Export, **Library**, Log | no Library |
+| "Save a copy every N epochs" (Train tab) | into the run's checkpoint | one shared file, `~/.auralite/autosave/studio_new_model.pt` |
+
+Nothing else changes: models, checkpoints and the other commands work as in
+2.19.1; a checkpoint of 2.19 loads and trains as before (a dialog run saved by
+2.19 cannot be continued with `continue_run`, as before: it kept no identity of
+its dialogs).
+
+**The run library** (`auralite/runs.py`, new)
+
+- A run is a folder `~/.auralite/runs/<id>/` (`20261105-143012-finetune`):
+  `run.json` (kind, method, base model, data, the engine's parameters, the
+  Studio's settings, the computer, sessions, the engine's summary, files, notes,
+  an evaluation), `metrics.jsonl` (a line per progress report, at most one
+  every 2 s, and every validation and epoch end) and, for the Studio's runs,
+  `checkpoint.pt` (where the run stands) and `model.pt` (its result).
+- `RunRecorder`: `callback(inner)` records a run's progress and calls the
+  progress callback it wraps (4-argument callbacks at epoch ends, as the engine
+  would); `checkpoint_params(params)` saves the checkpoint every 10 minutes into
+  the run's folder; `finish(summary, engine)` keeps the model — a stopped run
+  where it stands (it continues from there), a finished one as `model.pt`
+  without the optimizer state (its checkpoint is then deleted); `fail(error)`;
+  `resume(run)` records a continued run as a new session of the same run;
+  `save_and_finish` keeps the model where the run keeps it (its folder, or the
+  `--model` of `auralite train`). Recording never stops a run: its own errors
+  are logged, and a model that cannot be saved is noted in the record.
+- Statuses: running, finished, stopped, failed, and *interrupted* — a running
+  run whose process is gone (its heartbeat is written every 30 s; no
+  heartbeat for 6 hours counts too).
+- `Run.curve()`: the mean loss of the batches between two reports (the engine
+  reports the mean of the epoch so far), and for a continued run the steps as
+  they went in the end. `Run.continue_state()` says whether and why not.
+- `list_runs`, `find_run` (an id, the start of it, or `last`),
+  `compare_runs`, `describe_run`, `update_run` (name, notes, evaluation),
+  `delete_run` (or only its model files; never files outside its folder),
+  `continue_point`, `load_run_data` (the data read again as it was read),
+  `held_out_dialogs`, `interrupted_runs`.
+
+**`auralite runs`** (`list` [`--all`, `--json`], `show RUN` [`--json`],
+`compare RUN RUN…`, `continue RUN`, `delete RUN` [`--files`, `--yes`]);
+`auralite train` prints the id of the run it recorded, and after a stop also
+`auralite runs continue ID`.
+
+**AuraLite Studio: the Library tab** (`auralite/studio/qt/tab_library.py`,
+`auralite/studio/library.py`)
+
+- **Runs**: a table (name, status, kind, best validation loss, time, start)
+  with a search; the selected run's facts, curve, name and notes; *Continue*
+  (in the run's own tab, where its progress shows), *Open the result* (into
+  Chat), *Evaluate* (up to 30 held-out dialogs, replies of at most 48 tokens:
+  replies that stop by themselves, exact replies, the reply loss), *Train more*
+  (the Fine-tune tab with the result as the base), *Repeat* (the run's tab with
+  its settings, base and data), *Show files*, *Delete* (its model files, or the
+  run); *Compare* two runs or more: their curves on one chart and their settings
+  and results side by side, what differs in bold.
+- **Models**: downloads, run results, saved models, LoRA adapters and exports,
+  with their size — *Chat with it*, *Fine-tune it*, *Export it*, *Show in
+  folder*, *Remove from the list*, *Delete*. **Datasets**: the data you checked
+  or trained on (with how many runs used it) and prepared datasets. The top line:
+  the room of AuraLite's own files and what is free on the disk.
+- The Train and Fine-tune tabs record every run (once its base is loaded and its
+  data read), save its checkpoint every 10 minutes and keep its model; their
+  result line says *Saved in the library*. The Start tab offers to continue an
+  interrupted run (*Continue it*, *Show in the library*, *Dismiss*). *Tools →
+  Library* (Ctrl+L). Saved models, adapters, exports and checked data are
+  remembered in `~/.auralite/library.json`.
+
+**Engine**
+
+- `continue_run` of dialog runs: the checkpoint keeps the identity of the
+  dialogs (their number and the SHA-256 of their text in the run's template),
+  checked before the model changes; the run keeps its optimizer and schedule;
+  a dialog run that ends is marked finished like any other; `lora_embeddings`
+  is kept in the run's parameters (its default depends on whether the base is
+  4-bit). A run stopped at step 4 or 5 and continued ends with the same
+  weights, bit for bit, as the uninterrupted run — every weight, LoRA, QLoRA,
+  packed dialogs, an imported 4-bit model with 8-bit AdamW, from the model
+  saved after the stop and from a timed autosave (tests); a real run of the
+  Studio (SmolLM2-135M-Instruct, QLoRA on 2,000 dialogs, stopped at step 11 of
+  24 and continued from the Library) ended with the same 1,323 tensors as the
+  run that never stopped.
+- `AuraLiteEngine.unload_model()`: releases the model and its training state.
+
+**Fixed**
+
+- Training a LoRA checkpoint on when only its adapters had trained (an imported
+  model that knew the chat template's tokens, or text): its single optimizer
+  group was taken for 2.7's group of every parameter, and the Adam moments were
+  dropped.
+- The Studio held two models in memory while it loaded, imported or trained a
+  new one.
+
+**Tests**: `tests/test_runs_v220.py` (the engine's continuation, the recorder,
+the statuses, the commands), the Library in `tests/test_studio_qt.py`, the models
+and datasets in `tests/test_studio_core.py`.
+
 # 📦 v2.19.1 — AuraLite Studio never fails to start in silence: errors in a message box and a log, the C++ runtime PyTorch needs on Windows, `auralite doctor --studio`
 
 On Windows `auralite-studio` runs under pythonw, which has no console and no

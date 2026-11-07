@@ -21,7 +21,9 @@ measures a chat model (§ 16); a teacher model writes dialogs to fine-tune on
 or SimPO (§ 18). Since 2.18 data of any size trains from token shards on disk
 (Hugging Face datasets streamed too), big models get presets and a memory
 plan, the loss of a big vocabulary runs in chunks, and a stopped run
-continues exactly where it stopped (§ 20).
+continues exactly where it stopped (§ 20). Since 2.20 every run is kept in a
+run library (`auralite runs`, AuraLite Studio's Library), and dialog runs —
+LoRA and QLoRA included — continue exactly too (§ 22).
 
 ## 1. An epoch is one pass over the text
 
@@ -1936,3 +1938,150 @@ pytest tests/test_hf_v2181.py tests/test_hf_native_real.py
 "lora_lr": 0.001, "epochs": 1, "val_split": 0.05, "memory_plan": "auto",
 "seed": 1}`; `arith_data.py` writes "What is 13 plus 39?" → "13 plus 39 is
 52." dialogs.)
+
+## 22. The run library and continuing any run (2.20)
+
+### 22.1 Every run is recorded
+
+`auralite train` and AuraLite Studio keep every run in
+`~/.auralite/runs/<id>/` (`AURALITE_HOME`; the id is the start time and the
+kind, `20261105-143012-finetune`):
+
+* `run.json` — what the run is: its kind (`train`: a new model, `finetune`:
+  a model trained further, `preference`: DPO / SimPO), method, base model,
+  data (paths, kind, records), the engine's parameters, the Studio's settings,
+  the computer, its sessions, the engine's summary, its files, notes and an
+  evaluation;
+* `metrics.jsonl` — its curve: a line per progress report, at most one every
+  2 seconds, and every validation and epoch end. The engine reports the mean
+  loss of the epoch so far; the curve (`Run.curve()`) is the mean of the
+  batches between two reports, so it does not flatten as an epoch goes on;
+* the Studio's runs also keep their model files there: `checkpoint.pt`, where
+  the run stands (saved every 10 minutes and when it is stopped), and
+  `model.pt`, the model it ended with. A run of `auralite train` keeps its
+  files where the command put them (`--model`, `--autosave`).
+
+The status says how a run ended: *finished*, *stopped* (the Studio's *Stop
+now*, the second Ctrl+C), *failed* (an error; its message is kept) or *interrupted* — the
+process ended without saying: a crash, a power cut, a closed window. A running
+run writes a heartbeat every 30 seconds; it reads back as interrupted when its
+process is gone or nothing was heard of it for 6 hours. `--no-record` (or
+`AURALITE_NO_RUNS=1`) keeps a run of `auralite train` out of the library;
+`--run-name` names it.
+
+From Python:
+
+```python
+from auralite import runs
+recorder = runs.RunRecorder(kind="finetune", method="lora",
+                            data={"paths": ["chats.jsonl"], "kind": "dialogs"}, params=params)
+summary = engine.train(data, recorder.checkpoint_params(params),   # a checkpoint every 10 min
+                       progress_callback=recorder.callback(my_callback))
+recorder.finish(summary, engine)          # model.pt, or where it stands after a stop
+runs.list_runs()[0].curve()               # ([(step, loss), ...], [(step, val_loss), ...])
+```
+
+### 22.2 `auralite runs`
+
+```bash
+auralite runs                         # the newest 30 runs (--all, --json)
+auralite runs show last               # one run: status, settings, losses, files, how to continue
+auralite runs compare 20261105-1430 20261105-1612   # side by side; * marks what differs
+auralite runs continue last           # a stopped, failed or interrupted run, where it stood
+auralite runs delete ID --files       # only its model files: the record and curve stay (--yes)
+```
+
+A run is named by its id, the start of it, or `last`. `continue` loads the
+run's checkpoint, reads its data again and trains on with `continue_run`; the
+run gets a new session and its model is saved where the run keeps it.
+`delete` never deletes files a run keeps outside its folder.
+
+```text
+$ auralite runs
+ID                           STATUS       KIND         BEST VAL      TIME  NAME
+20261105-131839-finetune     finished     Fine-tune      0.1186     1 min  Fine-tune SmolLM2-135M-Instruct on train.jsonl
+20261105-131730-finetune     finished     Fine-tune      0.1186     1 min  Fine-tune SmolLM2-135M-Instruct on train.jsonl
+2 runs, 362.5 MB in /home/me/.auralite/runs
+
+$ auralite runs show last
+Fine-tune SmolLM2-135M-Instruct on train.jsonl  [20261105-131839-finetune]
+  Status:      finished
+  Started:     2026-11-05 13:18, 1 min of training in 2 sessions (AuraLite Studio)
+  Base model:  SmolLM2-135M-Instruct (hf:HuggingFaceTB/SmolLM2-135M-Instruct)
+  Method:      QLoRA (a 4-bit base with LoRA adapters)
+  Data:        train.jsonl (dialogs, 2,000 dialogs)
+  Settings:    epochs 1, context 128, batch 2, LoRA rank 16, learning rate 0.001 (LoRA), optimizer adamw8bit
+  Loss:        training 0.2181, best validation 0.1186 (0.0730 bits/byte)
+  Trained:     24 steps, 6,144 tokens, 91 tokens/s
+  Files:       result: model.pt (181.3 MB)
+  Result:      /home/me/.auralite/runs/20261105-131839-finetune/model.pt
+  Folder:      /home/me/.auralite/runs/20261105-131839-finetune
+```
+
+(These are the two runs of § 22.3: the second was stopped at step 11 and
+continued, and ended with the same weights.)
+
+### 22.3 Dialog runs continue exactly
+
+2.18 continued runs on texts and token shards; a dialog run started anew. Now
+dialog runs continue too — every weight, LoRA adapters, QLoRA (a 4-bit base,
+native or imported from Hugging Face), packed dialogs, 8-bit AdamW — from the
+model saved after a stop or from any autosave. The checkpoint keeps the
+identity of the dialogs (their number and the SHA-256 of their text in the
+run's template, the training dialogs first), so other dialogs or another split
+are refused before anything of the model changes; so are a text given to a
+dialog run and a dialog checkpoint of 2.19, which kept no identity.
+
+A run stopped at step 4 or 5 and continued ends with **the same weights, to
+the last bit**, as the run that never stopped, in every variant the tests run
+(12 to 32 steps, gradient accumulation, dropout, periodic validation): every
+weight, LoRA, QLoRA of a native model, packed dialogs with only the new token
+rows training, and an imported model in 4 bits with LoRA and 8-bit AdamW,
+from the model saved after the stop and from a timed autosave. The real run of
+the Studio ([docs/studio.md](studio.md#the-library-runs-models-datasets-220)):
+SmolLM2-135M-Instruct, QLoRA on 2,000 dialogs, stopped at step 11 of 24 and
+continued — the same 1,323 tensors, to the last bit, as the run that never
+stopped (both from the same random start: the Studio sets no seed, so two of
+its runs differ otherwise).
+
+With the memory plan on (the default), how a run splits its batch into
+micro-batches depends on the memory free when it starts — in one Studio
+session a second run saw less free memory than the first and chose smaller
+ones. A continued run always keeps its own split.
+
+Two details make it exact. A dialog run that ends is now marked finished in
+its checkpoint like any other (2.19 left the mark off, harmless while dialog
+runs could not continue). And `lora_embeddings`, whose default depends on the
+model (`"new"` for a 4-bit base), is kept in the run's parameters: a QLoRA run
+of a native model quantizes its base after choosing it, while its continuation
+starts from a base that is 4-bit already.
+
+### 22.4 Fixed on the way
+
+* **Training a LoRA checkpoint on** (`continue_training`, e.g. `auralite
+  train --resume lora.pt --lora 16` on text) lost the Adam moments when only
+  the adapters had trained — an imported model that knew the chat template's
+  tokens, or a text run: the optimizer's single parameter group was taken for
+  the layout of 2.7, a group of every parameter; the state did not fit ("could
+  not restore optimizer state") and the moments started over. The moments now
+  carry over (the same check also made a continued QLoRA run inexact).
+* **Two models in memory**: loading, importing or training a new model built
+  it before the old one was let go, so for a moment the memory held both — a
+  second QLoRA run of SmolLM2-135M in a row was killed on the 2 GB test
+  machine as it imported its base. `AuraLiteEngine.unload_model()` releases
+  the model and its optimizer; the Studio calls it once you agreed to replace
+  the model.
+* The Studio's Train tab wrote its "Save a copy every N epochs" copies of every
+  run to one file (`~/.auralite/autosave/studio_new_model.pt`); they go to the
+  run's own checkpoint now.
+
+### 22.5 Reproduce
+
+```bash
+pytest tests/test_runs_v220.py                    # the engine, the library, the commands
+pytest tests/test_studio_qt.py -k "library or recorded"   # the Studio's Library (PySide6)
+auralite train --data train.jsonl --resume hf:HuggingFaceTB/SmolLM2-135M-Instruct \
+  --quantize nf4 --lora 16 --pack-dialogs --params p.json --model qlora.pt
+#   Ctrl+C twice after a few steps, then:
+auralite runs continue last
+```
