@@ -1528,6 +1528,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         import uvicorn
     except ImportError:
+        from auralite import bundle
+        if bundle.packaged():                 # 2.21: the app leaves the server out
+            print("error: the server needs FastAPI and uvicorn", file=sys.stderr)
+            for line in bundle.missing_part("uvicorn", "serve"):
+                print(f"  {line}", file=sys.stderr)
+            return 2
         print("error: install serving dependencies: pip install fastapi uvicorn pydantic",
               file=sys.stderr)
         return 2
@@ -2381,6 +2387,9 @@ def build_parser() -> argparse.ArgumentParser:
                                       "pip install \"auralite-ai[studio]\"; "
                                       "auralite doctor --studio checks it)")
     _add_common_flags(p, suppress_defaults=True)
+    p.add_argument("--self-test", action="store_true",
+                   help="build the window without showing it and print what was found, "
+                        "like python -m auralite.studio --self-test (2.21)")
     p.set_defaults(func=cmd_studio)
     return parser
 
@@ -2423,6 +2432,16 @@ def _optional_packages() -> dict[str, str]:
     return found
 
 
+def _studio_check_command() -> list[str]:
+    """``python -m auralite.studio --self-test``; 2.21: in the app that needs no Python, its
+    console program (``auralite.exe studio --self-test``) - the Studio's own program has no
+    console, and a pipe reads nothing from it."""
+    from auralite import bundle
+    if bundle.packaged():
+        return bundle.cli_command("studio", "--self-test")
+    return [sys.executable, "-m", "auralite.studio", "--self-test"]
+
+
 def _studio_check(timeout: float = 300.0) -> tuple[int | None, str]:
     """2.19.1: ``python -m auralite.studio --self-test`` in a fresh process: its exit code
     (None: it did not finish) and what it printed. A crash inside Qt or PyTorch ends that
@@ -2430,7 +2449,7 @@ def _studio_check(timeout: float = 300.0) -> tuple[int | None, str]:
     import subprocess
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
-        proc = subprocess.run([sys.executable, "-m", "auralite.studio", "--self-test"],
+        proc = subprocess.run(_studio_check_command(),
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, timeout=timeout, env=env, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -2540,13 +2559,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return status
     print(f"AuraLite {__version__} - Python {platform.python_version()}, "
           f"PyTorch {torch.__version__}")
+    from auralite import bundle
+    if bundle.packaged():                         # 2.21: which app, and where
+        print(f"App: {bundle.describe()}")
     for line in hw.summary_lines():
         print(line)
     print("Optional: " + ", ".join(f"{name} {version or '-'}"
                                    for name, version in packages.items()))
     if "check" in studio:
         print("\nAuraLite Studio, checked in a fresh process "
-              "(python -m auralite.studio --self-test):")
+              f"({'auralite studio' if bundle.packaged() else 'python -m auralite.studio'}"
+              " --self-test):")
         for line in studio["check"]["output"].rstrip().splitlines():
             print("    " + line)
         print(f"  => {studio['check']['result']}")
@@ -2577,7 +2600,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("\nTo run it:")
         for command in commands:
             print("  " + command)
-    print("\nOr in the desktop app: auralite studio")
+    studio_program = bundle.studio_program()
+    print("\nOr in the desktop app: "
+          + (f"{studio_program.name} in {studio_program.parent}" if studio_program
+             else "auralite studio"))
     return status
 
 
@@ -2754,14 +2780,27 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 def cmd_studio(args: argparse.Namespace) -> int:
     """2.19: AuraLite Studio, the desktop app on Qt 6."""
+    from auralite.studio.app import SELF_TEST
     from auralite.studio.app import main as studio_main
-    return studio_main([])
+    return studio_main([SELF_TEST] if getattr(args, "self_test", False) else [])
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _configure_logging(args)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ModuleNotFoundError as err:
+        from auralite import bundle
+        if not bundle.packaged() or not err.name:
+            raise
+        # 2.21: the app that needs no Python leaves some optional parts out - say which,
+        # and where they come with, instead of a traceback
+        top = err.name.split(".")[0]
+        print(f"error: {err}", file=sys.stderr)
+        for line in bundle.missing_part(top, bundle.EXTRAS.get(top, "")):
+            print(f"  {line}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -14,11 +14,16 @@ htmlcov/
 benchmarks/latest_generation.json
 benchmarks/profiles/
 
-# Build output: `python -m build`, build_exe.bat (PyInstaller and its .spec)
+# Build output: `python -m build`, PyInstaller (packaging/app/build_app.py, build_exe.bat)
 build/
 dist/
-*.spec
+# A .spec PyInstaller writes when it runs without one; the app's own is tracked
+# (packaging/app/auralite_app.spec), so only the root's are ignored.
+/*.spec
 
 # Reports the CI steps write when run locally
 coverage.json
 pyright.json
+
+# 2.21: the app build environment (build_exe.bat)
+.venv-app/

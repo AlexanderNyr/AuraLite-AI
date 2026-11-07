@@ -439,3 +439,16 @@ QLoRA too. At most the last 10 minutes are trained again. In a terminal:
 saved after Ctrl+C). The data must be the same file: the run checks it. See
 [studio.md](studio.md#the-library-runs-models-datasets-220) and [training.md
 § 22](training.md#22-the-run-library-and-continuing-any-run-220).
+
+## 23. Is there a version that needs no Python?
+
+On Windows, yes (since 2.21): every release has
+`AuraLite-Studio-<version>-windows-x64.zip` with AuraLite Studio, the `auralite`
+command, Python, PyTorch and Qt inside. Unzip it, double-click
+`AuraLite Studio.exe`; `auralite.exe` in the same folder is the command line. Your
+models and runs stay in `%USERPROFILE%\.auralite`, so an update is a new folder and
+nothing to move. It trains on the processor (PyTorch's CUDA build does not fit a
+release) and leaves out the large optional parts — the classic interface,
+transformers, the server, ONNX, Hugging Face datasets; AuraLite installed with
+Python has them. Windows may warn that the app is not signed: *More info* → *Run
+anyway*. See [windows-app.md](windows-app.md).

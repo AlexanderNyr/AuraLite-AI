@@ -1,0 +1,25 @@
+# AuraLite app's build (2.21): exactly what packaging/app/build_app.py freezes and what
+# CI's windows-app job tests. Install into a virtual environment made for the build:
+#
+#     pip install -r packaging/app/requirements.txt
+#     pip install --no-deps .
+#
+# build_app.py refuses to build when what is installed differs from these pins.
+# PyTorch's CPU build comes from PyTorch's own index on every system ("+cpu"): the app
+# is CPU only - a CUDA build is larger than a GitHub release accepts (2 GB per file).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+numpy==2.5.4
+# Qt 6.9.3: the last Qt for processors without SSE4.2 / POPCNT, and the oldest the
+# `studio` extra allows (its Visual C++ runtime, 14.44, is what PyTorch 2.9+ needs).
+PySide6-Essentials==6.9.3
+shiboken6==6.9.3
+# Small optional parts the app includes: Hugging Face export (.safetensors), the fast
+# tokenizer, .zst data, physical cores for the advisor.
+safetensors==0.8.0
+tokenizers==0.23.3
+zstandard==0.25.0
+psutil==7.2.2
+# The freezer.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

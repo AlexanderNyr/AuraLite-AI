@@ -452,6 +452,10 @@ def test_deployment_files_use_the_package_paths():
     assert "from model_engine import" not in ci
     assert " server.openai_server:app" not in ci
     build = (REPO_ROOT / "build_exe.bat").read_text(encoding="utf-8")
-    assert "--collect-submodules auralite" in build
+    # 2.21: build_exe.bat builds the app through packaging/app/, whose spec collects the package
+    spec = (REPO_ROOT / "packaging" / "app" / "auralite_app.spec").read_text(encoding="utf-8")
+    assert "packaging\\app\\build_app.py" in build
+    assert 'collect_submodules("auralite"' in spec
     for old in ("model_engine", "kernels", "--collect-submodules gui", "--collect-submodules server"):
         assert old not in build, old
+        assert old not in spec, old

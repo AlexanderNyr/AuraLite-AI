@@ -3,10 +3,10 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.20.0-orange)
-![Coverage](https://img.shields.io/badge/coverage-86%25-green)
+![Version](https://img.shields.io/badge/version-2.21.0-orange)
+![Coverage](https://img.shields.io/badge/coverage-88%25-green)
 
-[Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
+[Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [Windows app](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
 
 **AuraLite AI** trains, fine-tunes and runs language models on your own computer — from a desktop app, **AuraLite Studio**, or the command line. Fine-tune Qwen, Llama, Mistral or SmolLM2 on your dialogs with QLoRA, even on a 4-core CPU without a GPU; grow a small model of your own from your texts; chat with the result and export it to llama.cpp, Ollama, LM Studio or transformers, or serve it with an OpenAI-compatible API. Everything runs locally in plain **PyTorch**, and every part of the engine is readable code — the Transformer architecture behind models like GPT-4, from tokenizer to sampler, open to look into.
 
@@ -14,8 +14,10 @@
 
 ```bash
 pip install "auralite-ai[studio]"    # AuraLite + PySide6 (Qt 6)
-auralite-studio                      # Start · Train · Fine-tune · Chat · Export · Log
+auralite-studio                      # Start · Train · Fine-tune · Chat · Export · Library · Log
 ```
+
+**On Windows without Python (2.21):** download `AuraLite-Studio-<version>-windows-x64.zip` from the [latest release](https://github.com/AlexanderNyr/AuraLite-AI/releases/latest), unzip it and double-click `AuraLite Studio.exe` — Python, PyTorch and Qt are inside, `auralite.exe` next to it is the command line. Guide: [docs/windows-app.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md).
 
 ![AuraLite Studio: the Fine-tune tab](https://raw.githubusercontent.com/AlexanderNyr/AuraLite-AI/main/docs/images/studio-finetune.png)
 
@@ -25,7 +27,7 @@ Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/do
 
 ```bash
 pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
-# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.20.0'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.21.0'
 auralite doctor --data chats.jsonl   # what this computer can train, with the command to run it (2.19)
 auralite train --text corpus.txt --model model.pt
 auralite generate --model model.pt --prompt "Once upon a time" --length 80
@@ -340,11 +342,11 @@ The image serves the OpenAI-compatible API on port 8000. It runs as an unprivile
    - Set the desired **Length** of the output.
    - Click **"Generate Text"** and watch the AI create content based on its training.
 
-## 🔨 Compiling to .exe (Windows)
-To bundle the application into a portable application folder:
-1. Run the provided `build_exe.bat` file.
-2. The script will automatically install `PyInstaller` and bundle the PyTorch environment using **`--onedir`** mode (faster startup and easier to update than a single-file build).
-3. The final build will be located in `dist/AuraLite_AI_v2/`. Launch it via `dist/AuraLite_AI_v2/AuraLite_AI_v2.exe` (distribute the whole folder).
+## 🔨 The Windows app (no Python)
+Every release since 2.21 attaches `AuraLite-Studio-<version>-windows-x64.zip`: AuraLite Studio and the `auralite` command with Python, PyTorch (CPU) and Qt inside — unzip it anywhere and start `AuraLite Studio.exe`. CI builds and checks it on every push (the `windows-app` job); the Release workflow builds it from the tag and attaches it with its SHA-256 and signed provenance.
+1. To build the same app yourself, run `build_exe.bat` in a clone (or the commands in [docs/windows-app.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md#building-it-yourself)).
+2. It installs the pinned packages of `packaging/app/requirements.txt` into `.venv-app`, installs AuraLite from the folder and runs `packaging/app/build_app.py --zip`.
+3. The app is in `dist/app/AuraLite-Studio-<version>/` and the zip in `dist/`; `packaging/app/smoke_app.py` checks either the way a user meets it. Distribute the whole folder (or the zip).
 
 ## ⚠️ Hardware Compatibility Note
 - **CUDA Acceleration**: Requires an NVIDIA GPU with Compute Capability 5.0 or higher.

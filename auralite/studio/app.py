@@ -14,6 +14,11 @@ Since 2.19.1 nothing that stops the Studio from starting may pass in silence:
 ``python -m auralite.studio --self-test`` builds the window without showing it and
 prints what it found (an install older than this code too: :func:`installation`);
 ``auralite doctor --studio`` runs it in a fresh process.
+
+2.21: in the app that needs no Python (:mod:`auralite.bundle`) nothing here names pip or
+``python -m``: the fixes are a fresh copy of the app and its own ``auralite.exe``, and the
+self-test also writes its report to ``logs/studio-self-test.txt`` - the Studio's program
+has no console to print to.
 """
 from __future__ import annotations
 
@@ -30,8 +35,10 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from auralite import bundle
+
 __all__ = ["CHILD", "QT_MINIMUM", "SELF_TEST", "crash_text", "failure_text",
-           "install_command", "main", "qt_problem", "self_test"]
+           "install_command", "main", "qt_problem", "report_path", "self_test"]
 
 CHILD = "--studio-child"            # the child process of a start without a console
 SELF_TEST = "--self-test"
@@ -74,6 +81,28 @@ def install_command(requirement: str = f"PySide6-Essentials>={QT_MINIMUM}", *,
     return f'{_python()} -m pip install {"-U " if upgrade else ""}"{requirement}"'
 
 
+def _reinstall_qt(requirement: str = f"PySide6-Essentials>={QT_MINIMUM}", *,
+                  upgrade: bool = False) -> str:
+    """The line that brings a working Qt: a pip command, or in the app (whose Qt is part of
+    it) a fresh copy of the app."""
+    if bundle.packaged():
+        return f"Unzip the app again into a new, empty folder: {bundle.DOWNLOAD_URL}"
+    return install_command(requirement, upgrade=upgrade)
+
+
+def _console_start() -> str:
+    """How to start the Studio in a console, where everything it prints shows."""
+    if bundle.packaged():
+        return bundle.quoted(bundle.cli_command("studio"))
+    return "python -m auralite.studio"
+
+
+def _doctor_line() -> str:
+    if bundle.packaged():
+        return bundle.quoted(bundle.cli_command("doctor", "--studio"))
+    return "auralite doctor --studio"
+
+
 def _source_folder() -> str:
     """The folder this code runs from when it is a source tree (it has ``pyproject.toml``)."""
     root = Path(__file__).resolve().parents[2]
@@ -99,6 +128,8 @@ def installation() -> tuple[str, str]:
     "auralite-ai[studio]"`` then installs nothing - pip only warns that the extra does
     not exist."""
     from auralite import __version__
+    if bundle.packaged():                 # the app: its own note, no pip metadata to trust
+        return bundle.describe(), ""
     folder = _source_folder()
     dist = _installed()
     if dist is None:
@@ -129,6 +160,9 @@ def qt_problem() -> str:
     except ImportError:
         if version:
             raise
+        if bundle.packaged():
+            return ("This copy of AuraLite Studio has no Qt (PySide6): a part of the app is "
+                    f"missing.\n\n    {_reinstall_qt()}")
         return ("AuraLite Studio needs PySide6 (Qt 6). Install it into this Python:\n\n"
                 f"    {install_command()}\n\n"
                 "The classic interface works without it: auralite-gui")
@@ -138,6 +172,10 @@ def qt_problem() -> str:
         cpuinfo = _read("/proc/cpuinfo") if sys.platform.startswith("linux") else ""
         _name, v2 = _simd(cpuinfo)
         if v2 is False and numbers >= (6, 10):
+            if bundle.packaged():
+                return (f"This processor has no SSE4.2 / POPCNT, which Qt {version} needs (Qt "
+                        f"6.10 and newer), and this copy of the app was built with it. The app "
+                        f"from {bundle.DOWNLOAD_URL} brings Qt 6.9, which runs here.")
             return (f"This processor has no SSE4.2 / POPCNT, which Qt {version} needs (Qt 6.10 "
                     f"and newer). Install the last Qt that runs here:\n\n"
                     f'    {install_command("PySide6-Essentials<6.10")}\n\n'
@@ -188,8 +226,8 @@ def failure_text(exc: BaseException, log_file: Path | None = None) -> str:
     from .errors import explain_error
     friendly = explain_error(exc, action="starting AuraLite Studio")
     if friendly.kind == "unknown":
-        friendly.hints = ["Start it in a console to see everything: python -m auralite.studio",
-                          "Check its parts: auralite doctor --studio"]
+        friendly.hints = [f"Start it in a console to see everything: {_console_start()}",
+                          f"Check its parts: {_doctor_line()}"]
     text = friendly.text()
     if log_file is not None:
         text += f"\n\nThe details are in {log_file}"
@@ -223,18 +261,19 @@ def crash_text(code: int, seconds: float, output: Path, faults: Path) -> str:
     seen = "\n".join(printed + stack).lower()
     if "incompatible processor" in seen:
         lines += ["", "This Qt build does not run on this processor. Install the last Qt "
-                      "that does:", f"    {install_command('PySide6-Essentials<6.10')}"]
+                      "that does:", f"    {_reinstall_qt('PySide6-Essentials<6.10')}"]
     elif "platform plugin" in seen:
         lines += ["", "Qt could not load its platform plugin. Reinstall it, and remove the "
                       "QT_PLUGIN_PATH variable if another program set it:",
-                  f"    {install_command(f'PySide6-Essentials>={QT_MINIMUM}', upgrade=True)}"]
+                  f"    {_reinstall_qt(upgrade=True)}"]
     elif any(s in seen for s in ("winerror 1114", "dll load failed",
                                  "dll initialization routine failed")):
         lines += ["", f"A library would not load. Install the latest Microsoft Visual C++ "
-                      f"Redistributable (x64): {VC_REDIST}", "and update Qt for Python:",
-                  f"    {install_command(f'PySide6-Essentials>={QT_MINIMUM}', upgrade=True)}"]
+                      f"Redistributable (x64): {VC_REDIST}",
+                  "and unzip the app again:" if bundle.packaged() else "and update Qt for Python:",
+                  f"    {_reinstall_qt(upgrade=True)}"]
     lines += ["", f"The logs are in {output.parent}",
-              "To see everything in a console: python -m auralite.studio"]
+              f"To see everything in a console: {_console_start()}"]
     return "\n".join(lines)
 
 
@@ -328,63 +367,92 @@ def _watch(argv: list[str]) -> int:
     return 3
 
 
+def report_path() -> Path:
+    """Where the self-test leaves its report (``logs/studio-self-test.txt``)."""
+    from .logs import log_dir
+    return log_dir() / "studio-self-test.txt"
+
+
 def self_test() -> int:
     """Build the window without showing it, and print what was found: 0 = the Studio
-    works here, 2 = it cannot start here (says why), 1 = it failed (with the traceback)."""
+    works here, 2 = it cannot start here (says why), 1 = it failed (with the traceback).
+    2.21: the report is also written to :func:`report_path` - the app's Studio program has
+    no console, and a user can send the file."""
+    lines: list[str] = []
+
+    def say(text: str = "") -> None:
+        lines.append(text)
+        print(text, flush=True)                 # nothing happens without a console
+
+    try:
+        return _self_test(say)
+    finally:
+        try:
+            path = report_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _self_test(say: Any) -> int:
     from auralite import __version__
 
     from .hardware import _system_name
     from .msvc_runtime import DLL, loaded_runtime, prepare_runtime, runtime_copies
     started = time.perf_counter()
-    print(f"AuraLite Studio self-test: AuraLite {__version__}, Python "
-          f"{platform.python_version()} ({sys.executable})", flush=True)
-    print(f"  System: {_system_name()}", flush=True)
+    say(f"AuraLite Studio self-test: AuraLite {__version__}, Python "
+        f"{platform.python_version()} ({sys.executable})")
+    say(f"  System: {_system_name()}")
     try:
         package, stale = installation()
-        print(f"  Installed: {package}", flush=True)
+        say(f"  Installed: {package}")
         if stale:
-            print(f"  ! {stale}", flush=True)
+            say(f"  ! {stale}")
         runtime = prepare_runtime()
         if sys.platform == "win32":
             copies = ", ".join(f"{c.origin} {c.text}" for c in runtime_copies()) or "none found"
             first = (f"{runtime.origin} {runtime.text}" if runtime is not None
                      else loaded_runtime() or "-")
-            print(f"  Visual C++ runtime ({DLL}): {copies}; loaded first: {first}", flush=True)
+            say(f"  Visual C++ runtime ({DLL}): {copies}; loaded first: {first}")
         problem = qt_problem()
         if problem:
-            print(f"\n{problem}\n\nRESULT: AuraLite Studio cannot start here (see above)")
+            say(f"\n{problem}\n\nRESULT: AuraLite Studio cannot start here (see above)")
             return 2
         from PySide6.QtCore import QCoreApplication, QEvent, qVersion
         from PySide6.QtWidgets import QApplication
-        print(f"  Qt: PySide6 {_qt_version() or '?'} (Qt {qVersion()})", flush=True)
+        say(f"  Qt: PySide6 {_qt_version() or '?'} (Qt {qVersion()})")
         from .qt.window import MainWindow
         from .settings import StudioSettings
         app = QApplication.instance()
         if not isinstance(app, QApplication):
             app = QApplication([_program()])
-        print(f"  Qt platform: {app.platformName()}", flush=True)
+        say(f"  Qt platform: {app.platformName()}")
         window = MainWindow(settings=StudioSettings(first_run_done=True), detect=False,
                             capture_streams=False, save_on_close=False,
                             auto_speed_test=False)
         tabs = ", ".join(window.tabs.tabText(i) for i in range(window.tabs.count()))
-        print(f"  Window: {tabs}", flush=True)
+        say(f"  Window: {tabs}")
         import torch
-        print(f"  PyTorch: {torch.__version__}", flush=True)
+        say(f"  PyTorch: {torch.__version__}")
+        if sys.platform == "win32":               # 2.21: the app brings this one itself
+            from .msvc_runtime import loaded_module
+            say(f"  vcruntime140_threads.dll: "
+                f"{loaded_module('vcruntime140_threads.dll') or 'not loaded'}")
         app.processEvents()
         from .hardware import detect_hardware
         hw = detect_hardware()
         v2 = {True: "yes", False: "no", None: "unknown"}[hw.x86_64_v2]
-        print(f"  Processor: {hw.cpu or '?'} - {hw.simd or '?'}, SSE4.2 + POPCNT: {v2}",
-              flush=True)
+        say(f"  Processor: {hw.cpu or '?'} - {hw.simd or '?'}, SSE4.2 + POPCNT: {v2}")
         window.close()
         window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     except Exception as exc:
-        print()
-        traceback.print_exc(file=sys.stdout)
-        print(f"\n{failure_text(exc)}\n\nRESULT: FAILED")
+        say()
+        say(traceback.format_exc().rstrip())
+        say(f"\n{failure_text(exc)}\n\nRESULT: FAILED")
         return 1
-    print(f"\nRESULT: OK - the window was built in {time.perf_counter() - started:.1f} s")
+    say(f"\nRESULT: OK - the window was built in {time.perf_counter() - started:.1f} s")
     return 0
 
 

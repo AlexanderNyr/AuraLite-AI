@@ -11,15 +11,12 @@ import errno
 import traceback
 from dataclasses import dataclass, field
 
+from auralite import bundle
+
 __all__ = ["FriendlyError", "explain_error"]
 
-#: Optional packages and the extra that installs them.
-_EXTRAS = {"transformers": "hf", "peft": "hf", "accelerate": "hf", "llama_cpp": "gguf",
-           "onnx": "export", "onnxruntime": "export", "onnxscript": "export",
-           "fastapi": "serve", "uvicorn": "serve", "datasets": "data", "pyarrow": "data",
-           "zstandard": "data", "tokenizers": "data", "PySide6": "studio",
-           "safetensors": "safetensors", "bitsandbytes": "qlora", "torchao": "torchao",
-           "sentence_transformers": "rag", "faiss": "rag"}
+#: Optional packages and the extra that installs them (2.21: kept in auralite.bundle).
+_EXTRAS = bundle.EXTRAS
 
 _MEMORY_HINTS = ["Fine-tune with the 4-bit base (QLoRA) and 8-bit AdamW",
                  "Keep «Memory plan» on auto: it splits the batch and recomputes activations",
@@ -96,6 +93,10 @@ def _library_hints(text: str) -> list[str]:
                 "again"]
     hints = [f"Install the latest Microsoft Visual C++ Redistributable (x64) - {VC_REDIST} "
              f"- then start AuraLite again"]
+    if bundle.packaged():                  # 2.21: the app brings its own Qt and PyTorch
+        return hints + ["Unzip the app again into a new, empty folder - a file may be missing "
+                        f"or blocked by an antivirus: {bundle.DOWNLOAD_URL}",
+                        "AuraLite Studio needs Windows 10 (version 1809) or newer"]
     if any(s in low for s in ("qt", "pyside", "shiboken")):
         hints += ['Update Qt for Python: pip install -U "PySide6-Essentials>=6.9.3"',
                   "Qt 6 needs Windows 10 (version 1809) or newer"]
@@ -129,11 +130,9 @@ def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
     for e in chain:
         if isinstance(e, ModuleNotFoundError) and e.name:
             top = e.name.split(".")[0]
-            extra = _EXTRAS.get(top)
-            hint = (f'pip install "auralite-ai[{extra}]"' if extra
-                    else f"pip install {top}")
+            # 2.21: in the app, what it leaves out and where that comes with
             return make("A package is missing", f"This needs the optional package «{top}».",
-                        [hint, "then start AuraLite again"], "missing_package")
+                        bundle.missing_part(top, _EXTRAS.get(top, "")), "missing_package")
     for e in chain:
         if isinstance(e, OSError) and getattr(e, "errno", None) == errno.ENOSPC:
             return make("The disk is full", f"There is no space left on the disk: {e}",
@@ -173,7 +172,9 @@ def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
                     ["AuraLite's engine imports Llama, Mistral, Qwen2 / Qwen2.5 and Qwen3 "
                      "models",
                      "Other models run through transformers: the classic interface's "
-                     "Model tab (pip install \"auralite-ai[hf]\")"], "model")
+                     "Model tab (pip install \"auralite-ai[hf]\")"
+                     + (" - AuraLite installed with Python, not this app"
+                        if bundle.packaged() else "")], "model")
     if kind_name == "DataFormatError":
         return make("The data cannot be used", message,
                     ["Dialogs: a .jsonl file with one {\"messages\": [...]} per line "

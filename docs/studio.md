@@ -15,9 +15,15 @@ screenshots).*
 
 The classic interface (`auralite-gui`, tkinter) stays as it was and keeps the
 features the Studio does not have yet (images, quantization, evaluation, the
-transformers backend): *Tools → Classic interface* opens it.
+transformers backend): *Tools → Classic interface* opens it (in AuraLite installed
+with Python; the Windows app leaves it out).
 
 ## Install and start
+
+**Windows without Python (2.21):** download `AuraLite-Studio-<version>-windows-x64.zip`
+from the [latest release](https://github.com/AlexanderNyr/AuraLite-AI/releases/latest),
+unzip it and double-click `AuraLite Studio.exe` — Python, PyTorch and Qt are inside:
+[docs/windows-app.md](windows-app.md). With Python, on any system:
 
 ```bash
 pip install "auralite-ai[studio]"    # AuraLite + PySide6 (Qt 6 for Python)

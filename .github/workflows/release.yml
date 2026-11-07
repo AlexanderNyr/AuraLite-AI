@@ -17,6 +17,12 @@ name: Release
 #                 anywhere). Off by default; see docs/releasing.md to enable it:
 #                 register the publisher on pypi.org, create the `pypi`
 #                 environment, set the repository variable PYPI_PUBLISH=true.
+#   * `windows-app` (2.21) — the Windows app that needs no Python, built from the
+#                 pinned packages (packaging/app/) and checked the way a user meets
+#                 it; `windows-app-publish` attaches its zip and SHA-256 to the
+#                 GitHub Release with signed provenance. The rest of the release
+#                 does not wait for it: a broken Windows build fails these two jobs
+#                 only, and the wheel, PyPI and the image go out as before.
 #
 # Dry run (v2.6.6): Actions → Release → "Run workflow" with `dry_run` ticked (the
 # default for manual runs) executes verify + build + the image build on the
@@ -166,6 +172,11 @@ jobs:
           body: |
             Built and tested by CI on this commit.
 
+            **Windows app, no Python needed:** `AuraLite-Studio-${{ needs.verify.outputs.version }}-windows-x64.zip`
+            (attached a few minutes after this release appears) - unzip it and start
+            `AuraLite Studio.exe`. Windows 10 / 11, 64-bit; trains on the processor.
+            Guide: [docs/windows-app.md](https://github.com/${{ github.repository }}/blob/v${{ needs.verify.outputs.version }}/docs/windows-app.md).
+
             Artifacts: `auralite_ai-${{ needs.verify.outputs.version }}-py3-none-any.whl`
             and the source distribution, with signed build provenance
             (`gh attestation verify <file> -R ${{ github.repository }}`). Install:
@@ -178,6 +189,67 @@ jobs:
 
             What changed: see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/v${{ needs.verify.outputs.version }}/CHANGELOG.md)
             and the docs in [`docs/`](https://github.com/${{ github.repository }}/tree/v${{ needs.verify.outputs.version }}/docs).
+
+  windows-app:
+    # 2.21: the Windows app from the tagged commit, built and checked exactly like CI's
+    # windows-app job (the same pins, packaging/app/build_app.py and smoke_app.py).
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the build's pinned packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r packaging/app/requirements.txt
+          pip install --no-deps .
+      - name: Build the app
+        run: python packaging/app/build_app.py --zip
+      - name: Check it the way a user meets it
+        shell: bash
+        run: python packaging/app/smoke_app.py "dist/AuraLite-Studio-${{ needs.verify.outputs.version }}-windows-x64.zip"
+      - name: Upload the app
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-app
+          path: |
+            dist/AuraLite-Studio-${{ needs.verify.outputs.version }}-windows-x64.zip
+            dist/AuraLite-Studio-${{ needs.verify.outputs.version }}-windows-x64.zip.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  windows-app-publish:
+    needs: [verify, release, windows-app]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # add the zip to the Release
+      id-token: write         # Sigstore certificate for the attestation
+      attestations: write
+    steps:
+      - name: Download the app
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-app
+          path: windows-app
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: windows-app/*.zip
+      - name: Attach it to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.verify.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          ls -l windows-app
+          (cd windows-app && sha256sum -c ./*.sha256)
+          gh release upload "$TAG" windows-app/* --clobber --repo "$REPO"
 
   image:
     needs: [verify, build]

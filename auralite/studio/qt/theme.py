@@ -1,7 +1,8 @@
 """Light and dark looks of the Studio (Fusion style, one stylesheet), 2.19."""
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QApplication
 
 ACCENT = "#2f6fdb"
@@ -77,3 +78,28 @@ def apply_theme(app: QApplication, dark: bool) -> None:
                      QColor(c["muted"]))
     app.setPalette(palette)
     app.setStyleSheet(stylesheet(dark))
+
+
+def icon_pixmap(size: int = 64) -> QPixmap:
+    """The app's icon at `size` pixels, drawn (no image file to ship). 2.21: any size - the
+    app's build writes 16 to 256 into the Windows program's .ico."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    painter.scale(size / 64, size / 64)            # drawn on a 64 x 64 grid
+    gradient = QLinearGradient(QPointF(0, 0), QPointF(64, 64))
+    gradient.setColorAt(0, QColor(ACCENT))
+    gradient.setColorAt(1, QColor("#7b4fd6"))
+    painter.setBrush(gradient)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(QRectF(2, 2, 60, 60), 14, 14)
+    font = QFont()
+    font.setPixelSize(40)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QColor("white"))
+    painter.drawText(QRectF(0, 0, 64, 62), Qt.AlignmentFlag.AlignCenter, "A")
+    painter.end()
+    return pixmap

@@ -34,6 +34,12 @@ built or uploaded from a laptop.
    cd /tmp && /tmp/wheel-venv/bin/python ~/AuraLite-AI/scripts/smoke_installed_wheel.py
    ```
 
+   2.21: and the `windows-app` job - the Windows app built from the pinned
+   packages of [`packaging/app/requirements.txt`](../packaging/app/requirements.txt)
+   and checked by `packaging/app/smoke_app.py`. Its zip is the run's artifact
+   (*auralite-studio-windows-x64*, kept a week): download it and try the app
+   before you tag.
+
 3. **Dry run of the release workflow** (v2.6.6). *Actions → Release → Run
    workflow* on `main`, leave `tag` empty and `dry_run` ticked (the default). The
    run executes `verify`, `build` and the Docker image build exactly as a tag
@@ -64,6 +70,15 @@ built or uploaded from a laptop.
 | `release` | GitHub Release with the artifacts and generated notes | — (skipped on a dry run) |
 | `image` | `ghcr.io/<owner>/auralite-ai:<version>` and `:latest` (CPU runtime); built but not pushed on a dry run | the Docker build fails |
 | `pypi` | uploads the *same* artifacts to PyPI | only runs when enabled (below), never on a dry run |
+| `windows-app` (2.21) | the Windows app from the tag: the pinned packages, `packaging/app/build_app.py --zip`, then `smoke_app.py` on the zip | the build or a check of the app fails |
+| `windows-app-publish` (2.21) | attaches `AuraLite-Studio-<version>-windows-x64.zip` and its `.sha256` to the GitHub Release, with signed provenance | the release or the app is missing (skipped on a dry run) |
+
+The Windows app does not hold the release back: `release`, `image` and `pypi` do
+not wait for it, so a broken Windows build fails only its two jobs. Fix it and
+re-run `windows-app` and `windows-app-publish` from the Actions page - the upload
+replaces a file of the same name (`--clobber`). To move the app to a newer PyTorch
+or Qt, change the pins in `packaging/app/requirements.txt`; CI's `windows-app` job
+tests the change on its push.
 
 ## Enabling PyPI (one time, no token)
 

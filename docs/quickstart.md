@@ -11,7 +11,10 @@ auralite-studio
 ```
 
 — looks at your computer, recommends a model and settings that fit it and walks
-you through fine-tuning or training ([docs/studio.md](studio.md)). The rest of
+you through fine-tuning or training ([docs/studio.md](studio.md)). On Windows it
+also comes without Python (2.21): unzip `AuraLite-Studio-<version>-windows-x64.zip`
+from the [latest release](https://github.com/AlexanderNyr/AuraLite-AI/releases/latest)
+and start `AuraLite Studio.exe` ([docs/windows-app.md](windows-app.md)). The rest of
 this page is the same with the command line and Python.
 
 ## 1. Install

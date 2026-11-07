@@ -1,3 +1,150 @@
+# 📦 v2.21.0 — AuraLite Studio, part 3: a Windows app that needs no Python; `auralite train` without pydantic; CI's coverage job green again
+
+Every release now has a Windows app: `AuraLite-Studio-2.21.0-windows-x64.zip` with
+AuraLite Studio, the `auralite` command and everything they run on — Python,
+PyTorch and Qt. Unzip it anywhere, double-click `AuraLite Studio.exe`: the Studio
+of 2.19 and 2.20 opens, with nothing to install. `auralite.exe` next to it is the
+command line, your models and runs stay in `%USERPROFILE%\.auralite` (an update is
+a new folder), and *Help → Check for updates* names the new zip. CI builds the app
+on every push and checks it the way a user meets it; the Release workflow builds it
+from the tag, checks it the same way and attaches it with its SHA-256 and signed
+provenance. Two fixes came out of building it: without pydantic — a plain
+`pip install auralite-ai`, and the app — `auralite train` refused every run, and
+CI's coverage job failed on 2.20.0 because the Studio's Qt code was never run
+there. Details: [docs/windows-app.md](docs/windows-app.md).
+
+**What changed for existing users**
+
+| | 2.21.0 | 2.20.0 |
+|---|---|---|
+| AuraLite on Windows without Python | the release's `AuraLite-Studio-<version>-windows-x64.zip`: unzip, start `AuraLite Studio.exe` | none (`build_exe.bat` built the classic GUI of 2.8 from a clone) |
+| `auralite train` without pydantic (`pip install auralite-ai`, `[studio]` — no `[serve]`) | trains | refused every run: *invalid training parameters: AuraLiteConfig.__init__() got an unexpected keyword argument 'seq_length'* |
+| `auralite studio --self-test` | the Studio's self-test, as `python -m auralite.studio --self-test` | no such option |
+| the self-test's report | printed, and written to `~/.auralite/logs/studio-self-test.txt` | printed only |
+| the Studio's icon | drawn at 16 to 256 pixels | 64 pixels |
+| CI's `coverage` job | runs the Studio's Qt suites too (PySide6, offscreen): 87.6 %, gate 85 % | without PySide6 the Qt code counted 0 %: 78.4 %, under the 80 % gate — red on 2.20.0 |
+| CI's PyInstaller check | `windows-app` on every push: the release's build, checked by `smoke_app.py` | `pyinstaller-smoke`, by hand only, built the classic GUI of 2.8 |
+| `build_exe.bat` | builds the release's Windows app (pinned packages) | the classic GUI of 2.8 with whatever was installed |
+
+Nothing else changes: models, checkpoints, the commands, the Studio and the classic
+GUI work as in 2.20.0. Installs from PyPI are the same packages as before.
+
+**The Windows app** (`packaging/app/`, new; [docs/windows-app.md](docs/windows-app.md))
+
+- One folder, two programs that share everything else: `AuraLite Studio.exe` (no
+  console; started with none it runs the window in a child process it watches, as
+  `auralite-studio` does since 2.19.1) and `auralite.exe` (the console command);
+  `auralite-app.json` (version, platform, Python, PyTorch, Qt, date, commit),
+  `README.txt`, `licenses\` (every bundled package's license files and
+  `THIRD-PARTY-NOTICES.txt`; Qt under the LGPL-3.0 - PySide6's wheels carry no license
+  file, so `licenses\Qt` has the LGPL-3.0 and GNU GPL texts from
+  `packaging/app/licenses/`, and the notices say where Qt's source is), `_internal\`.
+- Inside: Python 3.13, PyTorch 2.15.0 (CPU — a CUDA build is larger than the 2 GB a
+  release may attach), PySide6-Essentials 6.9.3 — the last Qt for processors
+  without SSE4.2, and the `studio` extra's minimum, so the app runs on any 64-bit
+  processor —, NumPy, safetensors, tokenizers, zstandard, psutil. Left out: the
+  classic interface, transformers / PEFT, Hugging Face datasets and Parquet, the
+  server, ONNX, llama.cpp; each comes with AuraLite installed with Python, and the
+  app says so when you reach one.
+- `requirements.txt`: the build's exact pins (PyTorch from its CPU index,
+  PyInstaller 6.22.3). `build_app.py` refuses to build when the environment differs
+  from them or AuraLite is not installed from that very folder (versions and a
+  digest of the code), draws the icon with the Studio's own drawing (an `.ico` of
+  PNGs, 16–256 px), writes the programs' file properties, runs PyInstaller with
+  `auralite_app.spec`, adds README.txt, auralite-app.json and the licenses, refuses
+  a path longer than 160 characters inside the zip (Windows' 260 minus a deep
+  Downloads folder: PyTorch's own license tree went past it), zips the folder and
+  writes the SHA-256 (with `\n` on Windows too, for `sha256sum -c`).
+- `auralite_app.spec`: `X utf8` for both programs — a frozen Python ignores
+  `PYTHONUTF8` and `PYTHONIOENCODING`, and Windows' code page would fail on the
+  first character outside it; `collect_submodules("auralite")` without the classic
+  GUI; the metadata the doctor and the libraries read, without the license copies
+  inside `*.dist-info` (PyInstaller collects PyTorch's itself); no UPX.
+- The Visual C++ runtime: PyTorch 2.13+'s `torch_cpu.dll` links
+  `vcruntime140_threads.dll`, which PyTorch's wheel does not ship and PyInstaller does
+  not collect (it takes no DLL from Windows' folder that is not on its list). The spec
+  puts the build machine's copy into the app, `rthook_vcruntime.py` loads it before
+  PyTorch asks for it, and `build_app.py` refuses a build in which a DLL imports a part
+  of the runtime the folder lacks. On Windows `smoke_app.py` checks that the
+  self-test finds the app's own copies loaded.
+- `entry_studio.py`, `entry_cli.py`: `multiprocessing.freeze_support()` first —
+  worker processes of a frozen program start the program again.
+- `smoke_app.py` checks a build the way a user meets it: unzipped into a folder with a
+  space and Cyrillic letters, `auralite --version`, `auralite doctor --studio`, the
+  Studio's program with `--self-test` (its report file), a real start of the Studio's
+  program with no console that closes itself (`AURALITE_STUDIO_SMOKE_SECONDS`), a
+  training run and `auralite data prepare --workers 2 --no-fast`. It found two
+  problems before anyone else did: `torch.utils.checkpoint` imports
+  `torch.testing._internal` (so the app keeps it), and `auralite train` without
+  pydantic (below).
+
+**AuraLite inside the app** (`auralite/bundle.py`, new)
+
+- `packaged()` (PyInstaller's `sys.frozen`), `app_folder()`, `studio_command()` /
+  `cli_command()` (the app's own programs; `python -m` elsewhere), `app_info()` /
+  `describe()` (auralite-app.json), `missing_part()` (inside the app: what it leaves
+  out and the pip command that has it), `update_hint()`, `zip_name()`,
+  `platform_tag()`, `EXTRAS` (module → pip extra, moved from the Studio's errors).
+- The Studio (`studio/app.py`): `installation()` names the app; the fixes it
+  suggests inside the app are a fresh copy of the app and `auralite.exe`, never pip
+  or `python -m`; the self-test also writes its report to
+  `logs/studio-self-test.txt` (the Studio's program has no console).
+- `studio/updates.py`: the app asks GitHub for the latest release and names its zip
+  for this computer — a release whose zip is not there yet is not offered as an
+  update; elsewhere PyPI as before.
+- `studio/errors.py`, `studio/hardware.py`: a package the app leaves out, a library
+  that does not load, a processor without SSE4.2 — explained for the app.
+- `studio/msvc_runtime.py`: the app's own `msvcp140.dll` (PyInstaller's folder) is
+  one of the copies the newest is chosen from.
+- `studio/qt/window.py`: no *Classic interface* in the app's Tools menu; *About*
+  names the build; the log says when the window is open; `AURALITE_STUDIO_SMOKE_SECONDS`
+  closes it — the setup wizard of a first start too — after that many seconds; the
+  icon is `theme.icon_pixmap(size)`, any size.
+- CLI: `auralite studio --self-test`; `auralite doctor --studio` runs it with
+  `auralite.exe` in the app (a pipe reads nothing from a program without a console)
+  and prints which app this is; inside the app a part it leaves out ends with what
+  to do instead of a traceback, `auralite serve` too.
+
+**`auralite train` without pydantic** (`auralite/engine/config.py`)
+
+`auralite train` checks its parameters with `AuraLiteConfig` (since 2.6.5). With
+pydantic that model keeps unknown keys (`extra="allow"`); without it the fallback was
+a dataclass that refused every key it did not declare — `seq_length`, `epochs`,
+`batch_size`, every training parameter. So without pydantic, which only `[serve]`,
+`[full]` and `[test]` bring, the command refused every run, `--params` or not; CI
+never saw it, every job installs pydantic. The fallback (`_PlainConfig`) now keeps
+other keys as pydantic does and refuses what pydantic refuses (a size of 0, a
+dropout of 1.5, `n_kv_heads` that does not divide `n_heads`).
+
+**CI** (`.github/workflows/ci.yml`)
+
+- `coverage`: installs `.[test,studio]` with Qt's system libraries and draws
+  offscreen, so the Studio's Qt modules count; gate 85 % (87.6 % with 2.21.0's code,
+  measured as the job runs). The job failed on 2.20.0 — every test passed, but
+  without PySide6 the 3,600 statements of the Studio's Qt modules counted as 0 %.
+- `windows-app` (replaces `pyinstaller-smoke`): Python 3.13 on windows-latest, the
+  pinned packages, `build_app.py --zip`, `smoke_app.py` on the zip; the zip is the
+  run's artifact for a week. The `workflow_dispatch` input of the old job is gone.
+
+**Release** (`.github/workflows/release.yml`): `windows-app` builds and checks the
+app from the tag; `windows-app-publish` attaches the zip and its `.sha256` with signed
+provenance (`gh release upload --clobber`). `release`, `image` and `pypi` do not wait
+for them. The release's text names the zip.
+
+**Tests**: `tests/test_bundle_v221.py` (new): the bundle's facts in and out of the app,
+the Studio's start, errors, updates, processor note and C++ runtime in the app, the CLI
+in the app, the plain config and `auralite train` without pydantic, the window in the
+app (no classic interface, the icon, a smoke start that closes the wizard), the build
+script (pins, environment check, icon, file properties, README, path lengths, zip and
+checksum, licenses), the spec, the entry scripts, the smoke test against a fake app, and
+the CI and Release jobs. `tests/test_packaging.py`: `build_exe.bat` builds through
+`packaging/app/`.
+
+**Docs**: [docs/windows-app.md](docs/windows-app.md) (new: download and start,
+requirements, where your things are, `auralite.exe`, updating, what the app leaves out,
+if it does not start, building it yourself); README, docs/studio.md,
+docs/quickstart.md, FAQ § 23, ARCHITECTURE, docs/releasing.md.
+
 # 📦 v2.20.0 — AuraLite Studio, part 2: a library of runs, models and datasets; any run continues where it stood
 
 Every training run is kept now — of the Studio's Train and Fine-tune tabs and of

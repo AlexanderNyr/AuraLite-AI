@@ -1,18 +1,19 @@
 """AuraLite Studio's main window: menu, tabs, status bar, and the shared state (2.19)."""
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import subprocess
 import sys
 from typing import Any
 
-from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence,
-                           QLinearGradient, QPainter, QPixmap)
-from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QMenu, QScrollArea,
-                               QTabWidget, QWidget)
+from PySide6.QtCore import QByteArray, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QMainWindow, QMenu,
+                               QScrollArea, QTabWidget, QWidget)
 
+from ... import bundle
 from ..hardware import Hardware, auralite_home, detect_hardware, format_gb, measure_gflops, \
     process_memory
 from ..library import remember_model
@@ -26,7 +27,7 @@ from .tab_library import LibraryTab
 from .tab_log import LogTab
 from .tab_start import StartTab
 from .tab_train import TrainTab
-from .theme import ACCENT, apply_theme
+from .theme import apply_theme, icon_pixmap
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
@@ -34,25 +35,11 @@ TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
 
 
 def studio_icon() -> QIcon:
-    """The app's icon, drawn (no image file to ship)."""
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    gradient = QLinearGradient(QPointF(0, 0), QPointF(64, 64))
-    gradient.setColorAt(0, QColor(ACCENT))
-    gradient.setColorAt(1, QColor("#7b4fd6"))
-    painter.setBrush(gradient)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawRoundedRect(QRectF(2, 2, 60, 60), 14, 14)
-    font = QFont()
-    font.setPixelSize(40)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.setPen(QColor("white"))
-    painter.drawText(QRectF(0, 0, 64, 62), Qt.AlignmentFlag.AlignCenter, "A")
-    painter.end()
-    return QIcon(pixmap)
+    """The app's icon, from 16 to 256 pixels."""
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(icon_pixmap(size))
+    return icon
 
 
 class MainWindow(QMainWindow):
@@ -173,7 +160,8 @@ class MainWindow(QMainWindow):
         self._action(tools, "Library: runs, models, datasets", lambda: self.goto("library"),
                      "Ctrl+L")
         tools.addSeparator()
-        self._action(tools, "Classic interface (tkinter)", self.open_classic)
+        if not bundle.packaged():             # 2.21: the app leaves the classic GUI out
+            self._action(tools, "Classic interface (tkinter)", self.open_classic)
         self._action(tools, "Open the AuraLite folder", lambda: self._open(str(auralite_home())))
         self._action(tools, "Open the log folder", lambda: self._open(str(log_dir())))
         help_menu = bar.addMenu("&Help")
@@ -561,12 +549,13 @@ class MainWindow(QMainWindow):
             qt = PySide6.__version__
         except Exception:
             qt = "?"
+        app = f"\nThis is {bundle.describe()}\n" if bundle.packaged() else ""
         inform(self, "About AuraLite Studio",
                f"AuraLite Studio {self.version}\n\n"
                f"Train, fine-tune and run language models on your own computer.\n\n"
                f"Python {platform.python_version()} · PyTorch {torch.__version__} · "
                f"Qt (PySide6) {qt}\nLicense: Apache-2.0\n"
-               f"https://github.com/AlexanderNyr/AuraLite-AI\n\n"
+               f"https://github.com/AlexanderNyr/AuraLite-AI\n{app}\n"
                f"Models: {auralite_home()}\nLogs: {log_dir()}")
 
     # ---- closing ---------------------------------------------------------------------
@@ -633,4 +622,34 @@ def run(argv: list[str] | None = None) -> int:
     window = MainWindow()
     install_excepthooks(window.error_raised.emit)
     window.show()
+    log = logging.getLogger("auralite.studio")
+    log.info("AuraLite Studio %s: the window is open (%s)", window.version,
+             bundle.describe() if bundle.packaged() else sys.executable)
+    seconds = _smoke_seconds()
+    if seconds:
+        # 2.21: CI starts the app's program the way a user does and needs it to close
+        log.info("%s=%s: closing the window in %s s", SMOKE_ENV, seconds, seconds)
+        QTimer.singleShot(int(seconds * 1000), lambda: _smoke_close(window))
     return int(app.exec())
+
+
+#: 2.21: close the window this many seconds after it opened (a smoke test of a build).
+SMOKE_ENV = "AURALITE_STUDIO_SMOKE_SECONDS"
+
+
+def _smoke_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(SMOKE_ENV, "") or 0))
+    except ValueError:
+        return 0.0
+
+
+def _smoke_close(window: MainWindow) -> None:
+    """Close what is open - the setup wizard of a first start is a modal dialog - then the
+    window; quit for sure a little later."""
+    logging.getLogger("auralite.studio").info("%s: closing the window now", SMOKE_ENV)
+    for widget in QApplication.topLevelWidgets():
+        if isinstance(widget, QDialog) and widget.isVisible():
+            widget.reject()
+    window.close()
+    QTimer.singleShot(5000, window, QApplication.quit)     # gone with the window

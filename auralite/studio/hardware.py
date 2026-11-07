@@ -372,7 +372,10 @@ def detect_hardware(*, gflops: float | None = None) -> Hardware:
     if simd in ("SSE4.2", "basic") and accelerator == "cpu":
         hw.notes.append("no AVX: training works, but several times slower than on a CPU with AVX2")
     if v2 is False:
-        hw.notes.append("no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9.3 here "
+        from auralite import bundle
+        hw.notes.append("no SSE4.2 / POPCNT: the app's Qt 6.9 runs here (Qt 6.10+ would not)"
+                        if bundle.packaged() else
+                        "no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9.3 here "
                         "(Qt 6.10+ needs an x86-64-v2 processor; pip install "
                         "\"PySide6-Essentials<6.10\"); the classic GUI works")
     return hw
