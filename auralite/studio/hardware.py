@@ -432,34 +432,61 @@ def measure_gflops(device: str = "cpu", *, seconds: float = 1.0, size: int = 768
 
 
 def process_memory() -> int:
-    """Bytes of RAM this process uses now (0 when unknown)."""
+    """Bytes of RAM this process uses now (0 when unknown). 2.21.2: psutil first (the app
+    brings it), then the system's own numbers."""
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss)
+    except Exception:            # not installed (an extra of nothing), or no permission
+        pass
     if sys.platform.startswith("linux"):
         match = re.search(r"^VmRSS:\s*(\d+)\s*kB", _read("/proc/self/status"), re.MULTILINE)
         return int(match.group(1)) * 1024 if match else 0
     if sys.platform == "win32":
-        class _Counters(ctypes.Structure):
-            _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
-                        ("PeakWorkingSetSize", ctypes.c_size_t),
-                        ("WorkingSetSize", ctypes.c_size_t),
-                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                        ("PagefileUsage", ctypes.c_size_t),
-                        ("PeakPagefileUsage", ctypes.c_size_t)]
-        counters = _Counters()
-        counters.cb = ctypes.sizeof(_Counters)
         try:
-            process = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[attr-defined]
-            if ctypes.windll.psapi.GetProcessMemoryInfo(  # type: ignore[attr-defined]
-                    process, ctypes.byref(counters), counters.cb):
-                return int(counters.WorkingSetSize)
+            return _windows_working_set()
         except Exception:
             return 0
-        return 0
     try:
         import resource
         peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         return peak if sys.platform == "darwin" else peak * 1024
     except Exception:
         return 0
+
+
+class _MemoryCounters(ctypes.Structure):
+    """PROCESS_MEMORY_COUNTERS (psapi.h)."""
+    _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t)]
+
+
+def _win_dll(name: str) -> Any:
+    return ctypes.WinDLL(name, use_last_error=True)  # type: ignore[attr-defined]
+
+
+def _windows_working_set(load: Any = None) -> int:
+    """Windows: this process' working set, from GetProcessMemoryInfo. 2.21.2: with the
+    handle types declared - without them ctypes passed GetCurrentProcess()'s pseudo-handle
+    (-1) as a 32-bit int, the call failed on 64-bit Windows and the Studio's status bar said
+    "RAM: 0.0 GB". `load` opens a DLL by name (tests give fakes; default: ctypes.WinDLL)."""
+    opener = load if load is not None else _win_dll
+    kernel32, psapi = opener("kernel32"), opener("psapi")
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetCurrentProcess.argtypes = []
+    psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MemoryCounters),
+                                           ctypes.c_ulong]
+    counters = _MemoryCounters()
+    counters.cb = ctypes.sizeof(_MemoryCounters)
+    if psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                                  counters.cb):
+        return int(counters.WorkingSetSize)
+    return 0

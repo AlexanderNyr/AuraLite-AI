@@ -131,9 +131,11 @@ def test_the_installation_is_the_app(fake_app):
 
 def test_failure_and_crash_texts_in_the_app_name_its_programs(fake_app, tmp_path):
     from auralite.studio import app
-    cli = bundle.quoted(bundle.cli_command())
+    # 2.21.2: `.\auralite.exe ...` and the folder to open the console in (the full path in
+    # quotes did not run in PowerShell)
+    studio, doctor = bundle.console_hint("studio"), bundle.console_hint("doctor", "--studio")
     text = app.failure_text(RuntimeError("boom"))
-    assert f"{cli} studio" in text and f"{cli} doctor --studio" in text
+    assert studio in text and doctor in text
     assert "python -m" not in text
     output, faults = tmp_path / "out.log", tmp_path / "faults.log"
     for seen in ("This application failed to start because no Qt platform plugin could be "
@@ -142,7 +144,7 @@ def test_failure_and_crash_texts_in_the_app_name_its_programs(fake_app, tmp_path
         output.write_text(seen + "\n", encoding="utf-8")
         crash = app.crash_text(0xC0000409, 1.0, output, faults)
         assert "Unzip the app again" in crash and bundle.DOWNLOAD_URL in crash, seen
-        assert "pip install" not in crash and f"{cli} studio" in crash
+        assert "pip install" not in crash and studio in crash
 
 
 def test_outside_the_app_the_texts_name_pip_and_python(tmp_path):

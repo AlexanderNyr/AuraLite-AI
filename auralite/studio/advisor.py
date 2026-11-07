@@ -21,8 +21,8 @@ from .datacheck import DataReport
 from .hardware import Hardware, format_gb
 
 __all__ = ["EFFICIENCY", "ModelFit", "PresetFit", "Recommendation", "estimate_finetune",
-           "memory_budget", "recommend_finetune", "recommend_pretrain", "suggested_epochs",
-           "suggested_seq_length", "tokens_per_second"]
+           "memory_budget", "preset_label", "recommend_finetune", "recommend_pretrain",
+           "suggested_epochs", "suggested_seq_length", "tokens_per_second"]
 
 #: Training's share of the measured matrix-product speed (CPU; calibrated, see above).
 EFFICIENCY = 0.45
@@ -152,6 +152,20 @@ class PresetFit:
     fits: bool
     tokens_per_second: float | None
     epoch_hours: float | None        # one pass over the data (None: no data / unknown)
+
+
+def preset_label(fit: PresetFit) -> str:
+    """2.21.2: a from-scratch size as the Studio lists it - its parameters with the chosen
+    vocabulary and its shape, "7M parameters - 8 layers, width 256". The preset's name is
+    its size with a large vocabulary: beside the real count it read as a second size that
+    contradicts it ("25m: 7M parameters"); the Studio shows it as the tooltip."""
+    from auralite.engine.sizing import MODEL_PRESETS
+    millions = fit.params / 1e6
+    size = f"{millions:,.1f}M" if millions < 1 else f"{millions:,.0f}M"
+    dims = MODEL_PRESETS.get(fit.preset) or {}
+    shape = f" - {dims['n_layers']} layers, width {dims['d_model']}" \
+        if "n_layers" in dims and "d_model" in dims else ""
+    return f"{size} parameters{shape}"
 
 
 @dataclass

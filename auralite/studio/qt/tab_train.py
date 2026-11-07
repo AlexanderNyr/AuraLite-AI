@@ -5,13 +5,14 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
                                QHBoxLayout, QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
                                QWidget)
 
 from auralite import runs as runlib
 
-from ..advisor import Recommendation, recommend_pretrain
+from ..advisor import Recommendation, preset_label, recommend_pretrain
 from ..datacheck import DataReport
 from ..hardware import format_gb
 from ..library import remember_dataset
@@ -187,8 +188,10 @@ class TrainTab(QWidget):
         for i, fit in enumerate(self.recommendation.presets):
             mark = " (recommended)" if self.recommendation.preset is fit else ""
             fits = "" if fit.fits else " - does not fit the memory"
-            self.size.setItemText(i, f"{fit.preset}: {fit.params / 1e6:,.0f}M parameters{mark}"
-                                     f"{fits}")
+            # 2.21.2: the real size and shape; the preset's name ("25m") is the tooltip
+            self.size.setItemText(i, f"{preset_label(fit)}{mark}{fits}")
+            self.size.setItemData(i, f"the {fit.preset} preset: auralite train --preset "
+                                     f"{fit.preset}", Qt.ItemDataRole.ToolTipRole)
         self._size_changed()
 
     def _size_changed(self, *_args: Any) -> None:

@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.21.1-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.21.1-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.21.2-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.21.2-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -57,14 +57,27 @@ library. Set the `AURALITE_HOME` variable to keep them elsewhere (another disk).
 
 The folder also has `auralite.exe`, the `auralite` command of
 [the quickstart](quickstart.md) — for a console. Open one in the folder (in
-Explorer: type `cmd` in the address bar) and run, for example:
+Explorer: type `powershell` or `cmd` in the address bar and press Enter) and type
+it with `.\` in front, for example:
 
-```bat
-auralite.exe doctor --studio
-auralite.exe runs
-auralite.exe train --data notes.txt --preset 25m --model my-model.pt
-auralite.exe chat --model my-model.pt
+```powershell
+.\auralite.exe doctor --studio
+.\auralite.exe runs
+.\auralite.exe train --data notes.txt --preset 25m --model my-model.pt
+.\auralite.exe chat --model my-model.pt
 ```
+
+The `.\` matters in PowerShell, the console Windows opens by default: it runs
+nothing from the current folder by its name alone. It looks for `auralite.exe` on
+PATH instead — and if AuraLite is installed with pip as well, that one runs,
+perhaps an older version that answers `invalid choice: 'doctor'`. cmd takes both
+forms. `.\auralite.exe doctor` says when `auralite` alone would run another
+AuraLite (2.21.2).
+
+For a report to attach to an issue, let the command write the file:
+`.\auralite.exe doctor --studio --out report.txt` (UTF-8). PowerShell's `>` would
+re-encode the output in the console's code page and garble whatever is not ASCII,
+such as a user name in Cyrillic letters.
 
 Everything the command does with Python it does here — training on several
 computers too (`--cluster-workers`, [docs/training.md](training.md)) — except the
@@ -106,15 +119,15 @@ Whatever stops the Studio is shown in a message box and written to
 printed) and `studio-faults.log` (where it crashed). In a console in the app's
 folder:
 
-```bat
-auralite.exe doctor --studio
+```powershell
+.\auralite.exe doctor --studio --out report.txt
 ```
 
 checks the computer and starts the Studio's self-test in a fresh process;
-`RESULT: OK` means the window starts. `"AuraLite Studio.exe" --self-test` runs the
-same check through the Studio's own program and leaves its report in
-`%USERPROFILE%\.auralite\logs\studio-self-test.txt`. That output is what an issue
-needs.
+`RESULT: OK` means the window starts, and `report.txt` keeps it all.
+`.\auralite.exe studio --self-test` runs the self-test alone; its report also goes
+to `%USERPROFILE%\.auralite\logs\studio-self-test.txt`. That output is what an
+issue needs.
 
 | What happens | What to do |
 |---|---|
@@ -139,7 +152,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.21.1-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.21.2-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins

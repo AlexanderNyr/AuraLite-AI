@@ -3,7 +3,7 @@
 ``packaging/app/build_app.py`` freezes AuraLite with PyInstaller into one folder
 that holds two programs and a note saying which build it is::
 
-    AuraLite-Studio-2.21.1/
+    AuraLite-Studio-2.21.2/
         AuraLite Studio.exe     the Studio, no console: double-click it
         auralite.exe            the ``auralite`` command, for a console
         auralite-app.json       this build: version, Python, PyTorch, Qt, date, commit
@@ -30,8 +30,9 @@ from pathlib import Path
 
 __all__ = ["APP_INFO", "APP_NAME", "DOWNLOAD_URL", "EXTRAS", "GUIDE_URL", "INCLUDED",
            "RELEASES_URL", "REPOSITORY", "AppInfo", "app_folder", "app_info", "cli_command", "cli_program",
-           "describe", "missing_part", "packaged", "platform_tag", "program_name", "quoted",
-           "studio_command", "studio_program", "update_hint", "zip_name"]
+           "console_command", "console_hint", "describe", "missing_part", "other_cli_on_path",
+           "packaged", "platform_tag", "program_name", "quoted", "studio_command",
+           "studio_program", "update_hint", "zip_name"]
 
 APP_NAME = "AuraLite Studio"
 APP_INFO = "auralite-app.json"
@@ -80,7 +81,7 @@ def platform_tag(system: str | None = None, machine: str | None = None) -> str:
 
 
 def zip_name(version: str, tag: str | None = None) -> str:
-    """``AuraLite-Studio-2.21.1-windows-x64.zip``: what the release attaches."""
+    """``AuraLite-Studio-2.21.2-windows-x64.zip``: what the release attaches."""
     return f"AuraLite-Studio-{version}-{tag or platform_tag()}.zip"
 
 
@@ -121,6 +122,51 @@ def cli_command(*args: str) -> list[str]:
 def quoted(command: list[str]) -> str:
     """`command` as one line to type (arguments with spaces in quotes)."""
     return " ".join(f'"{part}"' if (" " in part or not part) else part for part in command)
+
+
+def console_command(*args: str, system: str | None = None) -> str:
+    """2.21.2: ``auralite`` with `args` as a line to type in a console. In the app it is the
+    program in the app's folder, typed with that folder - ``.\\auralite.exe`` - which PowerShell
+    and cmd both run. PowerShell runs nothing from the current folder by its name alone: it
+    looks on PATH, and finds an AuraLite installed with pip there (often an older one), or
+    nothing. A full path in quotes would not do either: PowerShell takes it for a string.
+    Outside the app: the ``auralite`` command pip installs."""
+    system = system or sys.platform
+    if not packaged():
+        return quoted(["auralite", *args])
+    here = ".\\" if system == "win32" else "./"
+    return quoted([here + program_name("cli", system), *args])
+
+
+def console_hint(*args: str, system: str | None = None) -> str:
+    """:func:`console_command` and where to type it - in the app, the folder to open the
+    console in."""
+    command = console_command(*args, system=system)
+    folder = app_folder()
+    return f"{command} (in a console opened in {folder})" if folder else command
+
+
+def other_cli_on_path(path: str | None = None, system: str | None = None) -> Path | None:
+    """2.21.2: inside the app, the ``auralite`` program a console runs for the name alone when
+    it is not this app's - an AuraLite installed with pip, say: the first one on PATH, which
+    PowerShell always runs (cmd outside the app's folder). None outside the app, when PATH
+    has none, or when the first one is this app's own."""
+    own = cli_program()
+    if own is None:
+        return None
+    name = program_name("cli", system or sys.platform)
+    for entry in (os.environ.get("PATH", "") if path is None else path).split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry:
+            continue
+        candidate = Path(entry) / name
+        if candidate.is_file():
+            try:
+                same = candidate.resolve() == own.resolve()
+            except OSError:
+                same = False
+            return None if same else candidate
+    return None
 
 
 @dataclass(frozen=True)

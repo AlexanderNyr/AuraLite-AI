@@ -2497,6 +2497,22 @@ class TrainerMixin:
                            max_run_steps=total_steps, steps_per_epoch=opt_steps_per_epoch,
                            clock=clock)
 
+        def run_percent(epoch_progress: float) -> float:
+            """2.21.2: the run's progress (0-100) for every event of an epoch - its steps,
+            its validation, its end, a stop - in one measure: the share of the epochs (of
+            max_steps when they end the run first) or of the time budget, whichever is
+            further, since the first of them to run out ends the run. The steps took the
+            time's share alone and validation and the epoch's end the epochs' share alone:
+            with a time limit (the Studio sets one) the chart's training line and the
+            progress bar went back and forth at every epoch's end. Below 100 (99.99) while
+            the run goes on - a time limit's cooldown can outlast the limit - so only the
+            run's end shows 100 %."""
+            planned = epoch_progress / float(max(1, epochs))
+            if max_steps and max_steps < epochs * opt_steps_per_epoch:
+                planned = run_opt_steps / float(max_steps)
+            share = max(planned, ctl.fraction(planned))
+            return max(0.0, min(99.99, share * 100.0))
+
         # 2.16: a dialog step with several batches averages over its learned
         # tokens (one batch per step: the batch's mean, as before)
         weigh_tokens = dialogs is not None and accumulation_steps > 1
@@ -2725,11 +2741,9 @@ class TrainerMixin:
                         avg_loss = running_loss / max(1, seen_batches)
                         epoch_frac = seen_batches / float(n_loader_batches)
                         # overall percent across all epochs (2.18: or of max_steps /
-                        # max_tokens, when that ends the run first)
-                        planned = (epoch + epoch_frac) / float(max(1, epochs))
-                        if max_steps and max_steps < epochs * opt_steps_per_epoch:
-                            planned = run_opt_steps / float(max_steps)
-                        overall_frac = ctl.fraction(planned)
+                        # max_tokens, when that ends the run first; 2.21.2: one measure
+                        # for every event, run_percent)
+                        overall_frac = run_percent(epoch + epoch_frac) / 100.0
                         elapsed = now - train_t0
                         epoch_elapsed = now - epoch_t0
                         # speed from this epoch so far
@@ -2800,8 +2814,8 @@ class TrainerMixin:
                             "batches": n_loader_batches,
                             "global_step": completed_batches_total,
                             "total_steps": total_opt_steps,
-                            "percent": ((epoch + seen_batches / float(n_loader_batches))
-                                        / float(max(1, epochs))) * 100.0,
+                            "percent": run_percent(
+                                epoch + seen_batches / float(n_loader_batches)),
                             "elapsed": time.time() - train_t0,
                             "is_epoch_end": False,
                         },
@@ -2832,7 +2846,7 @@ class TrainerMixin:
                             "batches": n_loader_batches,
                             "global_step": completed_batches_total,
                             "total_steps": total_opt_steps,
-                            "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0 - 0.01,
+                            "percent": run_percent(epoch + 1),
                             "epoch_percent": 100.0,
                             "elapsed": time.time() - train_t0,
                             "is_epoch_end": False,
@@ -2846,7 +2860,7 @@ class TrainerMixin:
                     val_info = {"batch": n_loader_batches, "batches": n_loader_batches,
                                 "global_step": completed_batches_total,
                                 "total_steps": total_opt_steps,
-                                "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0 - 0.01,
+                                "percent": run_percent(epoch + 1),
                                 "epoch_percent": 100.0, "is_epoch_end": False}
                     val_epoch, val_loss_so_far = epoch + 1, running_loss / max(1, seen_batches)
 
@@ -2917,7 +2931,9 @@ class TrainerMixin:
                         "batches": n_loader_batches,
                         "global_step": completed_batches_total,
                         "total_steps": total_opt_steps,
-                        "percent": ((epoch + 1) / float(max(1, epochs))) * 100.0,
+                        # 100 % when the run ends here (2.21.2)
+                        "percent": (100.0 if budget_done or epoch + 1 >= epochs
+                                    else run_percent(epoch + 1)),
                         "epoch_percent": 100.0,
                         "lr": self.scheduler.get_lr() if self.scheduler else lr,
                         "batches_per_sec": (n_loader_batches / epoch_dur) if epoch_dur > 0 else 0.0,

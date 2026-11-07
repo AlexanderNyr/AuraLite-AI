@@ -91,15 +91,17 @@ def _reinstall_qt(requirement: str = f"PySide6-Essentials>={QT_MINIMUM}", *,
 
 
 def _console_start() -> str:
-    """How to start the Studio in a console, where everything it prints shows."""
+    """How to start the Studio in a console, where everything it prints shows. 2.21.2: in
+    the app ``.\\auralite.exe studio`` and the folder to open the console in - the full path
+    in quotes did not run in PowerShell."""
     if bundle.packaged():
-        return bundle.quoted(bundle.cli_command("studio"))
+        return bundle.console_hint("studio")
     return "python -m auralite.studio"
 
 
 def _doctor_line() -> str:
     if bundle.packaged():
-        return bundle.quoted(bundle.cli_command("doctor", "--studio"))
+        return bundle.console_hint("doctor", "--studio")
     return "auralite doctor --studio"
 
 

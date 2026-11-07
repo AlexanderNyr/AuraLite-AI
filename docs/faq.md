@@ -452,3 +452,16 @@ release) and leaves out the large optional parts — the classic interface,
 transformers, the server, ONNX, Hugging Face datasets; AuraLite installed with
 Python has them. Windows may warn that the app is not signed: *More info* → *Run
 anyway*. See [windows-app.md](windows-app.md).
+
+## 24. `auralite.exe doctor` says `invalid choice: 'doctor'`
+
+That was another `auralite.exe`. In PowerShell — the console Windows opens by
+default — a program in the current folder runs only with its folder in front:
+`.\auralite.exe doctor`. Without the `.\` PowerShell looks on PATH, and when
+AuraLite is installed with pip too, it runs that one: an older version has no
+`doctor` (2.19), `runs` (2.20) or `studio --self-test` (2.21). Type
+`.\auralite.exe` in the app's folder, or update the pip install
+(`pip install -U "auralite-ai[studio]"`) or remove it (`pip uninstall
+auralite-ai`). Since 2.21.2 `.\auralite.exe doctor` says when `auralite` alone
+runs another AuraLite. To save the report, use `--out report.txt` rather than
+PowerShell's `>`, which garbles letters outside ASCII.

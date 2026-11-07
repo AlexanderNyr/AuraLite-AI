@@ -2352,6 +2352,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--studio", action="store_true",
                    help="also check that AuraLite Studio's window starts here (a fresh "
                         "process builds it without showing it; exit code 1 if it fails)")
+    p.add_argument("--out", metavar="FILE",
+                   help="also write the report to FILE, in UTF-8 - for an issue (PowerShell's "
+                        "`>` would garble letters outside ASCII)")
     p.set_defaults(func=cmd_doctor)
 
     # 2.20: the run library
@@ -2495,8 +2498,42 @@ def _doctor_command(rec, data: list[str], params_file: str) -> list[str]:
             "auralite export --model my-chat-model.pt --format gguf --out my-chat-model.gguf"]
 
 
+class _Tee:
+    """A text stream that writes to several (2.21.2: ``doctor --out``)."""
+
+    def __init__(self, *streams: Any):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """2.19: the computer, the data, the model and settings that fit, the commands to run."""
+    """2.19: the computer, the data, the model and settings that fit, the commands to run.
+    2.21.2: ``--out FILE`` writes the same report to FILE in UTF-8 - PowerShell's ``>``
+    decodes a program's output in the console's code page and garbles what is not ASCII."""
+    out = getattr(args, "out", None)
+    if not out:
+        return _doctor_report(args)
+    import contextlib
+    import io
+    from pathlib import Path
+    copy = io.StringIO()
+    with contextlib.redirect_stdout(_Tee(sys.stdout, copy)):  # type: ignore[type-var]
+        status = _doctor_report(args)
+    target = Path(out)
+    target.write_text(copy.getvalue(), encoding="utf-8")
+    print(f"\nThe report is in {target.resolve()}")
+    return status
+
+
+def _doctor_report(args: argparse.Namespace) -> int:
     import platform
 
     import torch
@@ -2562,6 +2599,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from auralite import bundle
     if bundle.packaged():                         # 2.21: which app, and where
         print(f"App: {bundle.describe()}")
+        other = bundle.other_cli_on_path()        # 2.21.2: what `auralite` alone runs
+        if other is not None:
+            print(f"  ! In PowerShell `auralite` alone runs {other}, another AuraLite (from "
+                  f"pip?), and so does cmd outside the app's folder. For this app's type "
+                  f"{bundle.console_command()} in its folder.")
     for line in hw.summary_lines():
         print(line)
     print("Optional: " + ", ".join(f"{name} {version or '-'}"

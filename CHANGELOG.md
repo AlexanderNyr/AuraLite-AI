@@ -1,3 +1,88 @@
+# 📦 v2.21.2 — the Studio's chart and progress bar never go back; the RAM the Studio uses on Windows; `.\auralite.exe` in every hint
+
+From the first runs of the Windows app on a PC from 2011:
+
+- **The training chart turned back at every epoch's end**, and the progress bar
+  with it, in a run with a time limit — and the Studio sets one (60 minutes by
+  default). An epoch's steps took their place from the share of the time limit
+  spent, its validation and its end from the share of the epochs done; when the
+  two differ, the line went back to the validation point and on again. Every event
+  of an epoch now has one measure: the share of the epochs (of max_steps when they
+  end the run first) or of the time limit, whichever is further, since the first
+  of them to run out ends the run.
+- **"RAM: 0.0 GB"** in the Studio's status bar on Windows. GetProcessMemoryInfo was
+  called without its types declared, so ctypes passed the process' pseudo-handle as
+  a 32-bit number and the call failed on 64-bit Windows. psutil — which the app
+  brings — answers first now, and the system call has its types.
+- **`auralite.exe doctor` answered `invalid choice: 'doctor'`.** That was another
+  `auralite.exe`: PowerShell runs nothing from the current folder by its name
+  alone, and found an AuraLite 2.18.0 installed with pip on PATH. The hints of the
+  app, its README.txt and the guide now say `.\auralite.exe`, which PowerShell and
+  cmd both run; `.\auralite.exe doctor` says when `auralite` alone runs another
+  AuraLite; `doctor --out FILE` writes the report in UTF-8 — PowerShell's `>`
+  garbles letters outside ASCII, a user name in Cyrillic among them.
+- The Train tab lists a model size by its real parameters and shape — "7M
+  parameters - 8 layers, width 256" — instead of "25m: 7M parameters". The preset's
+  name is its size with a large vocabulary; it is the tooltip now.
+
+**What changed for existing users**
+
+| | 2.21.2 | 2.21.1 |
+|---|---|---|
+| progress of a run with a time limit (chart's x, progress bar) | one measure for every event: the share of the epochs or of the time limit, whichever is further | steps: the time's share; validation and the epoch's end: the epochs' share — the line and the bar went back at every epoch's end |
+| the Studio's progress | never goes back (the bar, the chart) | followed every event |
+| "RAM" in the status bar on Windows | what the Studio's process uses (psutil, or GetProcessMemoryInfo with its types) | 0.0 GB |
+| how the hints say the console program | `.\auralite.exe doctor --studio (in a console opened in <the app's folder>)` | the full path, in quotes when it has a space — which PowerShell does not run |
+| README.txt in the app | `.\auralite.exe …`, PowerShell or cmd | `auralite.exe …`, "open a terminal here" |
+| `auralite doctor` | `--out FILE`: the report in UTF-8 as well; in the app, says when `auralite` alone runs another AuraLite | — |
+| a model size in the Train tab | `7M parameters - 8 layers, width 256` (tooltip: the preset) | `25m: 7M parameters` |
+
+Nothing else changes: models, checkpoints, the other commands and the classic GUI
+work as in 2.21.1. A run's own numbers — its loss, its steps, its time — are the
+same; only where their points sit on the chart and how far the bar shows changed.
+
+**Training progress** (`auralite/engine/trainer.py`, `auralite/studio/progress.py`)
+
+- `run_percent(epoch_progress)` in `train()`: one function for the percent of
+  every event of an epoch — the steps, validation (both events), the epoch's end
+  and a stop. `max(planned, ctl.fraction(planned))`, where `planned` is the share
+  of the epochs, or of max_steps when they end the run first, and
+  `TrainControl.fraction` the share of a time budget (unchanged). Below 100
+  (99.99) while the run goes on — a time limit's cooldown can outlast the limit;
+  the end of the epoch where the run ends (its last, a spent budget, a finish)
+  shows 100 %.
+- `ProgressTracker.update`: the percent never falls below the last one of the run.
+
+**Memory** (`auralite/studio/hardware.py`): `process_memory()` asks psutil first;
+`_windows_working_set()` declares `GetCurrentProcess`'s return as a pointer-sized
+handle and `GetProcessMemoryInfo`'s arguments.
+
+**The console** (`auralite/bundle.py`, `auralite/studio/app.py`, `auralite/cli.py`,
+`packaging/app/build_app.py`)
+
+- `bundle.console_command(*args)`: the line to type — in the app `.\auralite.exe`
+  (`./auralite` on Linux), else `auralite`. `bundle.console_hint(*args)` adds the
+  folder to open the console in. The Studio's start-up hints (a failure, a crash)
+  use it.
+- `bundle.other_cli_on_path()`: inside the app, the first `auralite.exe` on PATH
+  when it is not the app's own; `auralite doctor` names it.
+- `auralite doctor --out FILE`.
+- README.txt: `.\auralite.exe …`, how to open PowerShell or cmd in the folder, and
+  `doctor --studio --out r.txt`.
+
+**Train tab** (`auralite/studio/advisor.py`, `auralite/studio/qt/tab_train.py`):
+`preset_label(fit)`; the preset is each item's tooltip.
+
+**Docs**: docs/windows-app.md (the command line with `.\`, why, and `--out`;
+`.\auralite.exe studio --self-test` instead of the Studio's program in quotes),
+docs/faq.md § 24 (`invalid choice: 'doctor'`), README.
+
+**Tests**: `tests/test_studio_fixes_v2212.py` (new) — a timed run's progress in
+order (a real run), the tracker, the memory on Windows (fake DLLs), the console
+lines and hints, the other `auralite` on PATH, `doctor --out`, README.txt, the
+Train tab's sizes. `tests/test_bundle_v221.py`: the start-up hints name
+`.\auralite.exe` and the folder.
+
 # 📦 v2.21.1 — the Windows app reaches the release: its check runs to the end, and runs the app under a Russian Windows user name
 
 2.21.0 built the Windows app, but CI's and the Release workflow's check of it ended in

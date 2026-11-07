@@ -79,7 +79,9 @@ class ProgressTracker:
         percent = _number(info.get("percent"))
         if percent is None:
             percent = 100.0 * current / max(1, total)
-        view.percent = max(0.0, min(100.0, percent))
+        # 2.21.2: a run's progress never goes back - neither the bar nor the chart's x
+        # (2.21.1's training line turned back at every epoch's end of a timed run)
+        view.percent = max(self.last.percent, max(0.0, min(100.0, percent)))
         view.loss = _number(loss)
         view.val_loss = _number(val_loss)
         view.eta_seconds = _number(info.get("eta_seconds"))

@@ -48,7 +48,7 @@ SPEC = HERE / "auralite_app.spec"
 REQUIREMENTS = HERE / "requirements.txt"
 #: The longest path inside the zip, its top folder included, that still unzips everywhere:
 #: Windows allows 260 characters, and a deep destination such as
-#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.21.1-windows-x64\ takes about 90.
+#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.21.2-windows-x64\ takes about 90.
 PATH_BUDGET = 160
 #: The distributions the app runs with (their dependencies follow); their licenses ship.
 RUNTIME_ROOTS = ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "safetensors",
@@ -381,6 +381,14 @@ def readme_text(info: dict, system: str = sys.platform) -> str:
     underline = "=" * len(title)
     smartscreen = ("\n  Windows may say \"Windows protected your PC\": the app is not signed. "
                    "Choose\n  \"More info\", then \"Run anyway\".\n" if windows else "")
+    # 2.21.2: typed with its folder - PowerShell runs nothing from the current folder by its
+    # name alone (it looks on PATH: an AuraLite from pip there, or nothing)
+    run = (".\\" if windows else "./") + cli
+    howto = (f'The command line is "{cli}" in this folder. Open PowerShell or cmd here (type\n'
+             "powershell in Explorer's address bar, press Enter) and type it with \".\\\" in\n"
+             "front - PowerShell runs nothing from this folder without it:" if windows else
+             f'The command line is "{cli}" in this folder. Open a terminal here and type it\n'
+             'with "./" in front:')
     return f"""{title}
 {underline}
 
@@ -390,18 +398,20 @@ Keep the whole folder together. It may live anywhere you can write to (not in
 Program Files); your models, runs, logs and settings are kept in {home}
 (set AURALITE_HOME to keep them elsewhere), never here.
 
-The command line is "{cli}" in this folder (open a terminal here):
-    {cli} doctor --studio    check this computer and that the Studio starts
-    {cli} runs               the run library
-    {cli} train --help       train from the command line
+{howto}
+    {run} doctor --studio              check this computer and that the Studio starts
+    {run} doctor --studio --out r.txt  the same, and the report in r.txt (for an issue)
+    {run} runs                         the run library
+    {run} train --help                 train from the command line
 
 Update: download the new zip from
     {bundle.DOWNLOAD_URL}
 and unzip it into a new folder; delete the old folder once the new one works.
 Remove: delete this folder (and {home} with your models and runs).
 
-If it does not start: the logs are in {logs}; run "{cli} doctor --studio" in a
-terminal here; the guide: {bundle.GUIDE_URL}
+If it does not start: the logs are in {logs}.
+Run "{run} doctor --studio" in a terminal here.
+The guide: {bundle.GUIDE_URL}
 
 Inside: AuraLite {info['version']}, Python {info['python']}, PyTorch {info['torch']} (runs on
 the processor; no GPU), Qt {info['qt']} (PySide6). The licenses are in the licenses
