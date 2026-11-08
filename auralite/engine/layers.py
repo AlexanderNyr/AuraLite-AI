@@ -216,12 +216,18 @@ class Attention(nn.Module):
                  head_dim: int | None = None,
                  qkv_bias: bool = False,
                  norm_eps: float = 1e-6,
-                 qk_norm_shared: bool = False):
+                 qk_norm_shared: bool = False,
+                 rotary_dim: int | None = None,
+                 output_gate: bool = False):
         super().__init__()
         self.n_heads = n_heads
         # 2.18.1: an explicit head size (Qwen3, Mistral Nemo: n_heads * head_dim
         # differs from d_model); by default d_model / n_heads as before
         self.head_dim = int(head_dim) if head_dim else d_model // n_heads
+        # 2.23: RoPE on the first `rotary_dim` dims of a head only (Qwen3.5: a quarter)
+        self.rotary_dim = int(rotary_dim) if rotary_dim else self.head_dim
+        if not 0 < self.rotary_dim <= self.head_dim or self.rotary_dim % 2:
+            raise ValueError(f"rotary_dim must be even and at most head_dim, got {rotary_dim}")
         self.n_kv_heads = (n_kv_heads or None) or n_heads
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads for GQA")
@@ -241,6 +247,10 @@ class Attention(nn.Module):
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
         self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        # 2.23: an output gate (Qwen3.5): the heads' output times sigmoid(W_g x), before W_o
+        self.output_gate = bool(output_gate)
+        if self.output_gate:
+            self.W_g = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         # 2.16: LoRA adapters on W_q/W_k/W_v/W_o (None until the model's
         # enable_lora(targets="attn" or "all"); see `_proj`)
         self.lora: nn.ModuleDict | None = None
@@ -293,7 +303,7 @@ class Attention(nn.Module):
         original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
         seq_len = max(self.max_seq_len, original + 1)
         return base * (((factor * seq_len / max(1, original)) - (factor - 1.0))
-                       ** (self.head_dim / max(1, self.head_dim - 2)))
+                       ** (self.rotary_dim / max(1, self.rotary_dim - 2)))
 
     def _rope_inv_freq_and_scale(self) -> tuple[torch.Tensor, float]:
         """Return inverse frequencies and post-scale for LLaMA-compatible RoPE.
@@ -309,8 +319,8 @@ class Attention(nn.Module):
         scaling = self.rope_scaling or {}
         scale_type = str(scaling.get("type", "none")).lower()
         factor = float(scaling.get("factor", 1.0) or 1.0)
-        dim_range = torch.arange(0, self.head_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (base ** (dim_range / self.head_dim))
+        dim_range = torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (base ** (dim_range / self.rotary_dim))
         mscale = 1.0
 
         if factor <= 1.0 or scale_type in {"none", ""}:
@@ -334,27 +344,27 @@ class Attention(nn.Module):
             # do not follow the current sequence length), so "dynamic_ntk" is
             # an alias of "ntk". At the original length this is regular RoPE.
             # `ntk_base` pins the result (ModernTransformer.extend_context).
-            inv_freq = 1.0 / (self._ntk_base() ** (dim_range / self.head_dim))
+            inv_freq = 1.0 / (self._ntk_base() ** (dim_range / self.rotary_dim))
         elif scale_type == "yarn":
             original = int(scaling.get("original_max_position_embeddings", self.max_seq_len))
             beta_fast = float(scaling.get("beta_fast", 32.0))
             beta_slow = float(scaling.get("beta_slow", 1.0))
-            low = math.floor(self._yarn_find_correction_dim(beta_fast, self.head_dim, base, original))
-            high = math.ceil(self._yarn_find_correction_dim(beta_slow, self.head_dim, base, original))
+            low = math.floor(self._yarn_find_correction_dim(beta_fast, self.rotary_dim, base, original))
+            high = math.ceil(self._yarn_find_correction_dim(beta_slow, self.rotary_dim, base, original))
             extrapolation = inv_freq
             interpolation = inv_freq / factor
             if scaling.get("yarn_blend") == "legacy":
                 # Models trained before 2.18.1 keep the frequencies they learned
                 # with: the blend ran the wrong way round (it interpolated the
                 # fast, short-wavelength dimensions and kept the slow ones).
-                ramp = self._yarn_linear_ramp_mask(low, high, self.head_dim // 2)
+                ramp = self._yarn_linear_ramp_mask(low, high, self.rotary_dim // 2)
                 inv_freq = interpolation * (1.0 - ramp) + extrapolation * ramp
             else:
                 # The paper's blend, as transformers computes it (2.18.1): the
                 # dimensions that turn many times over the original length are
                 # kept, the slow ones are interpolated.
-                ramp = self._yarn_linear_ramp_mask(max(low, 0), min(high, self.head_dim - 1),
-                                                   self.head_dim // 2)
+                ramp = self._yarn_linear_ramp_mask(max(low, 0), min(high, self.rotary_dim - 1),
+                                                   self.rotary_dim // 2)
                 inv_freq = interpolation * ramp + extrapolation * (1.0 - ramp)
             # DeepSeek/LLaMA YaRN convention: attention_factor defaults to
             # 0.1*ln(factor)+1.0 and scales both cos and sin.
@@ -416,6 +426,10 @@ class Attention(nn.Module):
         sin = self.rope_sin[start_pos:start_pos + seq_len].to(device=x.device, dtype=torch.float32)
         cos = cos[None, :, None, :]
         sin = sin[None, :, None, :]
+        if self.rotary_dim < self.head_dim:          # 2.23: the rest of a head passes as it is
+            rot, rest = x[..., :self.rotary_dim], x[..., self.rotary_dim:]
+            rf = rot.float()
+            return torch.cat([(rf * cos + self._rotate_half(rf) * sin).type_as(x), rest], dim=-1)
         xf = x.float()
         return (xf * cos + self._rotate_half(xf) * sin).type_as(x)
 
@@ -648,6 +662,8 @@ class Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep, **sdpa_gqa_kw)
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        if self.output_gate:
+            out = out * torch.sigmoid(self._proj("W_g", x))
         return self._proj("W_o", out)
 
     def reset_cache(self, capacity: int | None = None):
@@ -840,18 +856,29 @@ class TransformerBlock(nn.Module):
                  head_dim: int | None = None,
                  qkv_bias: bool = False,
                  norm_eps: float = 1e-6,
-                 qk_norm_shared: bool = False):
+                 qk_norm_shared: bool = False,
+                 rotary_dim: int | None = None,
+                 output_gate: bool = False,
+                 linear_attention: dict | None = None):
         super().__init__()
         self.attn_norm = RMSNorm(d_model, eps=norm_eps)
-        self.attn      = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
-                                   use_alibi=use_alibi,
-                                   rope_scaling=rope_scaling,
-                                   sliding_window=sliding_window,
-                                   kv_cache_dtype=kv_cache_dtype,
-                                   use_flex_attention=use_flex_attention,
-                                   use_qk_norm=use_qk_norm,
-                                   head_dim=head_dim, qkv_bias=qkv_bias,
-                                   norm_eps=norm_eps, qk_norm_shared=qk_norm_shared)
+        self.attn: nn.Module
+        if linear_attention is not None:
+            # 2.23: a linear-attention layer (Gated DeltaNet) in place of the attention
+            from auralite.engine.linear_attention import GatedDeltaNet, linear_attention_dims
+            self.attn = GatedDeltaNet(d_model, norm_eps=norm_eps,
+                                      **linear_attention_dims(linear_attention))
+        else:
+            self.attn = Attention(d_model, n_heads, n_kv_heads, max_seq_len,
+                                  use_alibi=use_alibi,
+                                  rope_scaling=rope_scaling,
+                                  sliding_window=sliding_window,
+                                  kv_cache_dtype=kv_cache_dtype,
+                                  use_flex_attention=use_flex_attention,
+                                  use_qk_norm=use_qk_norm,
+                                  head_dim=head_dim, qkv_bias=qkv_bias,
+                                  norm_eps=norm_eps, qk_norm_shared=qk_norm_shared,
+                                  rotary_dim=rotary_dim, output_gate=output_gate)
         self.ffn_norm  = RMSNorm(d_model, eps=norm_eps)
         self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
         self.dropout   = ResidualDropout(dropout) if dropout > 0 else nn.Identity()

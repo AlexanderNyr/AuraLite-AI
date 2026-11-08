@@ -377,7 +377,10 @@ def _tiny_model(**extra) -> ModernTransformer:
 
 def test_lora_targets():
     assert lora_target_names("ffn") == ("gate", "up", "down")
-    assert lora_target_names("all") == ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o")
+    # 2.23: "all" also names a hybrid model's projections (Qwen3.5); a plain model's adapters
+    # still list the seven it has
+    assert lora_target_names("all") == ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o",
+                                        "W_g", "in_proj_qkv", "in_proj_z", "out_proj")
     assert lora_target_names(["W_q"]) == ("W_q",)
     with pytest.raises(ValueError, match="lora_targets"):
         lora_target_names("everything")
@@ -387,6 +390,8 @@ def test_lora_targets():
     assert (model.lora_config or {})["targets"] == ["gate", "up", "down"]
     model.enable_lora(rank=2, targets="all")
     assert len(model.lora_pairs()) == 14
+    assert (model.lora_config or {})["targets"] == ["gate", "up", "down", "W_q", "W_k", "W_v",
+                                                    "W_o"]
     assert sum(1 for k in model.state_dict() if ".lora." in k) == 28
     assert all(layer.attn.lora is not None for layer in model.layers)
     model.disable_lora()
@@ -416,7 +421,9 @@ def test_attention_adapters_change_the_output_and_merge(targets):
         adapted = model(x)
     assert float((adapted - base).abs().max()) > 1e-3
     merged_count = model.merge_lora()
-    assert merged_count == len(lora_target_names(targets)) * 2
+    hybrid_only = ("W_g", "in_proj_qkv", "in_proj_z", "out_proj")        # 2.23: Qwen3.5's
+    assert merged_count == len([n for n in lora_target_names(targets)
+                                if n not in hybrid_only]) * 2
     assert not model.lora_adapters
     with torch.no_grad():
         assert float((model(x) - adapted).abs().max()) <= 1e-4
@@ -506,7 +513,7 @@ def test_lora_runs_learn_the_replies_only_by_default():
 def test_lora_on_dialogs_can_train_only_the_new_token_rows():
     engine, before, rows, _ = _lora_chat(lora_embeddings="new")
     model = engine.model
-    assert model.lora_config["targets"] == list(lora_target_names("all"))
+    assert model.lora_config["targets"] == ["gate", "up", "down", "W_q", "W_k", "W_v", "W_o"]
     assert model.lora_config["base_vocab"] == rows and model.embedding.num_embeddings > rows
     for key, value in model.state_dict().items():
         if ".lora." in key:

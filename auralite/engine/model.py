@@ -10,7 +10,7 @@ import math
 import torch
 import torch.nn as nn
 import logging
-from typing import cast
+from typing import Any, cast
 
 from .layers import ROPE_TABLE_PREBUILD, Attention, RMSNorm, TransformerBlock
 from .nf4 import NF4Linear
@@ -99,8 +99,34 @@ class ModernTransformer(nn.Module):
                  head_dim: int | None = None,
                  qkv_bias: bool = False,
                  norm_eps: float = 1e-6,
-                 qk_norm_shared: bool = False):
+                 qk_norm_shared: bool = False,
+                 layer_types: list[str] | tuple[str, ...] | None = None,
+                 linear_attention: dict | None = None,
+                 attn_output_gate: bool = False,
+                 rotary_dim: int | None = None):
         super().__init__()
+        # 2.23: hybrid models (Qwen3.5) - `layer_types` says which layers are
+        # "linear_attention" (Gated DeltaNet, with the dims of `linear_attention`) and which
+        # "full_attention"; the attention can gate its output and rotate part of a head
+        if layer_types is not None:
+            layer_types = [str(t) for t in layer_types]
+            if len(layer_types) != int(n_layers):
+                raise ValueError(f"layer_types has {len(layer_types)} entries for {n_layers} "
+                                 f"layers")
+            unknown = sorted(set(layer_types) - {"full_attention", "linear_attention"})
+            if unknown:
+                raise ValueError(f"unknown layer types {unknown}")
+            if all(t == "full_attention" for t in layer_types):
+                layer_types = None
+        self.layer_types = layer_types
+        if layer_types is not None:
+            from auralite.engine.linear_attention import linear_attention_dims
+            linear_attention = linear_attention_dims(linear_attention)
+        else:
+            linear_attention = None
+        self.linear_attention = linear_attention
+        self.attn_output_gate = bool(attn_output_gate)
+        self.rotary_dim = int(rotary_dim) if rotary_dim else None
         # 2.18.1: the fields of models imported from Hugging Face (hf_models.py)
         # - an explicit head size, q/k/v biases (Qwen2), the RMSNorm epsilon
         # and one QK-norm scale shared by the heads (Qwen3)
@@ -153,8 +179,12 @@ class ModernTransformer(nn.Module):
                              num_experts=num_experts,
                              use_qk_norm=use_qk_norm,
                              head_dim=head_dim, qkv_bias=qkv_bias,
-                             norm_eps=norm_eps, qk_norm_shared=qk_norm_shared)
-            for _ in range(n_layers)
+                             norm_eps=norm_eps, qk_norm_shared=qk_norm_shared,
+                             rotary_dim=rotary_dim, output_gate=attn_output_gate,
+                             linear_attention=(linear_attention if layer_types is not None
+                                               and layer_types[i] == "linear_attention"
+                                               else None))
+            for i in range(n_layers)
         ])
         self.final_norm  = RMSNorm(d_model, eps=norm_eps)
         self.head        = nn.Linear(d_model, vocab_size, bias=False)
@@ -223,7 +253,7 @@ class ModernTransformer(nn.Module):
         if new_len <= old_len:
             return False
         follow = self.context_window is not None and self.context_window == self.default_context_window()
-        layers = self._attention_layers()
+        layers = self._rope_layers()
         scaling = dict(self.rope_scaling or {})
         kind = str(scaling.get("type", "none")).lower()
         if kind in ("ntk", "dynamic_ntk") and "ntk_base" not in scaling and layers:
@@ -251,7 +281,7 @@ class ModernTransformer(nn.Module):
         For a model made on the "meta" device (imports, 4-bit checkpoints),
         whose tables are placeholders until the weights are in place.
         """
-        for attn in self._attention_layers():
+        for attn in self._rope_layers():
             attn._build_rope_buffers(min(int(attn.max_seq_len), ROPE_TABLE_PREBUILD))
             if device is not None:
                 attn.rope_cos = attn.rope_cos.to(device)
@@ -384,23 +414,38 @@ class ModernTransformer(nn.Module):
         for attn in self._attention_layers():
             attn.reset_cache(capacity)
 
-    def _attention_layers(self) -> list[Attention]:
+    def _attention_layers(self) -> list[Any]:
+        """Every layer's token mixer: an Attention, or (2.23) a GatedDeltaNet."""
         return [cast(TransformerBlock, layer).attn for layer in self.layers]
+
+    def _rope_layers(self) -> list[Attention]:
+        """The layers with attention and RoPE (2.23: a hybrid model's full-attention ones)."""
+        return [attn for attn in self._attention_layers() if isinstance(attn, Attention)]
+
+    @property
+    def is_hybrid(self) -> bool:
+        """Whether some layers are linear attention (2.23, Qwen3.5)."""
+        return self.layer_types is not None
 
     def truncate_cache(self, end: int) -> None:
         """Roll every layer's cache back to positions ``< end`` (2.8).
 
         Speculative decoding calls this after a rejected draft token instead
-        of re-running the model over the whole prefix.
+        of re-running the model over the whole prefix. 2.23: a linear-attention
+        layer's state cannot go back - ValueError before any layer changes, and
+        generation feeds the prompt again.
         """
-        for attn in self._attention_layers():
+        layers = self._attention_layers()
+        if self.is_hybrid and 0 < int(end) < self.cache_length:
+            raise ValueError("a hybrid model's linear-attention state cannot be rolled back")
+        for attn in layers:
             attn.truncate_cache(end)
 
     @property
     def cache_length(self) -> int:
         """Positions currently cached (the next token's position)."""
         layers = self._attention_layers()
-        return layers[0].cache_length if layers else 0
+        return int(layers[0].cache_length) if layers else 0
 
     def kv_cache_bytes(self) -> int:
         """Memory held by the KV caches of all layers, in bytes."""
@@ -481,6 +526,10 @@ class ModernTransformer(nn.Module):
                 # (this also registers them as proper submodules of the model)
                 block.lora = layer_lora
                 self.lora_adapters.append(layer_lora)
+        # 2.23: the targets this model has ("all" names a hybrid model's projections too):
+        # an adapter file of a plain model lists what it did before
+        present = {name.rsplit(".", 1)[-1] for name, _linear, _adapter in self.lora_pairs()}
+        self.lora_config["targets"] = [n for n in names if n in present] or names
 
     def disable_lora(self):
         """Disable LoRA and restore full training."""
@@ -553,7 +602,10 @@ class LoRALayer(nn.Module):
         # x: (..., in_features)
         # lora_A: (rank, in_features), lora_B: (out_features, rank)
         # result: x @ lora_A.T @ lora_B.T * scaling
-        return (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        # 2.23: in the adapter's dtype (float32) and back - a base stored in bfloat16
+        # (import --dtype bfloat16) trains its adapters too; a no-op for a float32 base
+        out = (x.to(self.lora_A.dtype) @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        return out.to(x.dtype)
 
     def delta_weight(self) -> torch.Tensor:
         """The change this adapter makes to the weight it adapts (out, in)."""
@@ -564,7 +616,10 @@ class LoRALayer(nn.Module):
 #: defaults. A checkpoint stores only those that differ, so the files of
 #: native models stay readable by older versions.
 ARCH_DEFAULTS_2181 = {"head_dim": None, "qkv_bias": False, "norm_eps": 1e-6,
-                      "qk_norm_shared": False}
+                      "qk_norm_shared": False,
+                      # 2.23: hybrid models (Qwen3.5)
+                      "layer_types": None, "linear_attention": None,
+                      "attn_output_gate": False, "rotary_dim": None}
 
 
 def arch_fields_2181(model: nn.Module) -> dict:
@@ -581,6 +636,16 @@ def arch_fields_2181(model: nn.Module) -> dict:
         out["norm_eps"] = eps
     if getattr(model, "qk_norm_shared", False):
         out["qk_norm_shared"] = True
+    # 2.23: hybrid models (Qwen3.5)
+    layer_types = getattr(model, "layer_types", None)
+    if layer_types:
+        out["layer_types"] = list(layer_types)
+        out["linear_attention"] = dict(getattr(model, "linear_attention", None) or {})
+    if getattr(model, "attn_output_gate", False):
+        out["attn_output_gate"] = True
+    rotary_dim = getattr(model, "rotary_dim", None)
+    if rotary_dim:
+        out["rotary_dim"] = int(rotary_dim)
     return out
 
 
@@ -620,8 +685,13 @@ def model_kwargs_from_checkpoint(checkpoint: dict) -> dict:
 
 
 #: Projections a LoRA adapter can sit on (2.16): the FFN's and the attention's.
-LORA_TARGETS = {"ffn": ("gate", "up", "down"), "attn": ("W_q", "W_k", "W_v", "W_o"),
-                "all": ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o")}
+#: 2.23: in a hybrid model the attention part also means the output gate (W_g) and the
+#: linear-attention layers' projections (Qwen3.5's names).
+LORA_TARGETS = {"ffn": ("gate", "up", "down"),
+                "attn": ("W_q", "W_k", "W_v", "W_o", "W_g", "in_proj_qkv", "in_proj_z",
+                         "out_proj"),
+                "all": ("gate", "up", "down", "W_q", "W_k", "W_v", "W_o", "W_g",
+                        "in_proj_qkv", "in_proj_z", "out_proj")}
 
 
 def lora_target_names(targets: str | list | tuple) -> tuple[str, ...]:

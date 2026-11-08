@@ -101,6 +101,10 @@ def test_a_size_trains_writes_and_says_its_memory(report):
     assert row["memory_used"] == row["memory_peak"] - row["memory_start"]
     assert row["memory_estimate"] < 300 << 20             # the run, not the framework too
     assert row["micro_batch"] * row["accumulation_steps"] >= bench.BATCH
+    # 2.23: the Studio's 32 windows a step, in batches of 8
+    assert row["micro_batch"] * row["accumulation_steps"] == bench.BATCH * bench.ACCUMULATION
+    assert report["settings"]["accumulation_steps"] == bench.ACCUMULATION == 4
+    assert "batches of 8 windows, 4 of them a step, Muon." in bench.to_markdown(report)
     assert report["settings"]["text"] == {"source": "built-in",
                                           "chars": len(bench.bench_text())}
     assert report["hardware"]["gflops"] > 0 and report["hardware"]["threads"] >= 1
@@ -251,14 +255,14 @@ def test_a_size_that_ran_out_of_memory_is_said_so():
     report = dict(FAKE, train=[dict(ROW), {"name": "medium",
                                            "label": "medium: 12 layers x 384 (preset 45m)",
                                            "error": "out of memory"}],
-                  finetune={"model": "hf:Qwen/Qwen2.5-0.5B-Instruct", "method": "qlora",
+                  finetune={"model": "hf:Qwen/Qwen3.5-0.8B", "method": "qlora",
                             "error": "out of memory"})
     text = bench.to_markdown(report)
     assert "| medium: 12 layers x 384 (preset 45m) | - | out of memory | - | - | - |" in text
-    assert "| hf:Qwen/Qwen2.5-0.5B-Instruct | qlora | out of memory | - | - |" in text
+    assert "| hf:Qwen/Qwen3.5-0.8B | qlora | out of memory | - | - |" in text
     assert bench.summary_lines(report)[1:] == [
         "medium: 12 layers x 384 (preset 45m): out of memory",
-        "Fine-tuning hf:Qwen/Qwen2.5-0.5B-Instruct (qlora): out of memory"]
+        "Fine-tuning hf:Qwen/Qwen3.5-0.8B (qlora): out of memory"]
 
 
 def test_fine_tuning_a_ready_model(tmp_path):
@@ -275,7 +279,7 @@ def test_fine_tuning_a_ready_model(tmp_path):
     text = bench.to_markdown(result)
     assert "## Fine-tuning a ready model" in text and "| tiny-llama (" in text
     assert bench.summary_lines(result)[-1].startswith("Fine-tuning tiny-llama (lora): ")
-    assert bench._model_name("hf:Qwen/Qwen2.5-0.5B-Instruct") == "hf:Qwen/Qwen2.5-0.5B-Instruct"
+    assert bench._model_name("hf:Qwen/Qwen3.5-0.8B") == "hf:Qwen/Qwen3.5-0.8B"
     # the same in a process of its own
     spec = tmp_path / "ft.json"
     spec.write_text(json.dumps({"kind": "finetune", "model": str(tmp_path / "tiny-llama"),
@@ -283,6 +287,94 @@ def test_fine_tuning_a_ready_model(tmp_path):
     row = bench._run_child(json.loads(spec.read_text(encoding="utf-8")), tmp_path,
                            lambda _line: None, None)
     assert row["method"] == "lora" and row["tokens_per_second"] > 0
+
+
+# ----------------------------------------------------------------------
+#  2.23: a model already on this computer
+# ----------------------------------------------------------------------
+def test_finetune_source_names_what_it_was_given(tmp_path):
+    assert bench.finetune_source("hf:Qwen/Qwen3.5-0.8B") == "hub"
+    assert bench.finetune_source(" HF:org/model@main ") == "hub"
+    folder = tmp_path / "Qwen3.5-0.8B"
+    folder.mkdir()
+    with pytest.raises(bench.BenchError, match="no config.json - not a downloaded Hugging Face"):
+        bench.finetune_source(str(folder))
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    assert bench.finetune_source(str(folder)) == "folder"
+    for name in ("chat.pt", "chat.safetensors", "CHAT.PT"):
+        (tmp_path / name).write_bytes(b"x")
+        assert bench.finetune_source(str(tmp_path / name)) == "checkpoint"
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(bench.BenchError, match="notes.txt: the benchmark fine-tunes a Hugging"):
+        bench.finetune_source(str(tmp_path / "notes.txt"))
+    with pytest.raises(bench.BenchError, match="no such folder or file"):
+        bench.finetune_source(str(tmp_path / "missing"))
+    with pytest.raises(bench.BenchError, match="--finetune needs a model"):
+        bench.finetune_source("  ")
+
+
+def test_a_wrong_model_path_fails_before_the_sizes(monkeypatch, tmp_path, capsys):
+    pytest.importorskip("torch")
+    from auralite import cli
+    from auralite.studio import hardware
+    stages: list[dict] = []
+    monkeypatch.setattr(hardware, "measure_gflops", lambda *a, **k: 10.0)
+    monkeypatch.setattr(bench, "_run_child",
+                        lambda spec, folder, say, stop: stages.append(spec) or {"error": "x"})
+    with pytest.raises(bench.BenchError, match="no such folder or file"):
+        bench.run_bench(sizes=["tiny"], seconds=1.0, finetune=str(tmp_path / "missing"))
+    assert stages == []                                  # not after minutes of the sizes
+    assert cli.main(["bench", "--sizes", "tiny", "--finetune", str(tmp_path / "missing"),
+                     "--out", str(tmp_path)]) == 2
+    assert "no such folder or file" in capsys.readouterr().err and stages == []
+
+
+def test_the_command_line_takes_a_models_path(monkeypatch, tmp_path, capsys):
+    from auralite import cli
+    seen: list[dict] = []
+    monkeypatch.setattr(bench, "run_bench", lambda **options: seen.append(options) or dict(FAKE))
+    folder = tmp_path / "Qwen3.5-0.8B"
+    assert cli.main(["bench", "--quick", "--out", str(tmp_path), "--finetune", str(folder),
+                     "--method", "qlora"]) == 0
+    assert seen[0]["finetune"] == str(folder) and seen[0]["method"] == "qlora"
+    assert f"then fine-tuning {folder}" in capsys.readouterr().err
+
+
+def test_fine_tuning_an_auralite_checkpoint(tmp_path):
+    """A model trained or imported before: its .pt file, loaded as the Studio opens it."""
+    pytest.importorskip("torch")
+    from auralite.engine import AuraLiteEngine
+    from tests.test_hf_v2181 import write_hf_folder
+    write_hf_folder(tmp_path / "tiny-llama", "llama")
+    engine = AuraLiteEngine()
+    engine.import_hf_model(str(tmp_path / "tiny-llama"))
+    engine.save_model(str(tmp_path / "tiny-chat.pt"))
+    lines: list[str] = []
+    ft = bench._finetune(str(tmp_path / "tiny-chat.pt"), "lora", 1.5, lines.append, None)
+    assert ft["architecture"] == "AuraLite checkpoint" and ft["method"] == "lora"
+    assert ft["tokens_per_second"] > 0 and ft["optimizer_steps"] >= 1 and ft["params"] > 0
+    assert lines[0] == f"Fine-tuning: loading {tmp_path / 'tiny-chat.pt'} (lora)"
+
+
+def test_fine_tuning_a_downloaded_qwen35_folder(tmp_path, monkeypatch):
+    """Qwen3.5 as Hugging Face ships it (the vision tower beside the text): QLoRA in the
+    benchmark, its linear attention included - imported in 4 bits (never whole in float32)."""
+    pytest.importorskip("torch")
+    from auralite.engine import AuraLiteEngine
+    from tests.test_qwen35_v2230 import _write_qwen35
+    _write_qwen35(tmp_path / "Qwen3.5-tiny", multimodal=True)
+    imports: list[dict] = []
+    real_import = AuraLiteEngine.import_hf_model
+
+    def import_hf_model(self, source, **options):
+        imports.append(options)
+        return real_import(self, source, **options)
+
+    monkeypatch.setattr(AuraLiteEngine, "import_hf_model", import_hf_model)
+    ft = bench._finetune(str(tmp_path / "Qwen3.5-tiny"), "qlora", 2.0, lambda _line: None, None)
+    assert imports[0]["quantize"] == "nf4"
+    assert ft["architecture"] == "Qwen3_5ForConditionalGeneration" and ft["method"] == "qlora"
+    assert ft["tokens_per_second"] > 0 and ft["optimizer_steps"] >= 1
 
 
 # ----------------------------------------------------------------------
@@ -336,12 +428,14 @@ def studio(tmp_path, monkeypatch):
     from auralite.studio.qt.window import MainWindow
     from auralite.studio.settings import StudioSettings
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    seen: dict[str, list] = {"inform": [], "confirm": [], "error": []}
-    answers = {"confirm": True}
+    seen: dict[str, list] = {"inform": [], "confirm": [], "error": [], "bench": []}
+    answers: dict = {"confirm": True, "bench": lambda start: start}
     common.DIALOGS.update(error=lambda friendly: seen["error"].append(friendly),
                           inform=lambda title, text: seen["inform"].append((title, text)),
                           confirm=lambda title, text: seen["confirm"].append((title, text))
                           or answers["confirm"],
+                          bench=lambda start: seen["bench"].append(start)
+                          or answers["bench"](start),
                           save=lambda title: "", open=lambda title: "", dir=lambda title: "")
     monkeypatch.setenv("AURALITE_HOME", str(tmp_path / "home"))
     window = MainWindow(engine=AuraLiteEngine(), settings=StudioSettings(first_run_done=True),
@@ -411,15 +505,17 @@ def test_tools_benchmark_runs_it_and_says_the_result(studio, monkeypatch, tmp_pa
 
     monkeypatch.setattr(bench, "run_bench", fake_run)
     monkeypatch.setattr(bench, "default_folder", lambda: tmp_path / "bench")
-    studio.answers["confirm"] = False
+    studio.answers["bench"] = lambda start: None            # Cancel
     studio.bench_action.trigger()
-    assert seen["confirm"][-1][0] == "Benchmark" and not calls and studio.busy == ""
-    assert "three sizes of a new model (tiny, small, medium)" in seen["confirm"][-1][1]
-    studio.answers["confirm"] = True
+    assert seen["bench"][-1].seconds == 60.0 and seen["bench"][-1].finetune is None
+    assert not calls and studio.busy == ""
+    studio.answers["bench"] = lambda start: start           # Start with the defaults
     studio.bench_action.trigger()
     assert studio.busy == "benchmark" and studio.bench_action.text() == "Stop the benchmark"
     _wait(app, lambda: studio.bench_job is None)
     assert calls[0]["sizes"] == list(bench.SIZES) and calls[0]["stop"] is not None
+    assert calls[0]["seconds"] == 60.0 and calls[0]["finetune"] is None
+    assert calls[0]["method"] == ""
     title, text = seen["inform"][-1]
     assert title == "Benchmark" and text.startswith(
         "small: 8 layers x 256 (preset 25m): 7M parameters - 1,061 tokens/s training, "
@@ -447,6 +543,96 @@ def test_tools_benchmark_stops(studio, monkeypatch, tmp_path):
     assert studio.seen["error"] == [] and studio.busy == ""
     assert studio.statusBar().currentMessage() == "The benchmark was stopped"
     assert studio.bench_action.text() == "Benchmark…"
+
+
+def test_tools_benchmark_fine_tunes_a_model_already_downloaded(studio, monkeypatch, tmp_path):
+    """2.23: the dialog's model - a downloaded folder here - reaches the benchmark, and the
+    next benchmark starts from the same settings."""
+    from auralite.studio.qt.bench_dialog import BenchChoice
+    app = studio.qapp
+    calls: list[dict] = []
+    monkeypatch.setattr(bench, "run_bench", lambda **options: calls.append(options)
+                        or dict(FAKE, finetune={"model": str(tmp_path / "Qwen3.5-0.8B"),
+                                                "architecture": "Qwen3_5ForConditionalGeneration",
+                                                "params": 752_393_024, "method": "qlora",
+                                                "tokens_per_second": 12.5, "tokens": 750,
+                                                "optimizer_steps": 3, "seconds_per_step": 10.0,
+                                                "seconds": 30.0, "micro_batch": 8,
+                                                "accumulation_steps": 1,
+                                                "memory_used": 3 << 30}))
+    monkeypatch.setattr(bench, "default_folder", lambda: tmp_path / "bench")
+    chosen = BenchChoice(seconds=30.0, finetune=str(tmp_path / "Qwen3.5-0.8B"), method="qlora")
+    studio.answers["bench"] = lambda start: chosen
+    studio.bench_action.trigger()
+    _wait(app, lambda: studio.bench_job is None)
+    assert calls[0]["seconds"] == 30.0 and calls[0]["method"] == "qlora"
+    assert calls[0]["finetune"] == str(tmp_path / "Qwen3.5-0.8B")
+    assert studio.seen["inform"][-1][1].split("\n")[1] == \
+        "Fine-tuning Qwen3.5-0.8B (qlora): 12 tokens/s, 3.00 GB"
+    studio.answers["bench"] = lambda start: None
+    studio.bench_action.trigger()
+    assert studio.seen["bench"][-1] == chosen               # the last settings come back
+
+
+def test_the_benchmark_dialog(studio, tmp_path):
+    """2.23: the catalog's Qwen3.5 0.8B or a model on this computer; Start only for a path
+    that is a model."""
+    from auralite.studio.qt import common
+    from auralite.studio.qt.bench_dialog import BenchChoice, BenchDialog, describe
+    dialog = BenchDialog(studio)
+    ok = dialog.buttons.button(dialog.buttons.StandardButton.Ok)
+    assert dialog.seconds.value() == 60 and not dialog.finetune.isChecked()
+    assert not dialog.group.isEnabled() and dialog.model_spec() is None and ok.isEnabled()
+    assert dialog.choice() == BenchChoice(seconds=60.0)
+    assert dialog.estimate.text() == f"About {bench.estimated_minutes(list(bench.SIZES), 60.0):,.0f} minutes"
+    dialog.finetune.setChecked(True)
+    assert dialog.from_catalog.isChecked() and dialog.catalog.isEnabled()
+    assert dialog.model_spec() == bench.FINETUNE_MODEL == "hf:Qwen/Qwen3.5-0.8B"
+    assert dialog.catalog.currentText().startswith("Qwen3.5 0.8B - 752M, 1.8 GB to download")
+    assert "(and the download, the first time)" in dialog.estimate.text()
+    assert not dialog.path.isEnabled() and ok.isEnabled()
+    # a path: typing it chooses "already downloaded"
+    dialog.path.setText(str(tmp_path / "nothing-here"))
+    assert dialog.from_disk.isChecked() and not dialog.catalog.isEnabled()
+    assert "no such folder or file" in dialog.problem.text() and not ok.isEnabled()
+    folder = tmp_path / "Qwen3.5-0.8B"
+    folder.mkdir()
+    dialog.path.setText(str(folder))
+    assert "no config.json" in dialog.problem.text() and not ok.isEnabled()
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    dialog.seconds.setValue(30)
+    assert dialog.problem.text() == "" and ok.isEnabled()
+    dialog.method.setCurrentIndex(dialog.method.findData("qlora"))
+    assert dialog.choice() == BenchChoice(seconds=30.0, finetune=str(folder), method="qlora")
+    assert describe(dialog.choice()) == "30 s per size, fine-tuning Qwen3.5-0.8B (qlora)"
+    # Folder... and File... ask through the Studio's dialogs
+    checkpoint = tmp_path / "my-model.pt"
+    checkpoint.write_bytes(b"x")
+    common.DIALOGS["open"] = lambda title: str(checkpoint)
+    dialog.from_catalog.setChecked(True)
+    dialog.pick_file.setEnabled(True)
+    dialog.pick_file.click()
+    assert dialog.from_disk.isChecked() and dialog.model_spec() == str(checkpoint)
+    assert dialog.problem.text() == ""
+    common.DIALOGS["dir"] = lambda title: str(folder)
+    dialog.pick_folder.click()
+    assert dialog.model_spec() == str(folder)
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    dialog.path.setText(str(tmp_path / "notes.txt"))
+    assert "a Hugging Face model folder or an AuraLite checkpoint" in dialog.problem.text()
+    dialog.close()
+    # the dialog opens with the settings it was given
+    again = BenchDialog(studio, BenchChoice(seconds=45.0, finetune="hf:Qwen/Qwen3.5-2B",
+                                            method="lora"))
+    assert again.finetune.isChecked() and again.from_catalog.isChecked()
+    assert again.model_spec() == "hf:Qwen/Qwen3.5-2B" and again.seconds.value() == 45
+    assert again.choice().method == "lora"
+    again.close()
+    local = BenchDialog(studio, BenchChoice(seconds=60.0, finetune=str(folder)))
+    assert local.from_disk.isChecked() and local.path.text() == str(folder)
+    local.close()
+    assert describe(BenchChoice(seconds=60.0, finetune="hf:Qwen/Qwen3.5-0.8B")) == \
+        "60 s per size, fine-tuning Qwen3.5 0.8B"
 
 
 # ----------------------------------------------------------------------
@@ -561,8 +747,8 @@ def test_quick_is_two_sizes_for_15_seconds(monkeypatch, tmp_path, capsys):
     assert seen[0]["generate_tokens"] == 32 and seen[0]["finetune"] is None
     assert cli.main(["bench", "--out", str(tmp_path), "--finetune", "--method", "lora"]) == 0
     assert seen[1]["sizes"] == ["tiny", "small", "medium"] and seen[1]["seconds"] == 60.0
-    assert seen[1]["finetune"] == "hf:Qwen/Qwen2.5-0.5B-Instruct" and seen[1]["method"] == "lora"
-    assert "then fine-tuning hf:Qwen/Qwen2.5-0.5B-Instruct" in capsys.readouterr().err
+    assert seen[1]["finetune"] == "hf:Qwen/Qwen3.5-0.8B" and seen[1]["method"] == "lora"
+    assert "then fine-tuning hf:Qwen/Qwen3.5-0.8B" in capsys.readouterr().err
 
 
 def test_a_child_keeps_the_engines_lines_to_itself(tmp_path, monkeypatch, capsys):

@@ -44,11 +44,11 @@ __all__ = ["DEFAULT_PROMPT_LOSS_WEIGHT", "DIALOG_LOSSES", "DialogSet", "PROMPT_T
 #: template has no end marker; "llama2" and "mistral" write no ``</s>`` after
 #: a reply in the history of a prompt, so a model would learn one text and be
 #: prompted with another.
-SFT_TEMPLATES = ("chatml", "gemma", "phi", "llama3")
+SFT_TEMPLATES = ("chatml", "gemma", "phi", "llama3", "qwen3_5")
 
 #: The marker the model learns to end a reply with (a stop string of the template).
 _END_OF_REPLY = {"chatml": "<|im_end|>", "gemma": "<end_of_turn>", "phi": "<|end|>",
-                 "llama3": "<|eot_id|>"}
+                 "llama3": "<|eot_id|>", "qwen3_5": "<|im_end|>"}
 
 #: Markers of each template that become special tokens (one id each).
 _SPECIAL_TOKENS = {
@@ -57,6 +57,8 @@ _SPECIAL_TOKENS = {
     "phi": ["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"],
     # 2.18.1: Llama 3 Instruct models (imported from Hugging Face)
     "llama3": ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+    # 2.23: Qwen3.5 - ChatML with an empty thinking block before every reply
+    "qwen3_5": ["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
 }
 
 #: What the loss learns: the assistant's replies (default) or every token.
@@ -243,15 +245,25 @@ def _render_parts(dialog: list[dict], template: str,
         raise ValueError(f"the {template} template's replies are not written as "
                          f"{head!r} + reply + {end!r}")
     tail = after[len(end):]
+    # 2.23: Qwen3.5 writes the replies before the last user message without the empty
+    # thinking block that opens the last one (its own template's history)
+    history = spec.get("assistant_history")
+    last_user = max((i for i, m in enumerate(dialog) if m.get("role") == "user"), default=-1)
     everything = loss == "all"
     out: list[tuple[str, bool, str]] = []
-    for message in dialog:
+    for i, message in enumerate(dialog):
         role, content = message.get("role"), str(message.get("content", ""))
         if role == "system":
             if spec["system"]:
                 out.append((spec["system"].format(system=content), everything, "system"))
         elif role == "user":
             out.append((spec["user"].format(user=content), everything, "user"))
+        elif role == "assistant" and history and i < last_user:
+            opening, closing = history.split("{assistant}")
+            out.append((opening, everything, "head"))
+            out.append((content + end, True, "reply"))
+            if closing[len(end):]:
+                out.append((closing[len(end):], everything, "tail"))
         elif role == "assistant":
             if head:
                 out.append((head, everything, "head"))

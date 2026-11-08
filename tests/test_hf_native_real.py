@@ -1,7 +1,7 @@
 """2.18.1 against the real thing: transformers and llama.cpp (the CI integrations job).
 
-Tiny random Llama / Llama 3.1 / Qwen2 / Mistral / Qwen3 models are made with
-transformers itself, imported into AuraLite's engine and compared logit by
+Tiny random Llama / Llama 3.1 / Qwen2 / Mistral / Qwen3 (and, 2.23, Qwen3.5) models are
+made with transformers itself, imported into AuraLite's engine and compared logit by
 logit; exported folders are loaded back by transformers, exported GGUF files
 by llama.cpp. Locally the module skips without the packages; the CI job sets
 AURALITE_REQUIRE_INTEGRATIONS=1, where a missing package fails.
@@ -125,5 +125,57 @@ def test_exported_gguf_runs_in_llama_cpp(hf_models, tmp_path, name):
     llm.eval(ids.tolist())
     theirs = np.array(llm.scores[:16])
     assert np.abs(theirs - ours).max() < 2e-3
+    assert llm.tokenize(b"the theatre", add_bos=False, special=False) == \
+        result.tokenizer.encode("the theatre")
+
+
+@pytest.mark.parametrize("variant", ["plain", "qlora"])
+def test_exported_qwen35_gguf_runs_in_llama_cpp(tmp_path, variant):
+    """2.23: a Qwen3.5 (made by transformers) imported, then exported as GGUF, computes in
+    llama.cpp what it computes in AuraLite: past the linear attention's 64-token chunks,
+    and with its recurrent state carried from one call to the next; a QLoRA model with its
+    adapters on every projection (the linear attention's included) merges into the file."""
+    llama_cpp = require("llama_cpp")
+    import numpy as np
+    if not hasattr(transformers, "Qwen3_5ForCausalLM"):     # the "minimum" leg: 4.46
+        pytest.skip("this transformers has no Qwen3.5 models")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(
+        vocab_size=271, hidden_size=64, intermediate_size=96, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, linear_num_key_heads=2,
+        linear_num_value_heads=4, linear_key_head_dim=16, linear_value_head_dim=16,
+        linear_conv_kernel_dim=4, tie_word_embeddings=True, attn_output_gate=True,
+        layer_types=["linear_attention"] * 3 + ["full_attention"], max_position_embeddings=256,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7,
+                         "partial_rotary_factor": 0.25, "mrope_section": [1, 1, 0],
+                         "mrope_interleaved": True})
+    model = transformers.Qwen3_5ForCausalLM(config).eval()
+    with torch.no_grad():
+        for key, param in model.named_parameters():
+            if "norm" in key or key.endswith("dt_bias"):
+                param.copy_(torch.randn_like(param) * 0.3)
+    model.save_pretrained(tmp_path / "q35")
+    (tmp_path / "q35" / "tokenizer.json").write_text(json.dumps(tiny_tokenizer_json()),
+                                                     encoding="utf-8")
+    result = import_hf(tmp_path / "q35", quantize="nf4" if variant == "qlora" else None)
+    if variant == "qlora":
+        result.model.enable_lora(rank=4, targets="all")
+        assert "in_proj_qkv" in (result.model.lora_config or {})["targets"]
+        with torch.no_grad():
+            for _name, _base, adapter in result.model.lora_pairs():
+                adapter.lora_B.normal_(0, 0.05)
+    ids = torch.randint(0, 268, (100,), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        ours = result.model(ids[None])[0].numpy()
+    path = tmp_path / "q35.gguf"
+    export_gguf(result.model, result.tokenizer, path, quant="f32", source=result.source)
+    llm = llama_cpp.Llama(model_path=str(path), n_ctx=128, logits_all=True, verbose=False)
+    llm.eval(ids.tolist())
+    assert np.abs(np.array(llm.scores[:100]) - ours).max() < 2e-3
+    llm.reset()
+    llm.eval(ids[:70].tolist())
+    llm.eval(ids[70:].tolist())
+    assert np.abs(np.array(llm.scores[:100]) - ours).max() < 2e-3
     assert llm.tokenize(b"the theatre", add_bos=False, special=False) == \
         result.tokenizer.encode("the theatre")

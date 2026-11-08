@@ -78,7 +78,7 @@ class FineTuneTab(QWidget):
             grid.addWidget(button, row_index, 0)
         self.catalog = QComboBox()
         for model in CATALOG:
-            self.catalog.addItem(f"{model.name} - {model.size_label}", model.repo)
+            self.catalog.addItem(f"{model.display_name} - {model.size_label}", model.repo)
         grid.addWidget(self.catalog, 0, 1, 1, 2)
         self.hub = QLineEdit()
         self.hub.setPlaceholderText("hf:ORG/NAME (Llama, Mistral, Qwen2 / Qwen2.5, Qwen3) or a "
@@ -415,7 +415,7 @@ class FineTuneTab(QWidget):
         for i, fit in enumerate(rec.options):
             mark = "  ★ recommended" if rec.choice is fit else ""
             verdict = "fits" if fit.fits else ("tight" if fit.tight else "too big")
-            self.catalog.setItemText(i, f"{fit.model.name} - {fit.model.size_label} · "
+            self.catalog.setItemText(i, f"{fit.model.display_name} - {fit.model.size_label} · "
                                         f"{verdict}{mark}")
         if rec.choice is not None:
             if not self._base_chosen:

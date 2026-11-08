@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import functools
 import json
 import logging
 import os
@@ -56,9 +57,14 @@ SUPPORTED_ARCHITECTURES = {
     "MistralForCausalLM": "mistral",
     "Qwen2ForCausalLM": "qwen2",
     "Qwen3ForCausalLM": "qwen3",
+    # 2.23: Qwen3.5 (0.8B to 9B) - hybrid linear / full attention; its text part
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
+    "Qwen3_5ForCausalLM": "qwen3_5",
 }
-_MODEL_TYPES = {"llama": "llama", "mistral": "mistral", "qwen2": "qwen2", "qwen3": "qwen3"}
+_MODEL_TYPES = {"llama": "llama", "mistral": "mistral", "qwen2": "qwen2", "qwen3": "qwen3",
+                "qwen3_5": "qwen3_5", "qwen3_5_text": "qwen3_5"}
 _FAMILY_ARCH = {family: arch for arch, family in SUPPORTED_ARCHITECTURES.items()}
+_FAMILY_ARCH["qwen3_5"] = "Qwen3_5ForCausalLM"      # what an export of the text part says
 
 #: Files of a model repository the import needs (the weights come on top).
 _MODEL_FILES = ("config.json", "tokenizer.json")
@@ -346,6 +352,47 @@ def _rope_settings(hf: dict) -> tuple[float, dict]:
     return float(theta if theta is not None else 10000.0), merged
 
 
+def text_config(hf: dict) -> dict:
+    """The language model's part of a config: Qwen3.5's ``text_config`` (2.23), else all."""
+    inner = hf.get("text_config")
+    if isinstance(inner, dict):
+        merged = dict(inner)
+        if merged.get("tie_word_embeddings") is None and "tie_word_embeddings" in hf:
+            merged["tie_word_embeddings"] = hf["tie_word_embeddings"]
+        return merged
+    return hf
+
+
+def _qwen35_config(hf: dict) -> dict:
+    """The hybrid fields of a Qwen3.5 config (2.23)."""
+    if hf.get("mlp_only_layers"):
+        raise HFModelError("mlp_only_layers: this Qwen3.5 variant is not supported")
+    if hf.get("num_experts") or hf.get("num_experts_per_tok"):
+        raise HFModelError("Qwen3.5 mixture-of-experts models (35B-A3B and up) are not "
+                           "supported: AuraLite imports the dense ones (0.8B to 9B)")
+    hidden_layers = int(hf["num_hidden_layers"])
+    types = hf.get("layer_types")
+    if not types:
+        interval = int(hf.get("full_attention_interval") or 4)
+        types = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                 for i in range(hidden_layers)]
+    types = [str(t) for t in types]
+    if len(types) != hidden_layers or set(types) - {"full_attention", "linear_attention"}:
+        raise HFModelError(f"layer_types {sorted(set(types))!r}: AuraLite knows "
+                           f"full_attention and linear_attention")
+    act = str(hf.get("hidden_act", "silu")).lower()
+    if act not in ("silu", "swish"):
+        raise HFModelError(f"hidden_act={act!r}: AuraLite's linear attention uses silu")
+    return {"layer_types": types,
+            "linear_attention": {
+                "num_k_heads": int(hf.get("linear_num_key_heads") or 16),
+                "num_v_heads": int(hf.get("linear_num_value_heads") or 16),
+                "k_head_dim": int(hf.get("linear_key_head_dim") or 128),
+                "v_head_dim": int(hf.get("linear_value_head_dim") or 128),
+                "conv_kernel": int(hf.get("linear_conv_kernel_dim") or 4)},
+            "attn_output_gate": bool(hf.get("attn_output_gate", True))}
+
+
 def native_config(hf: dict) -> dict:
     """The :class:`ModernTransformer` arguments of a Hugging Face ``config.json``.
 
@@ -354,12 +401,13 @@ def native_config(hf: dict) -> dict:
     a RoPE scaling AuraLite does not reproduce, per-layer sliding windows).
     """
     family = _family(hf)
+    hf = text_config(hf)
     act = str(hf.get("hidden_act", "silu")).lower()
     if act not in ("silu", "swish"):
         raise HFModelError(f"hidden_act={act!r}: AuraLite's feed-forward is SwiGLU (silu)")
     if hf.get("mlp_bias"):
         raise HFModelError("mlp_bias=true: AuraLite's feed-forward has no biases")
-    if family in ("llama", "qwen3", "mistral") and hf.get("attention_bias"):
+    if family in ("llama", "qwen3", "mistral", "qwen3_5") and hf.get("attention_bias"):
         raise HFModelError("attention_bias=true: AuraLite has no bias on the attention's "
                            "output projection")
     if hf.get("pretraining_tp", 1) not in (None, 1):
@@ -374,6 +422,14 @@ def native_config(hf: dict) -> dict:
     theta, rope = _rope_settings(hf)
     kind = str(rope.get("rope_type", rope.get("type", "default")) or "default").lower()
     scaling: dict = {"base": theta}
+    # 2.23: Qwen3.5 rotates a share of each head; its multimodal RoPE (mrope) gives text
+    # tokens the same position on its three axes, which is plain RoPE
+    rotary_dim = None
+    factor = rope.get("partial_rotary_factor", hf.get("partial_rotary_factor"))
+    if factor not in (None, 1, 1.0):
+        rotary_dim = int(head_dim * float(factor))
+        if rotary_dim % 2 or not 0 < rotary_dim <= head_dim:
+            raise HFModelError(f"partial_rotary_factor={factor}: {rotary_dim} rotary dims")
     if kind == "linear":
         scaling.update(type="linear", factor=float(rope["factor"]))
     elif kind == "llama3":
@@ -407,16 +463,21 @@ def native_config(hf: dict) -> dict:
     vocab = int(hf["vocab_size"])
     tie = bool(hf.get("tie_word_embeddings", False))
     explicit_head = head_dim if (hidden % heads or head_dim != hidden // heads) else None
-    return {
+    out = {
         "vocab_size": vocab, "d_model": hidden, "n_heads": heads,
         "n_layers": int(hf["num_hidden_layers"]), "d_ff": int(hf["intermediate_size"]),
         "max_seq_len": int(hf.get("max_position_embeddings") or 4096),
         "n_kv_heads": kv_heads if kv_heads != heads else None,
         "rope_scaling": scaling, "sliding_window": int(sliding) if sliding else None,
-        "tie_word_embeddings": tie, "use_qk_norm": family == "qwen3",
-        "qk_norm_shared": family == "qwen3", "head_dim": explicit_head,
+        "tie_word_embeddings": tie, "use_qk_norm": family in ("qwen3", "qwen3_5"),
+        "qk_norm_shared": family in ("qwen3", "qwen3_5"), "head_dim": explicit_head,
         "qkv_bias": family == "qwen2", "norm_eps": float(hf.get("rms_norm_eps", 1e-6)),
     }
+    if rotary_dim is not None:
+        out["rotary_dim"] = rotary_dim
+    if family == "qwen3_5":
+        out.update(_qwen35_config(hf))
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -440,6 +501,47 @@ _GLOBAL_NAMES = {"model.embed_tokens.weight": "embedding.weight",
 _NATIVE_GLOBAL_NAMES = {native: hf for hf, native in _GLOBAL_NAMES.items()}
 _LAYER_RE = re.compile(r"model\.layers\.(\d+)\.(.+)")
 _IGNORED = re.compile(r".*\.rotary_emb\.inv_freq$")
+
+
+# 2.23: Qwen3.5 - its text part sits under model.language_model (model. in a text-only
+# checkpoint); RMSNorms other than the gated one keep weight - 1 ("zero-centered"); q_proj
+# holds each head's query and its output gate one after the other
+_QWEN35_LINEAR = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d", "norm",
+                  "out_proj", "A_log", "dt_bias")
+_QWEN35_ATTN = {"W_q": "q_proj", "W_g": "q_proj", "W_k": "k_proj", "W_v": "v_proj",
+                "W_o": "o_proj", "q_norm": "q_norm", "k_norm": "k_norm"}
+_QWEN35_ZERO_CENTERED = re.compile(r"(final_norm|layers\.\d+\.(attn_norm|ffn_norm|attn\.q_norm|"
+                                   r"attn\.k_norm))\.weight")
+_QWEN35_SKIP = re.compile(r"(model\.visual\.|model\.vision_tower\.|mtp\.).*")
+
+
+def qwen35_hf_name(native: str, prefix: str = "model.language_model.") -> str:
+    """The Qwen3.5 checkpoint name of a native parameter (2.23)."""
+    if native == "embedding.weight":
+        return prefix + "embed_tokens.weight"
+    if native == "final_norm.weight":
+        return prefix + "norm.weight"
+    if native == "head.weight":
+        return "lm_head.weight"
+    match = re.fullmatch(r"layers\.(\d+)\.(.+)", native)
+    if match is None:
+        raise HFModelError(f"{native}: no Qwen3.5 equivalent")
+    layer, rest = match.groups()
+    base = f"{prefix}layers.{layer}."
+    if rest in ("attn_norm.weight", "ffn_norm.weight"):
+        return base + ("input_layernorm.weight" if rest.startswith("attn")
+                       else "post_attention_layernorm.weight")
+    if rest.startswith("ffn."):
+        return base + "mlp." + {"gate": "gate_proj", "up": "up_proj",
+                                "down": "down_proj"}[rest.split(".")[1]] + ".weight"
+    if rest.startswith("attn."):
+        part = rest[len("attn."):]
+        head = part.split(".")[0]
+        if head in _QWEN35_LINEAR:
+            return base + "linear_attn." + part
+        if head in _QWEN35_ATTN:
+            return base + "self_attn." + _QWEN35_ATTN[head] + part[len(head):]
+    raise HFModelError(f"{native}: no Qwen3.5 equivalent")
 
 
 def hf_to_native(name: str) -> str | None:
@@ -511,6 +613,13 @@ def detect_chat_template(tokenizer_config: dict | None, tokenizer: Any = None,
 
 
 _JINJA = {
+    "qwen3_5": (
+        "{% for message in messages %}{% if message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' + message['content'] + "
+        "'<|im_end|>' + '\\n' }}{% else %}{{ '<|im_start|>' + message['role'] + '\\n' + "
+        "message['content'] + '<|im_end|>' + '\\n' }}{% endif %}{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n<think>\\n\\n</think>"
+        "\\n\\n' }}{% endif %}"),
     "chatml": (
         "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + "
         "message['content'] + '<|im_end|>' + '\\n' }}{% endfor %}"
@@ -621,6 +730,8 @@ def import_hf(source: str | os.PathLike, *, quantize: str | None = None,
     if not isinstance(jinja, str):
         jinja = None
     template = detect_chat_template(tokenizer_config, tokenizer, jinja)
+    if family == "qwen3_5" and template == "chatml" and token_id(tokenizer, "</think>") is not None:
+        template = "qwen3_5"           # 2.23: its replies open with an empty thinking block
     torch_dtype = _dtype(dtype)
     device = torch.device(device)
 
@@ -628,24 +739,33 @@ def import_hf(source: str | os.PathLike, *, quantize: str | None = None,
         model = ModernTransformer(**kwargs)
     tensors = dict(iter_folder_tensors(folder))
     used: set[str] = set()
+    hf_name: Callable[[str], str] = native_to_hf
+    if family == "qwen3_5":
+        # 2.23: the multimodal checkpoints keep the text part under model.language_model
+        prefix = ("model.language_model." if any(n.startswith("model.language_model.")
+                                                 for n in tensors) else "model.")
+        hf_name = functools.partial(qwen35_hf_name, prefix=prefix)
 
     def read(native: str) -> torch.Tensor | None:
-        name = native_to_hf(native)
+        name = hf_name(native)
         file = tensors.get(name)
         if file is None:
             return None
         used.add(name)
-        return file.get(name)
+        tensor = file.get(name)
+        if family == "qwen3_5":
+            tensor = _qwen35_tensor(native, tensor, kwargs)
+        return tensor
 
     def need(native: str) -> torch.Tensor:
         tensor = read(native)
         if tensor is None:
-            raise HFModelError(f"{source}: the weights have no {native_to_hf(native)}")
+            raise HFModelError(f"{source}: the weights have no {hf_name(native)}")
         return tensor
 
     def check(native: str, tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
         if tuple(tensor.shape) != tuple(shape):
-            raise HFModelError(f"{native_to_hf(native)} has the shape {tuple(tensor.shape)}, "
+            raise HFModelError(f"{hf_name(native)} has the shape {tuple(tensor.shape)}, "
                                f"the config says {tuple(shape)}")
         return tensor
 
@@ -679,10 +799,23 @@ def import_hf(source: str | os.PathLike, *, quantize: str | None = None,
         del weight
         if progress_callback is not None and (done % 16 == 0 or done == total):
             progress_callback({"stage": "convert", "done": done, "total": total})
+    # 2.23: what the loop above does not reach - a linear-attention layer's convolution,
+    # its decay (A_log) and time-step bias (dt_bias)
+    for name, param in list(model.named_parameters()):
+        if not param.is_meta:
+            continue
+        tensor = read(name)
+        if tensor is None:
+            continue
+        check(name, tensor, tuple(param.shape))
+        owner, attr = _parent(model, name)
+        setattr(owner, attr, nn.Parameter(tensor.to(device=device, dtype=torch_dtype)))
     if kwargs["tie_word_embeddings"]:
         model.tie_weights()
+    skipped = sorted(n for n in tensors if family == "qwen3_5" and _QWEN35_SKIP.fullmatch(n))
     unused = sorted(n for n in tensors if n not in used and not _IGNORED.fullmatch(n)
-                    and not (n == "lm_head.weight" and kwargs["tie_word_embeddings"]))
+                    and not (n == "lm_head.weight" and kwargs["tie_word_embeddings"])
+                    and n not in skipped)
     if unused:
         raise HFModelError(f"{source}: tensors AuraLite has no place for: "
                            f"{', '.join(unused[:6])}{' ...' if len(unused) > 6 else ''}")
@@ -701,8 +834,10 @@ def import_hf(source: str | os.PathLike, *, quantize: str | None = None,
         add_bos = _post_processor_adds_bos(tokenizer.data, bos)
     repo, revision = (parse_hf_spec(str(source)) if str(source).lower().startswith("hf:")
                       else (str(source), ""))
+    architecture = next((a for a in hf_config.get("architectures") or ()
+                         if a in SUPPORTED_ARCHITECTURES), _FAMILY_ARCH[family])
     source_info = {
-        "family": family, "architecture": _FAMILY_ARCH[family], "repo": repo,
+        "family": family, "architecture": architecture, "repo": repo,
         "revision": revision, "config": hf_config, "generation_config": generation_config,
         "tokenizer_config": {k: v for k, v in tokenizer_config.items()
                              if k != "added_tokens_decoder"},
@@ -711,14 +846,42 @@ def import_hf(source: str | os.PathLike, *, quantize: str | None = None,
         "add_bos_token": bool(add_bos),
     }
     params = model.count_parameters()
-    info = {"source": str(source), "folder": str(folder), "architecture": _FAMILY_ARCH[family],
+    info = {"source": str(source), "folder": str(folder), "architecture": architecture,
             "params": params, "quantized_layers": quantized, "quantize": quantize,
+            "left_out": _left_out(skipped),
             "dtype": str(torch_dtype).replace("torch.", ""), "chat_template": template,
             "vocab_size": kwargs["vocab_size"], "context": kwargs["max_seq_len"],
             "seconds": time.time() - started, "memory_bytes": model_bytes(model)}
     logger.info("[AuraLite] Imported %s: %s params, %s%s", source, f"{params:,}",
                 info["dtype"], f", {quantized} layers in 4 bits (NF4)" if quantized else "")
     return HFImport(model, tokenizer, template, source_info, folder, info)
+
+
+def _qwen35_tensor(native: str, tensor: torch.Tensor, kwargs: dict) -> torch.Tensor:
+    """A Qwen3.5 tensor as the native model holds it (2.23): the query or the output gate
+    of q_proj, an RMSNorm weight + 1."""
+    if native.endswith((".attn.W_q.weight", ".attn.W_g.weight")):
+        heads = int(kwargs["n_heads"])
+        head_dim = int(kwargs.get("head_dim") or kwargs["d_model"] // heads)
+        if tensor.shape[0] != 2 * heads * head_dim:
+            raise HFModelError(f"q_proj has {tensor.shape[0]} rows, not query and gate for "
+                               f"{heads} heads of {head_dim}")
+        pairs = tensor.reshape(heads, 2, head_dim, tensor.shape[-1])
+        part = pairs[:, 0] if native.endswith("W_q.weight") else pairs[:, 1]
+        return part.reshape(heads * head_dim, tensor.shape[-1]).contiguous()
+    if _QWEN35_ZERO_CENTERED.fullmatch(native):
+        return tensor.to(torch.float32) + 1.0
+    return tensor
+
+
+def _left_out(skipped: list[str]) -> list[str]:
+    """What an import left out, in words (2.23: Qwen3.5's vision tower and MTP head)."""
+    parts = []
+    if any(n.startswith(("model.visual.", "model.vision_tower.")) for n in skipped):
+        parts.append("the vision encoder (images and video)")
+    if any(n.startswith("mtp.") for n in skipped):
+        parts.append("the multi-token prediction head")
+    return parts
 
 
 def _post_processor_adds_bos(data: dict, bos: Any) -> bool:
@@ -777,6 +940,18 @@ def export_family(model: ModernTransformer, source: dict | None = None) -> str:
         raise HFModelError("this model was trained with AuraLite's YaRN before 2.18.1, whose "
                            "frequencies no other runtime computes")
     family = (source or {}).get("family")
+    if getattr(model, "is_hybrid", False):
+        # 2.23: linear and full attention - Qwen3.5's text model
+        if not model.use_qk_norm or model.qkv_bias or model.sliding_window:
+            raise HFModelError("a hybrid model is written as Qwen3.5, which has a QK-norm and "
+                               "no q/k/v biases or sliding window")
+        if not model.qk_norm_shared and not _qk_norm_heads_equal(model):
+            raise HFModelError("this hybrid model has a QK-norm scale per head; Qwen3.5 shares "
+                               "one scale over the heads")
+        return "qwen3_5"
+    if getattr(model, "attn_output_gate", False) or getattr(model, "rotary_dim", None):
+        raise HFModelError("an attention output gate or partial RoPE without linear-attention "
+                           "layers has no Hugging Face equivalent here")
     if model.use_qk_norm:
         if not model.qk_norm_shared and not _qk_norm_heads_equal(model):
             raise HFModelError("this model has a QK-norm scale per head; Qwen3 (the only "
@@ -790,7 +965,7 @@ def export_family(model: ModernTransformer, source: dict | None = None) -> str:
 
 
 def _qk_norm_heads_equal(model: ModernTransformer) -> bool:
-    for attn in model._attention_layers():
+    for attn in model._rope_layers():
         for norm in (attn.q_norm, attn.k_norm):
             weight = norm.weight.detach()
             if weight.dim() == 2 and not torch.equal(weight, weight[:1].expand_as(weight)):
@@ -808,7 +983,7 @@ def _rope_config(model: ModernTransformer, attn_head_dim: int) -> tuple[float, d
         return theta, None
     if kind in ("ntk", "dynamic_ntk"):
         # AuraLite's NTK is static: plain RoPE with a larger base
-        return float(model._attention_layers()[0]._ntk_base()), None
+        return float(model._rope_layers()[0]._ntk_base()), None
     if kind == "linear":
         return theta, {"rope_type": "linear", "factor": factor}
     if kind == "llama3":
@@ -862,6 +1037,8 @@ def hf_config_for(model: ModernTransformer, family: str, tokenizer: Any,
     # transformers 5 reads rope_parameters; 4.x reads rope_theta / rope_scaling
     config["rope_parameters"] = dict(rope_scaling or {"rope_type": "default"},
                                      rope_theta=theta)
+    if family == "qwen3_5":
+        return _qwen35_config_for(model, config, base, theta)
     if family == "llama":
         config.update(attention_bias=False, mlp_bias=False, pretraining_tp=1)
     elif family == "mistral":
@@ -872,6 +1049,108 @@ def hf_config_for(model: ModernTransformer, family: str, tokenizer: Any,
         if family == "qwen3":
             config["attention_bias"] = False
     return config
+
+
+def _qwen35_config_for(model: ModernTransformer, config: dict, base: dict,
+                       theta: float) -> dict:
+    """The text-only ``config.json`` of a hybrid model (2.23): ``Qwen3_5ForCausalLM``."""
+    source_text = text_config(base) if base else {}
+    linear = dict(model.linear_attention or {})
+    rotary = int(model.rotary_dim or model.head_dim)
+    rope = {"rope_type": "default", "rope_theta": theta,
+            "partial_rotary_factor": rotary / float(model.head_dim)}
+    old_rope = source_text.get("rope_parameters") or {}
+    section = old_rope.get("mrope_section")
+    if not (isinstance(section, list) and sum(int(x) for x in section) == rotary // 2):
+        third = rotary // 2 // 3
+        section = [third, third, rotary // 2 - 2 * third]
+    rope.update(mrope_section=[int(x) for x in section],
+                mrope_interleaved=bool(old_rope.get("mrope_interleaved", True)))
+    types = list(model.layer_types or [])
+    full = [i for i, t in enumerate(types) if t == "full_attention"]
+    interval = (full[1] - full[0]) if len(full) > 1 else (full[0] + 1 if full else len(types))
+    out = {key: config[key] for key in (
+        "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "head_dim", "hidden_act",
+        "max_position_embeddings", "rms_norm_eps", "tie_word_embeddings", "torch_dtype",
+        "use_cache", "attention_dropout", "bos_token_id", "eos_token_id")}
+    out.update({
+        "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
+        "attention_bias": False, "attn_output_gate": bool(model.attn_output_gate),
+        "layer_types": types, "full_attention_interval": int(interval),
+        "linear_num_key_heads": int(linear.get("num_k_heads", 16)),
+        "linear_num_value_heads": int(linear.get("num_v_heads", 16)),
+        "linear_key_head_dim": int(linear.get("k_head_dim", 128)),
+        "linear_value_head_dim": int(linear.get("v_head_dim", 128)),
+        "linear_conv_kernel_dim": int(linear.get("conv_kernel", 4)),
+        "mlp_only_layers": [], "mtp_num_hidden_layers": 0, "rope_parameters": rope,
+        "dtype": config.get("torch_dtype")})
+    return out
+
+
+def qwen35_export_tensors(model: Any, prefix: str = "model."
+                          ) -> Iterator[tuple[str, tuple[int, ...], Callable[[], torch.Tensor]]]:
+    """``(Qwen3.5 name, shape, produce float32 tensor)`` of a hybrid model (2.23): the
+    query and the output gate interleaved per head into q_proj, the zero-centered norms
+    as weight - 1, adapters merged, 4-bit layers dequantized."""
+    from .linear_attention import GatedDeltaNet
+    model = _native_model(model)
+    adapters = {name: adapter for name, _linear, adapter in model.lora_pairs()}
+    rows, width = int(model.embedding.num_embeddings), int(model.d_model)
+
+    def norm(module: Any) -> Callable[[], torch.Tensor]:
+        return lambda: module.weight.detach().float().reshape(-1, module.weight.shape[-1])[0] - 1.0
+
+    yield (prefix + "embed_tokens.weight", (rows, width),
+           lambda: model.embedding.weight.detach().float())
+    for i, block in enumerate(model.layers):
+        layer = cast(TransformerBlock, block)
+        native = f"layers.{i}."
+        base = f"{prefix}layers.{i}."
+        yield (base + "input_layernorm.weight", (width,), norm(layer.attn_norm))
+        yield (base + "post_attention_layernorm.weight", (width,), norm(layer.ffn_norm))
+        attn: Any = layer.attn              # an Attention or (2.23) a GatedDeltaNet
+        if isinstance(attn, GatedDeltaNet):
+            for proj in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+                module = getattr(attn, proj)
+                yield (f"{base}linear_attn.{proj}.weight",
+                       (int(module.out_features), int(module.in_features)),
+                       lambda m=module, a=adapters.get(f"{native}attn.{proj}"):
+                       _merged_weight(m, a))
+            yield (base + "linear_attn.conv1d.weight", tuple(attn.conv1d.weight.shape),
+                   lambda a=attn: a.conv1d.weight.detach().float())
+            for name in ("A_log", "dt_bias"):
+                yield (f"{base}linear_attn.{name}", tuple(getattr(attn, name).shape),
+                       lambda a=attn, n=name: getattr(a, n).detach().float())
+            yield (base + "linear_attn.norm.weight", tuple(attn.norm.weight.shape),
+                   lambda a=attn: a.norm.weight.detach().float())
+        else:
+            heads, head_dim = int(attn.n_heads), int(attn.head_dim)
+
+            def q_proj(a: Any = attn, i: int = i, heads: int = heads,
+                       head_dim: int = head_dim) -> torch.Tensor:
+                q = _merged_weight(a.W_q, adapters.get(f"layers.{i}.attn.W_q"))
+                g = _merged_weight(a.W_g, adapters.get(f"layers.{i}.attn.W_g"))
+                return torch.stack([q.reshape(heads, head_dim, -1),
+                                    g.reshape(heads, head_dim, -1)], dim=1).reshape(
+                    2 * heads * head_dim, -1)
+
+            yield (base + "self_attn.q_proj.weight", (2 * heads * head_dim, width), q_proj)
+            for proj, hf in (("W_k", "k_proj"), ("W_v", "v_proj"), ("W_o", "o_proj")):
+                module = getattr(attn, proj)
+                yield (f"{base}self_attn.{hf}.weight",
+                       (int(module.out_features), int(module.in_features)),
+                       lambda m=module, a=adapters.get(f"{native}attn.{proj}"):
+                       _merged_weight(m, a))
+            yield (base + "self_attn.q_norm.weight", (head_dim,), norm(attn.q_norm))
+            yield (base + "self_attn.k_norm.weight", (head_dim,), norm(attn.k_norm))
+        for proj, hf in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
+            module = getattr(layer.ffn, proj)
+            yield (f"{base}mlp.{hf}.weight", (int(module.out_features), int(module.in_features)),
+                   lambda m=module, a=adapters.get(f"{native}ffn.{proj}"): _merged_weight(m, a))
+    yield (prefix + "norm.weight", (width,), norm(model.final_norm))
+    if model.head.weight is not model.embedding.weight:
+        yield ("lm_head.weight", (rows, width), lambda: model.head.weight.detach().float())
 
 
 def _merged_weight(module: nn.Module, adapter: Any) -> torch.Tensor:
@@ -900,7 +1179,7 @@ def export_tensors(model: Any) -> Iterator[tuple[str, tuple[int, ...], Callable[
     for i, block in enumerate(model.layers):
         prefix = f"layers.{i}."
         layer = cast(TransformerBlock, block)
-        attn = layer.attn
+        attn: Any = layer.attn              # an Attention or (2.23) a GatedDeltaNet
         ffn = layer.ffn
         yield (prefix + "attn_norm.weight", tuple(layer.attn_norm.weight.shape),
                lambda m=layer.attn_norm: m.weight.detach().float())
@@ -982,9 +1261,13 @@ def export_hf(model: Any, tokenizer: Any, out_dir: str | os.PathLike, *,
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     config = hf_config_for(model, family, tokenizer, source, torch_dtype)
-    specs = [TensorSpec(native_to_hf(name), shape, torch_dtype,
-                        lambda p=produce: p().to(torch_dtype))
-             for name, shape, produce in export_tensors(model)]
+    if family == "qwen3_5":           # 2.23: names, q_proj and the norms of Qwen3.5
+        specs = [TensorSpec(name, shape, torch_dtype, lambda p=produce: p().to(torch_dtype))
+                 for name, shape, produce in qwen35_export_tensors(model)]
+    else:
+        specs = [TensorSpec(native_to_hf(name), shape, torch_dtype,
+                            lambda p=produce: p().to(torch_dtype))
+                 for name, shape, produce in export_tensors(model)]
     shards: list[list[TensorSpec]] = [[]]
     size = 0
     for spec in specs:

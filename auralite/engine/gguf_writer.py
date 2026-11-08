@@ -49,7 +49,8 @@ _UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32, _FLOAT32, _BOOL, _STRING, _ARRA
 # llama.cpp token types
 _NORMAL, _UNKNOWN, _CONTROL, _USER_DEFINED, _UNUSED, _BYTE = range(1, 7)
 
-_ARCH = {"llama": "llama", "mistral": "llama", "qwen2": "qwen2", "qwen3": "qwen3"}
+_ARCH = {"llama": "llama", "mistral": "llama", "qwen2": "qwen2", "qwen3": "qwen3",
+         "qwen3_5": "qwen35"}
 
 #: The text llama.cpp tokenizes to tell BPE pre-tokenizers apart, and the
 #: sha256 of the token ids of some it knows (convert_hf_to_gguf.py).
@@ -73,6 +74,9 @@ KNOWN_PRE_TOKENIZERS = {
     "3ce83efda5659b07b1ad37ca97ca5797ea4285d9b9ab0dc679e4a720c9da7454": "gpt-2",
     "63b97e4253352e6f357cc59ea5b583e3a680eaeaf2632188c2b952de2588485e": "tekken",
     "9d032fcbd5501f4a38150912590928bfb36091efb5df11b8e2124b0390e3fb1e": "falcon3",
+    # 2.23: Qwen3.5 (its own pre-tokenizer: letters keep their combining marks)
+    "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4": "qwen35",
+    "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f": "qwen35",
 }
 
 
@@ -166,6 +170,9 @@ def _value(value: Any, kind: int | None = None) -> tuple[int, bytes]:
         return kind, struct.pack("<?", bool(value))
     if kind == _ARRAY:
         items = list(value) if isinstance(value, (list, tuple)) else [value]
+        if items and all(isinstance(v, bool) for v in items):       # 2.23: layer flags
+            return kind, struct.pack("<IQ", _BOOL, len(items)) + struct.pack(
+                f"<{len(items)}?", *items)
         if items and all(isinstance(v, str) for v in items):
             body = b"".join(_string(str(v)) for v in items)
             return kind, struct.pack("<IQ", _STRING, len(items)) + body
@@ -261,6 +268,156 @@ def _llama3_rope_factors(scaling: dict, head_dim: int) -> torch.Tensor:
 # ----------------------------------------------------------------------
 #  Export
 # ----------------------------------------------------------------------
+def _reorder_v_heads(tensor: torch.Tensor, dim: int, k_heads: int, per_k: int,
+                     head_dim: int) -> torch.Tensor:
+    """llama.cpp's order of a linear-attention layer's value heads (2.23): Hugging Face
+    keeps them grouped by key head, ggml's broadcast wants them tiled."""
+    shape = list(tensor.shape)
+    grouped = tensor.reshape(*shape[:dim], k_heads, per_k, head_dim, *shape[dim + 1:])
+    order = list(range(grouped.dim()))
+    order[dim], order[dim + 1] = order[dim + 1], order[dim]
+    return grouped.permute(*order).contiguous().reshape(*shape)
+
+
+def _qwen35_linear_tensors(attn: Any, blk: str, native: str, width: int,
+                           adapters: dict) -> list[tuple[str, tuple[int, ...], bool,
+                                                         Callable[[], torch.Tensor]]]:
+    """One Gated DeltaNet layer's tensors as llama.cpp's qwen35 reads them (2.23)."""
+    from .hf_models import _merged_weight
+    k_heads, v_heads = attn.num_k_heads, attn.num_v_heads
+    per_k, v_dim, key_dim = v_heads // k_heads, attn.v_head_dim, attn.key_dim
+
+    def tile(t: torch.Tensor, dim: int, head_dim: int) -> torch.Tensor:
+        return t if per_k == 1 else _reorder_v_heads(t, dim, k_heads, per_k, head_dim)
+
+    def merged(name: str) -> torch.Tensor:
+        return _merged_weight(getattr(attn, name), adapters.get(f"{native}attn.{name}"))
+
+    def qkv() -> torch.Tensor:
+        w = merged("in_proj_qkv")
+        return torch.cat([w[:2 * key_dim], tile(w[2 * key_dim:], 0, v_dim)])
+
+    def conv() -> torch.Tensor:
+        w = attn.conv1d.weight.detach().float().reshape(attn.conv_dim, -1)
+        return torch.cat([w[:2 * key_dim], tile(w[2 * key_dim:], 0, v_dim)])
+
+    def per_head(t: torch.Tensor) -> torch.Tensor:      # one value per value head
+        return tile(t.detach().float()[:, None], 0, 1)[:, 0]
+
+    return [
+        (blk + "attn_qkv.weight", (attn.conv_dim, width), False, qkv),
+        (blk + "attn_gate.weight", (attn.value_dim, width), False,
+         lambda: tile(merged("in_proj_z"), 0, v_dim)),
+        (blk + "ssm_beta.weight", (v_heads, width), False,
+         lambda: tile(attn.in_proj_b.weight.detach().float(), 0, 1)),
+        (blk + "ssm_alpha.weight", (v_heads, width), False,
+         lambda: tile(attn.in_proj_a.weight.detach().float(), 0, 1)),
+        (blk + "ssm_conv1d.weight", (attn.conv_dim, attn.conv_kernel), True, conv),
+        (blk + "ssm_dt.bias", (v_heads,), True, lambda: per_head(attn.dt_bias)),
+        (blk + "ssm_a", (v_heads,), True, lambda: per_head(-attn.A_log.detach().float().exp())),
+        (blk + "ssm_norm.weight", (v_dim,), True, lambda: attn.norm.weight.detach().float()),
+        (blk + "ssm_out.weight", (width, attn.value_dim), False,
+         lambda: tile(merged("out_proj"), 1, v_dim)),
+    ]
+
+
+def _qwen35_query_and_gate(attn: Any, native: str, adapters: dict) -> Callable[[], torch.Tensor]:
+    """q_proj as Qwen3.5 (and llama.cpp) keep it: each head's query, then its gate (2.23)."""
+    from .hf_models import _merged_weight
+    heads, head_dim = int(attn.n_heads), int(attn.head_dim)
+
+    def produce() -> torch.Tensor:
+        q = _merged_weight(attn.W_q, adapters.get(native + "attn.W_q"))
+        g = _merged_weight(attn.W_g, adapters.get(native + "attn.W_g"))
+        return torch.stack([q.reshape(heads, head_dim, -1), g.reshape(heads, head_dim, -1)],
+                           dim=1).reshape(2 * heads * head_dim, -1)
+
+    return produce
+
+
+def qwen35_gguf_tensors(model: Any) -> list[tuple[str, tuple[int, ...], bool,
+                                                    Callable[[], torch.Tensor]]]:
+    """``(name, shape, keep float32, produce)`` of a hybrid model as llama.cpp's ``qwen35``
+    reads it (2.23, after its convert_hf_to_gguf.py): q_proj with the output gate per head,
+    A as -exp(A_log), the convolution as (channels, taps), value heads tiled."""
+    from .hf_models import _merged_weight
+    from .layers import TransformerBlock
+    from .linear_attention import GatedDeltaNet
+    adapters = {name: adapter for name, _linear, adapter in model.lora_pairs()}
+    rows, width = int(model.embedding.num_embeddings), int(model.d_model)
+    out: list[tuple[str, tuple[int, ...], bool, Callable[[], torch.Tensor]]] = []
+
+    def weight(module: Any, key: str) -> Callable[[], torch.Tensor]:
+        return lambda: _merged_weight(module, adapters.get(key))
+
+    def norm(module: Any) -> Callable[[], torch.Tensor]:
+        return lambda: module.weight.detach().float().reshape(-1, module.weight.shape[-1])[0]
+
+    out.append(("token_embd.weight", (rows, width), False,
+                lambda: model.embedding.weight.detach().float()))
+    for i, block in enumerate(model.layers):
+        layer: Any = block
+        assert isinstance(layer, TransformerBlock)
+        native, blk = f"layers.{i}.", f"blk.{i}."
+        out.append((blk + "attn_norm.weight", (width,), True, norm(layer.attn_norm)))
+        out.append((blk + "post_attention_norm.weight", (width,), True, norm(layer.ffn_norm)))
+        attn: Any = layer.attn                  # an Attention or (2.23) a GatedDeltaNet
+        if isinstance(attn, GatedDeltaNet):
+            out += _qwen35_linear_tensors(attn, blk, native, width, adapters)
+        else:
+            heads, head_dim = int(attn.n_heads), int(attn.head_dim)
+            kv = int(attn.n_kv_heads) * head_dim
+            out += [
+                (blk + "attn_q.weight", (2 * heads * head_dim, width), False,
+                 _qwen35_query_and_gate(attn, native, adapters)),
+                (blk + "attn_k.weight", (kv, width), False, weight(attn.W_k, native + "attn.W_k")),
+                (blk + "attn_v.weight", (kv, width), False, weight(attn.W_v, native + "attn.W_v")),
+                (blk + "attn_output.weight", (width, heads * head_dim), False,
+                 weight(attn.W_o, native + "attn.W_o")),
+                (blk + "attn_q_norm.weight", (head_dim,), True, norm(attn.q_norm)),
+                (blk + "attn_k_norm.weight", (head_dim,), True, norm(attn.k_norm)),
+            ]
+        for proj, name in (("gate", "ffn_gate"), ("up", "ffn_up"), ("down", "ffn_down")):
+            module = getattr(layer.ffn, proj)
+            out.append((f"{blk}{name}.weight", (int(module.out_features), int(module.in_features)),
+                        False, weight(module, f"{native}ffn.{proj}")))
+    out.append(("output_norm.weight", (width,), True, norm(model.final_norm)))
+    if model.head.weight is not model.embedding.weight:
+        out.append(("output.weight", (rows, width), False,
+                    lambda: model.head.weight.detach().float()))
+    return out
+
+
+def _qwen35_meta(model: Any, arch: str, source: dict | None) -> list[tuple[str, Any, int | None]]:
+    """llama.cpp's qwen35 hyperparameters of a hybrid model (2.23)."""
+    from .hf_models import text_config
+    linear = dict(model.linear_attention or {})
+    if int(linear.get("k_head_dim", 0)) != int(linear.get("v_head_dim", -1)):
+        raise HFModelError("llama.cpp's qwen35 needs the linear attention's key and value "
+                           "heads of one size")
+    rope_dims = int(model.rotary_dim or model.head_dim)
+    config = (source or {}).get("config") or {}
+    rope = (text_config(config).get("rope_parameters") or {}) if config else {}
+    sections = [int(x) for x in (rope.get("mrope_section") or [])]
+    if sum(sections) != rope_dims // 2:
+        third = rope_dims // 2 // 3
+        sections = [third, third, rope_dims // 2 - 2 * third]
+    types = list(model.layer_types or [])
+    full = [i for i, t in enumerate(types) if t == "full_attention"]
+    interval = (full[1] - full[0]) if len(full) > 1 else (full[0] + 1 if full else len(types))
+    return [
+        (f"{arch}.rope.dimension_sections", (sections + [0, 0, 0, 0])[:4], None),
+        (f"{arch}.ssm.conv_kernel", int(linear["conv_kernel"]), _UINT32),
+        (f"{arch}.ssm.state_size", int(linear["k_head_dim"]), _UINT32),
+        (f"{arch}.ssm.group_count", int(linear["num_k_heads"]), _UINT32),
+        (f"{arch}.ssm.time_step_rank", int(linear["num_v_heads"]), _UINT32),
+        (f"{arch}.ssm.inner_size", int(linear["v_head_dim"]) * int(linear["num_v_heads"]),
+         _UINT32),
+        (f"{arch}.attention.recurrent_layers", [t == "linear_attention" for t in types], None),
+        (f"{arch}.full_attention_interval", int(interval), _UINT32),
+    ]
+
+
 def export_gguf(model: Any, tokenizer: Any, path: str | os.PathLike, *,
                 quant: str = "f16", chat_template: str = "chatml",
                 source: dict | None = None, name: str | None = None,
@@ -284,7 +441,7 @@ def export_gguf(model: Any, tokenizer: Any, path: str | os.PathLike, *,
     rope_kind = str(scaling.get("type", "none")).lower()
     theta = float(scaling.get("base", 10000.0))
     if rope_kind in ("ntk", "dynamic_ntk") and float(scaling.get("factor", 1.0) or 1.0) > 1.0:
-        theta = float(model._attention_layers()[0]._ntk_base())
+        theta = float(model._rope_layers()[0]._ntk_base())
     pre = pre_tokenizer_name(tokenizer)
     if pre is None:
         pre = "default"
@@ -307,11 +464,14 @@ def export_gguf(model: Any, tokenizer: Any, path: str | os.PathLike, *,
         (f"{arch}.attention.head_count_kv", kv_heads, _UINT32),
         (f"{arch}.attention.layer_norm_rms_epsilon", float(model.norm_eps), _FLOAT32),
         (f"{arch}.rope.freq_base", theta, _FLOAT32),
-        (f"{arch}.rope.dimension_count", head_dim, _UINT32),
+        (f"{arch}.rope.dimension_count", int(getattr(model, "rotary_dim", None) or head_dim),
+         _UINT32),
         (f"{arch}.attention.key_length", head_dim, _UINT32),
         (f"{arch}.attention.value_length", head_dim, _UINT32),
         (f"{arch}.vocab_size", rows, _UINT32),
     ]
+    if family == "qwen3_5":
+        meta += _qwen35_meta(model, arch, source)
     factor = float(scaling.get("factor", 1.0) or 1.0)
     if rope_kind == "linear" and factor > 1.0:
         meta += [(f"{arch}.rope.scaling.type", "linear", None),
@@ -337,7 +497,7 @@ def export_gguf(model: Any, tokenizer: Any, path: str | os.PathLike, *,
     if eos is not None:
         meta.append(("tokenizer.ggml.eos_token_id", int(eos), _UINT32))
     end = {"chatml": "<|im_end|>", "llama3": "<|eot_id|>", "gemma": "<end_of_turn>",
-           "phi": "<|end|>"}.get(chat_template)
+           "phi": "<|end|>", "qwen3_5": "<|im_end|>"}.get(chat_template)
     eot = token_id(tokenizer, end) if end else None
     if eot is not None and eot != eos:
         meta.append(("tokenizer.ggml.eot_token_id", int(eot), _UINT32))
@@ -354,7 +514,13 @@ def export_gguf(model: Any, tokenizer: Any, path: str | os.PathLike, *,
     if rope_kind == "llama3" and factor > 1.0:
         factors = _llama3_rope_factors(scaling, head_dim)
         tensors.append(("rope_freqs.weight", tuple(factors.shape), "f32", lambda f=factors: f))
-    for native, shape, produce in export_tensors(model):
+    if family == "qwen3_5":           # 2.23: llama.cpp's qwen35 names and layouts
+        for gguf_name, shape, keep_f32, produce in qwen35_gguf_tensors(model):
+            tensor_kind = "f32" if keep_f32 or len(shape) == 1 else kind
+            if tensor_kind == "q8_0" and shape[-1] % 32:
+                tensor_kind = "f16"
+            tensors.append((gguf_name, tuple(shape), tensor_kind, produce))
+    for native, shape, produce in (export_tensors(model) if family != "qwen3_5" else ()):
         gguf_name = _gguf_name(native)
         tensor_kind = kind if len(shape) == 2 else "f32"
         if tensor_kind == "q8_0" and shape[-1] % 32:

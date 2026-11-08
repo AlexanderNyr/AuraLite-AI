@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         self.auto_speed_test = auto_speed_test
         self._jobs: list[Job] = []
         self.bench_job: Job | None = None                   # 2.22: Tools -> Benchmark
+        self.bench_choice: Any = None                       # 2.23: its last settings
         self.version = __version__
         self.setWindowTitle(f"AuraLite Studio {__version__}")
         self.setWindowIcon(studio_icon())
@@ -242,27 +243,29 @@ class MainWindow(QMainWindow):
     def run_benchmark(self) -> None:
         """2.22: *Tools -> Benchmark*: ``auralite bench`` - how fast this computer trains and
         writes three sizes of a new model; the report goes to ~/.auralite/bench. While it
-        runs the menu item stops it."""
+        runs the menu item stops it. 2.23: a dialog first - the seconds per size and, if
+        asked, a fine-tune of a catalog model or of one already downloaded (a folder or a
+        checkpoint)."""
         from auralite import bench
+
+        from .bench_dialog import choose_benchmark, describe
         if self.bench_job is not None:
             self.bench_job.stop_event.set()
             self.statusBar().showMessage("Stopping the benchmark…")
             return
         sizes = list(bench.SIZES)
-        minutes = bench.estimated_minutes(sizes, bench.DEFAULT_SECONDS)
-        if not confirm(self, "Benchmark",
-                       f"Measure how fast this computer trains and writes: three sizes of a "
-                       f"new model ({', '.join(sizes)}), a minute of training each - about "
-                       f"{minutes:,.0f} minutes, offline. Close other programs: they slow it "
-                       f"down. The report (Markdown and JSON) goes to "
-                       f"{bench.default_folder()}.\n\nTools -> Stop the benchmark ends it."):
+        choice = choose_benchmark(self, self.bench_choice)
+        if choice is None:
             return
+        self.bench_choice = choice
         if not self.begin("benchmark"):
             return
+        log.info("[AuraLite] bench: %s", describe(choice))
 
         def work(job: Job) -> Any:
-            report = bench.run_bench(sizes=sizes, progress=job.progress.emit,
-                                     stop=job.stop_event)
+            report = bench.run_bench(sizes=sizes, seconds=choice.seconds,
+                                     finetune=choice.finetune, method=choice.method,
+                                     progress=job.progress.emit, stop=job.stop_event)
             return report, bench.save_report(report)
 
         job = Job("benchmark", work, self)

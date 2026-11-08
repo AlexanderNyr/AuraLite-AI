@@ -238,7 +238,7 @@ def test_render_segments_write_what_generate_chat_prompts(template):
         messages, template_name=template, add_generation_prompt=False)
     learned = [t for t, learn in segments if learn]
     end = {"chatml": "<|im_end|>", "gemma": "<end_of_turn>", "phi": "<|end|>",
-           "llama3": "<|eot_id|>"}[template]
+           "llama3": "<|eot_id|>", "qwen3_5": "<|im_end|>"}[template]
     assert learned == [DIALOG[2]["content"] + end, DIALOG[4]["content"] + end]
     second = [i for i, (_, learn) in enumerate(segments) if learn][1]
     assert "".join(t for t, _ in segments[:second]) == apply_chat_template(

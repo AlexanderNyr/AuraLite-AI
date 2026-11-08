@@ -105,6 +105,17 @@ CHAT_TEMPLATES = {
         "assistant": "<|start_header_id|>assistant<|end_header_id|>\n\n{assistant}<|eot_id|>",
         "stop": ["<|eot_id|>", "<|end_of_text|>"],
     },
+    # 2.23: Qwen3.5 answers at once when its reply opens with an empty thinking block, as
+    # its own template writes by default (enable_thinking off); the replies before the last
+    # user message are written without it, as that template writes a conversation's history
+    "qwen3_5": {
+        "name": "Qwen3.5 (ChatML, no thinking)",
+        "system": "<|im_start|>system\n{system}<|im_end|>\n",
+        "user": "<|im_start|>user\n{user}<|im_end|>\n",
+        "assistant": "<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant}<|im_end|>\n",
+        "assistant_history": "<|im_start|>assistant\n{assistant}<|im_end|>\n",
+        "stop": ["<|im_end|>", "<|endoftext|>"],
+    },
     "simple": {
         "name": "Simple (no special tokens)",
         "system": "System: {system}\n",
@@ -140,20 +151,25 @@ def apply_chat_template(
     tpl = CHAT_TEMPLATES[template_name]
 
     prompt_parts = []
+    # 2.23: a template may write the replies before the last user message another way
+    last_user = max((i for i, msg in enumerate(messages) if msg.role == "user"), default=-1)
 
-    for msg in messages:
+    for i, msg in enumerate(messages):
         if msg.role == "system":
             if tpl["system"]:
                 prompt_parts.append(tpl["system"].format(system=msg.content))
         elif msg.role == "user":
             prompt_parts.append(tpl["user"].format(user=msg.content))
         elif msg.role == "assistant":
-            prompt_parts.append(tpl["assistant"].format(assistant=msg.content))
+            reply = tpl.get("assistant_history") if i < last_user else None
+            prompt_parts.append((reply or tpl["assistant"]).format(assistant=msg.content))
 
     if add_generation_prompt:
         # Add the beginning of the assistant response
         if template_name == "chatml":
             prompt_parts.append("<|im_start|>assistant\n")
+        elif template_name == "qwen3_5":
+            prompt_parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         elif template_name == "gemma":
             prompt_parts.append("<start_of_turn>model\n")
         elif template_name == "phi":

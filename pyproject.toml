@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.22.0"
+version = "2.23.0"
 description = "Train, fine-tune and run language models on your own PC: native engine, QLoRA, GGUF and Hugging Face export, a desktop app (AuraLite Studio) and an OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.11"

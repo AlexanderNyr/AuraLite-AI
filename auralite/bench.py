@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["DEFAULT_SECONDS", "FINETUNE_MODEL", "QUICK", "SIZES", "BenchError", "bench_text",
+           "finetune_source",
            "default_folder", "estimated_minutes", "file_stem", "run_bench", "save_report",
            "size_dims", "summary_lines", "to_markdown"]
 
@@ -38,15 +39,20 @@ SIZES: dict[str, dict[str, Any]] = {
     "medium": {"preset": "45m"},
 }
 #: What every size trains with: the Studio's tokenizer and window; batches of 8 windows, so
-#: that even the medium size takes several steps in a minute on a PC from 2011.
+#: that even the medium size reports often in a minute on a PC from 2011, and (2.23) 4 of
+#: them per optimizer step - the Studio's 32 windows a step: what an optimizer step costs
+#: (Muon's) is shared by as many tokens as in the Studio.
 SEQ_LENGTH = 256
 BATCH = 8
+ACCUMULATION = 4
 VOCAB = 512
 DEFAULT_SECONDS = 60.0
 GENERATE_TOKENS = 128
 #: ``--quick``: two sizes, 15 seconds each (a check that it all runs, not numbers to quote).
 QUICK = {"sizes": ("tiny", "small"), "seconds": 15.0, "generate_tokens": 32}
-FINETUNE_MODEL = "hf:Qwen/Qwen2.5-0.5B-Instruct"
+#: 2.23: Qwen3.5 0.8B (1.7 GB, downloaded once); a folder of a downloaded Hugging Face model
+#: or an AuraLite checkpoint works as well (``--finetune PATH``)
+FINETUNE_MODEL = "hf:Qwen/Qwen3.5-0.8B"
 NIGHT_SECONDS = 8 * 3600
 
 ProgressFn = Callable[[str], None]
@@ -189,8 +195,9 @@ def _train_size(name: str, text: str, seconds: float, generate_tokens: int,
 
     dims = size_dims(name)
     params: dict[str, Any] = dict(dims)
-    params.update(seq_length=SEQ_LENGTH, batch_size=BATCH, tokenizer="bpe",
-                  bpe_vocab_size=VOCAB, epochs=100_000, time_budget_s=float(seconds),
+    params.update(seq_length=SEQ_LENGTH, batch_size=BATCH, accumulation_steps=ACCUMULATION,
+                  tokenizer="bpe", bpe_vocab_size=VOCAB, epochs=100_000,
+                  time_budget_s=float(seconds),
                   early_stopping_patience=0, val_split=0.0, memory_plan="auto",
                   progress_every_seconds=0.5, progress_every_batches=1, seed=0)
     if tokenizer_path:                  # trained once for every size (run_bench)
@@ -291,6 +298,30 @@ def _bench_dialogs(n: int = 48) -> list[list[dict[str, str]]]:
     return out
 
 
+def finetune_source(spec: str) -> str:
+    """What `spec` names for ``--finetune`` (2.23): ``"hub"`` (``hf:ORG/NAME``, downloaded
+    once into ~/.auralite/hf), ``"folder"`` (a downloaded Hugging Face model: config.json and
+    the weights) or ``"checkpoint"`` (an AuraLite .pt / .safetensors file); BenchError for a
+    path that is neither - before the benchmark spends minutes on the other stages."""
+    text = str(spec or "").strip()
+    if not text:
+        raise BenchError("--finetune needs a model: hf:ORG/NAME, a model folder or a checkpoint")
+    if text.lower().startswith("hf:"):
+        return "hub"
+    path = Path(text).expanduser()
+    if path.is_dir():
+        if not (path / "config.json").is_file():
+            raise BenchError(f"{path}: no config.json - not a downloaded Hugging Face model "
+                             f"folder (Qwen3.5, Qwen2/3, Llama, Mistral)")
+        return "folder"
+    if path.is_file():
+        if path.suffix.lower() not in (".pt", ".safetensors"):
+            raise BenchError(f"{path.name}: the benchmark fine-tunes a Hugging Face model "
+                             f"folder or an AuraLite checkpoint (.pt, .safetensors)")
+        return "checkpoint"
+    raise BenchError(f"{path}: no such folder or file")
+
+
 def _finetune(spec: str, method: str, seconds: float, progress: ProgressFn,
               stop: threading.Event | None) -> dict[str, Any]:
     from auralite.engine import AuraLiteEngine
@@ -308,9 +339,16 @@ def _finetune(spec: str, method: str, seconds: float, progress: ProgressFn,
             progress(f"  downloading: {int(info.get('all_bytes') or 0) / 1e6:,.0f} of "
                      f"{int(info['all_total']) / 1e6:,.0f} MB")
 
+    kind = finetune_source(spec)
     with _PeakMemory() as load_memory:
-        info = engine.import_hf_model(spec, quantize="nf4" if method == "qlora" else None,
-                                      progress_callback=on_transfer, stop_event=stop)
+        if kind == "checkpoint":            # 2.23: a model trained or imported before
+            engine.load_model(str(Path(spec).expanduser()))
+            info: dict = {"architecture": "AuraLite checkpoint"}
+        else:                               # 4 bits while it imports: less memory at once
+            info = engine.import_hf_model(str(Path(spec).expanduser()) if kind == "folder"
+                                          else spec,
+                                          quantize="nf4" if method == "qlora" else None,
+                                          progress_callback=on_transfer, stop_event=stop)
     settings = FineTuneSettings(method=method, seq_length=SEQ_LENGTH, epochs=1000,
                                 time_limit_min=float(seconds) / 60.0, val_split=0.0,
                                 batch_size=BATCH)
@@ -528,12 +566,14 @@ def _run(sizes: Any, seconds: float, generate_tokens: int, data: str | None,
         text_info["chars"] = len(text)
     if len(text.strip()) < 2000:
         raise BenchError("the text is too short to measure with (at least 2,000 characters)")
+    if finetune:
+        finetune_source(str(finetune))      # a wrong path fails now, not after the sizes
     report: dict[str, Any] = {
         "format": 1, "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "hardware": hardware.to_dict(),
         "environment": _environment(int(threads or hardware.train_threads)),
         "settings": {"seconds": seconds, "seq_length": SEQ_LENGTH, "batch_size": BATCH,
-                     "vocab": VOCAB, "generate_tokens": generate_tokens, "text": text_info,
+                     "accumulation_steps": ACCUMULATION, "vocab": VOCAB, "generate_tokens": generate_tokens, "text": text_info,
                      "isolated": bool(isolate)},
         "train": [], "finetune": None,
     }
@@ -601,7 +641,7 @@ def _tokens(n: float) -> str:
 
 
 def _model_name(spec: str) -> str:
-    """``hf:Qwen/Qwen2.5-0.5B-Instruct`` as it is; a folder or a file by its name."""
+    """``hf:Qwen/Qwen3.5-0.8B`` as it is; a folder or a file by its name."""
     text = str(spec)
     return text if text.lower().startswith("hf:") else (Path(text).name or text)
 
@@ -654,8 +694,10 @@ def to_markdown(report: dict[str, Any]) -> str:
     out += ["", "## Training a new model on the processor", "",
             f"Each size trained for {settings.get('seconds', 0):,.0f} s on {source}: BPE "
             f"{settings.get('vocab')}, a window of {settings.get('seq_length')} tokens, "
-            f"batches of {settings.get('batch_size')} windows, Muon. Tokens/s counts the "
-            f"training steps after the first one.", "",
+            f"batches of {settings.get('batch_size')} windows"
+            + (f", {settings['accumulation_steps']} of them a step"
+               if int(settings.get("accumulation_steps") or 1) > 1 else "")
+            + ", Muon. Tokens/s counts the training steps after the first one.", "",
             "| Model | Parameters | Training, tokens/s | In 8 hours | "
             + ("One pass over the text | " if show_epoch else "")
             + "Memory used (estimate) | Writing, tokens/s |",
@@ -671,8 +713,9 @@ def to_markdown(report: dict[str, Any]) -> str:
                        if row["tokens_per_second"] else 0.0)
             epoch = (f"{minutes:,.1f} min | " if minutes < 120 else f"{minutes / 60:,.1f} h | ")
         memory = f"{_gb(row['memory_used'])} ({_gb(row['memory_estimate'])})"
-        if row.get("gradient_checkpointing") or row.get("accumulation_steps", 1) > 1:
-            memory += f", batches of {row['micro_batch']}"
+        planned = int(settings.get("batch_size") or BATCH)
+        if row.get("gradient_checkpointing") or int(row.get("micro_batch") or planned) < planned:
+            memory += f", batches of {row['micro_batch']}"     # the memory plan split them
         out.append(f"| {row['label']} | {_millions(row['params'])} | "
                    f"{row['tokens_per_second']:,.0f} | {_tokens(row['night_tokens'])} tokens | "
                    f"{epoch}{memory} | {row['generate_tokens_per_second']:,.0f} |")

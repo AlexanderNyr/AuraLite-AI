@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.22.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.22.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.23.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.23.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -70,7 +70,10 @@ it with `.\` in front, for example:
 
 `.\auralite.exe bench` (2.22) measures how fast this computer trains and writes - three
 sizes of a new model, a minute each - and writes the table to
-`%USERPROFILE%\.auralite\bench\` ([benchmark.md](benchmark.md)).
+`%USERPROFILE%\.auralite\bench\` ([benchmark.md](benchmark.md)). With
+`--finetune` it also times a fine-tune of Qwen3.5 0.8B, and since 2.23 of a model already
+on the disk: `.\auralite.exe bench --finetune D:\models\Qwen3.5-0.8B` (a downloaded
+model's folder) or `--finetune my-chat-model.pt` (an AuraLite checkpoint).
 
 A model trained on plain text such as `notes.txt` continues text: `generate`
 writes on from a prompt, and so does the Studio's Chat tab (*continue the text*,
@@ -162,7 +165,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.22.0-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.23.0-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins

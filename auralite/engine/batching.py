@@ -105,7 +105,10 @@ def batchable_model(model: Any) -> bool:
         return False
     for block in model.layers:
         if not isinstance(block, TransformerBlock) or not isinstance(block.attn, Attention):
-            return False
+            return False                      # 2.23: a hybrid model's linear attention too
+        if getattr(block.attn, "output_gate", False) or \
+                getattr(block.attn, "rotary_dim", block.attn.head_dim) != block.attn.head_dim:
+            return False                      # 2.23: the batched step has neither
         if (type(block).forward is not TransformerBlock.forward
                 or type(block)._forward_impl is not TransformerBlock._forward_impl
                 or type(block.attn).forward is not Attention.forward

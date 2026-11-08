@@ -82,19 +82,27 @@ PUBLISHED = {"HuggingFaceTB/SmolLM2-135M-Instruct": 134.5e6,
              "Qwen/Qwen3-8B": 8.19e9, "meta-llama/Llama-3.2-1B-Instruct": 1.24e9,
              "meta-llama/Llama-3.2-3B-Instruct": 3.21e9,
              "meta-llama/Llama-3.1-8B-Instruct": 8.03e9,
-             "mistralai/Mistral-7B-Instruct-v0.3": 7.25e9}
+             "mistralai/Mistral-7B-Instruct-v0.3": 7.25e9,
+             # 2.23: Qwen3.5's text part (its vision tower and MTP head are not imported)
+             "Qwen/Qwen3.5-0.8B": 752_393_024, "Qwen/Qwen3.5-2B": 1_881_825_088,
+             "Qwen/Qwen3.5-4B": 4_205_751_296, "Qwen/Qwen3.5-9B": 8_953_803_264}
 
 
 def test_catalog_dimensions_give_the_published_sizes():
     assert {m.repo for m in CATALOG} == set(PUBLISHED)
     for model in CATALOG:
         assert abs(model.params - PUBLISHED[model.repo]) / PUBLISHED[model.repo] < 0.01, model
-        assert model.family in ("llama", "mistral", "qwen2", "qwen3")
+        assert model.family in ("llama", "mistral", "qwen2", "qwen3", "qwen3_5")
         assert 0 < model.hidden_params < model.params
         assert model.compute_params >= model.hidden_params
         assert model.spec == f"hf:{model.repo}" and model.download_gb > 0
-    sizes = [m.params for m in CATALOG]
-    assert sizes == sorted(sizes)                    # offered from small to big
+        assert model.older == (model.family != "qwen3_5")                # 2.23
+        assert model.display_name == model.name + (" (older)" if model.older else "")
+    newer = [m for m in CATALOG if not m.older]
+    assert list(CATALOG[:len(newer)]) == newer       # 2.23: the recommended generation first
+    for group in (newer, [m for m in CATALOG if m.older]):
+        sizes = [m.params for m in group]
+        assert sizes == sorted(sizes)                # offered from small to big
     gated = {m.repo for m in CATALOG if m.gated}
     assert gated == {r for r in PUBLISHED if r.startswith("meta-llama/")}
     assert not _model("Qwen/Qwen2.5-3B-Instruct").commercial
@@ -222,11 +230,15 @@ def test_data_in_another_language_prefers_a_multilingual_model():
 def test_a_bigger_english_model_loses_to_a_multilingual_one_for_cyrillic_data():
     russian = DataReport(paths=["x"], kind="dialogs", records=1500, tokens=225_000,
                          longest_tokens=300, script="cyrillic")
-    rec = recommend_finetune(_hw(16, system="Windows 10", gflops=300), russian)
+    older = tuple(m for m in CATALOG if m.older)
+    rec = recommend_finetune(_hw(16, system="Windows 10", gflops=300), russian, models=older)
     smol = next(f for f in rec.options if f.model.repo == "HuggingFaceTB/SmolLM2-1.7B-Instruct")
     assert smol.usable and smol.hours is not None and smol.hours <= 8      # it would fit...
     assert rec.choice is not None and rec.choice.model.repo == "Qwen/Qwen2.5-1.5B-Instruct"
     assert smol.model.params > rec.choice.model.params                  # ...and is bigger
+    # 2.23: with the whole catalog, the newer multilingual generation
+    newest = recommend_finetune(_hw(16, system="Windows 10", gflops=300), russian)
+    assert newest.choice is not None and newest.choice.model.family == "qwen3_5"
 
 
 def test_a_comfortable_fit_beats_a_bigger_tight_one():

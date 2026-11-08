@@ -70,25 +70,51 @@ def count_parameters(*, d_model: int, n_layers: int, n_heads: int, d_ff: int,
                      vocab_size: int, n_kv_heads: int | None = None,
                      tie_word_embeddings: bool = False, use_qk_norm: bool = True,
                      use_moe: bool = False, num_experts: int = 4,
-                     head_dim: int | None = None) -> dict[str, int]:
+                     head_dim: int | None = None, layer_types: Any = None,
+                     linear_attention: dict | None = None,
+                     attn_output_gate: bool = False) -> dict[str, int]:
     """``{"total", "muon", "adamw", "embedding"}`` parameters of a ModernTransformer.
 
     ``muon`` are the hidden matrices Muon trains, ``adamw`` the rest
     (embeddings, the head, norms) — the split of ``optimizer="muon"``.
+    2.23: a hybrid model's (Qwen3.5) linear-attention layers and output gates.
     """
     kv = int(n_kv_heads or n_heads)
     head_dim = int(head_dim or d_model // n_heads)      # 2.18.1: imported models
     kv_width = kv * head_dim
-    attn = d_model * n_heads * head_dim * 2 + d_model * kv_width * 2
+    attn = d_model * n_heads * head_dim * (3 if attn_output_gate else 2) + d_model * kv_width * 2
     ffn = 3 * d_model * d_ff
     if use_moe:
         ffn = ffn * int(num_experts) + d_model * int(num_experts)
     norms = 2 * d_model + (d_model + kv_width if use_qk_norm else 0)   # per-head q/k norms
-    hidden = n_layers * (attn + ffn)
+    linear_layers = sum(1 for t in (layer_types or ()) if t == "linear_attention")
+    hidden = (n_layers - linear_layers) * attn + n_layers * ffn
+    adamw_linear = 0
+    if linear_layers:
+        dims = _linear_dims(linear_attention)
+        hidden += linear_layers * (d_model * (dims["conv"] + dims["value"])
+                                   + dims["value"] * d_model)
+        # beta/alpha projections, the convolution, A, dt and the gated norm (AdamW's)
+        adamw_linear = linear_layers * (2 * d_model * dims["v_heads"] + dims["conv"] * dims["kernel"]
+                                        + 2 * dims["v_heads"] + dims["v_dim"])
+        norms = 2 * d_model
+        norms_full = (n_layers - linear_layers) * ((d_model + kv_width) if use_qk_norm else 0)
+    else:
+        norms_full = 0
     embedding = vocab_size * d_model
     head = 0 if tie_word_embeddings else vocab_size * d_model
-    adamw = embedding + head + n_layers * norms + d_model
+    adamw = embedding + head + n_layers * norms + norms_full + adamw_linear + d_model
     return {"total": hidden + adamw, "muon": hidden, "adamw": adamw, "embedding": embedding}
+
+
+def _linear_dims(value: dict | None) -> dict[str, int]:
+    """A linear-attention layer's widths (2.23): q+k+v (the convolution's channels), v, ..."""
+    from auralite.engine.linear_attention import linear_attention_dims
+    dims = linear_attention_dims(value)
+    key = dims["num_k_heads"] * dims["k_head_dim"]
+    value_width = dims["num_v_heads"] * dims["v_head_dim"]
+    return {"conv": 2 * key + value_width, "value": value_width, "v_heads": dims["num_v_heads"],
+            "v_dim": dims["v_head_dim"], "kernel": dims["conv_kernel"]}
 
 
 def _activation_values(d_model: int, n_heads: int, kv_width: int, d_ff: int,
@@ -109,7 +135,9 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
                              dropout: float = 0.0, device: str = "cpu",
                              use_moe: bool = False, num_experts: int = 4,
                              head_dim: int | None = None,
-                             weight_bytes: int | None = None) -> dict[str, Any]:
+                             weight_bytes: int | None = None, layer_types: Any = None,
+                             linear_attention: dict | None = None,
+                             attn_output_gate: bool = False) -> dict[str, Any]:
     """Bytes one training step holds, by part, and their ``total``.
 
     `batch_size` is the micro-batch (windows per forward pass); gradient
@@ -128,9 +156,16 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
     counts = count_parameters(d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
                               vocab_size=vocab_size, n_kv_heads=n_kv_heads,
                               tie_word_embeddings=tie_word_embeddings, use_moe=use_moe,
-                              num_experts=num_experts, head_dim=head_dim)
+                              num_experts=num_experts, head_dim=head_dim,
+                              layer_types=layer_types, linear_attention=linear_attention,
+                              attn_output_gate=attn_output_gate)
     total_params = counts["total"]
     kv_width = int(n_kv_heads or n_heads) * int(head_dim or d_model // n_heads)
+    if layer_types and any(t == "linear_attention" for t in layer_types):
+        # 2.23: a linear-attention layer keeps q, k, v and z per token where attention keeps
+        # its keys and values: count the wider of the two
+        dims = _linear_dims(linear_attention)
+        kv_width = max(kv_width, dims["conv"] + dims["value"])
     if lora_rank:
         per_layer = 2 * lora_rank * (4 * d_model + 2 * kv_width) + 3 * lora_rank * (
             2 * d_model + 2 * d_ff)

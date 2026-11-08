@@ -210,7 +210,7 @@ class ModelPage(QWizardPage):
             self.table.setRowCount(len(rec.options))
             chosen = 0
             for i, fit in enumerate(rec.options):
-                cells = [fit.model.name, fit.model.size_label, fit.method_label,
+                cells = [fit.model.display_name, fit.model.size_label, fit.method_label,
                          format_gb(fit.memory),
                          "yes" if fit.fits else ("tight" if fit.tight else "no"),
                          format_duration(fit.hours * 3600) if fit.hours is not None else "—",

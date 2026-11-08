@@ -72,10 +72,11 @@ right away.
 ![The Fine-tune tab after the wizard: Qwen2.5 1.5B with QLoRA for 1,200 dialogs in Russian](images/studio-finetune.png)
 
 1. **Base model.** *From the list* offers models AuraLite imports into its own
-   engine, from SmolLM2 135M to 8B models, each marked *fits*, *tight* or *too
-   big* for this computer, the recommended one starred. *Hugging Face name or
-   folder* takes any Llama, Mistral, Qwen2/2.5 or Qwen3 (`hf:ORG/NAME`, or a
-   downloaded folder); *My model file* a checkpoint you trained or imported; *The
+   engine: since 2.23 Qwen3.5 (0.8B, 2B, 4B, 9B) first, then the models before it
+   (SmolLM2, Qwen2.5, Qwen3, Llama 3, Mistral) marked *(older)*; each is marked *fits*,
+   *tight* or *too big* for this computer, the recommended one starred. *Hugging Face
+   name or folder* takes any Qwen3.5, Llama, Mistral, Qwen2/2.5 or Qwen3 (`hf:ORG/NAME`,
+   or a downloaded folder); *My model file* a checkpoint you trained or imported; *The
    model in memory* continues what is loaded.
 2. **Your data.** A `.jsonl` file of dialogs — one `{"messages": [{"role": "user",
    "content": ...}, {"role": "assistant", "content": ...}]}` per line (ShareGPT,
@@ -127,23 +128,30 @@ The Studio estimates the memory of a run with AuraLite's own estimate (within
 about 20 % of measured peaks) and the speed from the one-second speed test: a
 training step costs about 4 × the model's parameters in operations per token
 with LoRA, 6 × with gradient checkpointing. It recommends the largest model that
-fits the memory and finishes 1,000 dialogs (two passes) overnight; for data that
-is not in English, a multilingual model (Qwen). Measured on a 2-core CPU
-(2.18.1): Qwen2.5-0.5B with QLoRA trained at 39 tokens/s in 1.48 GB.
+fits the memory and finishes 1,000 dialogs (two passes) overnight — a Qwen3.5 when one
+does (2.23), else the largest older model that does; for data that is not in English, a
+multilingual model (Qwen). Measured on a 2-core CPU (2.18.1): Qwen2.5-0.5B with QLoRA
+trained at 39 tokens/s in 1.48 GB.
 
-| computer | recommended | 1,000 dialogs, two passes |
+| computer | recommended (2.23) | 1,000 dialogs, two passes |
 |---|---|---|
-| 4 GB, 2 cores (i3-2100) | SmolLM2 360M (English) or Qwen2.5 0.5B (other languages), QLoRA | 6–12 h |
-| 8 GB, 4 cores (i5-2400) | Qwen2.5 0.5B, QLoRA (Qwen2.5 1.5B for shorter dialogs) | 2.5–4 h |
-| 32 GB, 8 cores (AVX2) | Qwen2.5 1.5B–7B, QLoRA | 3–8 h |
-| GPU with 12–24 GB | Qwen2.5 7B, QLoRA | under 1 h (not measured) |
+| 4 GB, 4 threads | SmolLM2 135M (older), QLoRA | ~3 h |
+| 8 GB, i5-2400 class | Qwen2.5 0.5B (older), QLoRA — Qwen3.5 0.8B takes ~8 h | ~5 h |
+| 16 GB, i5-2400 class | Qwen3.5 0.8B, LoRA | ~8 h |
+| 32 GB, 8 threads | Qwen3.5 2B, QLoRA | ~5 h |
 
-(The two PCs assume 70 and 150 GFLOP/s; the Studio measures yours.)
+(The i5-2400 class is 72 GFLOP/s, the 8-thread PC 300; the Studio measures yours, and
+*Tools → Benchmark…* measures a real fine-tune.)
 
 **How fast is it really?** *Tools → Benchmark…* (2.22) trains three sizes of a new model
 for a minute each and times how they write — the same as `auralite bench`; the report, a
 Markdown table and JSON, goes to `~/.auralite/bench` ([benchmark.md](benchmark.md)). While
-it runs, the menu item stops it.
+it runs, the menu item stops it. Since 2.23 a dialog comes first: the seconds per size
+and, with *Also measure fine-tuning a model*, the model — from the catalog (Qwen3.5 0.8B
+first) or **one already downloaded**: *Folder…* for a Hugging Face model's folder (with
+`config.json`), *File…* for an AuraLite checkpoint (`.pt`, `.safetensors`) — and LoRA,
+QLoRA or *Auto*. Start stays grey until the path is a model; the next benchmark opens
+with the same choices.
 
 The same check without the window: `auralite doctor [--data dialogs.jsonl]` prints
 the computer, the models that fit and the `auralite train` command;

@@ -474,7 +474,7 @@ never seen a dialog, nor the markers a chat template wraps messages in. Since
 *Template* list: *auto*, or *continue the text*); with the command line use
 `auralite generate --model my-model.pt --prompt "..."` (`auralite chat` says so).
 To get a model that answers, train or fine-tune it on dialogs (`.jsonl`) — on a
-CPU, fine-tuning a ready model such as Qwen2.5 0.5B or SmolLM2 135M on your
+CPU, fine-tuning a ready model such as Qwen3.5 0.8B or SmolLM2 135M on your
 dialogs gets there much sooner than a model of your own.
 
 How well it continues depends on how much text it read. A 7M-parameter model needs
@@ -491,5 +491,21 @@ literature, your notes, documentation.
 Benchmark…*) measures it in about five minutes, offline: three sizes of a new model (0.9M,
 7M and 19M parameters) trained for a minute each — training tokens per second, tokens in
 a night, the memory each run takes — and how fast each writes. `--finetune` adds a LoRA
-fine-tune of Qwen2.5 0.5B. The report is a Markdown table and JSON in `~/.auralite/bench`.
-See [benchmark.md](benchmark.md).
+fine-tune of Qwen3.5 0.8B (2.23; 2.22 took Qwen2.5 0.5B), or of a model you downloaded
+before: `--finetune D:\models\Qwen3.5-0.8B` (its folder) or `--finetune my-model.pt` (an
+AuraLite checkpoint); the Studio's Benchmark dialog has *Folder…* and *File…* for it. The
+report is a Markdown table and JSON in `~/.auralite/bench`. See [benchmark.md](benchmark.md).
+
+## 27. Qwen 3.5, 3.6, 3.8 — which Qwen can I fine-tune?
+
+Qwen3.5 — 0.8B, 2B, 4B and 9B, released in March 2026 under Apache 2.0 — since 2.23: the
+Studio's list offers them first, and `auralite import` / `train --resume
+hf:Qwen/Qwen3.5-0.8B` / `chat` / `export --format hf|gguf` work with them in AuraLite's own
+engine, on the processor ([training.md](training.md) § 23). The text part is imported; the
+vision encoder (images, video) is not. Qwen2.5 and Qwen3 stay in the list, marked
+*(older)*: on a computer where no Qwen3.5 finishes overnight the Studio still recommends
+one of them, and SmolLM2 135M remains the model for 4 GB.
+
+Qwen 3.6 and 3.8 have open weights only from 27B parameters up (and mixture-of-experts
+models of 35B and more): too big to fine-tune on a CPU with 8–16 GB, and their
+mixture-of-experts layers are not supported. Qwen 3.7 is not released as weights.

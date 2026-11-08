@@ -139,7 +139,7 @@ class ModelFit:
                  else "speed unknown")
         time = f", ~{_hours_text(self.hours)}" if self.hours is not None else ""
         verdict = "fits" if self.fits else ("tight" if self.tight else "does not fit")
-        return (f"{self.model.name} ({self.model.size_label}): {self.method_label}, "
+        return (f"{self.model.display_name} ({self.model.size_label}): {self.method_label}, "
                 f"{format_gb(self.memory)} - {verdict}; {speed}{time}")
 
 
@@ -326,7 +326,8 @@ def recommend_finetune(hw: Hardware, data: DataReport | None = None, *,
 
     The choice is the largest recommended model that fits the memory and finishes within
     `max_hours` (else the quickest that fits); multilingual models for data that is not
-    in English, models that need no license acceptance and allow commercial use first.
+    in English, models that need no license acceptance and allow commercial use first,
+    and (2.23) the newer generation before the models marked ``older``.
     """
     budget = memory_budget(hw)
     device = "cuda" if hw.accelerator == "cuda" else "cpu"
@@ -356,7 +357,10 @@ def recommend_finetune(hw: Hardware, data: DataReport | None = None, *,
         in_time = [f for f in preferred if f.hours is None or f.hours <= max_hours]
         comfortable = [f for f in in_time if f.fits]
         if in_time:
-            rec.choice = max(comfortable or in_time, key=lambda f: f.model.params)
+            pool = comfortable or in_time
+            # 2.23: the newer generation (Qwen3.5) when one of it fits the night
+            pool = [f for f in pool if not f.model.older] or pool
+            rec.choice = max(pool, key=lambda f: f.model.params)
         else:
             rec.choice = min(preferred, key=lambda f: f.hours or 0.0)
             rec.warnings.append(f"every model takes longer than {max_hours:g} h on this "

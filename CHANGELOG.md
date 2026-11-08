@@ -1,3 +1,126 @@
+# 📦 v2.23.0 — Qwen3.5 in AuraLite's own engine; the benchmark fine-tunes a model already downloaded
+
+- **Qwen3.5** — 0.8B, 2B, 4B and 9B, released in March 2026 under Apache 2.0 — imports,
+  fine-tunes with LoRA and QLoRA on the processor, chats, saves and exports like the
+  models of 2.18.1: `auralite import hf:Qwen/Qwen3.5-0.8B`, `auralite train --resume
+  hf:Qwen/Qwen3.5-0.8B --quantize nf4 --lora 16`, `auralite chat`, `auralite export
+  --format hf|gguf`, and the Studio's Fine-tune tab. Qwen3.5 is a hybrid: three layers of
+  four are **Gated DeltaNet linear attention** — a state of 128 × 128 numbers per head
+  instead of every token's keys and values — and the fourth is attention with an output
+  gate, a quarter of each head rotated (partial RoPE) and query/key norms. AuraLite
+  computes the linear attention in plain PyTorch, on any processor: in chunks of 64
+  tokens for training and prompts, token by token from its state while it writes.
+  The published checkpoints are multimodal: the text part is imported, the vision encoder
+  and the multi-token-prediction head are left out (and the import says so).
+- **The same model as transformers' and llama.cpp's.** A tiny random Qwen3.5 made by
+  transformers 5.22 computes the same logits in AuraLite (largest difference 0.0; a cached
+  generation step within 1e-6); the Hugging Face export (`Qwen3_5ForCausalLM`) loads back
+  in transformers with the same logits; the GGUF export (llama.cpp's `qwen35`) computes
+  AuraLite's logits in llama.cpp 0.3.36 within 8e-5 (F32) over 100 tokens, also with the
+  prompt in two calls, and gives the same token ids. The real 0.8B was not run on the
+  build machine (2 GB of memory).
+- **The chat template `qwen3_5`** writes a conversation as Qwen3.5's own template does
+  with thinking off — the reply after an empty `<think></think>` block, the earlier
+  replies without it (the same text, compared with jinja2) — for chat and for
+  fine-tuning dialogs.
+- **The Studio's catalog lists Qwen3.5 first**; the models before it (Qwen2.5, Qwen3,
+  Llama 3, Mistral, SmolLM2) stay below, marked *(older)*. The advisor (`auralite doctor`,
+  the wizard) recommends a Qwen3.5 when one fits the memory and finishes overnight, else
+  the largest older model that does: Qwen3.5 0.8B with LoRA on 16 GB and an i5-2400,
+  Qwen3.5 2B on 32 GB and 8 threads, Qwen2.5 0.5B on 8 GB (where Qwen3.5 0.8B takes about
+  8 hours), SmolLM2 135M on 4 GB. The memory estimate and the parameter counts know the
+  linear attention (the 0.8B's text part: 752,393,024 parameters, as the real model).
+- **The benchmark fine-tunes a model already on the computer**: `auralite bench --finetune
+  D:\models\Qwen3.5-0.8B` (the folder of a downloaded Hugging Face model) or `--finetune
+  my-chat-model.pt` (an AuraLite checkpoint); a path that is neither stops the benchmark
+  at once, not after the other sizes. The default model is Qwen3.5 0.8B (2.22: Qwen2.5
+  0.5B). In the Studio, *Tools → Benchmark…* opens a dialog: the seconds per size and, if
+  asked, the model to fine-tune — from the catalog or one on the disk (*Folder…*,
+  *File…*) — with LoRA, QLoRA or Auto; Start waits for a path that is a model, and the
+  next benchmark opens with the same choices.
+- **The benchmark trains with 32 windows a step**, in batches of 8 — the Studio's batch.
+  2.22 made a step of every 8 windows and paid the optimizer's step (Muon's) four times as
+  often as the Studio: on the field test's i5-2400 the 7M model measured 774 tokens/s
+  where the Studio trained it at 1,061; 32 windows a step measured 12 % faster here. The
+  report says how it trained (`accumulation_steps` in its settings).
+- **Fixed: LoRA on a base stored in bfloat16.** A model imported with `--dtype bfloat16`
+  (half the memory of float32) stopped at the first LoRA or QLoRA step ("expected m1 and
+  m2 to have the same dtype") — every family, not only Qwen3.5. The adapters now compute in
+  float32 and add their result in the base's dtype; a float32 base computes as before.
+- **The real Qwen3.5-0.8B**, downloaded from the Hub on the build machine (2 GB of memory):
+  imported in 4 bits with bfloat16 tables in 37 s and 1.2 GB, 752,393,024 parameters as
+  the catalog counts them, its chat template recognized; it answers "Paris" to "What is
+  the capital of France? Answer in one word." and 56 to seven times eight asked in
+  Russian. A fine-tune of the whole model needs more memory than that machine has; its
+  layers trained at their real dims in a 4-layer slice.
+
+**What changed for existing users**
+
+| | 2.23.0 | 2.22.0 |
+|---|---|---|
+| Qwen3.5 (0.8B–9B) | import, LoRA / QLoRA, chat, export to HF and GGUF | refused (`Qwen3_5ForConditionalGeneration`) |
+| the Studio's model list | Qwen3.5 first, the rest marked *(older)* | Qwen2.5, Qwen3, Llama, Mistral, SmolLM2 |
+| `auralite bench --finetune` | default Qwen3.5 0.8B; also a folder or a checkpoint | Qwen2.5 0.5B; `hf:` names and folders |
+| *Tools → Benchmark…* | a dialog: seconds, the model to fine-tune (catalog, folder, file), the method | a yes/no question, no fine-tune |
+| the benchmark's training steps | 8 windows × 4 per step | 8 windows per step |
+| LoRA / QLoRA on a bfloat16 base | trains | stopped at the first step |
+
+Models, checkpoints and adapters of other families are unchanged: `--lora-targets all`
+names the new projections too, but a model records only the targets it has. Benchmark
+reports of 2.22 and 2.23 differ in their steps (see above): compare like with like.
+
+**The engine** (`auralite/engine/linear_attention.py`, new): `GatedDeltaNet` (the layer:
+its projections, the causal convolution and its cache, the gated delta rule, the gated
+RMS norm), `chunk_gated_delta_rule()` and `recurrent_gated_delta_rule()` (the two forms
+of the rule; they agree to 1e-6). `ModernTransformer(layer_types=..., linear_attention=
+{...}, attn_output_gate=True, rotary_dim=N)` builds a hybrid model (`is_hybrid`);
+`Attention(rotary_dim=, output_gate=)` rotates part of a head and gates its output.
+Checkpoints keep the new fields. The KV cache of a hybrid model cannot be rolled back to a
+shorter prefix (the linear state has no history): generation feeds the prompt again, and
+batched decoding (`chat-eval`, the server's batches) takes one reply at a time.
+`nf4.QUANTIZABLE_LINEARS` and `LORA_TARGETS` include `W_g`, `in_proj_qkv`, `in_proj_z`,
+`out_proj`. `LoRALayer.forward` computes in the adapter's dtype and returns the input's.
+
+**Hugging Face** (`auralite/engine/hf_models.py`): `Qwen3_5ForConditionalGeneration` (the
+`model.language_model.` prefix; vision and MTP tensors skipped, `info["left_out"]`) and
+`Qwen3_5ForCausalLM`; q_proj split into the query and the gate; Qwen3.5's zero-centred
+norms stored as ordinary ones (+1) and written back (−1); the mixture-of-experts variants
+are refused by name. The export writes `Qwen3_5ForCausalLM` (`model_type:
+qwen3_5_text`, no MTP layers).
+
+**GGUF** (`auralite/engine/gguf_writer.py`): `qwen35` — the recurrent layers' tensors
+(`attn_qkv`, `attn_gate`, `ssm_a` = −exp(A_log), `ssm_alpha`, `ssm_beta`, `ssm_conv1d`,
+`ssm_dt.bias`, `ssm_norm`, `ssm_out`), the value heads in llama.cpp's order, the query and
+its gate interleaved per head, `ssm.*`, `rope.dimension_sections`,
+`attention.recurrent_layers`, `full_attention_interval`; Qwen3.5's pre-tokenizer.
+
+**The Studio** (`auralite/studio/`): `catalog.py` — four Qwen3.5 entries, `BaseModel.older`
+and `display_name`, the hybrid dims; `advisor.py` — the newer generation first among the
+models that finish in time; `sizing.py` (engine) — parameters and memory of hybrid
+models; `qt/bench_dialog.py` (new) — the Benchmark dialog (`DIALOGS["bench"]` answers it
+in tests); `qt/window.py` — *Tools → Benchmark…* through it; the Fine-tune tab and the
+wizard show *(older)*.
+
+**The benchmark** (`auralite/bench.py`): `finetune_source()` (hub, folder, checkpoint, or
+BenchError), `_finetune()` loads a checkpoint as the Studio opens one, `FINETUNE_MODEL`
+`hf:Qwen/Qwen3.5-0.8B`, `ACCUMULATION = 4`. **The command line**: `--finetune [MODEL]`'s
+help names folders and checkpoints.
+
+**Docs**: docs/training.md § 23 (new: Qwen3.5 — what differs, the checks, CPU times,
+reproduce), docs/benchmark.md, docs/studio.md, docs/faq.md § 27 (new: Qwen 3.5, 3.6,
+3.8), docs/windows-app.md, README.
+
+**Tests**: `tests/test_qwen35_v2230.py` (new) — the two forms of the delta rule, a layer
+writing from its state, a hybrid model training and generating from its caches, LoRA and
+4 bits on the new projections, checkpoints, Qwen3.5 checkpoints in both layouts imported
+and exported, the GGUF layout, the chat template against Qwen's, the catalog, the memory
+estimate, the advisor, LoRA on a bfloat16 base, and (integrations job) the logits against
+transformers.
+`tests/test_hf_native_real.py`: a Qwen3.5 GGUF in llama.cpp. `tests/test_bench_v2220.py`:
+`finetune_source`, a wrong path failing first, a checkpoint and a Qwen3.5 folder
+fine-tuned, `--finetune PATH`, the Benchmark dialog and its choices. CI's integrations job
+runs `tests/test_qwen35_v2230.py`.
+
 # 📦 v2.22.0 — `auralite bench`: a computer's numbers for training and writing in one command; the memory plan keeps a margin
 
 - **`auralite bench`** (and *Tools → Benchmark…* in the Studio) measures in a few minutes,

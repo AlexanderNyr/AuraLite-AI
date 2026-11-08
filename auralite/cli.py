@@ -2379,10 +2379,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", metavar="FILE",
                    help="train on this text file instead of the built-in text (the report "
                         "then says how long one pass over it takes)")
-    p.add_argument("--finetune", nargs="?", const="hf:Qwen/Qwen2.5-0.5B-Instruct",
+    p.add_argument("--finetune", nargs="?", const="hf:Qwen/Qwen3.5-0.8B",
                    metavar="MODEL",
-                   help="also fine-tune a ready model with LoRA (default "
-                        "hf:Qwen/Qwen2.5-0.5B-Instruct: about 1 GB, downloaded once)")
+                   help="also fine-tune a ready model with LoRA: hf:ORG/NAME (downloaded "
+                        "once), the folder of a model downloaded before, or an AuraLite "
+                        "checkpoint (.pt); default hf:Qwen/Qwen3.5-0.8B (1.7 GB)")
     p.add_argument("--method", choices=["lora", "qlora"],
                    help="how --finetune trains (default: QLoRA below 8 GB of memory, else LoRA)")
     p.add_argument("--threads", type=int, metavar="N", help="training threads (default: AuraLite's)")

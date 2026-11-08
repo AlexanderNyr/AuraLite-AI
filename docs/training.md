@@ -2085,3 +2085,100 @@ auralite train --data train.jsonl --resume hf:HuggingFaceTB/SmolLM2-135M-Instruc
 #   Ctrl+C twice after a few steps, then:
 auralite runs continue last
 ```
+
+## 23. Qwen3.5 in AuraLite's own engine (2.23)
+
+Qwen3.5 (March 2026, Apache 2.0) is the small Qwen of 2026: 0.8B, 2B, 4B and 9B dense
+models. Since 2.23 AuraLite imports, fine-tunes (LoRA and QLoRA, on the processor),
+chats with, saves and exports them like the models of § 21, and the Studio's catalog
+offers them first (the models before them stay below, marked *older*).
+
+```bash
+auralite import hf:Qwen/Qwen3.5-0.8B --out q35.pt                  # 1.8 GB, downloaded once
+auralite train --data dialogs.jsonl --resume hf:Qwen/Qwen3.5-0.8B --quantize nf4 --lora 16 --memory-plan auto --model q35-chat.pt
+auralite chat --model q35-chat.pt
+auralite export --model q35-chat.pt --format hf --out q35-chat-hf            # transformers
+auralite export --model q35-chat.pt --format gguf --quant q8_0 --out q35-chat.gguf
+auralite bench --finetune D:\models\Qwen3.5-0.8B                   # a folder downloaded before
+```
+
+### 23.1 What is different in it
+
+* **Linear attention in three layers of four.** Qwen3.5's layers go three of Gated
+  DeltaNet to one of ordinary attention. A Gated DeltaNet layer keeps a state of 128 × 128
+  numbers per head instead of the keys and values of every token: a long conversation
+  costs no more memory than a short one in those layers. AuraLite computes it in plain
+  PyTorch, on any processor: in chunks of 64 tokens for training and prompts, token by
+  token (from the state and the last 3 tokens of its convolution) while it writes.
+* **The full-attention layers** gate their output per head (the gate comes out of the
+  query projection), rotate a quarter of every head (partial RoPE, base 10,000,000) and
+  normalize queries and keys.
+* **The vocabulary** is 248,320 tokens: in float32 the embedding alone is 1 GB for the
+  0.8B model, which is why its LoRA needs more memory than its size suggests.
+* **The published checkpoints are multimodal** (`Qwen3_5ForConditionalGeneration`):
+  AuraLite imports the text part and leaves out the vision encoder and the
+  multi-token-prediction head; the import says so (`left_out`). Text-only checkpoints
+  (`Qwen3_5ForCausalLM`, such as AuraLite's own export) import as they are. The mixture
+  of experts (`qwen3_5_moe`: Qwen3.5-35B-A3B, Qwen3.6-35B-A3B) is refused by name.
+* **LoRA and QLoRA** reach the linear attention too: `--lora-targets all` adds its input
+  projections (q, k, v and the gate z) and its output to the attention and feed-forward
+  layers; QLoRA stores them in NF4. A model records only the targets it has, so adapters
+  of older models are unchanged.
+* **Chat**: the `qwen3_5` template — ChatML, the reply after an empty `<think></think>`
+  block and the earlier replies of a conversation without it: the same text as Qwen3.5's
+  own template writes with `enable_thinking` off, which answers at once instead of
+  thinking aloud (compared with jinja2 on the 0.8B's `chat_template.jinja`). Fine-tuning
+  dialogs are written the same way.
+
+### 23.2 Checked against transformers and llama.cpp
+
+* A tiny random Qwen3.5 made by transformers 5.22 computes the same logits in AuraLite
+  (largest difference 0.0 over the whole sequence; one generation step from the caches
+  within 1e-6) — `tests/test_qwen35_v2230.py`, run by the integrations job.
+* Exported as a Hugging Face folder (`Qwen3_5ForCausalLM`, `model_type: qwen3_5_text`),
+  transformers loads it back with the same logits.
+* Exported as GGUF (llama.cpp's `qwen35` architecture), llama.cpp (llama-cpp-python
+  0.3.36) computes AuraLite's logits within 8e-5 in F32 over 100 tokens — past one chunk
+  of 64 — also when the prompt comes in two calls (the recurrent state carried from the
+  first to the second); within 3e-4 in F16 and 8e-3 in Q8_0. The tokenizer gives the same
+  ids (`tests/test_hf_native_real.py`).
+* The real Qwen3.5-0.8B, downloaded from the Hub on the build machine (2 GB of memory):
+  imported in 4 bits with bfloat16 tables (`--quantize nf4 --dtype bfloat16`) in 37 s and
+  1.2 GB, 752,393,024 parameters — the catalog's count of its text part — and its chat
+  template recognized. Greedy replies: "Paris" to "What is the capital of France? Answer
+  in one word.", 56 to seven times eight asked in Russian, and "Old computers were often
+  bulky, heavy, and required significant manual maintenance to operate effectively." A
+  fine-tune of the whole model needs more memory than that machine has.
+
+### 23.3 How long it takes on a CPU
+
+The advisor (`auralite doctor`, the Studio's wizard) recommends a Qwen3.5 when one fits the
+memory and finishes overnight, else the largest older model that does. Its estimates for
+1,000 dialogs, two passes:
+
+| computer | recommendation | memory | time |
+|---|---|---|---|
+| 4 GB, 4 threads | SmolLM2 135M (older), QLoRA | 1.8 GB | ~3 h |
+| 8 GB, i5-2400 class (72 GFLOP/s) | Qwen2.5 0.5B (older), QLoRA — Qwen3.5 0.8B takes ~8 h | 3.2 GB | ~5 h |
+| 16 GB, i5-2400 class | **Qwen3.5 0.8B**, LoRA | 6.6 GB | ~8 h |
+| 32 GB, 8 threads (300 GFLOP/s) | **Qwen3.5 2B**, QLoRA | 7.3 GB | ~5 h |
+
+They are estimates, and for Qwen3.5 the speed is the least certain part: its linear
+attention computes in many small matrix products, which a processor runs below the speed of
+the large ones the estimate assumes. On the build machine a 4-layer slice at Qwen3.5-0.8B's
+real dims (three Gated DeltaNet layers and one attention layer, LoRA, windows of 256 tokens)
+trained 1.6 times slower per parameter than the same slice with attention only. Take the
+times above as the shortest they can be, and measure: `auralite bench --finetune` fine-tunes
+Qwen3.5 0.8B (or a model you downloaded: `--finetune FOLDER`) for a minute and reports the
+real tokens per second.
+
+A base stored in bfloat16 (`auralite import ... --dtype bfloat16`, half the memory of float32)
+trains its LoRA adapters since 2.23 — before, every family stopped at the first step.
+
+### 23.4 Reproduce
+
+```bash
+pytest tests/test_qwen35_v2230.py                 # the layer, the model, import/export, GGUF
+AURALITE_REQUIRE_INTEGRATIONS=1 pytest tests/test_qwen35_v2230.py tests/test_hf_native_real.py
+#   (with transformers >= 5 and llama-cpp-python >= 0.3.36 installed)
+```

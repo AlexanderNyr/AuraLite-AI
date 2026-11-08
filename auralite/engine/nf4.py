@@ -46,7 +46,9 @@ _MIDPOINTS = (NF4_CODE[1:] + NF4_CODE[:-1]) / 2
 _PAIRS = torch.stack([NF4_CODE.repeat_interleave(16), NF4_CODE.repeat(16)], dim=1)
 
 #: The block linears quantized by default: the attention's and the FFN's.
-QUANTIZABLE_LINEARS = ("W_q", "W_k", "W_v", "W_o", "gate", "up", "down")
+QUANTIZABLE_LINEARS = ("W_q", "W_k", "W_v", "W_o", "gate", "up", "down",
+                       # 2.23: the output gate and the linear-attention projections
+                       "W_g", "in_proj_qkv", "in_proj_z", "out_proj")
 
 _CHUNK = 1 << 22          # values quantized at a time (bounds the temporary memory)
 _ABSMAX_BLOCK = 256
