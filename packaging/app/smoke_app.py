@@ -1,7 +1,7 @@
 """Check a built AuraLite app the way a user meets it (2.21) - CI runs it after every build.
 
-    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.24.0-windows-x64.zip
-    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.24.0
+    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.25.0-windows-x64.zip
+    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.25.0
 
 A zip is unzipped first, into a folder whose path has a space and letters outside ASCII.
 Everything runs as under a Windows user name in Russian (2.21.1): the app's data

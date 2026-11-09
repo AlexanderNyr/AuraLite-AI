@@ -172,6 +172,9 @@ class ModelTabMixin:
             return
         try:
             self.engine.save_model(path)
+            remember = getattr(self, "_remember_model", None)
+            if remember is not None:
+                remember(path)
             self.model_file_label.config(
                 text=f"Saved: {os.path.basename(path)}", foreground="black")
             messagebox.showinfo("Saved",
@@ -268,8 +271,9 @@ class ModelTabMixin:
         return result["value"]
 
 
-    def load_model(self):
-        path = filedialog.askopenfilename(
+    def load_model(self, path=None):
+        # 2.25: `path` from File -> Recent models; else the file dialog
+        path = path or filedialog.askopenfilename(
             title="Load Model",
             filetypes=[
                 ("Supported models", "*.pt *.gguf"),
@@ -319,6 +323,9 @@ class ModelTabMixin:
             if "n_kv_heads" in p and p["n_kv_heads"] is not None:
                 self.n_kv_heads_var.set(str(p["n_kv_heads"]))
             self._refresh_model_info()
+            remember = getattr(self, "_remember_model", None)
+            if remember is not None:
+                remember(path)
         except GGUFNotAvailableError as e:
             # The engine's message already carries the prebuilt-wheel command
             # (a bare `pip install llama-cpp-python` compiles llama.cpp).

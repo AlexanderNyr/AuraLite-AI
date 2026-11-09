@@ -15,6 +15,7 @@ from .tabs.export import ExportTabMixin
 from .tabs.console import ConsoleTabMixin
 from .tabs.chat import ChatTabMixin
 from .tabs.result_view import ResultViewMixin
+from .menu import MenuMixin
 from . import common as gui_common
 from . import session as gui_session
 from .async_ops import TkAsyncBridge
@@ -43,7 +44,7 @@ def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
 
 class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             QuantizationTabMixin, EvaluationTabMixin, ExportTabMixin, ConsoleTabMixin,
-            ChatTabMixin, ResultViewMixin):
+            ChatTabMixin, ResultViewMixin, MenuMixin):
     """AuraLite desktop app: tabs live in `gui/tabs/*`, shared state here."""
 
     #: Notebook tab names, in build order — used for titles and for the
@@ -83,8 +84,8 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.root.minsize(min(560, win_w), min(420, win_h))
         self.root.configure(bg="#f5f6f7")
 
-        # Dark theme toggle (NEW v2.5)
-        self.dark_mode = tk.BooleanVar(value=False)
+        # Dark theme toggle (NEW v2.5); 2.25: remembered (View -> Dark theme as well)
+        self.dark_mode = tk.BooleanVar(value=self.gui_config.theme == "dark")
 
         self.engine = AuraLiteEngine()
         self.is_trained = False
@@ -134,6 +135,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self.param_label = ttk.Label(info_row, text="Parameters: —",
                                      style="Sub.TLabel")
         self.param_label.pack(side=tk.LEFT, padx=8)
+        self._build_footer_tools(info_row)      # 2.25: RAM and the speed test, as the Studio
         # Dark theme toggle (moved down together with the rest of the header).
         theme_btn = ttk.Checkbutton(info_row, text="🌙 Dark", variable=self.dark_mode,
                                     command=self._toggle_dark_mode)
@@ -167,6 +169,9 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._build_evaluation_tab()
         self._build_export_tab()
         self._build_console_tab()
+        self._build_menu()                      # 2.25: File, View, Tools, Help (gui/menu.py)
+        if self.dark_mode.get():
+            self._apply_theme(light=False)
 
         # Language selector (v2.6.5): tabs are re-labelled in place, the choice
         # is remembered in gui_config.json. Shown only when the catalogue has
@@ -313,9 +318,10 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
 
 
     def _toggle_dark_mode(self):
-        """Toggle between light and dark theme."""
-        is_dark = self.dark_mode.get()
+        """Toggle between light and dark theme (2.25: remembered for the next start)."""
+        is_dark = bool(self.dark_mode.get())
         self._apply_theme(light=not is_dark)
+        self.gui_config = self.gui_config.update(theme="dark" if is_dark else "light")
 
 
     # ---- language / session (v2.6.5) ---------------------------------
@@ -368,6 +374,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         except Exception:
             pass
         self._save_session()
+        self._stop_memory_ticks()
         try:
             self.gui_config.save()
         except Exception as exc:      # pragma: no cover - read-only home
@@ -391,89 +398,16 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
 
 
     def _refresh_model_info(self):
+        # 2.25: the text is shared with the Studio's Model tab (studio/modelinfo.py)
+        from auralite.studio.modelinfo import model_info_lines
+        lines = model_info_lines(self.engine)
         m = self.engine.model
-        lines = []
-        if m is None:
-            lines.append("No model in memory.")
-        elif self.engine.is_gguf_model():
-            tok = self.engine.tokenizer
-            n_params = m.count_parameters() if hasattr(m, "count_parameters") else 0
-            lines.append("Backend         : GGUF / llama.cpp")
-            lines.append(f"File            : {getattr(m, 'path', '—')}")
-            lines.append(f"Parameters      : {n_params:,}" if n_params else "Parameters      : —")
-            lines.append(f"Vocab size      : {self.engine.vocab_size or '—'}")
-            lines.append(f"Tokenizer       : {tok.kind if tok else 'gguf'}")
-            lines.append(f"max_seq_len     : {getattr(m, 'max_seq_len', '—')}")
-            lines.append(f"threads         : {getattr(m, 'n_threads', '—')}")
-            lines.append(f"GPU layers      : {getattr(m, 'n_gpu_layers', '—')}")
-            lines.append(f"Batch           : {getattr(m, 'n_batch', '—')}")
-            lines.append(f"mmap / mlock    : {getattr(m, 'use_mmap', '—')} / {getattr(m, 'use_mlock', '—')}")
-            lines.append(f"Chat completion : {'Yes' if getattr(m, 'use_chat_completion', False) else 'No'}")
-            lines.append(f"Chat format     : {getattr(m, 'chat_format', None) or 'auto/default'}")
-            lines.append("Training        : not supported for .gguf (inference-only)")
-            meta = getattr(m, "metadata", {}) or {}
-            if meta:
-                lines.append("")
-                lines.append("GGUF metadata:")
-                for k in sorted(meta)[:40]:
-                    lines.append(f"  {k} = {meta[k]}")
-        elif self.engine.is_hf_model():
-            tok = self.engine.tokenizer
-            info = self.engine.hf_proxy.get_info() if self.engine.hf_proxy else {}
-            lines.append("Backend         : Hugging Face / transformers")
-            lines.append(f"Model           : {info.get('model', self.engine.hf_path or '—')}")
-            lines.append(f"Parameters      : {m.count_parameters():,}")
-            lines.append(f"Trainable       : {m.count_trainable_parameters():,}")
-            lines.append(f"Vocab size      : {self.engine.vocab_size or '—'}")
-            lines.append(f"Tokenizer       : {type(tok).__name__ if tok else '—'}")
-            lines.append(f"max_seq_len     : {info.get('max_seq_len', getattr(m, 'max_seq_len', '—'))}")
-            lines.append(f"device          : {info.get('device', self.engine.device)}")
-            lines.append(f"Quantized       : {'Yes' if info.get('is_quantized') else 'No'}")
-            lines.append(f"LoRA / PEFT     : {'Yes' if info.get('is_peft') else 'No'}")
-            if info.get('lora_config'):
-                lines.append(f"LoRA config     : {info['lora_config']}")
-            lines.append("Training        : use the HF / LoRA fine-tuning tools in the Model tab")
-        else:
-            tok = self.engine.tokenizer
-            lines.append(f"Parameters      : {m.count_parameters():,}")
-            if hasattr(m, 'lora_rank') and m.lora_rank > 0:
-                lines.append(f"Trainable (LoRA): {m.count_trainable_parameters():,} "
-                             f"(rank {m.lora_rank})")
-            lines.append(f"Vocab size      : {self.engine.vocab_size}")
-            lines.append(f"Tokenizer       : {tok.kind if tok else '—'}")
-            # 2.15: the template a chat model was fine-tuned with; the Chat tab
-            # follows it
+        if m is not None and not self.engine.is_gguf_model() and not self.engine.is_hf_model():
+            # 2.15: the template a chat model was fine-tuned with; the Chat tab follows it
             template = getattr(self.engine, "default_chat_template", None) or "chatml"
-            specials = getattr(tok, "special_tokens", None) or []
-            lines.append(f"Chat template   : {template}"
-                         + (f" ({', '.join(specials)})" if specials else ""))
             chat_var = getattr(self, "chat_template_var", None)
             if chat_var is not None and template in CHAT_TEMPLATES:
                 chat_var.set(template)
-            lines.append(f"d_model         : {m.d_model}")
-            lines.append(f"d_ff            : {m.d_ff}")
-            lines.append(f"n_heads         : {m.n_heads}")
-            lines.append(f"n_layers        : {m.n_layers}")
-            n_kv = m.n_kv_heads or m.n_heads
-            lines.append(f"n_kv_heads      : {n_kv} "
-                         f"({'GQA' if m.n_kv_heads and m.n_kv_heads < m.n_heads else 'MHA'})")
-            lines.append(f"max_seq_len     : {m.max_seq_len}")
-            window = getattr(self.engine, "context_window", None)
-            lines.append(f"gen. window     : {window if window else 'full context'}"
-                         f"{' (trained length)' if window and window == m.max_seq_len else ''}")
-            lines.append(f"dropout         : {m.dropout}")
-            lines.append(f"ALiBi           : {'Yes ✅' if m.use_alibi else 'No'}")
-            lines.append(f"device          : {self.engine.device}")
-            if self.engine.last_val_loss is not None:
-                lines.append(f"last val loss   : {self.engine.last_val_loss:.4f}")
-            last_bpb = getattr(self.engine, "last_val_bpb", None)
-            if last_bpb is not None:
-                lines.append(f"last val BPB    : {last_bpb:.4f} bits/byte")
-            if self.engine.params_used:
-                lines.append("")
-                lines.append("Last training params:")
-                for k, v in self.engine.params_used.items():
-                    lines.append(f"  {k} = {v}")
         self.model_info.config(state=tk.NORMAL)
         self.model_info.delete("1.0", tk.END)
         self.model_info.insert(tk.END, "\n".join(lines))

@@ -1,3 +1,47 @@
+# 📦 v2.25.0 — The Studio quantizes, evaluates and opens every kind of model; the classic interface gets the Studio's menu
+
+Part 2 of moving everything the classic interface (tkinter) does into AuraLite Studio, and
+the first step the other way: the classic interface stays, and what the Studio has goes
+into it as well. [docs/classic.md](docs/classic.md) has the table of what is where and
+when the other side gets it.
+
+- **The Model tab** (Studio): what the model in memory is — shape, tokenizer, template,
+  parameters, the last loss; for a GGUF file llama.cpp's settings and its metadata; for a
+  transformers model its name and LoRA. GGUF files open with llama.cpp's settings
+  (context, GPU layers, threads, batch, chat format, chat completion, mmap, mlock — from
+  the `AURALITE_GGUF_*` variables), and *File → Open* and the recent models use them too.
+  Hugging Face models (a name or a downloaded folder) are imported into AuraLite (4 bits:
+  NF4) or run by transformers: 4-bit, 8-bit or full precision, LoRA adapters on load or
+  later, saved and loaded, the Hub both ways, *Trust remote code* only after a question,
+  and a LoRA / QLoRA fine-tune on the training data or a text file with its passes,
+  learning rate, batch, length and accumulation (the classic tab fixed them). AuraLite's
+  own LoRA adapters are merged, saved and loaded. Without `transformers`, `peft` or
+  `llama-cpp-python` the tab says what to install (prebuilt for llama.cpp).
+- **The Quantize tab**: dynamic and static INT8, QAT, GPTQ, AWQ, HQQ and FP16 / BF16 /
+  FP8, the bits each offers and only the settings it reads; calibration text from the
+  training data (dialogs give the words of their turns, at most a million characters) or
+  a file; the benchmark, every method compared in one table (Stop ends it), the quantized
+  weights saved, *Back to the original*. A failed quantization leaves the model as it was.
+- **The Evaluate tab**: a chat model on held-out dialogs — stopped by itself, exact
+  replies, stray template markers, the replies' loss, examples — saved as JSON; benchmarks
+  of lm-evaluation-harness with common tasks a click away (needs `pip install lm_eval`).
+- **The classic interface gets the Studio's menu bar**: *File* (open, save, recent models,
+  quit), *View* (the dark theme, now remembered), *Tools* (the benchmark with the Studio's
+  choices — seconds per size and a fine-tune of a catalog model, a folder or a checkpoint;
+  the speed test; the AuraLite folder; AuraLite Studio), *Help* (the guide, updates,
+  about); the memory in use and the last speed test in the footer; HQQ in the Quant tab;
+  a dialogs file calibrates with the words of its turns. The model's description and the
+  chat evaluation's rows come from the same code in both interfaces.
+- **AWQ searches the balance it is given.** `QuantConfig.awq_alpha` was read by nothing:
+  the search tried its grid only. It now joins the grid; the default 0.5 is in the grid
+  already, so the default result is the same.
+- CI: the integrations job runs the Studio's Model tab with transformers and PEFT for real
+  (a tiny Llama loaded with adapters, the adapters saved and loaded back exactly, a
+  fine-tune, an import into AuraLite).
+- Next: 2.26 brings images, the chat's agent mode and its plots to the Studio, and the
+  Fine-tune and Start tabs to the classic interface; 2.27 the library, the wizard, run
+  recording and log files to the classic interface; then the Russian interface.
+
 # 📦 v2.24.0 — The Studio does what the classic interface's Train, Generate and Export tabs do
 
 Part 1 of moving everything the classic interface (tkinter) does into AuraLite Studio —

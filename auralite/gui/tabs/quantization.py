@@ -31,7 +31,8 @@ class QuantizationTabMixin:
             ("QAT", "qat"),
             ("GPTQ", "gptq"),
             ("AWQ", "awq"),
-            ("Half (FP16/BF16)", "half"),
+            ("HQQ", "hqq"),                     # 2.25: as the Studio's Quantize tab
+            ("Half (FP16/BF16/FP8)", "half"),
         ]
         self.q_method_combo = ttk.Combobox(
             row1, textvariable=self.q_method_var,
@@ -48,6 +49,8 @@ class QuantizationTabMixin:
             values=["int2", "int3", "int4", "int8", "fp16", "bf16"],
             state="readonly", width=8)
         self.q_bits_combo.pack(side=tk.LEFT, padx=4)
+        self.q_bits_combo.bind("<<ComboboxSelected>>",
+                               lambda _e: self._update_quant_description())
 
         # Method description
         self.q_desc_label = ttk.Label(method_frame, text="", wraplength=750,
@@ -240,7 +243,10 @@ class QuantizationTabMixin:
         try:
             m = QuantMethod(method)
             desc = METHOD_DESCRIPTIONS.get(m, "")
-            self.q_desc_label.config(text=desc)
+            # 2.25: FP8 is for storage - the Studio's note
+            from auralite.studio.quantize import bits_note
+            note = bits_note(str(self.q_bits_var.get()))
+            self.q_desc_label.config(text=f"{desc}\n{note}" if note else desc)
         except Exception:
             self.q_desc_label.config(text="")
 
@@ -266,9 +272,14 @@ class QuantizationTabMixin:
     def _use_training_file_for_calib(self):
         if self.selected_file_path:
             try:
-                with open(self.selected_file_path, "r",
-                          encoding="utf-8", errors="ignore") as f:
-                    self.q_calib_text = f.read()
+                # 2.25: dialogs give the words of their turns (the Studio's rule), not JSON
+                from auralite.studio.quantize import calibration_text
+                try:
+                    self.q_calib_text = calibration_text([self.selected_file_path])
+                except ValueError:
+                    with open(self.selected_file_path, "r",
+                              encoding="utf-8", errors="ignore") as f:
+                        self.q_calib_text = f.read()
                 n = len(self.q_calib_text)
                 self.q_calib_label.config(
                     text=f"Using training file: "

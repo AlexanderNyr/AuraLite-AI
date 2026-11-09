@@ -21,11 +21,14 @@ from ..logs import install_excepthooks, log_dir, setup_logging
 from ..settings import StudioSettings, load_settings, save_settings
 from .common import Job, ask_open, ask_save, confirm, inform, show_error
 from .tab_chat import ChatTab
+from .tab_evaluate import EvaluateTab
 from .tab_export import ExportTab
 from .tab_finetune import FineTuneTab
 from .tab_generate import GenerateTab
 from .tab_library import LibraryTab
 from .tab_log import LogTab
+from .tab_model import ModelTab
+from .tab_quantize import QuantizeTab
 from .tab_start import StartTab
 from .tab_train import TrainTab
 from .theme import apply_theme, icon_pixmap
@@ -34,7 +37,8 @@ log = logging.getLogger("auralite.studio")
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
-              ("chat", "Chat"), ("generate", "Generate"), ("export", "Export"),
+              ("chat", "Chat"), ("generate", "Generate"), ("model", "Model"),
+              ("quantize", "Quantize"), ("evaluate", "Evaluate"), ("export", "Export"),
               ("library", "Library"), ("log", "Log"))
 
 
@@ -88,12 +92,18 @@ class MainWindow(QMainWindow):
         self.finetune_tab = FineTuneTab(self)
         self.chat_tab = ChatTab(self)
         self.generate_tab = GenerateTab(self)          # 2.24: the classic Generate tab
+        self.model_tab = ModelTab(self)                # 2.25: the classic Model, Quant and
+        self.quantize_tab = QuantizeTab(self)          # Eval tabs
+        self.evaluate_tab = EvaluateTab(self)
         self.export_tab = ExportTab(self)
         self.library_tab = LibraryTab(self)
         self.log_tab = LogTab(self)
         self.pages: dict[str, QWidget] = {"start": self.start_tab, "train": self.train_tab,
                                           "finetune": self.finetune_tab, "chat": self.chat_tab,
                                           "generate": self.generate_tab,
+                                          "model": self.model_tab,
+                                          "quantize": self.quantize_tab,
+                                          "evaluate": self.evaluate_tab,
                                           "export": self.export_tab, "library": self.library_tab,
                                           "log": self.log_tab}
         for key, title in TAB_TITLES:
@@ -364,7 +374,8 @@ class MainWindow(QMainWindow):
         if engine.is_gguf_model():
             return f"GGUF model {os.path.basename(engine.gguf_path or '')} (chat only)"
         if engine.is_hf_model():
-            return f"transformers model {engine.hf_path or ''} (chat only here)"
+            peft = " with LoRA adapters" if getattr(engine.hf_proxy, "is_peft", False) else ""
+            return f"transformers model {engine.hf_path or ''}{peft}"
         native = getattr(model, "module", model)
         parts = []
         used = getattr(engine, "params_used", {}) or {}
@@ -427,8 +438,13 @@ class MainWindow(QMainWindow):
             return
         engine = self.engine
         self.statusBar().showMessage(f"Opening {os.path.basename(path)}…")
+        gguf = path.lower().endswith(".gguf")
+        options = self.model_tab.gguf_options() if gguf else {}   # 2.25: llama.cpp's settings
+
         def work(_job: Job) -> Any:
             engine.unload_model()             # 2.20: one model in memory, not two
+            if gguf:
+                return engine.load_gguf_model(path, **options)
             return engine.load_model(path)
 
         job = Job("open-model", work, self)
@@ -638,7 +654,8 @@ class MainWindow(QMainWindow):
     # ---- closing ---------------------------------------------------------------------
     def running_jobs(self) -> list[Job]:
         jobs = [tab.job for tab in (self.train_tab, self.finetune_tab, self.chat_tab,
-                                    self.generate_tab, self.export_tab)
+                                    self.generate_tab, self.model_tab, self.quantize_tab,
+                                    self.evaluate_tab, self.export_tab)
                 if getattr(tab, "job", None) is not None]
         for extra in (self.finetune_tab.distill_job, self.train_tab.worker_job):
             if extra is not None:

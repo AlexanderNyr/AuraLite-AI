@@ -61,6 +61,10 @@ class GuiConfig:
     last_image_dir: str = ""
     attention_layer: int = 0
     plot_top_tokens: int = 20
+    # 2.25: from the Studio - File -> Recent models, the speed test
+    recent_models: list[str] = field(default_factory=list)
+    gflops: float = 0.0                  # the last speed test (0: none)
+    gflops_threads: int = 0              # the threads it ran with
 
     # ---- persistence --------------------------------------------------
     @classmethod
@@ -94,6 +98,13 @@ class GuiConfig:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    def add_recent(self, path: str, keep: int = 8) -> "GuiConfig":
+        """A copy with `path` first among the recent models (2.25, as the Studio keeps them)."""
+        path = os.path.abspath(str(path))
+        recent = [p for p in self.recent_models
+                  if isinstance(p, str) and os.path.normcase(p) != os.path.normcase(path)]
+        return replace(self, recent_models=[path, *recent][:keep], last_model=path)
 
 
 def load_config(path: str | Path | None = None) -> GuiConfig:

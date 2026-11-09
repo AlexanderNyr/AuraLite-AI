@@ -16,11 +16,12 @@ screenshots).*
 Everything the classic interface (`auralite-gui`, tkinter) does is moving into the
 Studio, in parts: since 2.24 its Train, Generate and Export tabs ([the Train tab's
 expert settings](#everything-the-train-tab-sets-224), [the Generate
-tab](#the-generate-tab-224)); quantization, evaluation and the Model tab (GGUF
-models in chat, the transformers backend, the Hub) follow in 2.25, images and the
-chat's agent mode in 2.26. Until then *Tools → Classic interface* opens it (in
+tab](#the-generate-tab-224)), since 2.25 its Quant, Eval and Model tabs ([the Model,
+Quantize and Evaluate tabs](#the-model-quantize-and-evaluate-tabs-225)); images and the
+chat's agent mode follow in 2.26. Until then *Tools → Classic interface* opens it (in
 AuraLite installed with Python; the Windows app leaves it out). The classic interface
-stays and keeps being updated.
+stays, and what the Studio has goes into it as well ([docs/classic.md](classic.md),
+with the table of what is where).
 
 ## Install and start
 
@@ -61,6 +62,9 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | **Fine-tune** | everything for models that already exist: the base, your data, the method (QLoRA, LoRA, every weight), dialogs written by a teacher model, the LoRA adapters |
 | **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog. A model trained on plain text continues what you write (*continue the text*, 2.21.3) |
 | **Generate** (2.24) | the model writes on from a prompt with every sampling setting: temperature, top-k, top-p, min-p, the repetition penalty; several prompts in a batch, a draft first (thinking), web snippets as context; save, append or copy the text |
+| **Model** (2.25) | what the model in memory is; GGUF files with llama.cpp's settings; a Hugging Face model imported into AuraLite or run by transformers (4-bit, 8-bit, LoRA adapters, a fine-tune), the Hub; AuraLite's own LoRA adapters merged, saved, loaded |
+| **Quantize** (2.25) | the model made smaller: dynamic and static INT8, QAT, GPTQ, AWQ, HQQ, FP16/BF16/FP8, with their settings and calibration text; the benchmark, every method compared, the weights saved, the original back |
+| **Evaluate** (2.25) | a chat model on dialogs it did not train on (stopped by itself, exact replies, the loss of the replies); benchmarks of lm-evaluation-harness (ARC, HellaSwag, MMLU, …) |
 | **Export** | a GGUF file (llama.cpp, Ollama, LM Studio), a Hugging Face folder (transformers, vLLM) or an AuraLite checkpoint; since 2.24 also a PyTorch 2 program (`.pt2`), ONNX and TorchScript |
 | **Library** (2.20) | every run with its curve, settings, results and files — continue a stopped or interrupted one, compare runs, evaluate a chat model; the models and datasets on the disk and the room they take |
 | **Log** | everything AuraLite reports while it works, errors, warnings and epochs in their own colours (2.24); copy it, save it to a file (2.24) — the log file keeps it too |
@@ -157,6 +161,56 @@ draft first and the answer with it in view; *search the web* (DuckDuckGo) gives 
 snippets of a search as context (offline it writes without them); *the whole history*
 lets every token see everything instead of the trained window (past the trained length
 the text gets worse). The text can be saved, appended to a file or copied.
+
+## The Model, Quantize and Evaluate tabs (2.25)
+
+The classic interface's Model, Quant and Eval tabs, in the Studio.
+
+**Model.** The top shows what the model in memory is: its shape, tokenizer and chat
+template, its parameters (trainable ones with adapters), the last training's loss — for
+a GGUF file llama.cpp's settings and the file's metadata, for a transformers model its
+name and LoRA. *Merge the adapters*, *Save the adapters…* and *Load adapters…* handle
+AuraLite's own LoRA adapters.
+
+- **GGUF files** (llama.cpp, needs `llama-cpp-python` — the tab gives the command for a
+  prebuilt one): the context, the layers on the GPU (`-1`: all, `0`: none), the threads,
+  the batch, the chat format, *Use llama.cpp's chat template*, mmap and mlock; then
+  *Open a GGUF file…*. *File → Open* and the recent models open GGUF files with these
+  settings too; they start from the `AURALITE_GGUF_*` variables.
+- **Hugging Face models**, a name (`Qwen/Qwen3.5-0.8B`) or a downloaded folder:
+  *Import into AuraLite* converts it into AuraLite's own model — it then trains, chats,
+  quantizes and exports like one trained here (4 bits: NF4, about a quarter of the
+  memory). *Load with transformers* runs it as it is (needs `transformers` and `peft`):
+  4-bit, 8-bit or full precision, LoRA adapters on load or later, adapters saved and
+  loaded, *Load from the Hub…*, *Push to the Hub…* (asks whether private; log in to
+  Hugging Face first). *Local files only* keeps it off the network; *Trust remote code*
+  asks before it runs code from the model's repository.
+- **A fine-tune of the transformers model** (LoRA; QLoRA when loaded in 4 bits) on the
+  data chosen on the Train or Fine-tune tab, or on a text file split at blank lines
+  (paragraphs of more than 30 characters): passes, learning rate, batch, length and
+  accumulation; *Stop* keeps what is done. For dialogs, recipes and runs in the library
+  use the Fine-tune tab.
+
+**Quantize.** The method — dynamic INT8 (no calibration, the fastest on a CPU), static
+INT8, QAT (trains a little with the rounding), GPTQ, AWQ, HQQ (no calibration) and
+FP16/BF16/FP8 — with the bits it offers and only the settings it reads: the group size,
+GPTQ's damping, AWQ's balance (searched with the grid around it), QAT's passes and
+learning rate, symmetric or not, per channel. Static, QAT, GPTQ and AWQ need
+calibration text: *The training data* (the Train or Fine-tune tab's, at most a million
+characters; dialogs give the words of their turns) or *From a file…*. *Quantize* keeps
+the original in memory: *Benchmark* measures the quantized model (size, perplexity,
+speed — on the calibration text), *Save the quantized model…* writes a `.pt` that opens
+again, *Back to the original* restores it as it was. *Compare every method* quantizes a
+copy each way and shows them in one table. A quantized model is for using: train or
+fine-tune the original.
+
+**Evaluate.** *Evaluate on the dialogs* lets a chat model reply to held-out dialogs
+(`.jsonl`; at most how many, the reply's length) and shows how often a reply stops by
+itself, matches the reference exactly, carries no stray template markers, and the loss
+of the reference replies — with examples; *Save the results…* keeps them as JSON.
+*Run the benchmarks* runs lm-evaluation-harness on the tasks named (the buttons add
+common ones), few-shot, batch and a limit per task — it needs `pip install lm_eval` and
+downloads its datasets.
 
 ## Chatting with a model you trained from scratch (2.21.3)
 

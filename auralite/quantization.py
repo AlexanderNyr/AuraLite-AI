@@ -115,6 +115,7 @@ class QuantConfig:
     # AWQ specific
     awq_n_calibration: int = 128
     awq_alpha: float = 0.5             # balance between weight and activation saliency
+                                       # (2.25: searched along with the grid below)
     awq_clip_ratio: float = 1.0
     awq_grid_alphas: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     awq_grid_clip_ratios: tuple[float, ...] = (0.85, 0.9, 0.95, 1.0)
@@ -482,6 +483,12 @@ class FakeQuantize(nn.Module):
 # ======================================================================
 #  Main Quantization Engine
 # ======================================================================
+
+def awq_alphas(config: QuantConfig) -> tuple[float, ...]:
+    """The balances AWQ searches (2.25): its grid, and the one set in the settings
+    (``awq_alpha``, which the Quantize tabs offer) when the grid lacks it."""
+    return tuple(dict.fromkeys((*config.awq_grid_alphas, float(config.awq_alpha))))
+
 
 class QuantizationEngine:
     """Handles all quantization methods for AuraLite models."""
@@ -1116,7 +1123,7 @@ class QuantizationEngine:
             best_clip = float(config.awq_clip_ratio)
             sample_cols = min(in_features, 2048)
             sample_idx = torch.linspace(0, in_features - 1, sample_cols, device=device).long()
-            for alpha in config.awq_grid_alphas:
+            for alpha in awq_alphas(config):
                 saliency = act_n * float(alpha) + w_n * (1.0 - float(alpha))
                 threshold = torch.quantile(saliency, 0.99)
                 salient_mask = saliency >= threshold

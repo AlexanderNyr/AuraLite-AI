@@ -234,20 +234,9 @@ class EvaluationTabMixin:
         threading.Thread(target=run, daemon=True).start()
 
     def _show_chat_eval(self, result: dict):
-        def fmt(value, pattern):
-            return "n/a" if value is None else pattern.format(value)
-
-        rows = [
-            ("Stopped by itself", fmt(result["stop_rate"], "{:.1%}")),
-            ("Exact replies", fmt(result["exact"], "{:.1%}")),
-            ("No stray template markers", fmt(result["clean_rate"], "{:.1%}")),
-            ("Reply loss (nats per token)", fmt(result["reply_loss"], "{:.4f}")),
-            ("Reply bits per byte", fmt(result["reply_bpb"], "{:.4f}")),
-            ("New tokens per reply", fmt(result["mean_new_tokens"], "{:.1f}")),
-        ]
-        for sample in result.get("samples", []):
-            mark = "✓" if sample["exact"] else ("·" if sample["stopped"] else "…")
-            rows.append((f"{mark} {sample['user'][:40]}", sample["reply"][:120]))
+        # 2.25: the rows are shared with the Studio's Evaluate tab (studio/evaluate.py)
+        from auralite.studio.evaluate import chat_eval_rows
+        rows = chat_eval_rows(result)
         for metric, value in rows:
             self.chat_eval_table.insert("", tk.END, values=(metric, value))
         self.chat_eval_status.config(

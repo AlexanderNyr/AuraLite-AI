@@ -28,7 +28,8 @@ from ..logs import log_dir
 log = logging.getLogger("auralite.studio")
 
 #: Tests put callables here instead of real dialogs: "error"(FriendlyError),
-#: "inform"(title, text), "confirm"(title, text) -> bool, "open"/"save"/"dir" -> path.
+#: "inform"(title, text), "confirm"(title, text) -> bool, "open"/"save"/"dir" -> path,
+#: (2.25) "text"(title) -> the line typed.
 DIALOGS: dict[str, Callable[..., Any]] = {}
 
 
@@ -178,6 +179,16 @@ def ask_dir(parent: QWidget | None, title: str, start: str = "") -> str:
     if sink is not None:
         return str(sink(title) or "")
     return QFileDialog.getExistingDirectory(parent, title, start)
+
+
+def ask_text(parent: QWidget | None, title: str, label: str, text: str = "") -> str:
+    """2.25: a line of text the user types (a repository's name); "" when cancelled."""
+    sink = DIALOGS.get("text")
+    if sink is not None:
+        return str(sink(title) or "")
+    from PySide6.QtWidgets import QInputDialog
+    value, ok = QInputDialog.getText(parent, title, label, text=text)
+    return str(value).strip() if ok else ""
 
 
 def package_note(module: str) -> str:

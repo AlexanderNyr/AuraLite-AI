@@ -421,13 +421,15 @@ def test_integrations_job_runs_real_hf_and_llama_cpp_without_skipping():
     assert job["env"]["AURALITE_REQUIRE_INTEGRATIONS"] == "1"
     assert job["env"]["AURALITE_TEST_GGUF"].endswith("stories260K.gguf")
     joined = "\n".join(str(step.get("run", "")) for step in job["steps"])
-    assert ".[test,serve,hf,gguf]" in joined
+    assert ".[test,serve,hf,gguf,studio]" in joined          # 2.25: the Studio's Model tab
+    assert job["env"]["QT_QPA_PLATFORM"] == "offscreen" and "libxkbcommon0" in joined
     assert "--only-binary llama-cpp-python" in joined          # never compile llama.cpp
     assert "abetlen.github.io/llama-cpp-python/whl/cpu" in joined
     assert "find_spec('bitsandbytes') is None" in joined       # HF must work without it
     for suite in ("tests/test_hf_real.py", "tests/test_gguf_real.py",
                   "tests/test_hf_native_real.py",           # 2.18.1: native import/export
-                  "tests/test_qwen35_v2230.py"):            # 2.23: against transformers
+                  "tests/test_qwen35_v2230.py",             # 2.23: against transformers
+                  "tests/test_studio_hf_real.py"):          # 2.25: the Studio's Model tab
         assert suite in joined
     # The "minimum" leg installs exactly the lower bounds the `hf` extra promises.
     assert job["strategy"]["matrix"]["hf"] == ["latest", "minimum"]

@@ -8,34 +8,20 @@ defaults (a :class:`BenchChoice`) and returns the choice, or None for Cancel.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
+# 2.25: the choice itself is toolkit-free, shared with the classic interface's dialog
+from ..benchchoice import METHODS, BenchChoice, check_choice, default_choice, describe
 from .common import DIALOGS, ask_dir, ask_open, hint
 
-#: The fine-tuning method: "" lets the benchmark choose (QLoRA below 8 GB of memory).
-METHODS = (("", "Auto: LoRA with 8 GB of memory or more, else QLoRA"),
-           ("lora", "LoRA (a float base)"), ("qlora", "QLoRA (a 4-bit base: less memory)"))
+__all__ = ["CHECKPOINTS", "METHODS", "BenchChoice", "BenchDialog", "choose_benchmark",
+           "default_choice", "describe"]
+
 CHECKPOINTS = "AuraLite checkpoints (*.pt *.safetensors);;All files (*)"
-
-
-@dataclass
-class BenchChoice:
-    """What to measure: `seconds` of training per size; `finetune` a model spec
-    (``hf:ORG/NAME``, a folder, a checkpoint) or None; `method` "", "lora" or "qlora"."""
-
-    seconds: float
-    finetune: str | None = None
-    method: str = ""
-
-
-def default_choice() -> BenchChoice:
-    from auralite import bench
-    return BenchChoice(seconds=bench.DEFAULT_SECONDS)
 
 
 class BenchDialog(QDialog):
@@ -170,17 +156,11 @@ class BenchDialog(QDialog):
 
     def check(self) -> str:
         """Why Start cannot begin ("" when it can): a path that is not a model."""
-        from auralite import bench
         if not self.finetune.isChecked():
             return ""
-        spec = self.model_spec()
-        if not spec:
-            return "Choose the model: a folder or a checkpoint file"
-        try:
-            bench.finetune_source(spec)
-        except bench.BenchError as exc:
-            return str(exc)
-        return ""
+        return check_choice(BenchChoice(seconds=float(self.seconds.value()),
+                                        finetune=self.model_spec() or "",
+                                        method=str(self.method.currentData() or "")))
 
     def choice(self) -> BenchChoice:
         return BenchChoice(seconds=float(self.seconds.value()), finetune=self.model_spec(),
@@ -199,15 +179,3 @@ def choose_benchmark(parent: QWidget | None = None,
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
     return dialog.choice()
-
-
-def describe(choice: BenchChoice) -> str:
-    """One line for the status bar and the log: ``"60 s per size, fine-tuning Qwen3.5 0.8B"``."""
-    from auralite.studio.catalog import find_model
-    text = f"{choice.seconds:g} s per size"
-    if choice.finetune:
-        model = find_model(choice.finetune) if choice.finetune.lower().startswith("hf:") \
-            else None
-        name = model.name if model is not None else Path(choice.finetune).name
-        text += f", fine-tuning {name}" + (f" ({choice.method})" if choice.method else "")
-    return text

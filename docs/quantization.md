@@ -17,9 +17,9 @@ be quantized with their own tooling.
 | Static INT8 | `static` | `int8` | yes | Calibration pass picks activation ranges; closest to what `torch.ao` eager quantization does. |
 | QAT | `qat` | `int8` (also `int4`) | yes | Fake-quantize (STE) layers you then fine-tune; best quality/lowest bit counts, most work. |
 | GPTQ | `gptq` | `int2`, `int3`, `int4`, `int8` | yes | Layer-wise Hessian (inverse-Hessian) rounding, error-compensating; the strongest post-training option at low bits. |
-| AWQ | `awq` | `int4`, `int8` | yes | Activation-aware scaling: protects the weight channels that matter for the calibration activations. |
+| AWQ | `awq` | `int4`, `int8` | yes | Activation-aware scaling: protects the weight channels that matter for the calibration activations. The search tries the balances of `awq_grid_alphas` and, since 2.25, `awq_alpha` with them. |
 | HQQ | `hqq` | `int2`…`int8` | no | Half-Quadratic Quantization — calibration-free low-bit path. |
-| Half precision | `half` | `fp16`, `bf16` | no | Not really quantization: just halves the dtype of every parameter. |
+| Half precision | `half` | `fp16`, `bf16`, `fp8_e4m3`, `fp8_e5m2` | no | Not really quantization: just halves the dtype of every parameter. FP8 is for storage only: a processor cannot compute in PyTorch's float8, so an FP8 model is saved, not run. |
 
 ### Backends (dynamic INT8)
 
@@ -59,9 +59,11 @@ results = compare_quantizations(engine.model, engine.tokenizer, calibration_text
 print(format_comparison_table(results))
 ```
 
-The GUI Quantization tab wraps the same calls: pick method/bits, optionally point
-at calibration text, optionally fine-tune a QAT model, then read the benchmark
-table (size, compression ratio, tokens/s, perplexity) side by side.
+The Studio's Quantize tab (2.25) and the classic interface's Quant tab wrap the same
+calls: pick method/bits, point at calibration text when the method needs it (the
+training data or a file; a dialogs file gives the words of its turns), optionally
+fine-tune a QAT model, then read the benchmark table (size, compression ratio,
+tokens/s, perplexity) side by side, save the result or go back to the original.
 
 ## What to actually expect
 

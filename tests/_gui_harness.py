@@ -274,6 +274,10 @@ def build_gui_app(tmp_path, monkeypatch, prepare=None, config=None,
                 base.language = language
             stack.enter_context(patch.object(gui_config_module, "load_config",
                                              lambda *a, **k: base))
+            # 2.25: app.py holds its own reference (``from .config import load_config``)
+            from auralite.gui import app as gui_app_module
+            stack.enter_context(patch.object(gui_app_module, "load_config",
+                                             lambda *a, **k: base))
         if prepare is not None:
             prepare()
         # `AIApp.__init__` replaces `sys.stdout`/`sys.stderr` with a console
