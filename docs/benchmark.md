@@ -1,4 +1,4 @@
-# Measuring a computer: `auralite bench` (2.22, 2.23)
+# Measuring a computer: `auralite bench` (2.22, 2.23, 2.23.1)
 
 How fast does this computer train a model of its own, how much memory does a run take, and
 how fast does the model write? `auralite bench` measures it in a few minutes, offline, and
@@ -61,6 +61,12 @@ stays grey until the path is a model, and the next benchmark opens with the same
    checkpoint (`.pt`, `.safetensors`), such as a model fine-tuned before. A path that is
    neither stops the benchmark at once, not after the minutes of the other sizes.
 
+   A step is 8 windows of 256 tokens; the memory plan reads them in as many passes as the
+   free memory needs. Since 2.23.1 the row shows how (**Windows x passes**: `4 x 2` is two
+   passes of 4 windows, `, checkpointing` when the plan recomputes the layers in backward)
+   and, as for a new model, what the plan estimated next to the memory used. The JSON also
+   keeps the import's own peak (`memory_load`).
+
 The built-in text is plain English sentences from a fixed list of words, generated from a
 fixed seed: the same on every computer, so that results compare. What a text says does not
 change the speed; the size of the model and its window do.
@@ -86,6 +92,27 @@ An example — a cloud machine with 2 virtual cores (Xeon, AVX-512, 334 GFLOP/s 
 
 (A cloud machine's speed changes from day to day: 2.22's run there measured 256 GFLOP/s.
 Compare computers by reports made the same way — the version is in the report.)
+
+And a PC from 2011 — the field test's Core i5-2400 (4 cores, AVX, 76 GFLOP/s), 16 GB with
+8.89 GB free, Windows 10, AuraLite 2.23.0's app with `--finetune`; the whole benchmark took
+47.5 minutes, most of it the download of Qwen3.5 0.8B:
+
+```
+| Model | Parameters | Training, tokens/s | In 8 hours | Memory used (estimate) | Writing, tokens/s |
+|---|---|---|---|---|---|
+| tiny: 4 layers x 128 | 0.9M | 4,466 | 128.6M tokens | 0.13 GB (0.13 GB) | 159 |
+| small: 8 layers x 256 (preset 25m) | 7M | 923 | 26.6M tokens | 0.46 GB (0.52 GB) | 75 |
+| medium: 12 layers x 384 (preset 45m) | 19M | 353 | 10.2M tokens | 1.01 GB (1.13 GB) | 43 |
+
+| Model | Method | Tokens/s | Seconds per step | Memory used |
+|---|---|---|---|---|
+| hf:Qwen/Qwen3.5-0.8B (763M) | lora | 14 | 149.08 | 9.48 GB |
+```
+
+The fine-tune's 9.48 GB was more than was free: 2.23.0 planned Qwen3.5's memory without its
+linear-attention layers and kept batches of 4 windows (the plan saw 6.1 GB). 2.23.1 counts
+them — 10.2 GB for batches of 4 — and on this PC reads a step's 8 windows one at a time
+(`1 x 8`, about 5.6 GB); see [training.md §23.3](training.md#233-how-long-it-takes-on-a-cpu).
 
 ## Reading the numbers
 

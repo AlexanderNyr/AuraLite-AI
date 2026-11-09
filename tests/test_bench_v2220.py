@@ -259,7 +259,7 @@ def test_a_size_that_ran_out_of_memory_is_said_so():
                             "error": "out of memory"})
     text = bench.to_markdown(report)
     assert "| medium: 12 layers x 384 (preset 45m) | - | out of memory | - | - | - |" in text
-    assert "| hf:Qwen/Qwen3.5-0.8B | qlora | out of memory | - | - |" in text
+    assert "| hf:Qwen/Qwen3.5-0.8B | qlora | out of memory | - | - | - |" in text
     assert bench.summary_lines(report)[1:] == [
         "medium: 12 layers x 384 (preset 45m): out of memory",
         "Fine-tuning hf:Qwen/Qwen3.5-0.8B (qlora): out of memory"]
@@ -276,6 +276,12 @@ def test_fine_tuning_a_ready_model(tmp_path):
     assert ft["method"] == "lora" and ft["architecture"] == "LlamaForCausalLM"
     assert ft["tokens_per_second"] > 0 and ft["optimizer_steps"] >= 1
     assert ft["seconds_per_step"] is not None and ft["memory_used"] >= 0
+    # 2.23.1: the plan's estimate (the run on top of the framework) and the import's peak
+    assert ft["memory_estimate"] is not None and 0 < ft["memory_estimate"] < 300 << 20
+    assert 0 <= ft["memory_load"] <= ft["memory_used"]
+    assert ft["micro_batch"] * ft["accumulation_steps"] == bench.BATCH
+    assert ft["gradient_checkpointing"] is False and f"| {ft['micro_batch']} x " in \
+        bench.to_markdown(result)
     text = bench.to_markdown(result)
     assert "## Fine-tuning a ready model" in text and "| tiny-llama (" in text
     assert bench.summary_lines(result)[-1].startswith("Fine-tuning tiny-llama (lora): ")

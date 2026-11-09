@@ -1,3 +1,33 @@
+# 📦 v2.23.1 — Qwen3.5's memory plan counts its linear attention; the benchmark shows a fine-tune's plan
+
+- **Fine-tuning a Qwen3.5 no longer plans more memory than there is.** On the i5-2400 of
+  the field test (16 GB, 8.89 GB free), `auralite bench --finetune` fine-tuned Qwen3.5 0.8B
+  with LoRA in batches of 4 windows of 256 tokens and took 9.48 GB — more than was free, and
+  Windows paged. The trainer's memory plan had counted the model as a plain transformer,
+  without its 18 linear-attention layers, and saw 6.1 GB. Since 2.23.1 the plan knows a
+  hybrid model's layers, and the estimate counts each kind by its own measure: a Gated
+  DeltaNet layer keeps about 72,000 values per token for backward at the 0.8B's dims (its
+  convolution's q, k and v, the delta rule's chunks, the gate and its norm), more than
+  twice an attention layer's 29,600. Against what autograd saves, at seven sizes up to the
+  0.8B's: within 3 % at the real dims, 7 % at the smallest. Batches of 4 are now estimated
+  at 10.2 GB on that PC; with the model loaded, the plan reads a step's 8 windows one at a
+  time (about 5.6 GB) — a few percent slower than batches of 4 that fit, much faster than
+  paging. Plain models are estimated exactly as before.
+- **The advisor's Qwen3.5 memory figures follow** (one window of 512 tokens): 0.8B with
+  LoRA 7.4 GB (2.23.0: 6.6), 2B with QLoRA 8.0 GB (7.3). On a fast PC with 16 GB, Qwen3.5
+  4B now needs gradient checkpointing — about 4 hours for 1,000 dialogs instead of 2.7 —
+  and is still the recommendation.
+- **The benchmark's fine-tune row shows the plan**: *Windows x passes* (`1 x 8`, `4 x 2`;
+  `, checkpointing` when the plan recomputes the layers) and the plan's estimate next to the
+  memory used, as the rows of new models do; the JSON adds `memory_estimate`,
+  `memory_load` (the import's own peak) and `gradient_checkpointing`.
+- **Measured on the i5-2400** (Windows 10, 4 threads, AVX, 76 GFLOP/s; 2.23.0's app): the
+  benchmark's new 32-window steps measure 21 % (0.9M), 19 % (7M: 923 tokens/s, where the
+  Studio trains it at 1,061) and 56 % (19M) more than 2.22's one-batch steps; Qwen3.5 0.8B
+  fine-tunes with LoRA at 14 tokens/s, faster than the advisor's 11 — two passes over 1,000
+  dialogs take about 6 hours there. [training.md §23.3](docs/training.md#233-how-long-it-takes-on-a-cpu)
+  and [benchmark.md](docs/benchmark.md) have the numbers.
+
 # 📦 v2.23.0 — Qwen3.5 in AuraLite's own engine; the benchmark fine-tunes a model already downloaded
 
 - **Qwen3.5** — 0.8B, 2B, 4B and 9B, released in March 2026 under Apache 2.0 — imports,

@@ -49,6 +49,13 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 _ACT_D, _ACT_F, _ACT_KV, _ACT_H, _ACT_DROPOUT = 7.6, 4.0, 3.0, 3.0, 2.0
+#: 2.23.1, hybrid models (Qwen3.5): a linear-attention layer keeps values per unit of its
+#: convolution's channels (q, k and v) and per unit of its value width (the delta rule's
+#: chunks, the gate and its norm); a gated attention layer its queries and gate per unit
+#: of their width, and more per unit beyond d_model. Measured: within 5 % of what autograd
+#: saves, three sizes up to Qwen3.5-0.8B's.
+_ACT_LIN_CONV, _ACT_LIN_VALUE = 3.9, 13.4
+_ACT_GATE, _ACT_WIDE = 0.8, 4.2
 _ACT_BF16 = 0.84
 _CKPT_D = 1.25
 #: Gradients of the activations during backward, on top of the saved ones
@@ -56,6 +63,11 @@ _CKPT_D = 1.25
 _ACT_MARGIN = 1.2
 #: The framework itself (Python, torch, buffers): CPU and CUDA context.
 _OVERHEAD = {"cpu": 600 << 20, "cuda": 900 << 20}
+
+
+def overhead_bytes(device: str = "cpu") -> int:
+    """What the framework itself takes (Python, torch, buffers) in an estimate (2.23.1)."""
+    return _OVERHEAD["cuda" if str(device).startswith("cuda") else "cpu"]
 
 
 def preset_params(name: str) -> dict[str, Any]:
@@ -126,6 +138,17 @@ def _activation_values(d_model: int, n_heads: int, kv_width: int, d_ff: int,
     return values
 
 
+def _linear_activation_values(d_model: int, d_ff: int, linear_attention: dict | None,
+                              dropout: float) -> float:
+    """Values autograd keeps per token in a linear-attention layer (2.23.1)."""
+    dims = _linear_dims(linear_attention)
+    values = (_ACT_D * d_model + _ACT_F * d_ff + _ACT_LIN_CONV * dims["conv"]
+              + _ACT_LIN_VALUE * dims["value"])
+    if dropout and dropout > 0:
+        values += _ACT_DROPOUT * d_model
+    return values
+
+
 def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff: int,
                              vocab_size: int, seq_length: int, batch_size: int,
                              n_kv_heads: int | None = None, tie_word_embeddings: bool = False,
@@ -160,12 +183,9 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
                               layer_types=layer_types, linear_attention=linear_attention,
                               attn_output_gate=attn_output_gate)
     total_params = counts["total"]
-    kv_width = int(n_kv_heads or n_heads) * int(head_dim or d_model // n_heads)
-    if layer_types and any(t == "linear_attention" for t in layer_types):
-        # 2.23: a linear-attention layer keeps q, k, v and z per token where attention keeps
-        # its keys and values: count the wider of the two
-        dims = _linear_dims(linear_attention)
-        kv_width = max(kv_width, dims["conv"] + dims["value"])
+    head_dim = int(head_dim or d_model // n_heads)
+    kv_width = int(n_kv_heads or n_heads) * head_dim
+    linear_layers = sum(1 for t in (layer_types or ()) if t == "linear_attention")
     if lora_rank:
         per_layer = 2 * lora_rank * (4 * d_model + 2 * kv_width) + 3 * lora_rank * (
             2 * d_model + 2 * d_ff)
@@ -180,11 +200,23 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
     adamw_state = 2.04 if optimizer == "adamw8bit" else 8      # 8-bit: codes + block scales
     optimizer_bytes = 4 * muon_trained + adamw_state * adamw_trained
     tokens = int(batch_size) * int(seq_length)
-    per_layer = _activation_values(d_model, n_heads, kv_width, d_ff, dropout) * 4
-    if amp in ("bf16", "fp16"):
-        per_layer *= _ACT_BF16
+    scale = 4 * (_ACT_BF16 if amp in ("bf16", "fp16") else 1.0)
+    per_layer = _activation_values(d_model, n_heads, kv_width, d_ff, dropout)
+    if attn_output_gate:
+        # 2.23.1: the gate, and queries wider than d_model (Qwen3.5-0.8B: 2,048 for 1,024)
+        width = n_heads * head_dim
+        per_layer += _ACT_GATE * width + _ACT_WIDE * max(0, width - d_model)
+    per_layer *= scale
+    # 2.23.1: each kind of layer by its own count - a linear-attention layer keeps more
+    # than twice what an attention layer keeps (2.23.0 counted both as one in between,
+    # and the trainer's plan left the linear layers out)
+    per_linear = _linear_activation_values(d_model, d_ff, linear_attention, dropout) * scale \
+        if linear_layers else 0.0
     if gradient_checkpointing:
-        activations = tokens * (n_layers * _CKPT_D * d_model * 4 + per_layer)
+        activations = tokens * (n_layers * _CKPT_D * d_model * 4 + max(per_layer, per_linear))
+    elif linear_layers:
+        activations = tokens * ((n_layers - linear_layers) * per_layer
+                                + linear_layers * per_linear)
     else:
         activations = tokens * n_layers * per_layer
     activations *= _ACT_MARGIN                    # their gradients during backward
@@ -200,7 +232,7 @@ def estimate_training_memory(*, d_model: int, n_layers: int, n_heads: int, d_ff:
     else:
         out_bytes = 2 if amp in ("bf16", "fp16") else 4
         logits = logit_values * (out_bytes + 4 + 4 + 4)
-    overhead = _OVERHEAD["cuda" if str(device).startswith("cuda") else "cpu"]
+    overhead = overhead_bytes(device)
     states = weights + gradients + optimizer_bytes
     # the optimizer step, after backward freed the activations: AdamW's
     # multi-tensor update holds temporaries about twice its parameters

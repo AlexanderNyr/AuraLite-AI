@@ -141,7 +141,8 @@ trained at 39 tokens/s in 1.48 GB.
 | 32 GB, 8 threads | Qwen3.5 2B, QLoRA | ~5 h |
 
 (The i5-2400 class is 72 GFLOP/s, the 8-thread PC 300; the Studio measures yours, and
-*Tools → Benchmark…* measures a real fine-tune.)
+*Tools → Benchmark…* measures a real fine-tune. On the real i5-2400 Qwen3.5 0.8B
+fine-tuned at 14 tokens/s, faster than the advisor assumes: about 6 hours.)
 
 **How fast is it really?** *Tools → Benchmark…* (2.22) trains three sizes of a new model
 for a minute each and times how they write — the same as `auralite bench`; the report, a

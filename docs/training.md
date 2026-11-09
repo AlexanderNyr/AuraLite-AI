@@ -2160,17 +2160,28 @@ memory and finishes overnight, else the largest older model that does. Its estim
 |---|---|---|---|
 | 4 GB, 4 threads | SmolLM2 135M (older), QLoRA | 1.8 GB | ~3 h |
 | 8 GB, i5-2400 class (72 GFLOP/s) | Qwen2.5 0.5B (older), QLoRA — Qwen3.5 0.8B takes ~8 h | 3.2 GB | ~5 h |
-| 16 GB, i5-2400 class | **Qwen3.5 0.8B**, LoRA | 6.6 GB | ~8 h |
-| 32 GB, 8 threads (300 GFLOP/s) | **Qwen3.5 2B**, QLoRA | 7.3 GB | ~5 h |
+| 16 GB, i5-2400 class | **Qwen3.5 0.8B**, LoRA | 7.4 GB | ~8 h |
+| 32 GB, 8 threads (300 GFLOP/s) | **Qwen3.5 2B**, QLoRA | 8.0 GB | ~5 h |
 
-They are estimates, and for Qwen3.5 the speed is the least certain part: its linear
-attention computes in many small matrix products, which a processor runs below the speed of
-the large ones the estimate assumes. On the build machine a 4-layer slice at Qwen3.5-0.8B's
-real dims (three Gated DeltaNet layers and one attention layer, LoRA, windows of 256 tokens)
-trained 1.6 times slower per parameter than the same slice with attention only. Take the
-times above as the shortest they can be, and measure: `auralite bench --finetune` fine-tunes
-Qwen3.5 0.8B (or a model you downloaded: `--finetune FOLDER`) for a minute and reports the
-real tokens per second.
+(The memory is one window of 512 tokens; 2.23.0 said 6.6 and 7.3 GB, see below.)
+
+**Measured on the i5-2400** of the field test (16 GB, Windows 10, 4 threads, 76 GFLOP/s,
+2.23.0's app): `auralite bench --finetune` fine-tuned Qwen3.5 0.8B with LoRA at **14 tokens
+per second**, faster than the advisor's 11 — Gated DeltaNet's many small matrix products
+cost less there than a 4-layer slice on the build machine suggested (1.6 times slower per
+parameter than attention). So the times above err on the long side: two passes over 1,000
+dialogs (about 300,000 tokens) take about 6 hours on that PC. To know your own computer:
+`auralite bench --finetune` (or `--finetune FOLDER` for a model already downloaded)
+fine-tunes Qwen3.5 0.8B for a minute and reports the tokens per second.
+
+That run also found a bug of 2.23.0: the trainer planned a Qwen3.5's memory as a plain
+transformer's, without its linear-attention layers — which keep more than twice what an
+attention layer keeps for backward (at the 0.8B's dims about 72,000 values per token against
+29,600). Batches of 4 windows of 256 tokens took 9.5 GB where the plan saw 6.1, with 8.9 GB
+free, and Windows paged. Since 2.23.1 the plan knows a hybrid model's layers and counts each
+kind by its own measure — within 3 % of what autograd saves at the 0.8B's dims, 7 % at the
+smallest — and batches of 4 are estimated at 10.2 GB. On that PC, with the model loaded, a step's 8 windows
+now go one at a time, in about 5.6 GB.
 
 A base stored in bfloat16 (`auralite import ... --dtype bfloat16`, half the memory of float32)
 trains its LoRA adapters since 2.23 — before, every family stopped at the first step.

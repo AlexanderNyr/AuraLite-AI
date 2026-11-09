@@ -969,6 +969,13 @@ class TrainerMixin:
                 num_experts=int(getattr(native, "num_experts", 4) or 4),
                 head_dim=int(getattr(native, "head_dim", 0) or 0) or None,
                 weight_bytes=_nf4_bytes(native) if _nf4.nf4_layers(native) else None)
+            # 2.23.1: a hybrid model's (Qwen3.5) linear-attention layers and output gates -
+            # 2.23.0 planned it as a plain transformer, about half its activations
+            if getattr(native, "layer_types", None):
+                dims.update(layer_types=list(native.layer_types),
+                            linear_attention=dict(native.linear_attention or {}))
+            if getattr(native, "attn_output_gate", False):
+                dims["attn_output_gate"] = True
         except (AttributeError, TypeError, ValueError):
             return None, micro, accumulation, chunk_tokens
         chunked = None if auto_chunk else bool(chunk_tokens)

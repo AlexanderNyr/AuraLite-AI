@@ -325,6 +325,7 @@ def finetune_source(spec: str) -> str:
 def _finetune(spec: str, method: str, seconds: float, progress: ProgressFn,
               stop: threading.Event | None) -> dict[str, Any]:
     from auralite.engine import AuraLiteEngine
+    from auralite.engine import sizing as _sizing
     from auralite.engine.dialogs import DialogSet
     from auralite.studio.recipes import FineTuneSettings, finetune_params
 
@@ -379,6 +380,7 @@ def _finetune(spec: str, method: str, seconds: float, progress: ProgressFn,
     if speed <= 0 and summary.get("seconds"):
         speed = tokens / float(summary["seconds"])
     steps = int(summary.get("optimizer_steps") or 0)
+    estimate = summary.get("memory_estimate")
     result = {
         "model": spec, "architecture": str((info or {}).get("architecture") or ""),
         "params": int(engine.model.count_parameters()), "method": method,
@@ -388,7 +390,12 @@ def _finetune(spec: str, method: str, seconds: float, progress: ProgressFn,
         "seconds": round(float(summary.get("seconds") or 0.0), 1),
         "micro_batch": int(summary.get("batch_size") or BATCH),
         "accumulation_steps": int(summary.get("accumulation_steps") or 1),
+        "gradient_checkpointing": bool(summary.get("gradient_checkpointing")),
         "memory_used": int(max(memory.peak, load_memory.peak) - load_memory.start),
+        # 2.23.1: the import's own peak, and what the memory plan expected the run to need
+        # on top of the framework (as for a new model)
+        "memory_load": int(load_memory.peak - load_memory.start),
+        "memory_estimate": int(estimate) - _sizing.overhead_bytes("cpu") if estimate else None,
     }
     del engine
     gc.collect()
@@ -722,17 +729,33 @@ def to_markdown(report: dict[str, Any]) -> str:
     ft = report.get("finetune")
     if ft:
         out += ["", "## Fine-tuning a ready model", "",
-                "| Model | Method | Tokens/s | Seconds per step | Memory used |",
-                "|---|---|---|---|---|"]
+                f"Built-in dialogs, windows of {settings.get('seq_length') or SEQ_LENGTH} tokens, "
+                f"{settings.get('batch_size') or BATCH} of them a step: the memory plan reads them "
+                "in as many passes as the free memory needs (windows x passes).", "",
+                "| Model | Method | Tokens/s | Seconds per step | Windows x passes "
+                "| Memory used (estimate) |",
+                "|---|---|---|---|---|---|"]
         if ft.get("error"):
-            out.append(f"| {_model_name(ft['model'])} | {ft['method']} | {ft['error']} | - | - |")
+            out.append(f"| {_model_name(ft['model'])} | {ft['method']} | {ft['error']} "
+                       "| - | - | - |")
         else:
             out.append(f"| {_model_name(ft['model'])} ({_millions(ft['params'])}) | "
                        f"{ft['method']} | {ft['tokens_per_second']:,.0f} | "
-                       f"{ft['seconds_per_step'] or '-'} | {_gb(ft['memory_used'])} |")
+                       f"{ft['seconds_per_step'] or '-'} | {_passes(ft)} | "
+                       f"{_gb(ft['memory_used'])}"
+                       + (f" ({_gb(ft['memory_estimate'])})" if ft.get("memory_estimate")
+                          else "") + " |")
     out += ["", f"Measured with `auralite bench` in {report.get('seconds', 0) / 60:,.1f} min. "
             "Writing: one prompt, sampling (temperature 0.8, top-k 40), after a warm-up.", ""]
     return "\n".join(out)
+
+
+def _passes(row: dict[str, Any]) -> str:
+    """``"4 x 2"``: a fine-tune's windows per pass and passes per step (2.23.1)."""
+    if not row.get("micro_batch"):
+        return "-"
+    text = f"{row['micro_batch']} x {row.get('accumulation_steps') or 1}"
+    return text + (", checkpointing" if row.get("gradient_checkpointing") else "")
 
 
 def file_stem(report: dict[str, Any]) -> str:
