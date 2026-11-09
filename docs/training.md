@@ -2159,11 +2159,14 @@ memory and finishes overnight, else the largest older model that does. Its estim
 | computer | recommendation | memory | time |
 |---|---|---|---|
 | 4 GB, 4 threads | SmolLM2 135M (older), QLoRA | 1.8 GB | ~3 h |
-| 8 GB, i5-2400 class (72 GFLOP/s) | Qwen2.5 0.5B (older), QLoRA — Qwen3.5 0.8B takes ~8 h | 3.2 GB | ~5 h |
-| 16 GB, i5-2400 class | **Qwen3.5 0.8B**, LoRA | 7.4 GB | ~8 h |
-| 32 GB, 8 threads (300 GFLOP/s) | **Qwen3.5 2B**, QLoRA | 8.0 GB | ~5 h |
+| 8 GB, i5-2400 class (72 GFLOP/s) | **Qwen3.5 0.8B**, QLoRA | 5.7 GB | ~7 h |
+| 16 GB, i5-2400 class | **Qwen3.5 0.8B**, LoRA | 7.4 GB | ~7 h |
+| 32 GB, 8 threads (300 GFLOP/s) | **Qwen3.5 2B**, QLoRA | 8.0 GB | ~4.5 h |
 
-(The memory is one window of 512 tokens; 2.23.0 said 6.6 and 7.3 GB, see below.)
+(The memory is one window of 512 tokens; 2.23.0 said 6.6 and 7.3 GB, see below. 2.24
+calibrates the speed on the i5-2400's benchmarks — 50 % of the measured product speed
+instead of 45 % — and with 8 GB Qwen3.5 0.8B now fits a night: 2.23 recommended Qwen2.5
+0.5B there.)
 
 **Measured on the i5-2400** of the field test (16 GB, Windows 10, 4 threads, 76 GFLOP/s,
 2.23.0's app): `auralite bench --finetune` fine-tuned Qwen3.5 0.8B with LoRA at **14 tokens
@@ -2182,6 +2185,11 @@ free, and Windows paged. Since 2.23.1 the plan knows a hybrid model's layers and
 kind by its own measure — within 3 % of what autograd saves at the 0.8B's dims, 7 % at the
 smallest — and batches of 4 are estimated at 10.2 GB. On that PC, with the model loaded, a step's 8 windows
 now go one at a time, in about 5.6 GB.
+
+Measured again with 2.23.1, with 12 GB free this time: the plan read a step's 8 windows
+in four passes of 2 (`2 x 4`), the run took 6.86 GB where the plan estimated 6.70, and
+Qwen3.5 0.8B trained at **16.1 tokens per second** (4 steps of 88 s) — two passes over
+1,000 dialogs in about 5 hours.
 
 A base stored in bfloat16 (`auralite import ... --dtype bfloat16`, half the memory of float32)
 trains its LoRA adapters since 2.23 — before, every family stopped at the first step.

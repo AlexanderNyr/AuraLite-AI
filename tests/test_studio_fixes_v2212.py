@@ -367,7 +367,9 @@ def test_the_train_tab_lists_sizes_by_parameters(studio):
     from PySide6.QtCore import Qt
     tab = studio.train_tab
     tab._update_estimates()
-    texts = [tab.size.itemText(i) for i in range(tab.size.count())]
+    # 2.24: the last entry is a shape of one's own
+    assert tab.size.itemData(tab.size.count() - 1) == "custom"
+    texts = [tab.size.itemText(i) for i in range(tab.size.count() - 1)]
     assert texts and all(" parameters - " in text and " layers, width " in text
                          for text in texts)
     assert not any(text.startswith(f"{tab.size.itemData(i)}:") for i, text in enumerate(texts))

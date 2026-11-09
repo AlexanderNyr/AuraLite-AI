@@ -497,8 +497,13 @@ def test_the_advisor_prefers_qwen35_when_it_fits_the_night():
     strong = recommend_finetune(pc(32, 300.0, 8))
     assert strong.choice is not None and strong.choice.model.family == "qwen3_5"
     assert strong.choice.model.params > i5_2400.choice.model.params
-    # with 8 GB Qwen3.5 0.8B takes longer than a night: an older model that does not
-    small = recommend_finetune(pc(8, 72.0))
+    # 2.24 (the advisor calibrated on the i5-2400's benchmark): 8 GB fine-tune Qwen3.5 0.8B
+    # with QLoRA overnight; a slower PC takes longer than a night with it: an older model
+    eight = recommend_finetune(pc(8, 72.0))
+    assert eight.choice is not None and eight.choice.model.repo == "Qwen/Qwen3.5-0.8B"
+    assert eight.choice.method == "qlora" and eight.choice.hours is not None
+    assert eight.choice.hours <= 8
+    small = recommend_finetune(pc(8, 55.0))
     q35 = next(f for f in small.options if f.model.repo == "Qwen/Qwen3.5-0.8B")
     assert q35.usable and q35.hours is not None and q35.hours > 8
     assert small.choice is not None and small.choice.model.older

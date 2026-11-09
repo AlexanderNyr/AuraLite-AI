@@ -1,4 +1,5 @@
-"""The Export tab: the model in memory as GGUF, a Hugging Face folder or a checkpoint (2.19)."""
+"""The Export tab: the model in memory as GGUF, a Hugging Face folder or a checkpoint (2.19);
+2.24: also as a PyTorch 2 program (.pt2), ONNX and TorchScript, as the classic interface."""
 from __future__ import annotations
 
 import os
@@ -6,18 +7,30 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLineEdit, QPushButton, QRadioButton, QVBoxLayout,
-                               QWidget)
+                               QHBoxLayout, QLineEdit, QPushButton, QRadioButton, QSpinBox,
+                               QVBoxLayout, QWidget)
 
 from ..library import remember_model
-from .common import Job, ask_dir, ask_save, heading, hint, open_path, primary
+from .common import Job, ask_dir, ask_save, heading, hint, open_path, package_note, primary
 
 if TYPE_CHECKING:
     from .window import MainWindow
 
 FORMATS = (("gguf", "GGUF file - for llama.cpp, Ollama and LM Studio"),
            ("hf", "Hugging Face folder - for transformers, vLLM and the Hub"),
-           ("pt", "AuraLite checkpoint (.pt) - to train further or open here later"))
+           ("pt", "AuraLite checkpoint (.pt) - to train further or open here later"),
+           # 2.24: the classic interface's formats (auralite.export.ModelExporter)
+           ("pt2", "PyTorch 2 program (.pt2) - runs without AuraLite: "
+                   "torch.export.load(path).module()"),
+           ("onnx", "ONNX (.onnx) - for ONNX Runtime and other runtimes"),
+           ("torchscript", "TorchScript (.pt) - for older PyTorch runtimes (PyTorch "
+                           "deprecated it)"),
+           ("all", "PyTorch 2 and ONNX together, into a folder"))
+#: where each format goes when no path was chosen
+_SUFFIXES = {"gguf": ".gguf", "hf": "-hf", "pt": ".pt", "pt2": ".pt2", "onnx": ".onnx",
+             "torchscript": "-torchscript.pt", "all": "-export"}
+#: the formats ModelExporter writes, and the package each needs
+_NEEDS = {"onnx": "onnx", "all": "onnx"}
 QUANTS = (("f16", "F16 - exact (recommended)"), ("q8_0", "Q8_0 - about half the size, "
                                                           "nearly the same"),
           ("bf16", "BF16"), ("f32", "F32 - largest"))
@@ -60,6 +73,31 @@ class ExportTab(QWidget):
         self.optimizer = QCheckBox("Keep the optimizer's state (continues training exactly; "
                                    "a bigger file)")
         form.addRow("", self.optimizer)
+        # 2.24: .pt2, ONNX and TorchScript
+        self.dynamic = QCheckBox("Any batch size and length up to the model's context "
+                                 "(.pt2, ONNX)")
+        self.dynamic.setChecked(True)
+        form.addRow("", self.dynamic)
+        self.opset = QSpinBox()
+        self.opset.setRange(0, 30)
+        self.opset.setSpecialValueText("the exporter's")
+        self.opset.setToolTip("ONNX's operator set: 18 and up use PyTorch's newer exporter "
+                              "(with onnxscript), lower ones the TorchScript-based one")
+        form.addRow("ONNX opset:", self.opset)
+        self.script = QComboBox()
+        self.script.addItem("Trace (recommended)", "trace")
+        self.script.addItem("Script", "script")
+        self.optimize = QCheckBox("Optimize for inference")
+        self.optimize.setChecked(True)
+        script_row = QHBoxLayout()
+        script_row.addWidget(self.script)
+        script_row.addWidget(self.optimize)
+        script_row.addStretch(1)
+        form.addRow("TorchScript:", script_row)
+        self.needs = hint("")
+        self.needs.setStyleSheet("color: #b9770e")
+        self.needs.setVisible(False)
+        form.addRow("", self.needs)
         self.path = QLineEdit()
         self.browse = QPushButton("Choose…")
         path_row = QHBoxLayout()
@@ -104,22 +142,35 @@ class ExportTab(QWidget):
         self.quant.setEnabled(fmt == "gguf")
         self.dtype.setEnabled(fmt == "hf")
         self.optimizer.setEnabled(fmt == "pt")
+        self.dynamic.setEnabled(fmt in ("pt2", "onnx", "all"))
+        self.opset.setEnabled(fmt in ("onnx", "all"))
+        self.script.setEnabled(fmt == "torchscript")
+        self.optimize.setEnabled(fmt == "torchscript")
+        note = package_note(_NEEDS[fmt]) if fmt in _NEEDS else ""
+        self.needs.setText(note)
+        self.needs.setVisible(bool(note))
         base = os.path.join(self.studio.settings.last_model_dir or os.path.expanduser("~"),
                             "my-model")
         current = self.path.text().strip()
-        stem = os.path.splitext(current)[0] if current else base
-        self.path.setText({"gguf": stem + ".gguf", "hf": stem + "-hf", "pt": stem + ".pt"}[fmt]
-                          if not current or current.endswith((".gguf", ".pt", "-hf"))
-                          else current)
+        stem = current if current else base
+        for suffix in sorted(_SUFFIXES.values(), key=len, reverse=True):
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+                break
+        known = not current or any(current.endswith(s) for s in _SUFFIXES.values())
+        self.path.setText(stem + _SUFFIXES[fmt] if known else current)
+        self._model_changed()
 
     def _choose_path(self) -> None:
         fmt = self.fmt()
-        if fmt == "hf":
+        if fmt in ("hf", "all"):
             folder = ask_dir(self, "Choose an empty folder for the model")
             if folder:
                 self.path.setText(folder)
             return
-        filters = {"gguf": "GGUF (*.gguf)", "pt": "AuraLite model (*.pt)"}[fmt]
+        filters = {"gguf": "GGUF (*.gguf)", "pt": "AuraLite model (*.pt)",
+                   "pt2": "PyTorch 2 program (*.pt2)", "onnx": "ONNX (*.onnx)",
+                   "torchscript": "TorchScript (*.pt)"}[fmt]
         path = ask_save(self, "Save the model as", filters, self.path.text().strip())
         if path:
             self.path.setText(path)
@@ -130,7 +181,10 @@ class ExportTab(QWidget):
             not engine.is_hf_model()
         self.model_label.setText(self.studio.model_description() if engine.model is not None
                                  else "No model yet: train, fine-tune or open one first.")
-        self.export_button.setEnabled(native and self.job is None and not self.studio.busy)
+        needs = getattr(self, "needs", None)
+        missing = needs is not None and bool(needs.text())
+        self.export_button.setEnabled(native and self.job is None and not self.studio.busy
+                                      and not missing)
 
     def export(self) -> None:
         engine = self.studio.engine
@@ -146,6 +200,10 @@ class ExportTab(QWidget):
         quant = str(self.quant.currentData())
         dtype = str(self.dtype.currentData())
         keep_optimizer = self.optimizer.isChecked()
+        dynamic = self.dynamic.isChecked()
+        opset = int(self.opset.value()) or None
+        method = str(self.script.currentData())
+        optimize = self.optimize.isChecked()
 
         def work(job: Job) -> Any:
             parent = os.path.dirname(os.path.abspath(path))
@@ -154,6 +212,9 @@ class ExportTab(QWidget):
                 return engine.export_gguf_model(path, quant=quant)
             if fmt == "hf":
                 return engine.export_hf_model(path, dtype=dtype)
+            if fmt in ("pt2", "onnx", "torchscript", "all"):
+                return _export_program(engine, fmt, path, dynamic=dynamic, opset=opset,
+                                       method=method, optimize=optimize)
             engine.save_model(path, include_optimizer=keep_optimizer)
             return {"path": path}
 
@@ -179,7 +240,8 @@ class ExportTab(QWidget):
             self.studio.model_saved(path)
             self.studio.end(model_dirty=False)
         else:
-            remember_model(path, "export", note=self.studio.model_origin)   # 2.20: the library
+            if self.fmt() in ("gguf", "hf"):          # what the Studio opens again
+                remember_model(path, "export", note=self.studio.model_origin)  # 2.20: library
             self.studio.end(model_dirty=None)
         self._model_changed()
 
@@ -189,6 +251,31 @@ class ExportTab(QWidget):
         self.studio.end(model_dirty=None)
         self._model_changed()
         self.studio.report_error(exc, "the export")
+
+
+def _export_program(engine: Any, fmt: str, path: str, *, dynamic: bool, opset: int | None,
+                    method: str, optimize: bool) -> dict[str, Any]:
+    """2.24: .pt2, ONNX, TorchScript, or .pt2 and ONNX into a folder (the classic
+    interface's Export tab; auralite.export.ModelExporter)."""
+    import warnings
+
+    from auralite.export import ModelExporter
+    exporter = ModelExporter(engine.model, engine.tokenizer, engine.device)
+    info: dict[str, Any] = {"path": path, "warnings": []}
+    if fmt == "pt2":
+        exporter.export_pt2(path, dynamic=dynamic)
+    elif fmt == "onnx":
+        exporter.export_onnx(path, opset_version=opset, dynamic_axes=dynamic)
+        info["warnings"].append(f"written by the {exporter.last_onnx_exporter} exporter")
+    elif fmt == "torchscript":
+        with warnings.catch_warnings():          # PyTorch's deprecation: the format's choice
+            warnings.simplefilter("ignore", FutureWarning)
+            exporter.export_torchscript(path, method=method, optimize=optimize)
+        info["warnings"].append("TorchScript is deprecated by PyTorch: .pt2 is its successor")
+    else:
+        pt2, onnx = exporter.export_all(path)
+        info["files"] = [pt2, onnx]
+    return info
 
 
 def _size(path: str) -> int:

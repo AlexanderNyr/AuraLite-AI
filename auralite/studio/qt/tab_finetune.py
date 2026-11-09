@@ -26,7 +26,8 @@ from ..library import remember_dataset, remember_model
 from ..progress import ended_by_itself, format_duration, summary_text
 from ..recipes import FineTuneSettings, SettingsError, finetune_params
 from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, confirm,
-                     heading, hint, inform, run_training, show_error)
+                     heading, hint, inform, load_settings_file, run_training,
+                     save_settings_file, show_error)
 from .widgets import DataPicker, RunPanel
 
 if TYPE_CHECKING:
@@ -154,7 +155,23 @@ class FineTuneTab(QWidget):
         for key, label in OBJECTIVES:
             self.objective.addItem(label, key)
         self.objective_label = QLabel("Preference pairs:")
-        how.addRow(self.objective_label, self.objective)
+        # 2.24: the classic interface's beta and epochs of preference training
+        self.beta = QLineEdit("auto")
+        self.beta.setMaximumWidth(80)
+        self.beta.setToolTip("How far the model may move from where it started: auto is 0.1 "
+                             "for DPO, 2.0 for SimPO")
+        self.pref_epochs = QSpinBox()
+        self.pref_epochs.setRange(0, 1000)
+        self.pref_epochs.setSpecialValueText("auto (3)")
+        self.objective_row = QWidget()
+        pref_row = QHBoxLayout(self.objective_row)
+        pref_row.setContentsMargins(0, 0, 0, 0)
+        pref_row.addWidget(self.objective, 1)
+        pref_row.addWidget(QLabel("beta:"))
+        pref_row.addWidget(self.beta)
+        pref_row.addWidget(QLabel("passes:"))
+        pref_row.addWidget(self.pref_epochs)
+        how.addRow(self.objective_label, self.objective_row)
         self.how_form = how
         self.template = QComboBox()
         for key, label in TEMPLATES:
@@ -167,6 +184,12 @@ class FineTuneTab(QWidget):
         adv = QFormLayout()
         self.lora_lr = QLineEdit("0.001")
         adv.addRow("LoRA learning rate:", self.lora_lr)
+        # 2.24: which layers LoRA trains (the classic interface's LoRA targets)
+        self.lora_targets = QComboBox()
+        self.lora_targets.addItem("Every projection (recommended)", "all")
+        self.lora_targets.addItem("Attention only", "attn")
+        self.lora_targets.addItem("Feed-forward only", "ffn")
+        adv.addRow("LoRA trains:", self.lora_targets)
         self.full_lr = QLineEdit("3e-5")
         adv.addRow("Learning rate (every weight):", self.full_lr)
         self.batch = QSpinBox()
@@ -265,6 +288,14 @@ class FineTuneTab(QWidget):
             after.addWidget(button)
         after.addStretch(1)
         layout.addLayout(after)
+        # 2.24: settings files (the classic interface's Save Config / Load Config)
+        files = QHBoxLayout()
+        files.addStretch(1)
+        self.save_settings_button = QPushButton("Save settings…")
+        self.load_settings_button = QPushButton("Load settings…")
+        files.addWidget(self.save_settings_button)
+        files.addWidget(self.load_settings_button)
+        layout.addLayout(files)
         layout.addStretch(1)
 
         # ---- signals
@@ -297,6 +328,8 @@ class FineTuneTab(QWidget):
         self.merge_button.clicked.connect(self.merge_adapters)
         self.save_adapter_button.clicked.connect(self.save_adapters)
         self.load_adapter_button.clicked.connect(self.load_adapters)
+        self.save_settings_button.clicked.connect(self.save_settings)
+        self.load_settings_button.clicked.connect(self.load_settings)
         window.hardware_changed.connect(lambda _hw: self._update_estimates())
         window.model_changed.connect(self._model_changed)
         compact_spins(self)
@@ -397,7 +430,7 @@ class FineTuneTab(QWidget):
     # ---- estimates -------------------------------------------------------------
     def _data_changed(self, report: DataReport | None) -> None:
         pairs = report is not None and report.kind == "preferences"
-        self.how_form.setRowVisible(self.objective, pairs)
+        self.how_form.setRowVisible(self.objective_row, pairs)
         if report is not None and report.paths and os.path.exists(report.paths[0]):
             self.studio.settings.last_data_dir = os.path.dirname(os.path.abspath(
                 report.paths[0]))
@@ -485,6 +518,11 @@ class FineTuneTab(QWidget):
                 weight = float(weight_text)
             except ValueError as err:
                 raise SettingsError("the prompt weight is a number from 0 to 1, or auto") from err
+        beta_text = self.beta.text().strip().lower()
+        try:
+            beta = None if beta_text in ("", "auto") else float(beta_text)
+        except ValueError as err:
+            raise SettingsError("beta is a number above 0 (like 0.1), or auto") from err
         method = self.method()
         return FineTuneSettings(
             method=method, lora_rank=int(self.rank.value()),
@@ -497,7 +535,9 @@ class FineTuneTab(QWidget):
             prompt_weight=weight, pack_dialogs=self.pack.isChecked(),
             objective=str(self.objective.currentData()) if self._pairs() else "auto",
             val_split=float(self.val_split.value()),
-            memory_plan="auto" if self.memory_plan.isChecked() else "off")
+            memory_plan="auto" if self.memory_plan.isChecked() else "off",
+            lora_targets=str(self.lora_targets.currentData()),
+            preference_beta=beta, preference_epochs=int(self.pref_epochs.value()))
 
     def set_base(self, spec: str) -> None:
         """Choose the base: a model of the catalog, a ``.pt`` file, a Hugging Face
@@ -543,9 +583,40 @@ class FineTuneTab(QWidget):
                 self.objective.setCurrentIndex(index)
             self.val_split.setValue(float(s.val_split))
             self.memory_plan.setChecked(s.memory_plan == "auto")
+            index = self.lora_targets.findData(s.lora_targets)
+            if index >= 0:
+                self.lora_targets.setCurrentIndex(index)
+            self.beta.setText("auto" if s.preference_beta is None else f"{s.preference_beta:g}")
+            self.pref_epochs.setValue(int(s.preference_epochs))
             self._user_tuned = True              # keep them when the base or data changes
         finally:
             self._applying = False
+
+    def save_settings(self) -> None:
+        """2.24: the form, its base and its data to a settings file."""
+        try:
+            settings = self.settings()
+        except SettingsError as err:
+            show_error(self, err)
+            return
+        save_settings_file(self, "finetune", settings.to_dict(), self.data.paths(),
+                           base=self.base_spec() if self.source() != "memory" else "")
+
+    def load_settings(self) -> None:
+        """2.24: the form from a settings file, with its base and data when they are there."""
+        try:
+            doc = load_settings_file(self, "finetune")
+        except (OSError, ValueError) as err:
+            show_error(self, err, "reading the settings")
+            return
+        if doc is None:
+            return
+        self.apply_settings(FineTuneSettings.from_dict(doc.get("settings") or {}))
+        if doc.get("base"):
+            self.set_base(str(doc["base"]))
+        paths = [p for p in doc.get("data") or [] if isinstance(p, str)]
+        if paths and os.path.exists(paths[0]):
+            self.data.set_path(paths[0])
 
     def apply_run(self, run: runlib.Run, base: str | None = None) -> None:
         """Fill the form from a run of the library (2.20): Repeat (its base) or

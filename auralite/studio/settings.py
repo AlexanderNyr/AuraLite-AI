@@ -35,6 +35,8 @@ class StudioSettings:
     check_updates: bool = True
     gflops: float = 0.0                   # the last speed test (0: none)
     gflops_threads: int = 0               # the threads it ran with
+    last_tab: str = ""                    # 2.24: the tab open when the Studio closed
+    language: str = ""                    # 2.24: the Studio's language ("": English)
 
     def add_recent(self, path: str) -> None:
         path = os.path.abspath(path)

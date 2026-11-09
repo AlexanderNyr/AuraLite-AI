@@ -23,6 +23,7 @@ from .common import Job, ask_open, ask_save, confirm, inform, show_error
 from .tab_chat import ChatTab
 from .tab_export import ExportTab
 from .tab_finetune import FineTuneTab
+from .tab_generate import GenerateTab
 from .tab_library import LibraryTab
 from .tab_log import LogTab
 from .tab_start import StartTab
@@ -33,7 +34,8 @@ log = logging.getLogger("auralite.studio")
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
-              ("chat", "Chat"), ("export", "Export"), ("library", "Library"), ("log", "Log"))
+              ("chat", "Chat"), ("generate", "Generate"), ("export", "Export"),
+              ("library", "Library"), ("log", "Log"))
 
 
 def studio_icon() -> QIcon:
@@ -85,16 +87,18 @@ class MainWindow(QMainWindow):
         self.train_tab = TrainTab(self)
         self.finetune_tab = FineTuneTab(self)
         self.chat_tab = ChatTab(self)
+        self.generate_tab = GenerateTab(self)          # 2.24: the classic Generate tab
         self.export_tab = ExportTab(self)
         self.library_tab = LibraryTab(self)
         self.log_tab = LogTab(self)
         self.pages: dict[str, QWidget] = {"start": self.start_tab, "train": self.train_tab,
                                           "finetune": self.finetune_tab, "chat": self.chat_tab,
+                                          "generate": self.generate_tab,
                                           "export": self.export_tab, "library": self.library_tab,
                                           "log": self.log_tab}
         for key, title in TAB_TITLES:
             page = self.pages[key]
-            if key in ("chat", "library", "log"):
+            if key in ("chat", "generate", "library", "log"):
                 self.tabs.addTab(page, title)
                 continue
             scroll = QScrollArea()
@@ -130,6 +134,8 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(QByteArray.fromHex(self.settings.geometry.encode()))
             except Exception:
                 pass
+        if self.settings.last_tab in self.pages:         # 2.24: where the last session was
+            self.goto(self.settings.last_tab)
         self._update_status()
         self._update_memory()
         if detect:
@@ -484,9 +490,13 @@ class MainWindow(QMainWindow):
         self.model_changed.emit()
 
     def model_trained(self, how: str) -> None:
-        """After a run: a new model, or the base fine-tuned."""
+        """After a run: a new model, the model trained further (2.24), or the base
+        fine-tuned."""
         if how == "new":
             self.model_origin = "new model"
+        elif how == "more":
+            if self.model_origin and not self.model_origin.endswith("(trained further)"):
+                self.model_origin += " (trained further)"
         elif self.model_origin and not self.model_origin.endswith("(fine-tuned)"):
             self.model_origin += " (fine-tuned)"
         self.model_path = ""
@@ -628,9 +638,11 @@ class MainWindow(QMainWindow):
     # ---- closing ---------------------------------------------------------------------
     def running_jobs(self) -> list[Job]:
         jobs = [tab.job for tab in (self.train_tab, self.finetune_tab, self.chat_tab,
-                                    self.export_tab) if getattr(tab, "job", None) is not None]
-        if self.finetune_tab.distill_job is not None:
-            jobs.append(self.finetune_tab.distill_job)
+                                    self.generate_tab, self.export_tab)
+                if getattr(tab, "job", None) is not None]
+        for extra in (self.finetune_tab.distill_job, self.train_tab.worker_job):
+            if extra is not None:
+                jobs.append(extra)
         return [j for j in jobs if j is not None and j.running()]
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
@@ -652,6 +664,8 @@ class MainWindow(QMainWindow):
                 job.thread.join(timeout=10)
         if self.save_on_close:
             self.settings.geometry = bytes(self.saveGeometry().toHex().data()).decode()
+            self.settings.last_tab = TAB_TITLES[self.tabs.currentIndex()][0] \
+                if 0 <= self.tabs.currentIndex() < len(TAB_TITLES) else ""
             save_settings(self.settings)
         self.memory_timer.stop()
         self.log_tab.detach()

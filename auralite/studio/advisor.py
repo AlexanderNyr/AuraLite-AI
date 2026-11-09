@@ -9,7 +9,12 @@ costs about 4 x the model's parameters in operations per token with LoRA
 when every weight trains, 8 x for both. Calibrated on 2.18.1's runs on a
 2-thread CPU (254 GFLOP/s in the product): Qwen2.5-0.5B QLoRA with
 checkpointing 39 tokens/s, SmolLM2-135M LoRA 207 tokens/s - training
-reached about 45 % of the product's speed.
+reached about 45 % of the product's speed. 2.24: 50 %, with the benchmarks of
+the field test's Core i5-2400 (76 GFLOP/s) and of the 2-thread CPU (334 that
+day): new models of 6.6M and 19M parameters train within 7 % of the estimate
+on both (the i5-2400: 923 and 353 tokens/s for 965 and 328), Qwen3.5-0.8B
+LoRA ran at 16.1 tokens/s on the i5-2400 for 12.6, and 2.18.1's runs come to
+within 4 % of it.
 """
 from __future__ import annotations
 
@@ -26,7 +31,7 @@ __all__ = ["EFFICIENCY", "ModelFit", "PresetFit", "Recommendation", "estimate_fi
            "tokens_per_second"]
 
 #: Training's share of the measured matrix-product speed (CPU; calibrated, see above).
-EFFICIENCY = 0.45
+EFFICIENCY = 0.50
 #: The same on a GPU (bfloat16 product measured): small batches use it less well.
 GPU_EFFICIENCY = 0.30
 #: QLoRA decodes its 4-bit weights in every pass: about 5 % slower than LoRA (measured).
@@ -394,11 +399,27 @@ def recommend_finetune(hw: Hardware, data: DataReport | None = None, *,
 
 
 def _preset_fit(name: str, hw: Hardware, budget: int, vocab: int, tokens: int) -> PresetFit:
-    from auralite.engine.sizing import (count_parameters, estimate_training_memory,
-                                        preset_params)
+    from auralite.engine.sizing import preset_params
     preset = preset_params(name)
     seq = int(preset.pop("seq_length"))
-    dims = dict(preset, vocab_size=vocab)
+    return shape_fit(preset, hw, vocab=vocab, tokens=tokens, seq_length=seq, name=name,
+                     budget=budget)
+
+
+def shape_fit(shape: dict[str, Any], hw: Hardware, *, vocab: int = 512, tokens: int = 0,
+              seq_length: int = 512, name: str = "custom", budget: int | None = None
+              ) -> PresetFit:
+    """A new model of `shape` (``d_model``, ``n_layers``, ``n_heads``, ``n_kv_heads``,
+    ``d_ff``) on this computer: parameters, memory, speed, one pass over `tokens` (2.24:
+    the Train tab's shape of one's own; the presets are measured the same way)."""
+    from auralite.engine.sizing import count_parameters, estimate_training_memory
+    budget = memory_budget(hw) if budget is None else budget
+    seq = int(seq_length)
+    dims = {k: shape[k] for k in ("d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff")
+            if k in shape}
+    dims["vocab_size"] = int(vocab)
+    if shape.get("tie_word_embeddings"):
+        dims["tie_word_embeddings"] = True
     params = count_parameters(**dims)["total"]
     device = "cuda" if hw.accelerator == "cuda" else "cpu"
     memory = estimate_training_memory(seq_length=min(seq, 512), batch_size=1,

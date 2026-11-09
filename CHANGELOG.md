@@ -1,3 +1,49 @@
+# 📦 v2.24.0 — The Studio does what the classic interface's Train, Generate and Export tabs do
+
+Part 1 of moving everything the classic interface (tkinter) does into AuraLite Studio —
+the Windows app has no classic interface. Quantization, evaluation and the Model tab
+(GGUF models in chat, the transformers backend, the Hub) follow in 2.25, images and the
+chat's agent mode in 2.26, then the Studio in Russian (an English / Russian switch). The
+classic interface stays and keeps being updated.
+
+- **Train: everything the classic interface set.** *A shape of my own…* — layers, width,
+  heads, key/value heads (grouped-query attention), the feed-forward width, ALiBi
+  positions, QK-norm, one table for input and output, RoPE scaling — with its parameters,
+  memory and speed shown as for the sizes. A tokenizer file of one's own (AuraLite's,
+  `tokenizer.json`, `vocab.json` + `merges.txt`, a model's); *Train the tokenizer only…*
+  and *Save the model's tokenizer…*. *Prepare the dataset…*: the text tokenized into token
+  shards once (Stop keeps what is done). *Suggest* passes for about 20 tokens of text per
+  parameter, and a patience. The model in memory trained further instead of a new one.
+  Dialogs: the chat template, the prompt's weight, whole dialogs per window. Advanced:
+  accumulation, the learning-rate schedule, Muon's learning rate, dropout, gradient
+  clipping, `torch.compile`, every GPU (DDP). **Several computers**: this one as the main
+  computer (with its address shown) or *Help another computer* — Join / Leave. *Save
+  settings…* / *Load settings…* keep the form and the data in a file.
+- **The Generate tab**: the model writes on from a prompt with temperature, top-k, top-p,
+  min-p and the repetition penalty; a suggested length; the text as it is written or at
+  once; one prompt per line as a batch; *thinking* (a draft first); web snippets
+  (DuckDuckGo) as context; the whole history instead of the trained window; save, append
+  to a file, copy, stop.
+- **Export: a PyTorch 2 program (`.pt2`, runs without AuraLite), ONNX and TorchScript**,
+  or `.pt2` and ONNX together into a folder; any batch size and length, the ONNX opset,
+  trace or script. A format whose package is missing says what to install (the app does
+  not include `onnx`).
+- **Fine-tune:** which layers LoRA trains (every projection, attention, feed-forward);
+  the beta and passes of preference pairs; settings files.
+- **The Log tab** colours errors, warnings, epochs and finished work, and saves what it
+  shows to a file (the classic Console). **The Studio opens on the tab it was closed on.**
+- **The advisor is calibrated on the i5-2400's benchmarks**: training reaches 50 % of the
+  measured matrix-product speed (2.19: 45 %). New models of 6.6M and 19M parameters train
+  within 7 % of the estimate on the i5-2400 and on the 2-thread build machine; Qwen3.5
+  0.8B LoRA ran at 16.1 tokens/s on the i5-2400 (2.23.1, 2 x 4 windows, 6.86 GB used for
+  6.70 estimated) where the advisor says 12.6. With 8 GB, Qwen3.5 0.8B with QLoRA now fits
+  a night (about 7 h; 2.23: Qwen2.5 0.5B).
+- **Fixed:** preparing a dataset with the character tokenizer
+  (`prepare_dataset(tokenizer_kind="char")`, the classic interface's *Prepare Dataset*
+  with *Char-level*) always failed: it called `CharTokenizer.fit`, which does not exist.
+- The language groundwork: `auralite.studio.i18n.tr()`, the new tabs' words go through
+  it; the switch and the Russian words come when every tab is in the Studio.
+
 # 📦 v2.23.1 — Qwen3.5's memory plan counts its linear attention; the benchmark shows a fine-tune's plan
 
 - **Fine-tuning a Qwen3.5 no longer plans more memory than there is.** On the i5-2400 of

@@ -171,7 +171,7 @@ def test_memory_budget_leaves_room_for_the_system():
 def test_speed_follows_the_measured_speed_and_the_method():
     hw = _hw(16, gflops=200)
     lora = _speed(500_000_000, hw)
-    assert lora == pytest.approx(0.45 * 200e9 / (4 * 500e6))
+    assert lora == pytest.approx(0.50 * 200e9 / (4 * 500e6))      # 2.24: 50 % (was 45 %)
     assert _speed(500_000_000, hw, checkpointing=True) == pytest.approx(lora * 4 / 6)
     assert _speed(500_000_000, hw, lora=False) == pytest.approx(lora * 4 / 6)
     assert _speed(500_000_000, hw, qlora=True) < lora

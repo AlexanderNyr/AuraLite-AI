@@ -1,17 +1,19 @@
-"""The Log tab: what AuraLite reports while it works, and the log file (2.19)."""
+"""The Log tab: what AuraLite reports while it works, and the log file (2.19); 2.24: lines
+coloured by what they say and saved to a file, as the classic interface's Console."""
 from __future__ import annotations
 
+import html
 import io
 import logging
 import sys
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
 
 from ..logs import log_dir
-from .common import heading, hint, open_path
+from .common import ask_save, heading, hint, open_path, show_error
 
 if TYPE_CHECKING:
     from .window import MainWindow
@@ -19,6 +21,24 @@ if TYPE_CHECKING:
 
 class _Bridge(QObject):
     line = Signal(str)
+
+
+#: 2.24: what a line says -> its colour (the classic Console's rules; the first match wins)
+LEVELS = (("traceback", "error"), ("error", "error"), ("exception", "error"),
+          ("critical", "error"), ("fail", "error"), ("warning", "warn"), ("warn:", "warn"),
+          ("deprecat", "warn"), ("note:", "info"), ("info:", "info"), ("complete", "ok"),
+          ("finished", "ok"), ("training done", "ok"), ("saved", "ok"), ("epoch", "epoch"))
+COLOURS = {"error": "#c0392b", "warn": "#b9770e", "info": "#2471a3", "epoch": "#7d3c98",
+           "ok": "#1e8449"}
+
+
+def line_level(line: str) -> str:
+    """The kind of a log line (``"error"``, ``"warn"``, ...; ``""``: plain)."""
+    low = str(line).lower()
+    for needle, level in LEVELS:
+        if needle in low:
+            return level
+    return ""
 
 
 class _QtHandler(logging.Handler):
@@ -90,10 +110,20 @@ class LogTab(QWidget):
         buttons = QHBoxLayout()
         self.open_button = QPushButton("Open the log folder")
         self.copy_button = QPushButton("Copy all")
+        self.save_button = QPushButton("Save to a file…")
         self.clear_button = QPushButton("Clear")
-        for button in (self.open_button, self.copy_button, self.clear_button):
+        for button in (self.open_button, self.copy_button, self.save_button,
+                       self.clear_button):
             buttons.addWidget(button)
         buttons.addStretch(1)
+        legend = " · ".join(f"<span style='color:{COLOURS[k]}'>{name}</span>"
+                            for k, name in (("error", "errors"), ("warn", "warnings"),
+                                            ("epoch", "epochs"), ("ok", "done"),
+                                            ("info", "notes")))
+        self.legend = hint("")
+        self.legend.setTextFormat(Qt.TextFormat.RichText)
+        self.legend.setText(legend)
+        buttons.addWidget(self.legend)
         layout.addLayout(buttons)
         self.bridge = _Bridge(self)
         self.bridge.line.connect(self.append)
@@ -102,6 +132,7 @@ class LogTab(QWidget):
         self.copy_button.clicked.connect(
             lambda: QGuiApplication.clipboard().setText(self.view.toPlainText()))
         self.clear_button.clicked.connect(self.view.clear)
+        self.save_button.clicked.connect(self.save)
         self._streams: tuple[Any, Any] | None = None
 
     def attach(self, capture_streams: bool = True) -> None:
@@ -121,4 +152,21 @@ class LogTab(QWidget):
             self._streams = None
 
     def append(self, line: str) -> None:
-        self.view.appendPlainText(line)
+        level = line_level(line)
+        if not level:
+            self.view.appendPlainText(line)
+            return
+        self.view.appendHtml(f"<span style='color:{COLOURS[level]}; white-space:pre'>"
+                             f"{html.escape(line)}</span>")
+
+    def save(self) -> None:
+        """2.24: the lines shown here to a text file (the classic Console's Save)."""
+        path = ask_save(self, "Save the log", "Text (*.txt *.log);;All files (*)",
+                        "auralite-log.txt")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.view.toPlainText() + "\n")
+        except OSError as err:
+            show_error(self, err, "saving the log")

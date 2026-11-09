@@ -8,6 +8,7 @@ modal dialog.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -177,6 +178,54 @@ def ask_dir(parent: QWidget | None, title: str, start: str = "") -> str:
     if sink is not None:
         return str(sink(title) or "")
     return QFileDialog.getExistingDirectory(parent, title, start)
+
+
+def package_note(module: str) -> str:
+    """2.24: "" when the optional package `module` is installed, else what a feature that
+    needs it takes - the pip command, or in the app that the app leaves it out."""
+    import importlib.util
+    try:
+        if importlib.util.find_spec(module) is not None:
+            return ""
+    except (ImportError, ValueError):
+        pass
+    from auralite import bundle
+    hints = bundle.missing_part(module, bundle.EXTRAS.get(module, ""))
+    return f"Needs the package «{module}»: " + (hints[0] if hints else f"pip install {module}")
+
+
+#: 2.24: what a settings file of the Studio says it is (Save settings… / Load settings…)
+SETTINGS_FORMAT = "auralite-studio-settings"
+
+
+def save_settings_file(parent: QWidget | None, tab: str, settings: dict[str, Any],
+                       data: list[str] | None = None, **extra: Any) -> str:
+    """Write a tab's settings (and its data's paths) to a JSON file the user picks (2.24:
+    the classic interface's Save Config); returns the path, or "" when cancelled."""
+    path = ask_save(parent, "Save the settings", "Settings (*.json)", f"{tab}-settings.json")
+    if not path:
+        return ""
+    doc = {"format": SETTINGS_FORMAT, "version": 1, "tab": tab, "settings": dict(settings),
+           "data": list(data or []), **extra}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_settings_file(parent: QWidget | None, tab: str) -> dict[str, Any] | None:
+    """Read a settings file of `tab` the user picks (None when cancelled). Raises
+    ValueError for a file that is not one, OSError when it cannot be read."""
+    path = ask_open(parent, "Load settings", "Settings (*.json);;All files (*)")
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict) or doc.get("format") != SETTINGS_FORMAT:
+        raise ValueError(f"{os.path.basename(path)} is not a settings file of AuraLite Studio")
+    if doc.get("tab") != tab:
+        raise ValueError(f"{os.path.basename(path)} holds settings of the {doc.get('tab')} "
+                         f"tab, not of the {tab} tab")
+    return doc
 
 
 def open_path(path: str) -> bool:

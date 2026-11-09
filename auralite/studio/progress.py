@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["ProgressTracker", "ProgressView", "format_duration", "summary_text"]
+__all__ = ["ProgressTracker", "ProgressView", "format_duration", "stage_percent", "stage_text",
+           "summary_text"]
 
 
 def format_duration(seconds: float | None) -> str:
@@ -150,6 +151,22 @@ def _stage_text(info: dict) -> str:
     if eta is not None and done < total:
         parts.append(f"about {format_duration(eta)} left")
     return " · ".join(p for p in parts if p)
+
+
+def stage_text(info: dict) -> str:
+    """2.24: the line of a task outside training (a tokenizer, a dataset): its stage with
+    the numbers, else its message."""
+    if info.get("stage_label") or info.get("stage"):
+        return _stage_text(info)
+    return str(info.get("message") or "")
+
+
+def stage_percent(info: dict) -> float | None:
+    """2.24: how far a task's stage is, in percent (None: unknown)."""
+    done, total = _number(info.get("stage_done")), _number(info.get("stage_total"))
+    if done is None or not total:
+        return None
+    return max(0.0, min(100.0, 100.0 * done / total))
 
 
 def ended_by_itself(summary: dict | None, stopped: bool = False) -> bool:

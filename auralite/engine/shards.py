@@ -777,7 +777,7 @@ def train_sample_tokenizer(sources: Any, *, vocab_size: int = 8192, kind: str = 
         raise DataFormatError("found no text to fit a tokenizer on")
     if kind == "char":
         tokenizer: Any = CharTokenizer()
-        tokenizer.fit(sample)
+        tokenizer.train(sample)          # 2.24: it called fit(), which CharTokenizer lacks
     else:
         tokenizer = BPETokenizer(pretokenizer=pretokenizer)
         tokenizer.train(sample, vocab_size=int(vocab_size))

@@ -13,10 +13,14 @@ from Hugging Face.
 *The Start tab on a 4-core i5-2400 with 8 GB (the example computer of these
 screenshots).*
 
-The classic interface (`auralite-gui`, tkinter) stays as it was and keeps the
-features the Studio does not have yet (images, quantization, evaluation, the
-transformers backend): *Tools → Classic interface* opens it (in AuraLite installed
-with Python; the Windows app leaves it out).
+Everything the classic interface (`auralite-gui`, tkinter) does is moving into the
+Studio, in parts: since 2.24 its Train, Generate and Export tabs ([the Train tab's
+expert settings](#everything-the-train-tab-sets-224), [the Generate
+tab](#the-generate-tab-224)); quantization, evaluation and the Model tab (GGUF
+models in chat, the transformers backend, the Hub) follow in 2.25, images and the
+chat's agent mode in 2.26. Until then *Tools → Classic interface* opens it (in
+AuraLite installed with Python; the Windows app leaves it out). The classic interface
+stays and keeps being updated.
 
 ## Install and start
 
@@ -53,12 +57,13 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | tab | what it is for |
 |---|---|
 | **Start** | this computer (memory, processor, GPU, disk, a one-second speed test), the model that fits it best, recent models, and the three ways in: fine-tune a ready model, train a new one, open a model |
-| **Train** | a new model from scratch, from your texts: the size (sized to the memory and the data), the tokenizer, the window, a time limit |
+| **Train** | a new model from scratch, from your texts: the size (sized to the memory and the data) or a shape of your own, the tokenizer (or one of your own), the window, a time limit; a prepared dataset for big data, several computers, the model in memory trained further, settings files (2.24) |
 | **Fine-tune** | everything for models that already exist: the base, your data, the method (QLoRA, LoRA, every weight), dialogs written by a teacher model, the LoRA adapters |
 | **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog. A model trained on plain text continues what you write (*continue the text*, 2.21.3) |
-| **Export** | a GGUF file (llama.cpp, Ollama, LM Studio), a Hugging Face folder (transformers, vLLM) or an AuraLite checkpoint |
+| **Generate** (2.24) | the model writes on from a prompt with every sampling setting: temperature, top-k, top-p, min-p, the repetition penalty; several prompts in a batch, a draft first (thinking), web snippets as context; save, append or copy the text |
+| **Export** | a GGUF file (llama.cpp, Ollama, LM Studio), a Hugging Face folder (transformers, vLLM) or an AuraLite checkpoint; since 2.24 also a PyTorch 2 program (`.pt2`), ONNX and TorchScript |
 | **Library** (2.20) | every run with its curve, settings, results and files — continue a stopped or interrupted one, compare runs, evaluate a chat model; the models and datasets on the disk and the room they take |
-| **Log** | everything AuraLite reports while it works; the log file keeps it |
+| **Log** | everything AuraLite reports while it works, errors, warnings and epochs in their own colours (2.24); copy it, save it to a file (2.24) — the log file keeps it too |
 
 The **setup wizard** (*Tools → Setup wizard*, and the first time the Studio starts)
 asks what you want to do, looks at the computer, reads the data, shows the models
@@ -100,6 +105,59 @@ llama.cpp server, a model folder or checkpoint — or the model in memory) answe
 file of questions; with a judge it keeps only right answers and also writes
 preference pairs. The dialogs become the data of the next run.
 
+Since 2.24, as in the classic interface: *Advanced settings → LoRA trains* every
+projection, the attention only or the feed-forward layers only; preference pairs take
+their own *beta* and *passes* (auto: beta 0.1 for DPO, 2.0 for SimPO; 3 passes); *Save
+settings…* / *Load settings…* keep the whole form, the base and the data in a file.
+
+## Everything the Train tab sets (2.24)
+
+The Train tab starts simple — a size that fits, the tokenizer, the window, a time limit
+— and since 2.24 also sets everything the classic interface's Train tab did:
+
+- **A shape of your own.** *Model size → A shape of my own…* opens the shape, filled
+  from the size chosen before: layers, width (`d_model`), heads, key/value heads
+  (grouped-query attention; *one per head* is none), the feed-forward width. Options:
+  ALiBi positions instead of rotary ones, QK-norm (on: steadier training), one table for
+  the input and the output (older models' way), RoPE scaling (linear, NTK, YaRN — not a
+  free longer context: train on longer windows to read further). The line under the size
+  shows the parameters, the memory and the speed of the shape, as for the sizes.
+- **The tokenizer.** BPE, characters, or *a tokenizer file of my own* (AuraLite's
+  `.json`, a `tokenizer.json`, `vocab.json` with `merges.txt`, or a model's).
+  *Train the tokenizer only…* learns it on the training text, saves it and selects it —
+  one tokenizer for several models; *Save the model's tokenizer…* writes the one of the
+  model in memory.
+- **A prepared dataset.** *Prepare the dataset…* tokenizes the text into token shards on
+  disk once (with the tokenizer chosen): big data then trains without reading the text
+  again, *Stop* keeps what is done and preparing again continues it.
+- **Passes.** *Suggest* picks the passes for about 20 tokens of text per parameter;
+  *Patience* says after how many passes without progress the run stops.
+- **The model in memory trained further** instead of a new one: it keeps its shape and
+  tokenizer (the run in the library is "Train the model in memory on …").
+- **Dialogs** (a chat model from scratch, from a `.jsonl`): the chat template, the
+  prompt's weight in the loss, whole dialogs per window.
+- **Advanced settings:** batches added up per step (accumulation), the learning-rate
+  schedule (WSD or cosine), Muon's own learning rate, dropout (auto or a number),
+  gradient clipping, `torch.compile`, every GPU of the computer (DDP, with two or more).
+- **Several computers** ([training.md § 12](training.md#12-training-on-several-computers-214)): *Computers that help* and the
+  port make this computer the main one, and say its address; on the others, *Help
+  another computer* with that address and *Join* — they train a part of every step
+  until *Leave*.
+- **Settings files:** *Save settings…* / *Load settings…* keep the whole form and the
+  data's path in a `.json` file.
+
+## The Generate tab (2.24)
+
+The classic interface's Generate tab: the model in memory writes on from a prompt.
+*Sampling* has the temperature (lower: safer and more repetitive), top-k, top-p, min-p
+and the repetition penalty (1.0 is off, 1.1–1.3 fights loops); *Suggest* picks a length
+for the prompt and the model's context. *How*: the text as it is written or at once;
+*one prompt per line* writes them all as one batch; *thinking* lets the model write a
+draft first and the answer with it in view; *search the web* (DuckDuckGo) gives it the
+snippets of a search as context (offline it writes without them); *the whole history*
+lets every token see everything instead of the trained window (past the trained length
+the text gets worse). The text can be saved, appended to a file or copied.
+
 ## Chatting with a model you trained from scratch (2.21.3)
 
 A model trained on plain text — a story, your notes — has learned to write on from
@@ -133,16 +191,18 @@ does (2.23), else the largest older model that does; for data that is not in Eng
 multilingual model (Qwen). Measured on a 2-core CPU (2.18.1): Qwen2.5-0.5B with QLoRA
 trained at 39 tokens/s in 1.48 GB.
 
-| computer | recommended (2.23) | 1,000 dialogs, two passes |
+| computer | recommended (2.24) | 1,000 dialogs, two passes |
 |---|---|---|
 | 4 GB, 4 threads | SmolLM2 135M (older), QLoRA | ~3 h |
-| 8 GB, i5-2400 class | Qwen2.5 0.5B (older), QLoRA — Qwen3.5 0.8B takes ~8 h | ~5 h |
-| 16 GB, i5-2400 class | Qwen3.5 0.8B, LoRA | ~8 h |
-| 32 GB, 8 threads | Qwen3.5 2B, QLoRA | ~5 h |
+| 8 GB, i5-2400 class | Qwen3.5 0.8B, QLoRA | ~7 h |
+| 16 GB, i5-2400 class | Qwen3.5 0.8B, LoRA | ~7 h |
+| 32 GB, 8 threads | Qwen3.5 2B, QLoRA | ~4.5 h |
 
 (The i5-2400 class is 72 GFLOP/s, the 8-thread PC 300; the Studio measures yours, and
-*Tools → Benchmark…* measures a real fine-tune. On the real i5-2400 Qwen3.5 0.8B
-fine-tuned at 14 tokens/s, faster than the advisor assumes: about 6 hours.)
+*Tools → Benchmark…* measures a real fine-tune. 2.24 calibrates the speed on the
+benchmarks of the real i5-2400 — 50 % of the measured product speed instead of 45 % —
+which brings Qwen3.5 0.8B within a night on 8 GB. There it fine-tuned with LoRA at 16
+tokens/s, still faster than the advisor assumes: about 5 hours.)
 
 **How fast is it really?** *Tools → Benchmark…* (2.22) trains three sizes of a new model
 for a minute each and times how they write — the same as `auralite bench`; the report, a

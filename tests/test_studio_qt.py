@@ -106,7 +106,8 @@ def _dialogs_file(path, n: int = 24) -> str:
 # ----------------------------------------------------------------------
 def test_window_has_its_tabs_menus_and_status(studio):
     tabs = [studio.tabs.tabText(i) for i in range(studio.tabs.count())]
-    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Export", "Library", "Log"]
+    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Generate", "Export", "Library",
+                    "Log"]
     menus = [a.text() for a in studio.menuBar().actions()]
     assert menus == ["&File", "&View", "&Tools", "&Help"]
     assert studio.windowTitle().startswith("AuraLite Studio 2.")
@@ -114,7 +115,7 @@ def test_window_has_its_tabs_menus_and_status(studio):
     assert studio.device_label.text() == "CPU · 4 threads"
     assert studio.model_status.text() == "Model: no model"
     studio.goto("export")
-    assert studio.tabs.currentIndex() == 4
+    assert studio.tabs.currentIndex() == 5
 
 
 def test_a_gpu_too_old_for_pytorch_is_not_used(studio):
@@ -145,7 +146,7 @@ def test_finetune_tab_marks_the_recommendation_and_estimates(studio):
     assert tab.method_buttons[rec.choice.method].isChecked()
     assert tab.estimate.text().startswith("Estimate: ~")
     assert rec.choice.model.name in tab.base_info.text()
-    assert not tab.how_form.isRowVisible(tab.objective)    # only for preference pairs
+    assert not tab.how_form.isRowVisible(tab.objective_row)    # only for preference pairs
 
 
 def test_finetune_settings_follow_the_form(studio, tmp_path, qapp):
@@ -171,7 +172,7 @@ def test_finetune_settings_follow_the_form(studio, tmp_path, qapp):
                      encoding="utf-8")
     tab.data.set_path(str(pairs))
     wait(qapp, lambda: tab.data.report is not None)
-    assert tab.data.report.kind == "preferences" and tab.how_form.isRowVisible(tab.objective)
+    assert tab.data.report.kind == "preferences" and tab.how_form.isRowVisible(tab.objective_row)
 
 
 def test_starting_without_data_explains_why(studio, dialogs):
@@ -750,7 +751,7 @@ def test_a_studio_run_is_recorded_stopped_and_continued(studio, tmp_path, qapp, 
     start.refresh_interrupted()
     assert start.interrupted.isVisibleTo(start) and run.name in start.interrupted_label.text()
     start._show_interrupted()
-    assert studio.tabs.currentIndex() == 5 and shelf.current_run().id == run.id
+    assert studio.tabs.currentIndex() == 6 and shelf.current_run().id == run.id
     start._dismiss_interrupted()
     assert not start.interrupted.isVisibleTo(start)
     assert runlib.find_run(run.id).record["dismissed"] is True
@@ -774,7 +775,7 @@ def test_a_fresh_process_builds_the_window(tmp_path, monkeypatch, capsys):
     assert "RESULT: OK - the window was built in" in output
     assert "Qt platform: offscreen" in output and "PyTorch: " in output
     assert "  Installed: " in output                    # 2.19.1: the package pip knows
-    assert "Window: Start, Train, Fine-tune, Chat, Export, Library, Log" in output
+    assert "Window: Start, Train, Fine-tune, Chat, Generate, Export, Library, Log" in output
     assert "SSE4.2 + POPCNT: " in output
     if os.name == "nt":
         assert "Visual C++ runtime (msvcp140.dll): system 14." in output
