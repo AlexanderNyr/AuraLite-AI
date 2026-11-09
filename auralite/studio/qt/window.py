@@ -27,6 +27,7 @@ from .tab_finetune import FineTuneTab
 from .tab_generate import GenerateTab
 from .tab_library import LibraryTab
 from .tab_log import LogTab
+from .tab_images import ImagesTab
 from .tab_model import ModelTab
 from .tab_quantize import QuantizeTab
 from .tab_start import StartTab
@@ -37,9 +38,9 @@ log = logging.getLogger("auralite.studio")
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
 TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
-              ("chat", "Chat"), ("generate", "Generate"), ("model", "Model"),
-              ("quantize", "Quantize"), ("evaluate", "Evaluate"), ("export", "Export"),
-              ("library", "Library"), ("log", "Log"))
+              ("chat", "Chat"), ("generate", "Generate"), ("images", "Images"),
+              ("model", "Model"), ("quantize", "Quantize"), ("evaluate", "Evaluate"),
+              ("export", "Export"), ("library", "Library"), ("log", "Log"))
 
 
 def studio_icon() -> QIcon:
@@ -92,6 +93,7 @@ class MainWindow(QMainWindow):
         self.finetune_tab = FineTuneTab(self)
         self.chat_tab = ChatTab(self)
         self.generate_tab = GenerateTab(self)          # 2.24: the classic Generate tab
+        self.images_tab = ImagesTab(self)              # 2.26: the classic Image tab
         self.model_tab = ModelTab(self)                # 2.25: the classic Model, Quant and
         self.quantize_tab = QuantizeTab(self)          # Eval tabs
         self.evaluate_tab = EvaluateTab(self)
@@ -101,6 +103,7 @@ class MainWindow(QMainWindow):
         self.pages: dict[str, QWidget] = {"start": self.start_tab, "train": self.train_tab,
                                           "finetune": self.finetune_tab, "chat": self.chat_tab,
                                           "generate": self.generate_tab,
+                                          "images": self.images_tab,
                                           "model": self.model_tab,
                                           "quantize": self.quantize_tab,
                                           "evaluate": self.evaluate_tab,
@@ -529,14 +532,8 @@ class MainWindow(QMainWindow):
     # ---- the run library (2.20) ------------------------------------------------------
     def run_hardware(self) -> dict[str, Any]:
         """This computer, as a run's record keeps it."""
-        from auralite.runs import machine_summary
-        info = machine_summary(self.engine)
-        hw = self.hardware
-        if hw is not None:
-            info.update(cpu=hw.cpu or info.get("cpu", ""), cores=hw.cores, threads=hw.threads,
-                        memory_gb=round(hw.memory_total / (1 << 30), 1) if hw.memory_total
-                        else None, accelerator=hw.accelerator, system=hw.system)
-        return info
+        from ..runner import machine_record
+        return machine_record(self.engine, self.hardware)
 
     def run_saved(self, run: Any) -> bool:
         """After a recorded run: the model in memory is the run's result, kept in
@@ -654,8 +651,8 @@ class MainWindow(QMainWindow):
     # ---- closing ---------------------------------------------------------------------
     def running_jobs(self) -> list[Job]:
         jobs = [tab.job for tab in (self.train_tab, self.finetune_tab, self.chat_tab,
-                                    self.generate_tab, self.model_tab, self.quantize_tab,
-                                    self.evaluate_tab, self.export_tab)
+                                    self.generate_tab, self.images_tab, self.model_tab,
+                                    self.quantize_tab, self.evaluate_tab, self.export_tab)
                 if getattr(tab, "job", None) is not None]
         for extra in (self.finetune_tab.distill_job, self.train_tab.worker_job):
             if extra is not None:
@@ -672,6 +669,11 @@ class MainWindow(QMainWindow):
         if not running and self.engine.model is not None and self.model_dirty and \
                 not confirm(self, "Quit AuraLite Studio?",
                             "The model in memory is not saved. Quit anyway?"):
+            event.ignore()
+            return
+        if not running and self.images_tab.unsaved and self.images_tab.has_model() and \
+                not confirm(self, "Quit AuraLite Studio?",
+                            "The image generator in memory is not saved. Quit anyway?"):
             event.ignore()
             return
         for job in running:

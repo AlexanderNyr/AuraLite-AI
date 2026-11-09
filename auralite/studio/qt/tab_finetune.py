@@ -18,29 +18,26 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBo
 
 from auralite import runs as runlib
 
+from .. import runner
 from ..advisor import ModelFit, Recommendation, recommend_finetune
 from ..catalog import CATALOG, BaseModel, find_model
 from ..datacheck import DataReport
-from ..hardware import format_gb
+from ..finetuneform import (LORA_TARGETS, METHODS, OBJECTIVES, SOURCE_LABELS, SOURCES,
+                            TEMPLATES, base_lines, catalog_label, estimate_text, hub_spec,
+                            settings_from_form)
 from ..library import remember_dataset, remember_model
+from ..modelinfo import merge_question
 from ..progress import ended_by_itself, format_duration, summary_text
 from ..recipes import FineTuneSettings, SettingsError, finetune_params
 from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, confirm,
-                     heading, hint, inform, load_settings_file, run_training,
-                     save_settings_file, show_error)
+                     heading, hint, inform, job_events, load_settings_file, run_training,
+                     save_settings_file, show_error, training_callback)
 from .widgets import DataPicker, RunPanel
 
 if TYPE_CHECKING:
     from .window import MainWindow
 
-SOURCES = ("catalog", "hub", "file", "memory")
-METHODS = (("qlora", "QLoRA: a 4-bit base + small adapters (least memory)"),
-           ("lora", "LoRA: small adapters on the full-precision base"),
-           ("full", "Every weight (most memory; for small models)"))
-OBJECTIVES = (("auto", "DPO (recommended)"), ("simpo", "SimPO"),
-              ("sft", "SFT on the chosen replies"))
-TEMPLATES = (("", "The model's own"), ("chatml", "ChatML"), ("llama3", "Llama 3"),
-             ("gemma", "Gemma"), ("phi", "Phi"))
+# 2.26: the form's choices are the classic Fine-tune tab's too (studio/finetuneform.py)
 JUDGES = (("none", "none"), ("exact", "exact answer"), ("contains", "contains the answer"),
           ("number", "same number"), ("teacher", "the teacher judges"))
 
@@ -70,10 +67,8 @@ class FineTuneTab(QWidget):
         grid = QGridLayout(base_box)
         self.source_group = QButtonGroup(self)
         self.source_buttons: dict[str, QRadioButton] = {}
-        labels = {"catalog": "From the list:", "hub": "Hugging Face name or folder:",
-                  "file": "My model file (.pt):", "memory": "The model in memory:"}
         for row_index, key in enumerate(SOURCES):
-            button = QRadioButton(labels[key])
+            button = QRadioButton(SOURCE_LABELS[key])
             self.source_group.addButton(button)
             self.source_buttons[key] = button
             grid.addWidget(button, row_index, 0)
@@ -186,9 +181,8 @@ class FineTuneTab(QWidget):
         adv.addRow("LoRA learning rate:", self.lora_lr)
         # 2.24: which layers LoRA trains (the classic interface's LoRA targets)
         self.lora_targets = QComboBox()
-        self.lora_targets.addItem("Every projection (recommended)", "all")
-        self.lora_targets.addItem("Attention only", "attn")
-        self.lora_targets.addItem("Feed-forward only", "ffn")
+        for key, label in LORA_TARGETS:
+            self.lora_targets.addItem(label, key)
         adv.addRow("LoRA trains:", self.lora_targets)
         self.full_lr = QLineEdit("3e-5")
         adv.addRow("Learning rate (every weight):", self.full_lr)
@@ -364,11 +358,7 @@ class FineTuneTab(QWidget):
         if source == "catalog":
             return f"hf:{self.catalog.currentData()}"
         if source == "hub":
-            text = self.hub.text().strip()
-            if text and not os.path.exists(text) and not text.lower().startswith("hf:") \
-                    and "/" in text:
-                text = "hf:" + text
-            return text
+            return hub_spec(self.hub.text())
         if source == "file":
             return self.file.text().strip()
         return ""
@@ -387,20 +377,7 @@ class FineTuneTab(QWidget):
             self._choose_base("file")
 
     def _base_changed(self, *_args: Any) -> None:
-        fit = self._fit_of(self.selected_model())
-        lines = []
-        if fit is not None:
-            m = fit.model
-            note = m.note[:1].upper() + m.note[1:]
-            lines.append(f"{m.name}: {m.size_label} parameters, {m.license}"
-                         + (" (no commercial use)" if not m.commercial else "")
-                         + f", download {m.download_gb:.1f} GB. {note}.")
-            lines.append(fit.line())
-            lines += [f"Note: {n}" for n in fit.notes]
-        elif self.source() == "memory":
-            lines.append("Fine-tunes the model that is loaded now.")
-        elif self.source() == "file":
-            lines.append("Loads the file, then fine-tunes it.")
+        lines = base_lines(self._fit_of(self.selected_model()), self.source())
         self.base_info.setText("\n".join(lines))
         self._update_estimate_line()
 
@@ -446,10 +423,7 @@ class FineTuneTab(QWidget):
             else None
         self.recommendation = rec = recommend_finetune(hw, report)
         for i, fit in enumerate(rec.options):
-            mark = "  ★ recommended" if rec.choice is fit else ""
-            verdict = "fits" if fit.fits else ("tight" if fit.tight else "too big")
-            self.catalog.setItemText(i, f"{fit.model.display_name} - {fit.model.size_label} · "
-                                        f"{verdict}{mark}")
+            self.catalog.setItemText(i, catalog_label(fit, rec.choice is fit))
         if rec.choice is not None:
             if not self._base_chosen:
                 index = self.catalog.findData(rec.choice.model.repo)
@@ -470,22 +444,8 @@ class FineTuneTab(QWidget):
         self._base_changed()
 
     def _update_estimate_line(self) -> None:
-        model = self.selected_model()
-        rec = self.recommendation
-        if model is None or rec is None:
-            self.estimate.setText("")
-            return
-        from ..advisor import estimate_finetune
-        tokens = rec.options[0].tokens if rec.options else 0
-        fit = estimate_finetune(model, self.method(), rec.hardware,
-                                seq_length=int(self.seq.value()), tokens=tokens,
-                                budget=rec.budget)
-        verdict = ("fits" if fit.fits else "tight: close other programs" if fit.tight
-                   else "too big for this computer's memory")
-        time_text = (f", about {format_duration(fit.hours * 3600)} for {fit.tokens:,} tokens"
-                     if fit.hours is not None else "")
-        self.estimate.setText(f"Estimate: ~{format_gb(fit.memory)} of memory ({verdict})"
-                              f"{time_text}")
+        self.estimate.setText(estimate_text(self.selected_model(), self.method(),
+                                            self.recommendation, int(self.seq.value())))
 
     def _model_changed(self) -> None:
         engine = self.studio.engine
@@ -503,41 +463,20 @@ class FineTuneTab(QWidget):
 
     # ---- settings ----------------------------------------------------------------
     def settings(self) -> FineTuneSettings:
-        """The form as :class:`FineTuneSettings` (SettingsError for an unreadable number)."""
-        def number(edit: QLineEdit, name: str) -> float:
-            try:
-                return float(edit.text().strip())
-            except ValueError as err:
-                raise SettingsError(f"{name} must be a number (like 0.001)") from err
-
-        weight_text = self.prompt_weight.text().strip().lower()
-        if weight_text in ("", "auto"):
-            weight = None
-        else:
-            try:
-                weight = float(weight_text)
-            except ValueError as err:
-                raise SettingsError("the prompt weight is a number from 0 to 1, or auto") from err
-        beta_text = self.beta.text().strip().lower()
-        try:
-            beta = None if beta_text in ("", "auto") else float(beta_text)
-        except ValueError as err:
-            raise SettingsError("beta is a number above 0 (like 0.1), or auto") from err
-        method = self.method()
-        return FineTuneSettings(
-            method=method, lora_rank=int(self.rank.value()),
-            lora_lr=number(self.lora_lr, "the LoRA learning rate") if method != "full" else None,
-            lr=number(self.full_lr, "the learning rate") if method == "full" else 3e-5,
-            optimizer="adamw8bit" if self.adam8.isChecked() else "adamw",
-            epochs=int(self.epochs.value()), max_steps=int(self.max_steps.value()),
-            time_limit_min=float(self.time_limit.value()), seq_length=int(self.seq.value()),
-            batch_size=int(self.batch.value()), chat_template=str(self.template.currentData()),
-            prompt_weight=weight, pack_dialogs=self.pack.isChecked(),
-            objective=str(self.objective.currentData()) if self._pairs() else "auto",
-            val_split=float(self.val_split.value()),
-            memory_plan="auto" if self.memory_plan.isChecked() else "off",
-            lora_targets=str(self.lora_targets.currentData()),
-            preference_beta=beta, preference_epochs=int(self.pref_epochs.value()))
+        """The form as :class:`FineTuneSettings` (SettingsError for an unreadable number;
+        2.26: read as the classic Fine-tune tab reads its form)."""
+        return settings_from_form({
+            "method": self.method(), "lora_rank": self.rank.value(),
+            "lora_lr": self.lora_lr.text(), "lr": self.full_lr.text(),
+            "adam8": self.adam8.isChecked(), "epochs": self.epochs.value(),
+            "max_steps": self.max_steps.value(), "time_limit_min": self.time_limit.value(),
+            "seq_length": self.seq.value(), "batch_size": self.batch.value(),
+            "chat_template": self.template.currentData(),
+            "prompt_weight": self.prompt_weight.text(), "pack_dialogs": self.pack.isChecked(),
+            "objective": self.objective.currentData(), "val_split": self.val_split.value(),
+            "memory_plan": self.memory_plan.isChecked(),
+            "lora_targets": self.lora_targets.currentData(), "beta": self.beta.text(),
+            "pref_epochs": self.pref_epochs.value()}, pairs=self._pairs())
 
     def set_base(self, spec: str) -> None:
         """Choose the base: a model of the catalog, a ``.pt`` file, a Hugging Face
@@ -681,54 +620,22 @@ class FineTuneTab(QWidget):
         if not self.studio.begin("fine-tuning"):
             return
         paths = list(report.paths)
-        method = settings.method
         # 2.20: the run goes into the library (a checkpoint every 10 minutes);
         # its record is made once the base is loaded and the data read
-        base = {"spec": spec if source != "memory" else self.studio.model_path,
-                "label": runlib.base_label(spec) if source != "memory" else
-                (self.studio.model_origin or "the model in memory")}
+        base = runner.base_record(source, spec, self.studio.model_path,
+                                  self.studio.model_origin)
         record = {"base": base, "settings": settings.to_dict(),
                   "hardware": self.studio.run_hardware(),
                   "data": {"paths": paths, "kind": report.kind, "records": report.records,
                            "tokens": report.tokens, "bytes": report.bytes}}
 
         def work(job: Job) -> Any:
-            from auralite.engine import PreferenceSet, load_training_data
-            if source != "memory":
-                # 2.20: the old model leaves first - one model in memory, not two
-                engine.unload_model()
-                job.progress.emit(("unloaded", None))
-            if source in ("catalog", "hub"):
-                job.progress.emit(("stage", f"Getting {spec}…", 0.0))
-
-                def import_progress(info: dict) -> None:
-                    job.progress.emit(("import", dict(info)))
-
-                engine.import_hf_model(spec, quantize="nf4" if method == "qlora" else None,
-                                       progress_callback=import_progress,
-                                       stop_event=job.stop_event)
-                job.progress.emit(("loaded", spec))
-            elif source == "file":
-                job.progress.emit(("stage", f"Loading {os.path.basename(spec)}…", None))
-                engine.load_model(spec)
-                job.progress.emit(("loaded", spec))
-            if job.stop_event.is_set():
-                return {"stopped_during": "loading the base model"}
-            job.progress.emit(("stage", "Reading the data…", None))
-            data = load_training_data(paths)
-            as_dialogs = isinstance(data, PreferenceSet) and settings.objective == "sft"
-            if as_dialogs:
-                data = data.as_dialogs()
-            pairs = isinstance(data, PreferenceSet)
-            data_info = dict(record["data"], options={"as_dialogs": True} if as_dialogs else {})
-            recorder = runlib.RunRecorder(
-                kind="preference" if pairs else "finetune",
-                method=str(params.get("method", "dpo")) if pairs else method,
-                params=params, **{**record, "data": data_info})
-            job.recorder = recorder                         # type: ignore[attr-defined]
-            # preference runs are short and start anew: no checkpoints for them
-            run_params = params if pairs else recorder.checkpoint_params(params)
-            return run_training(job, engine, recorder, data, run_params)
+            # 2.26: the steps are the classic Fine-tune tab's too (studio/runner.py)
+            return runner.finetune(engine, source=source, spec=spec, settings=settings,
+                                   params=params, paths=paths, record=record,
+                                   progress_callback=training_callback(job),
+                                   stop_event=job.stop_event, finish_event=job.finish_event,
+                                   on_event=job_events(job))
 
         self._start_job(work)
 
@@ -810,8 +717,8 @@ class FineTuneTab(QWidget):
         saved = run is not None and self.studio.run_saved(run)
         text = summary_text(summary, time.time() - self._started, stopped)
         if run is not None and saved:
-            text += (" Saved in the library: it can continue from there."
-                     if run.continue_state()[0] else " Saved in the library.")
+            text += (". Saved in the library: it can continue from there."
+                     if run.continue_state()[0] else ". Saved in the library.")
         self.panel.end(text, complete=ended_by_itself(summary, stopped))
         self.studio.end(model_dirty=not saved and self.studio.engine.model is not None)
         self._model_changed()
@@ -837,20 +744,9 @@ class FineTuneTab(QWidget):
     # ---- adapters -----------------------------------------------------------------------
     def merge_adapters(self) -> None:
         engine = self.studio.engine
-        native = getattr(engine.model, "module", engine.model)
-        try:
-            from auralite.engine.nf4 import nf4_layers
-            quantized = bool(nf4_layers(native))
-        except Exception:
-            quantized = False
-        if quantized:
-            need = int(native.count_parameters()) * 4
-            if not confirm(self, "Merge into full precision?",
-                           f"The base is stored in 4 bits. Merged, every weight is a float32 "
-                           f"one: about {format_gb(need)} of memory and a bigger file, but "
-                           f"fast replies. Save the adapters first to keep the small "
-                           f"version.\n\nMerge now?"):
-                return
+        question = merge_question(engine)          # 2.26: the classic interface asks it too
+        if question and not confirm(self, "Merge into full precision?", question):
+            return
         try:
             merged = engine.merge_lora()
         except Exception as err:

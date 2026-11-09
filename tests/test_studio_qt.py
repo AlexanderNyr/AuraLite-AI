@@ -106,8 +106,8 @@ def _dialogs_file(path, n: int = 24) -> str:
 # ----------------------------------------------------------------------
 def test_window_has_its_tabs_menus_and_status(studio):
     tabs = [studio.tabs.tabText(i) for i in range(studio.tabs.count())]
-    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Generate", "Model", "Quantize",
-                    "Evaluate", "Export", "Library", "Log"]          # 2.25: three more
+    assert tabs == ["Start", "Train", "Fine-tune", "Chat", "Generate", "Images", "Model",
+                    "Quantize", "Evaluate", "Export", "Library", "Log"]  # 2.26: Images
     menus = [a.text() for a in studio.menuBar().actions()]
     assert menus == ["&File", "&View", "&Tools", "&Help"]
     assert studio.windowTitle().startswith("AuraLite Studio 2.")
@@ -115,7 +115,7 @@ def test_window_has_its_tabs_menus_and_status(studio):
     assert studio.device_label.text() == "CPU · 4 threads"
     assert studio.model_status.text() == "Model: no model"
     studio.goto("export")
-    assert studio.tabs.currentIndex() == 8                     # 2.25: after Model, Quantize…
+    assert studio.tabs.currentIndex() == 9                     # 2.26: after Images, Model…
 
 
 def test_a_gpu_too_old_for_pytorch_is_not_used(studio):
@@ -751,7 +751,7 @@ def test_a_studio_run_is_recorded_stopped_and_continued(studio, tmp_path, qapp, 
     start.refresh_interrupted()
     assert start.interrupted.isVisibleTo(start) and run.name in start.interrupted_label.text()
     start._show_interrupted()
-    assert studio.tabs.currentIndex() == 9 and shelf.current_run().id == run.id  # Library
+    assert studio.tabs.currentIndex() == 10 and shelf.current_run().id == run.id  # Library
     start._dismiss_interrupted()
     assert not start.interrupted.isVisibleTo(start)
     assert runlib.find_run(run.id).record["dismissed"] is True
@@ -775,8 +775,8 @@ def test_a_fresh_process_builds_the_window(tmp_path, monkeypatch, capsys):
     assert "RESULT: OK - the window was built in" in output
     assert "Qt platform: offscreen" in output and "PyTorch: " in output
     assert "  Installed: " in output                    # 2.19.1: the package pip knows
-    assert ("Window: Start, Train, Fine-tune, Chat, Generate, Model, Quantize, Evaluate, "
-            "Export, Library, Log") in output
+    assert ("Window: Start, Train, Fine-tune, Chat, Generate, Images, Model, Quantize, "
+            "Evaluate, Export, Library, Log") in output
     assert "SSE4.2 + POPCNT: " in output
     if os.name == "nt":
         assert "Visual C++ runtime (msvcp140.dll): system 14." in output

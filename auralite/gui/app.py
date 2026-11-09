@@ -5,7 +5,9 @@ entry point `python gui_app.py` re-exports `AIApp`/`main` from here.
 """
 import multiprocessing
 
+from .tabs.start import StartTabMixin
 from .tabs.training import TrainTabMixin
+from .tabs.finetune import FineTuneTabMixin
 from .tabs.image import ImageTabMixin
 from .tabs.generation import GenerationTabMixin
 from .tabs.model import ModelTabMixin
@@ -42,15 +44,15 @@ def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
     return f"{win_w}x{win_h}"
 
 
-class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
-            QuantizationTabMixin, EvaluationTabMixin, ExportTabMixin, ConsoleTabMixin,
-            ChatTabMixin, ResultViewMixin, MenuMixin):
+class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, GenerationTabMixin,
+            ModelTabMixin, QuantizationTabMixin, EvaluationTabMixin, ExportTabMixin,
+            ConsoleTabMixin, ChatTabMixin, ResultViewMixin, MenuMixin):
     """AuraLite desktop app: tabs live in `gui/tabs/*`, shared state here."""
 
     #: Notebook tab names, in build order — used for titles and for the
     #: session snapshot (`gui/session.py` stores the active tab by name).
-    _TAB_NAMES = ("train", "image", "gen", "chat", "model", "quant", "eval",
-                  "export", "console")
+    _TAB_NAMES = ("start", "train", "finetune", "image", "gen", "chat", "model", "quant",
+                  "eval", "export", "console")        # 2.26: Start and Fine-tune, as the Studio
 
     def __init__(self, root):
         self.root = root
@@ -159,8 +161,13 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
             self.notebook.add(container, text=tr(f"tab.{_name}"))
             self._tab_widgets[_name] = container
         self._active_tab_name = self._tab_names[0]
+        try:                                    # 2.26: the session keeps the tab shown last
+            self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        except Exception:                       # pragma: no cover - an exotic Tk
+            pass
 
         self._build_training_tab()
+        self._build_finetune_tab()              # 2.26
         self._build_image_tab()
         self._build_generation_tab()
         self._build_chat_tab()
@@ -169,6 +176,7 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._build_evaluation_tab()
         self._build_export_tab()
         self._build_console_tab()
+        self._build_start_tab()                 # 2.26: last - it shows what the others hold
         self._build_menu()                      # 2.25: File, View, Tools, Help (gui/menu.py)
         if self.dark_mode.get():
             self._apply_theme(light=False)
@@ -323,6 +331,14 @@ class AIApp(TrainTabMixin, ImageTabMixin, GenerationTabMixin, ModelTabMixin,
         self._apply_theme(light=not is_dark)
         self.gui_config = self.gui_config.update(theme="dark" if is_dark else "light")
 
+
+    def _on_tab_changed(self, _event=None):
+        """2.26: remember the tab shown (the session restores it; it stayed the first)."""
+        try:
+            index = self.notebook.index("current")
+            self._active_tab_name = self._tab_names[int(index)]
+        except Exception:                       # a test double, a closing window
+            pass
 
     # ---- language / session (v2.6.5) ---------------------------------
     def _on_language_change(self, display_name):

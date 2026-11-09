@@ -276,7 +276,7 @@ def test_the_new_tabs_are_in_the_window(studio):
     from auralite.studio.qt.window import TAB_TITLES
     titles = [studio.tabs.tabText(i) for i in range(studio.tabs.count())]
     assert titles == [title for _key, title in TAB_TITLES]
-    assert titles[5:8] == ["Model", "Quantize", "Evaluate"]
+    assert titles[6:9] == ["Model", "Quantize", "Evaluate"]      # 2.26: Images before them
     for key in ("model", "quantize", "evaluate"):
         studio.goto(key)
         assert studio.tabs.currentIndex() == [k for k, _ in TAB_TITLES].index(key)

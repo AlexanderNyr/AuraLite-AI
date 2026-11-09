@@ -504,7 +504,7 @@ def test_the_build_pins_every_package_and_the_qt_the_studio_needs():
     assert pins["shiboken6"] == pins["pyside6-essentials"]
     assert pins["torch"].endswith("+cpu")
     assert {"numpy", "safetensors", "tokenizers", "zstandard", "psutil", "pyinstaller",
-            "pyinstaller-hooks-contrib"} <= set(pins)
+            "pyinstaller-hooks-contrib", "pillow"} <= set(pins)     # 2.26: Pillow
     text = build.REQUIREMENTS.read_text(encoding="utf-8")
     assert "--extra-index-url https://download.pytorch.org/whl/cpu" in text
     assert not set(pins) & {"matplotlib", "pydantic", "fastapi", "transformers"}
@@ -760,6 +760,7 @@ def test_the_spec_leaves_out_what_the_docs_say_it_leaves_out():
     assert "torch.testing._internal" not in left_out            # torch.utils.checkpoint needs it
     for name in bundle.INCLUDED:
         assert name not in left_out
+    assert "PIL" in bundle.INCLUDED and "PIL" not in left_out    # 2.26: the image generator
     guide = (REPO / "docs" / "windows-app.md").read_text(encoding="utf-8")
     for part in ("classic interface", "transformers", "server", "ONNX", "Parquet"):
         assert part in guide, part
@@ -786,7 +787,7 @@ def test_the_entry_scripts_turn_worker_processes_into_workers_first():
 def test_the_smoke_test_checks_what_a_user_meets():
     smoke = _load("smoke_app")
     assert smoke.STEPS == ("version", "doctor", "selftest", "start", "train", "workers",
-                           "bench")                                  # 2.22: bench --quick
+                           "bench", "images")      # 2.22: bench --quick; 2.26: Pillow
     assert smoke.SMOKE_ENV == "AURALITE_STUDIO_SMOKE_SECONDS"
     assert " " in smoke.ODD_FOLDER and not smoke.ODD_FOLDER.isascii()
     for name in smoke.STEPS:
@@ -904,3 +905,17 @@ def test_build_exe_bat_builds_the_app_the_way_ci_does():
     assert "packaging\\app\\build_app.py" in text and "--zip" in text
     assert "-m pip install --no-deps --force-reinstall ." in text   # this folder's code
     assert "gui_app.py" not in text and "--exclude-module PySide6" not in text
+
+
+def test_the_smoke_tests_pictures_are_png_files_pillow_reads(tmp_path):
+    """2.26: smoke_app.py writes its pictures with the standard library alone."""
+    smoke = _load("smoke_app")
+    data = smoke.png_bytes(16, 16, 3)
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    path = tmp_path / "p.png"
+    path.write_bytes(data)
+    PIL = pytest.importorskip("PIL.Image")
+    with PIL.open(path) as image:
+        assert image.size == (16, 16) and image.mode == "RGB"
+        assert image.getpixel((1, 2)) == ((1 * 16 + 3 * 31) % 256, (2 * 16 + 3 * 17) % 256,
+                                          (3 * 40) % 256)

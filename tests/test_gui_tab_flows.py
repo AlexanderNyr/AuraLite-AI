@@ -2343,7 +2343,9 @@ class TestChatTab:
         chat_app._plot_attention_map()
 
         matrix = calls["matrix"]
-        assert matrix.ndim == 3            # (batch, query, key)
+        # 2.26: the heads' average (query, key) - a (heads, query, key) map raised
+        # "Invalid shape" in matplotlib's imshow, which this test's double hid
+        assert matrix.ndim == 2
         assert matrix.shape[-1] == matrix.shape[-2]
         assert calls["tokens"]
         assert chat_app.gui_config.attention_layer == 0
@@ -2380,7 +2382,9 @@ class TestChatTab:
 
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
         chat_app.agent_mode_var.set(True)
-        chat_app._on_agent_mode_toggle()
+        # 2.26: agent mode asks once a session (the tools run on this computer)
+        with dialog_double("messagebox.askyesno", True):
+            chat_app._on_agent_mode_toggle()
         assert "Agent Mode ON" in chat_app.chat_status.config.call_args.kwargs["text"]
 
         stopped = []
@@ -2391,12 +2395,13 @@ class TestChatTab:
         assert chat_app._agent is None
 
     def test_agent_message_streams_into_the_chat(self, chat_app, monkeypatch):
+        import auralite.agent as agent_package
         import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
-        monkeypatch.setattr(chat_module, "AuraLiteAgent", _FakeAgent)
-        monkeypatch.setattr(chat_module, "Sandbox", _FakeSandbox)
+        monkeypatch.setattr(agent_package, "AuraLiteAgent", _FakeAgent)
+        monkeypatch.setattr(agent_package, "Sandbox", _FakeSandbox)
         chat_app.chat_history[:] = [{"role": "user", "content": "old"}]
         chat_app.chat_text.content = ""
 
@@ -2408,6 +2413,7 @@ class TestChatTab:
         assert chat_app.agent_stop_btn.config.call_args.kwargs["state"] == "disabled"
 
     def test_agent_tool_calls_are_logged(self, chat_app, monkeypatch):
+        import auralite.agent as agent_package
         import auralite.gui.tabs.chat as chat_module
 
         class NoisyAgent(_FakeAgent):
@@ -2417,8 +2423,8 @@ class TestChatTab:
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
-        monkeypatch.setattr(chat_module, "AuraLiteAgent", NoisyAgent)
-        monkeypatch.setattr(chat_module, "Sandbox", _FakeSandbox)
+        monkeypatch.setattr(agent_package, "AuraLiteAgent", NoisyAgent)
+        monkeypatch.setattr(agent_package, "Sandbox", _FakeSandbox)
         chat_app.agent_sandbox_log.content = ""
 
         chat_app._send_agent_message("calculate something")
@@ -2428,17 +2434,18 @@ class TestChatTab:
         assert "= 4" in log
 
     def test_agent_errors_are_shown_in_the_chat(self, chat_app, monkeypatch):
+        import auralite.agent as agent_package
         import auralite.gui.tabs.chat as chat_module
 
         monkeypatch.setattr(threading, "Thread", InlineThread)
         monkeypatch.setattr(chat_module.gui_common, "HAS_AGENT", True)
-        monkeypatch.setattr(chat_module, "Sandbox", _FakeSandbox)
+        monkeypatch.setattr(agent_package, "Sandbox", _FakeSandbox)
 
         class BrokenAgent(_FakeAgent):
             def run_streaming(self, *a, **k):
                 raise RuntimeError("tool chain broke")
 
-        monkeypatch.setattr(chat_module, "AuraLiteAgent", BrokenAgent)
+        monkeypatch.setattr(agent_package, "AuraLiteAgent", BrokenAgent)
         chat_app.chat_text.content = ""
 
         chat_app._send_agent_message("do something")

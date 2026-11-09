@@ -2,10 +2,12 @@
 
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
+from auralite.studio import agentmode, insights
+
 from .. import common as gui_common
 from .. import visualizations
 from ..i18n import tr
-from ..common import (AuraLiteAgent, CHAT_TEMPLATES, Figure, FigureCanvasTkAgg, HAS_CHAT_SUPPORT, Sandbox, TOOL_REGISTRY, messagebox, threading, tk, ttk)
+from ..common import (CHAT_TEMPLATES, Figure, FigureCanvasTkAgg, HAS_CHAT_SUPPORT, messagebox, threading, tk, ttk)
 
 class ChatTabMixin:
     def _build_chat_tab(self):
@@ -98,11 +100,26 @@ class ChatTabMixin:
         )
         self.agent_mode_cb.pack(anchor=tk.W)
 
+        # 2.26: which tools it may use and its limits, as in the Studio (studio/agentmode.py)
+        self.agent_tool_vars: dict = {}
+        steps, seconds = agentmode.form_defaults()      # the AURALITE_AGENT_* variables
+        self.agent_steps_var = tk.StringVar(value=str(steps))
+        self.agent_timeout_var = tk.StringVar(value=f"{seconds:g}")
+        self._agent_accepted = False          # the warning is confirmed once a session
         if gui_common.HAS_AGENT:
-            tool_names = list(TOOL_REGISTRY.keys())
-            ttk.Label(agent_left, text="Available tools:", font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
-            for tn in tool_names:
-                ttk.Label(agent_left, text=f"  • {tn}", font=("Segoe UI", 9)).pack(anchor=tk.W)
+            ttk.Label(agent_left, text="Tools it may use:", font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
+            for row in agentmode.tool_rows():
+                var = tk.BooleanVar(value=row.available)
+                self.agent_tool_vars[row.name] = var
+                ttk.Checkbutton(agent_left, text=row.name + (f" ({row.note})" if row.note else ""),
+                                variable=var,
+                                state=tk.NORMAL if row.available else tk.DISABLED).pack(anchor=tk.W)
+            limits = ttk.Frame(agent_left)
+            limits.pack(anchor=tk.W, pady=(4, 0))
+            ttk.Label(limits, text="Steps:").pack(side=tk.LEFT)
+            ttk.Entry(limits, textvariable=self.agent_steps_var, width=4).pack(side=tk.LEFT, padx=(2, 8))
+            ttk.Label(limits, text="Seconds per tool:").pack(side=tk.LEFT)
+            ttk.Entry(limits, textvariable=self.agent_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
         else:
             ttk.Label(agent_left, text="⚠ agent/ package not found.",
                       foreground="red", font=("Segoe UI", 9)).pack(anchor=tk.W)
@@ -145,8 +162,8 @@ class ChatTabMixin:
         self.chat_history = []
 
         # Agent state
-        self._agent: "AuraLiteAgent | None" = None
-        self._agent_sandbox: "Sandbox | None" = None
+        self._agent = None             # an auralite.agent.AuraLiteAgent while it answers
+        self._agent_sandbox = None     # the chat's auralite.agent.Sandbox (2.26: one a chat)
         self._agent_stop_event = threading.Event()
 
 
@@ -174,6 +191,15 @@ class ChatTabMixin:
             value=str(getattr(self.gui_config, "attention_layer", 0)))
         ttk.Entry(controls, textvariable=self.chat_attention_layer_var,
                   width=4).pack(side=tk.LEFT)
+        # 2.26: one head or their average, over the last N tokens (as the Studio)
+        ttk.Label(controls, text=tr("lbl.attention_head")).pack(side=tk.LEFT, padx=(8, 2))
+        self.chat_attention_head_var = tk.StringVar(value="avg")
+        ttk.Entry(controls, textvariable=self.chat_attention_head_var,
+                  width=5).pack(side=tk.LEFT)
+        ttk.Label(controls, text=tr("lbl.tokens")).pack(side=tk.LEFT, padx=(8, 2))
+        self.chat_attention_tokens_var = tk.StringVar(value=str(insights.DEFAULT_TOKENS))
+        ttk.Entry(controls, textvariable=self.chat_attention_tokens_var,
+                  width=5).pack(side=tk.LEFT)
 
         self.chat_plot_ax = None
         if gui_common.HAS_MATPLOTLIB:
@@ -187,15 +213,10 @@ class ChatTabMixin:
                       style="Sub.TLabel").pack(anchor=tk.W)
 
     def _last_response_text(self) -> str:
-        for message in reversed(getattr(self, "chat_history", []) or []):
-            if message.get("role") == "assistant" and message.get("content"):
-                return str(message["content"])
-        return ""
+        return insights.last_reply(list(getattr(self, "chat_history", []) or []))
 
     def _last_exchange_text(self) -> str:
-        parts = [m.get("content", "") for m in getattr(self, "chat_history", []) or []
-                 if m.get("role") in ("user", "assistant") and m.get("content")]
-        return "\n".join(parts[-2:])
+        return insights.last_exchange(list(getattr(self, "chat_history", []) or []))
 
     def _plot_token_distribution(self):
         """Bar chart of the token frequencies of the last assistant reply."""
@@ -218,8 +239,13 @@ class ChatTabMixin:
         self.chat_status.config(text=f"{tr('lbl.tokens')}: {len(pairs)} unique / {len(text)} chars")
 
     def _plot_attention_map(self):
-        """Heatmap of this layer's attention over the last user+assistant turn."""
+        """Heatmap of this layer's attention over the last user+assistant turn: one head
+        or the heads' average (2.26: a layer's maps of every head raised before)."""
         if not self._ensure_native_model():
+            return
+        why = insights.inspectable(self.engine)
+        if why:
+            messagebox.showinfo(tr("btn.attention"), why)
             return
         text = self._last_exchange_text()
         if not text.strip():
@@ -230,16 +256,18 @@ class ChatTabMixin:
         except (TypeError, ValueError):
             layer = 0
         try:
-            matrix = self.engine.attention_maps(text, layer=layer)
-            ids = self.engine.encode(text)[-matrix.shape[-1]:]
-            tokens = [self.engine.decode([i]) for i in ids]
+            head = insights.parse_head(self.chat_attention_head_var.get())
+            max_tokens = insights.parse_tokens(self.chat_attention_tokens_var.get())
+            matrix, tokens, heads = insights.attention_view(
+                self.engine, text, layer=layer, head=head, max_tokens=max_tokens)
         except Exception as exc:
             messagebox.showwarning(tr("btn.attention"), str(exc))
             return
         visualizations.plot_attention_heatmap(
-            self.chat_plot_ax, matrix, tokens=tokens,
-            title=tr("msg.attention_title", layer=layer))
+            self.chat_plot_ax, matrix, tokens=tokens, max_labels=insights.MAX_LABELLED,
+            title=insights.attention_caption(layer, head, heads))
         self._refresh_chat_plot()
+        self.chat_status.config(text=f"{len(tokens)} tokens; brighter is more attention.")
         self.gui_config = self.gui_config.update(attention_layer=layer)
 
     def _ensure_native_model(self, need_tokens: bool = False) -> bool:
@@ -405,18 +433,50 @@ class ChatTabMixin:
                     "agent/ package not found. Make sure the agent/ directory is present.")
                 self.agent_mode_var.set(False)
                 return
+            # 2.26: the tools run on this computer - say so once a session (as the Studio)
+            if not self._agent_accepted:
+                if not messagebox.askyesno("Turn agent mode on?",
+                                           agentmode.WARNING + "\n\nTurn agent mode on?"):
+                    self.agent_mode_var.set(False)
+                    return
+                self._agent_accepted = True
             self._log_sandbox("Agent mode enabled. Sandbox initialised.", "info")
             self.chat_status.config(text="🤖 Agent Mode ON — I have access to terminal, files, web search.")
         else:
             if self._agent is not None:
                 self._agent.stop()
                 self._agent = None
+            self._drop_agent_sandbox()
             self.chat_status.config(text="Agent mode disabled.")
             self._log_sandbox("Agent mode disabled.", "info")
+
+    def _agent_options(self):
+        """2.26: the agent's options from the form (ValueError: a field out of range, or
+        no tool turned on)."""
+        tools = [name for name, var in self.agent_tool_vars.items() if var.get()]
+        template = getattr(self, "chat_template_var", None)
+        return agentmode.options_from_form(
+            tools, self.agent_steps_var.get(), self.agent_timeout_var.get(),
+            chat_template=(template.get() if template is not None else "") or "chatml")
+
+    def _drop_agent_sandbox(self):
+        """The chat's temporary folder goes (a new chat, agent mode off)."""
+        sandbox, self._agent_sandbox = self._agent_sandbox, None
+        if sandbox is not None:
+            try:
+                sandbox.cleanup()
+            except Exception:          # a folder Windows still holds: it goes later
+                pass
 
 
     def _send_agent_message(self, user_msg: str):
         """Handle a message in agent mode."""
+        try:
+            options = self._agent_options()
+        except ValueError as exc:
+            messagebox.showwarning("Agent mode", f"Cannot start the agent: {exc}.")
+            self.chat_input.insert(0, user_msg)        # the message is not lost
+            return
         self._append_chat_message("user", user_msg)
         self.chat_send_btn.config(state=tk.DISABLED)
         self.agent_stop_btn.config(state=tk.NORMAL)
@@ -428,40 +488,25 @@ class ChatTabMixin:
                 if not gui_common.HAS_AGENT:
                     raise RuntimeError("Agent package not available")
 
-                # Create/reuse sandbox
+                # 2.26: one sandbox a chat, the tools turned on, the limits typed - the
+                # Studio's agent (studio/agentmode.py)
                 if self._agent_sandbox is None:
-                    self._agent_sandbox = Sandbox(timeout=15.0)
-
-                # Create fresh agent
-                agent = AuraLiteAgent(
-                    self.engine,
-                    sandbox=self._agent_sandbox,
-                    max_iterations=8,
-                    max_tokens_per_step=512,
-                    temperature=0.7,
-                    top_p=0.9,
-                    top_k=40,
-                    repetition_penalty=1.1,
-                    chat_template=getattr(self, 'chat_template_var', None) and self.chat_template_var.get() or "chatml",
-                )
+                    self._agent_sandbox = agentmode.make_sandbox(options.timeout)
+                agent = agentmode.make_agent(self.engine, options, sandbox=self._agent_sandbox)
                 self._agent = agent
 
-                # Build history (exclude last user msg — agent gets it fresh)
-                history = list(self.chat_history[:-1]) if self.chat_history else []
+                # The chat so far: the message itself goes in fresh (2.26: it is not in
+                # the history yet, so the whole history goes - [:-1] dropped the last reply)
+                history = list(self.chat_history)
 
                 # Stream agent output to chat display
                 self.root.after(0, self._begin_chat_stream)
                 full_output_parts = []
 
                 def step_callback(step):
-                    # Log each tool call to sandbox log
-                    for tc in step.tool_calls:
-                        name = tc.get("name", "?")
-                        self.root.after(0, lambda n=name: self._log_sandbox(f"→ Tool: {n}", "tool"))
-                    for res in step.tool_results:
-                        tag = "ok" if res.success else "error"
-                        out = res.to_text()[:300]
-                        self.root.after(0, lambda o=out, t=tag: self._log_sandbox(o, t))
+                    # Log each tool call and its result to the sandbox log
+                    for line, tag in agentmode.step_lines(step):
+                        self.root.after(0, lambda o=line, t=tag: self._log_sandbox(o, t))
 
                 agent.on_step = step_callback
 
@@ -522,6 +567,7 @@ class ChatTabMixin:
 
     def _clear_chat_history(self):
         self.chat_history.clear()
+        self._drop_agent_sandbox()              # 2.26: a new chat, a new temporary folder
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
         self.chat_text.config(state=tk.DISABLED)

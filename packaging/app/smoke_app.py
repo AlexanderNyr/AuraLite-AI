@@ -1,7 +1,7 @@
 """Check a built AuraLite app the way a user meets it (2.21) - CI runs it after every build.
 
-    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.25.0-windows-x64.zip
-    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.25.0
+    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.26.0-windows-x64.zip
+    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.26.0
 
 A zip is unzipped first, into a folder whose path has a space and letters outside ASCII.
 Everything runs as under a Windows user name in Russian (2.21.1): the app's data
@@ -20,7 +20,10 @@ run tells everything:
 5. ``train``    - ``auralite train`` on a small text (PyTorch trains inside the app), and the
    run is in ``auralite runs``;
 6. ``workers``  - ``auralite data prepare --workers 2 --no-fast``: worker processes of a
-   frozen program start the program again, and must turn into workers.
+   frozen program start the program again, and must turn into workers;
+7. ``bench``    - ``auralite bench --quick``: a model trains and writes, the report is saved;
+8. ``images``   - ``auralite image-train`` on a folder of pictures (2.26: the app brings
+   Pillow, which reads them and writes the samples).
 
 Only the standard library: this runs with any Python, outside the app. It prints UTF-8 to any
 console or pipe, and on GitHub Actions a failed check is also an annotation of the run - with
@@ -32,12 +35,14 @@ import argparse
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
 import zipfile
+import zlib
 from pathlib import Path
 
 #: A folder with a space and letters outside ASCII ("AuraLite test", the second word in
@@ -48,7 +53,7 @@ ODD_FOLDER = "AuraLite \u0442\u0435\u0441\u0442"
 USER_FOLDER = "\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c"
 SMOKE_ENV = "AURALITE_STUDIO_SMOKE_SECONDS"
 SMOKE_SECONDS = 8
-STEPS = ("version", "doctor", "selftest", "start", "train", "workers", "bench")
+STEPS = ("version", "doctor", "selftest", "start", "train", "workers", "bench", "images")
 WINDOWS = sys.platform == "win32"
 #: How much of a failed check's output its annotation keeps (the end of it).
 ANNOTATION_LINES = 60
@@ -85,6 +90,22 @@ def tail(text: str, lines: int = ANNOTATION_LINES, chars: int = ANNOTATION_CHARS
     """The end of `text`: its last `lines` lines, at most `chars` characters."""
     kept = "\n".join(text.rstrip().splitlines()[-lines:])
     return kept[-chars:]
+
+
+def png_bytes(width: int, height: int, seed: int = 0) -> bytes:
+    """A small RGB picture as a PNG file, with the standard library only (no Pillow outside
+    the app): stripes whose colors follow `seed`."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    rows = b"".join(b"\x00" + bytes((x * 16 + seed * 31) % 256 if c == 0 else
+                                     (y * 16 + seed * 17) % 256 if c == 1 else
+                                     (seed * 40) % 256
+                                     for x in range(width) for c in range(3))
+                    for y in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows))
+            + chunk(b"IEND", b""))
 
 
 def unzip(archive: Path, target: Path) -> Path:
@@ -244,6 +265,22 @@ class Smoke:
         ok = (code == 0 and len(reports) == 2 and "| tiny: 4 layers x 128 | 0.9M |" in out
               and "Saved: " in out)
         return ok, f"{out}\n--- reports: {', '.join(reports) or 'none'}"
+
+    def step_images(self) -> tuple[bool, str]:
+        """2.26: the picture generator trains on a folder of PNG files and writes samples -
+        Pillow inside the app reads and writes them."""
+        folder = self.files / "pictures"
+        folder.mkdir(parents=True, exist_ok=True)
+        for i in range(8):
+            (folder / f"p{i}.png").write_bytes(png_bytes(16, 16, i))
+        model, grid = self.files / "pictures.pt", self.files / "samples.png"
+        code, out = self.run([str(self.cli), "image-train", "--images", str(folder),
+                              "--preset", "tiny", "--epochs", "1", "--img-size", "16",
+                              "--batch-size", "4", "--val-split", "0", "--model", str(model),
+                              "--samples", str(grid), "--quiet"])
+        ok = (code == 0 and "saved: " in out and model.is_file() and grid.is_file()
+              and grid.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n")
+        return ok, out
 
     def check(self, steps: list[str]) -> bool:
         for name in steps:

@@ -3,7 +3,7 @@
 ``packaging/app/build_app.py`` freezes AuraLite with PyInstaller into one folder
 that holds two programs and a note saying which build it is::
 
-    AuraLite-Studio-2.25.0/
+    AuraLite-Studio-2.26.0/
         AuraLite Studio.exe     the Studio, no console: double-click it
         auralite.exe            the ``auralite`` command, for a console
         auralite-app.json       this build: version, Python, PyTorch, Qt, date, commit
@@ -41,7 +41,8 @@ RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 DOWNLOAD_URL = f"{RELEASES_URL}/latest"
 GUIDE_URL = f"https://github.com/{REPOSITORY}/blob/main/docs/windows-app.md"
 #: The optional packages the app includes; anything else optional comes with pip only.
-INCLUDED = ("PySide6", "safetensors", "tokenizers", "zstandard", "psutil", "numpy")
+INCLUDED = ("PySide6", "safetensors", "tokenizers", "zstandard", "psutil", "numpy",
+            "PIL")                    # 2.26: Pillow - the image generator trains in the app
 #: Optional packages and the pip extra that installs them.
 EXTRAS = {"transformers": "hf", "peft": "hf", "accelerate": "hf", "llama_cpp": "gguf",
           "onnx": "export", "onnxruntime": "export", "onnxscript": "export",
@@ -81,7 +82,7 @@ def platform_tag(system: str | None = None, machine: str | None = None) -> str:
 
 
 def zip_name(version: str, tag: str | None = None) -> str:
-    """``AuraLite-Studio-2.25.0-windows-x64.zip``: what the release attaches."""
+    """``AuraLite-Studio-2.26.0-windows-x64.zip``: what the release attaches."""
     return f"AuraLite-Studio-{version}-{tag or platform_tag()}.zip"
 
 

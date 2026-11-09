@@ -15,11 +15,13 @@ numpy==2.5.4
 PySide6-Essentials==6.9.3
 shiboken6==6.9.3
 # Small optional parts the app includes: Hugging Face export (.safetensors), the fast
-# tokenizer, .zst data, physical cores for the advisor.
+# tokenizer, .zst data, physical cores for the advisor - and (2.26) Pillow, which reads the
+# pictures the Images tab's generator trains on and measures its quality.
 safetensors==0.8.0
 tokenizers==0.23.3
 zstandard==0.25.0
 psutil==7.2.2
+pillow==13.0.0
 # The freezer.
 pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.9

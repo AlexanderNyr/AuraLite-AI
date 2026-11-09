@@ -652,7 +652,8 @@ def test_the_apps_readme_and_smoke_test_know_the_benchmark():
     assert ".\\auralite.exe bench                        how fast this computer trains" in \
         build.readme_text(info, "win32")
     smoke = _load("smoke_app")
-    assert smoke.STEPS[-1] == "bench" and callable(smoke.Smoke.step_bench)
+    # 2.26: the images step comes after it
+    assert "bench" in smoke.STEPS and callable(smoke.Smoke.step_bench)
 
 
 def test_the_memory_plan_keeps_a_margin(monkeypatch):

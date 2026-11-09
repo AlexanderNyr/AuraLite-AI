@@ -748,7 +748,8 @@ def describe_run(run: Run) -> list[tuple[str, str]]:
     if isinstance(error, dict) and error.get("message"):
         kind = f"{error['type']}: " if error.get("type") else ""
         lines.append(("Error", kind + str(error["message"]).strip().splitlines()[0]))
-    source = {"studio": "AuraLite Studio", "cli": "auralite train"}.get(run.source, run.source)
+    source = {"studio": "AuraLite Studio", "cli": "auralite train",
+              "gui": "the classic interface"}.get(run.source, run.source)
     when = format_when(run.created)
     if run.seconds is not None:
         sessions = run.record.get("sessions") or []

@@ -773,6 +773,12 @@ class ModelTabMixin:
                 refresh()
             except Exception:  # noqa: BLE001 - cosmetic
                 pass
+        follow = getattr(self, "_ft_model_changed", None)       # 2.26: the Fine-tune tab
+        if callable(follow):
+            try:
+                follow()
+            except Exception:  # noqa: BLE001 - cosmetic
+                pass
 
     def merge_lora_adapters(self):
         """Fold the LoRA adapters into the weights (a plain model again)."""
@@ -781,6 +787,11 @@ class ModelTabMixin:
         if not self.engine.has_lora():
             messagebox.showinfo("Merge LoRA", "The model in memory has no LoRA adapters (train "
                                               "with a LoRA rank, or load an adapter).")
+            return
+        # 2.26: a 4-bit base becomes float32 when merged - ask first, as the Studio does
+        from auralite.studio.modelinfo import merge_question
+        question = merge_question(self.engine)
+        if question and not messagebox.askyesno("Merge into full precision?", question):
             return
         try:
             merged = self.engine.merge_lora()

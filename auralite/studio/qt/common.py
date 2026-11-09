@@ -8,7 +8,6 @@ modal dialog.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QFileDialog, QFrame, QHBoxLayou
 
 from ..errors import FriendlyError, explain_error
 from ..logs import log_dir
+from ..settingsfile import SETTINGS_FORMAT, read_settings, write_settings  # noqa: F401
 
 log = logging.getLogger("auralite.studio")
 
@@ -97,18 +97,23 @@ def training_callback(job: Job, min_interval: float = 0.12) -> Callable[..., Non
 def run_training(job: Job, engine: Any, recorder: Any, data: Any, params: dict) -> Any:
     """``engine.train`` with the run recorded in the library (2.20): its curve,
     its checkpoint, and at the end its model (in the run's folder) or its error.
-    Runs on the job's thread; the summary is the job's result."""
-    try:
-        summary = engine.train(data, params,
-                               progress_callback=recorder.callback(training_callback(job)),
-                               stop_event=job.stop_event, finish_event=job.finish_event)
-    except BaseException as exc:
-        recorder.fail(exc)
-        raise
-    if not (isinstance(summary, dict) and summary.get("stopped_during")):
-        job.progress.emit(("stage", "Saving the run in the library…", None))
-    recorder.save_and_finish(summary, engine)
-    return summary
+    Runs on the job's thread; the summary is the job's result. (2.26: the steps are
+    :func:`auralite.studio.runner.train_recorded`, the classic interface's too.)"""
+    from ..runner import train_recorded
+    return train_recorded(engine, recorder, data, params, training_callback(job),
+                          stop_event=job.stop_event, finish_event=job.finish_event,
+                          on_event=job_events(job))
+
+
+def job_events(job: Job) -> Callable[..., None]:
+    """2.26: the ``on_event`` of :mod:`auralite.studio.runner` for a job: the run's
+    recorder becomes ``job.recorder``, every other event goes to ``job.progress``."""
+    def on_event(kind: str, *payload: Any) -> None:
+        if kind == "recorder":
+            job.recorder = payload[0]                       # type: ignore[attr-defined]
+        else:
+            job.progress.emit((kind, *payload))
+    return on_event
 
 
 # ----------------------------------------------------------------------
@@ -205,10 +210,6 @@ def package_note(module: str) -> str:
     return f"Needs the package «{module}»: " + (hints[0] if hints else f"pip install {module}")
 
 
-#: 2.24: what a settings file of the Studio says it is (Save settings… / Load settings…)
-SETTINGS_FORMAT = "auralite-studio-settings"
-
-
 def save_settings_file(parent: QWidget | None, tab: str, settings: dict[str, Any],
                        data: list[str] | None = None, **extra: Any) -> str:
     """Write a tab's settings (and its data's paths) to a JSON file the user picks (2.24:
@@ -216,11 +217,7 @@ def save_settings_file(parent: QWidget | None, tab: str, settings: dict[str, Any
     path = ask_save(parent, "Save the settings", "Settings (*.json)", f"{tab}-settings.json")
     if not path:
         return ""
-    doc = {"format": SETTINGS_FORMAT, "version": 1, "tab": tab, "settings": dict(settings),
-           "data": list(data or []), **extra}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2)
-    return path
+    return write_settings(path, tab, settings, data, **extra)
 
 
 def load_settings_file(parent: QWidget | None, tab: str) -> dict[str, Any] | None:
@@ -229,14 +226,7 @@ def load_settings_file(parent: QWidget | None, tab: str) -> dict[str, Any] | Non
     path = ask_open(parent, "Load settings", "Settings (*.json);;All files (*)")
     if not path:
         return None
-    with open(path, encoding="utf-8") as f:
-        doc = json.load(f)
-    if not isinstance(doc, dict) or doc.get("format") != SETTINGS_FORMAT:
-        raise ValueError(f"{os.path.basename(path)} is not a settings file of AuraLite Studio")
-    if doc.get("tab") != tab:
-        raise ValueError(f"{os.path.basename(path)} holds settings of the {doc.get('tab')} "
-                         f"tab, not of the {tab} tab")
-    return doc
+    return read_settings(path, tab)
 
 
 def open_path(path: str) -> bool:

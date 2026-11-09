@@ -10,9 +10,8 @@ from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QListWi
 
 from auralite import runs as runlib
 
-from ..advisor import recommend_finetune
-from ..hardware import Hardware, format_gb
-from ..progress import format_duration
+from ..hardware import Hardware
+from ..startinfo import fit_lines, interrupted_text
 from .common import heading, hint, primary
 
 if TYPE_CHECKING:
@@ -126,17 +125,8 @@ class StartTab(QWidget):
         self.interrupted.setVisible(run is not None)
         if run is None:
             return
-        step = run.progress.get("step")
-        saved = run.record.get("checkpoint_saved") or {}
-        text = (f"<b>A run was interrupted:</b> {_html(run.name)}"
-                + (f", at step {int(step):,}" if step else "") + ". ")
-        if saved.get("step"):
-            text += (f"Its checkpoint is from step {int(saved['step']):,} "
-                     f"({runlib.format_when(saved.get('time'))}); ")
-        text += "it continues from there exactly as it would have gone on."
-        if len(runs) > 1:
-            text += f" ({len(runs) - 1} more in the library.)"
-        self.interrupted_label.setText(text)
+        headline, rest = interrupted_text(run, len(runs) - 1)      # 2.26: shared with tk
+        self.interrupted_label.setText(f"<b>{_html(headline)}</b>{_html(rest)}")
 
     def _continue_interrupted(self) -> None:
         if self.interrupted_run is not None:
@@ -166,32 +156,7 @@ class StartTab(QWidget):
         self.hardware_label.setText("\n".join(hw.summary_lines()))
         self.speed_button.setText("Run the speed test again" if hw.gflops
                                   else "Run the speed test (1 s)")
-        rec = recommend_finetune(hw)
-        lines = [f"Memory a run may use: {format_gb(rec.budget)}"]
-        choice = rec.choice
-        if choice is None:
-            lines.append("None of the catalog's models fits: a small model trained from "
-                         "scratch does")
-        else:
-            lines.append(f"Recommended to fine-tune: {choice.model.name}, "
-                         f"{choice.method_label}")
-            speed = (f", ~{choice.tokens_per_second:,.0f} tokens/s"
-                     if choice.tokens_per_second else "")
-            hours = (f", ~{format_duration(choice.hours * 3600)} for 1,000 dialogs "
-                     f"(2 passes)" if choice.hours is not None else "")
-            lines.append(f"about {format_gb(choice.memory)} of memory{speed}{hours}")
-        usable = [f for f in rec.options if f.usable]
-        if usable:
-            biggest = max(usable, key=lambda f: f.model.params)
-            if choice is None or biggest.model is not choice.model:
-                took = (f", ~{format_duration(biggest.hours * 3600)}"
-                        if biggest.hours is not None else "")
-                lines.append(f"The biggest that fits: {biggest.model.name} "
-                             f"({biggest.method_label}{took})")
-        lines += rec.warnings
-        if not rec.measured:
-            lines.append("Times are rough until the speed test runs.")
-        self.fit_label.setText("\n".join(lines))
+        self.fit_label.setText("\n".join(fit_lines(hw)))         # 2.26: shared with tk
 
     def refresh_recent(self) -> None:
         self.recent.clear()

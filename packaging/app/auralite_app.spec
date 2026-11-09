@@ -23,7 +23,7 @@ VERSION_INFO = os.environ.get("AURALITE_APP_VERSION_INFO") or None   # Windows: 
 # interface and the optional parts that come with pip's extras. Excluded even when the build
 # environment has them installed, so every build holds the same parts.
 LEFT_OUT = [
-    "auralite.gui", "tkinter", "_tkinter", "matplotlib", "PIL",
+    "auralite.gui", "tkinter", "_tkinter", "matplotlib",
     "transformers", "peft", "accelerate", "bitsandbytes", "sentencepiece", "tiktoken",
     "datasets", "pyarrow", "pandas", "huggingface_hub",
     "llama_cpp", "onnx", "onnxruntime", "onnxscript", "torchao",
@@ -42,7 +42,7 @@ hiddenimports = collect_submodules("auralite", filter=lambda name: not name.star
 # The metadata `auralite doctor`, the self-test and the libraries themselves read.
 datas = []
 for dist in ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "shiboken6",
-             "safetensors", "tokenizers", "zstandard", "psutil"):
+             "safetensors", "tokenizers", "zstandard", "psutil", "pillow"):
     try:
         datas += copy_metadata(dist)
     except Exception:              # an optional part this environment does not have

@@ -129,7 +129,7 @@ class AuraLiteAgent:
                     break
                 name = call["name"]
                 args = call["args"]
-                result: ToolResult = dispatch_tool(name, args, self.sandbox)
+                result: ToolResult = self._dispatch(name, args)
                 step.tool_results.append(result)
                 tool_result_parts.append(f"[TOOL RESULT: {name}]\n{result.to_text()}\n[/TOOL RESULT]")
 
@@ -182,17 +182,19 @@ class AuraLiteAgent:
                 args = call["args"]
 
                 yield f"\n\n[TOOL RESULT: {name}]\n"
-                result: ToolResult = dispatch_tool(name, args, self.sandbox)
+                result: ToolResult = self._dispatch(name, args)
                 out = result.to_text()
                 yield out
                 yield "\n[/TOOL RESULT]\n"
                 result_parts.append(f"[TOOL RESULT: {name}]\n{out}\n[/TOOL RESULT]")
 
                 if self.on_step:
+                    # 2.26: the call this result answers (all of them before: a window
+                    # that logs each step listed every call again with each result)
                     self.on_step(AgentStep(
                         iteration=iteration,
                         model_output=model_output,
-                        tool_calls=tool_calls,
+                        tool_calls=[call],
                         tool_results=[result],
                     ))
 
@@ -200,6 +202,15 @@ class AuraLiteAgent:
                 "role": "user",
                 "content": "\n\n".join(result_parts) + "\n\nPlease continue.",
             })
+
+    def _dispatch(self, name: str, args: dict) -> ToolResult:
+        """Run the tool call `name` - only a tool of ``enabled_tools`` (2.26): before, the
+        list only shaped the system prompt, and a model that wrote a call to a tool left
+        out of it (Python, say) still had it run."""
+        if name not in self.enabled_tools:
+            return ToolResult.fail(f"Tool '{name}' is not enabled here. Enabled tools: "
+                                   f"{', '.join(self.enabled_tools)}")
+        return dispatch_tool(name, args, self.sandbox)
 
     def _build_initial_messages(self, user_message: str, history) -> list:
         messages: list = [{"role": "system", "content": self._system_prompt}]

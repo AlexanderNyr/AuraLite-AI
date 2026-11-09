@@ -117,6 +117,8 @@ class MenuMixin:
             self.gui_config.save()
         except Exception:                          # a read-only home: remembered this run
             pass
+        if hasattr(self, "start_recent"):          # 2.26: the Start tab's list follows
+            self._start_refresh_recent()           # type: ignore[attr-defined]
 
     def _fill_recent_menu(self) -> None:
         menu = self.recent_menu
@@ -210,6 +212,9 @@ class MenuMixin:
             pass
         self.speed_label.config(text=self._speed_text())
         print(f"[AuraLite] Speed test: {gflops:,.0f} GFLOP/s")
+        measured = getattr(self, "_hardware_measured", None)     # 2.26: the Start tab's fit
+        if callable(measured):
+            measured(gflops)
 
     def _speed_failed(self, message: str) -> None:
         self.speed_label.config(text=self._speed_text())

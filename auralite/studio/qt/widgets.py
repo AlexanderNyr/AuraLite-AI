@@ -1,5 +1,5 @@
 """The Studio's own widgets: the loss chart, the run panel and the data picker (2.19);
-the curves of runs in the library (2.20)."""
+the curves of runs in the library (2.20); the Chat tab's insights (2.26)."""
 from __future__ import annotations
 
 import os
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPu
                                QSizePolicy, QVBoxLayout, QWidget)
 
 from ..datacheck import DataReport, inspect_data
+from ..insights import MAX_LABELLED
 from ..progress import ProgressTracker, ProgressView
 from .common import Job, ask_dir, ask_open, hint, primary
 from .theme import ACCENT
@@ -113,10 +114,11 @@ class CurveChart(QWidget):
     """
 
     def __init__(self, parent: QWidget | None = None,
-                 empty_text: str = "This run has no curve yet"):
+                 empty_text: str = "This run has no curve yet", x_label: str = "step"):
         super().__init__(parent)
         self.series: list[tuple[str, list[tuple[float, float]], list[tuple[float, float]]]] = []
         self.empty_text = empty_text
+        self.x_label = x_label                # 2.26: the Images tab counts epochs
         self.setMinimumHeight(170)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
@@ -176,7 +178,8 @@ class CurveChart(QWidget):
             painter.drawText(QRectF(p.x() - 40, area.bottom() + 3, 80, 16),
                              Qt.AlignmentFlag.AlignCenter, f"{x:,.0f}")
         painter.drawText(QRectF(area.left(), area.bottom() + 3, area.width() / 2 - 44, 16),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "   step")
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         f"   {self.x_label}")
         for (_name, train, val), (train_color, val_color) in zip(self.series, self.colors(),
                                                                  strict=True):
             if train:
@@ -216,6 +219,131 @@ class CurveChart(QWidget):
             painter.drawText(QPointF(x + 18, y), label)
             y += 16
         painter.end()
+
+
+#: 2.26: the heatmap's colors from 0 to the highest attention (close to viridis).
+HEAT_COLORS = ((68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37))
+
+
+def heat_color(value: float) -> QColor:
+    """The heatmap's color of `value` in 0..1."""
+    v = max(0.0, min(1.0, float(value))) * (len(HEAT_COLORS) - 1)
+    i = min(int(v), len(HEAT_COLORS) - 2)
+    t = v - i
+    low, high = HEAT_COLORS[i], HEAT_COLORS[i + 1]
+    return QColor(*(int(round(a + (b - a) * t)) for a, b in zip(low, high, strict=True)))
+
+
+class InsightView(QWidget):
+    """The Chat tab's insights (2.26): bars of the most frequent tokens, or one layer's
+    attention as a heatmap - drawn here, without matplotlib."""
+
+    def __init__(self, parent: QWidget | None = None,
+                 empty_text: str = "Token frequencies and attention maps appear here"):
+        super().__init__(parent)
+        self.mode = ""                                   # "", "bars" or "heatmap"
+        self.bars: list[tuple[str, int]] = []
+        self.matrix: Any = None
+        self.labels: list[str] = []
+        self.title = ""
+        self.empty_text = empty_text
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+    def show_bars(self, bars: list[tuple[str, int]], title: str = "") -> None:
+        self.mode, self.bars, self.title = "bars", list(bars), title
+        self.setMinimumHeight(max(220, 26 + 18 * len(self.bars)))
+        self.update()
+
+    def show_heatmap(self, matrix: Any, labels: list[str], title: str = "") -> None:
+        import numpy as np
+        self.mode, self.title = "heatmap", title
+        self.matrix = np.asarray(matrix, dtype=float)
+        self.labels = list(labels)
+        self.setMinimumHeight(420)
+        self.update()
+
+    def clear(self) -> None:
+        self.mode, self.bars, self.matrix, self.labels, self.title = "", [], None, [], ""
+        self.setMinimumHeight(220)
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        text = palette.color(palette.ColorRole.WindowText)
+        painter.setPen(QPen(text, 1))
+        rect = QRectF(self.rect()).adjusted(8, 6, -8, -6)
+        if self.mode == "bars" and self.bars:
+            self._paint_bars(painter, rect, text)
+        elif self.mode == "heatmap" and self.matrix is not None and self.matrix.size:
+            self._paint_heatmap(painter, rect, text)
+        else:
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.empty_text)
+        painter.end()
+
+    def _paint_title(self, painter: QPainter, rect: QRectF) -> QRectF:
+        if not self.title:
+            return rect
+        painter.drawText(QRectF(rect.left(), rect.top(), rect.width(), 18),
+                         Qt.AlignmentFlag.AlignCenter, self.title)
+        return rect.adjusted(0, 22, 0, 0)
+
+    def _paint_bars(self, painter: QPainter, rect: QRectF, text: QColor) -> None:
+        rect = self._paint_title(painter, rect)
+        metrics = painter.fontMetrics()
+        label_width = min(160.0, max(metrics.horizontalAdvance(label) for label, _ in self.bars)
+                          + 8.0)
+        count_width = metrics.horizontalAdvance(f"{max(c for _, c in self.bars):,}") + 10.0
+        row = max(10.0, min(20.0, rect.height() / max(1, len(self.bars))))
+        top_count = max(1, max(c for _, c in self.bars))
+        span = max(10.0, rect.width() - label_width - count_width)
+        for i, (label, count) in enumerate(self.bars):
+            y = rect.top() + i * row
+            shown = metrics.elidedText(label, Qt.TextElideMode.ElideRight, int(label_width - 6))
+            painter.setPen(QPen(text, 1))
+            painter.drawText(QRectF(rect.left(), y, label_width - 6, row),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, shown)
+            width = span * count / top_count
+            painter.fillRect(QRectF(rect.left() + label_width, y + 2, width, row - 4),
+                             QColor(ACCENT))
+            painter.drawText(QRectF(rect.left() + label_width + width + 4, y, count_width, row),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             f"{count:,}")
+
+    def _paint_heatmap(self, painter: QPainter, rect: QRectF, text: QColor) -> None:
+        rect = self._paint_title(painter, rect)
+        matrix = self.matrix
+        rows, cols = int(matrix.shape[0]), int(matrix.shape[-1])
+        metrics = painter.fontMetrics()
+        labelled = len(self.labels) == cols and cols <= MAX_LABELLED
+        margin = (min(90.0, max((metrics.horizontalAdvance(t) for t in self.labels),
+                                default=0) + 10.0) if labelled else 8.0)
+        side = max(1.0, min((rect.width() - margin - 4) / max(1, cols),
+                            (rect.height() - margin - 4) / max(1, rows)))
+        left, top = rect.left() + margin, rect.top()
+        high = float(matrix.max()) or 1.0
+        for r in range(rows):
+            for c in range(cols):
+                painter.fillRect(QRectF(left + c * side, top + r * side, side + 0.5, side + 0.5),
+                                 heat_color(float(matrix[r, c]) / high))
+        if not labelled:
+            return
+        painter.setPen(QPen(text, 1))
+        every = max(1, int(-(-metrics.height() // side)))     # labels that do not overlap
+        for i, label in enumerate(self.labels):
+            if i % every:
+                continue
+            shown = metrics.elidedText(label, Qt.TextElideMode.ElideRight, int(margin - 8))
+            painter.drawText(QRectF(rect.left(), top + i * side, margin - 4, side),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, shown)
+            painter.save()
+            painter.translate(left + (i + 1) * side, top + rows * side + 4)
+            painter.rotate(90)
+            painter.drawText(QRectF(0, 0, margin - 4, side), Qt.AlignmentFlag.AlignLeft |
+                             Qt.AlignmentFlag.AlignVCenter, shown)
+            painter.restore()
 
 
 class RunPanel(QWidget):

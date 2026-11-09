@@ -44,18 +44,27 @@ def plot_token_distribution(ax, pairs, top: int = 20, title: str | None = None):
     return ax
 
 
-def plot_attention_heatmap(ax, matrix, tokens=None, title: str | None = None):
-    """Heatmap of an attention matrix ``(T, T)`` (averaged over heads or single).
+def plot_attention_heatmap(ax, matrix, tokens=None, title: str | None = None,
+                           max_labels: int = 48):
+    """Heatmap of an attention matrix ``(T, T)`` - or ``(heads, T, T)``, drawn as the
+    heads' average (2.26: such a map raised "Invalid shape" before).
 
-    ``tokens`` — optional per-position labels (decoded token strings).
+    ``tokens`` — optional per-position labels (decoded token strings), drawn when there
+    are at most `max_labels` of them (more would overlap).
     """
     ax.clear()
     if matrix is None or getattr(matrix, "size", 0) == 0:
         ax.set_title(title or "Attention (empty)")
         return ax
-    ax.imshow(matrix, aspect="auto", cmap="viridis", vmin=0.0)
-    size = matrix.shape[-1] if hasattr(matrix, "shape") else 0
-    if tokens is not None and size:
+    import numpy as np
+    data = np.asarray(matrix, dtype=float)
+    if data.ndim == 3:
+        data = data.mean(axis=0)
+    if data.ndim != 2:
+        raise ValueError(f"an attention map is (T, T) or (heads, T, T), not {data.shape}")
+    ax.imshow(data, aspect="auto", cmap="viridis", vmin=0.0)
+    size = int(data.shape[-1])
+    if tokens is not None and 0 < size <= max(1, int(max_labels)):
         labels = [_visible(t) for t in list(tokens)[:size]]
         ax.set_xticks(range(len(labels)), labels, rotation=90)
         ax.set_yticks(range(len(labels)), labels)

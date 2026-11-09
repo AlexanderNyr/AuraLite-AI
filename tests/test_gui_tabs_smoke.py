@@ -91,12 +91,13 @@ def app(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------
 #  P1.5 — every tab builds and survives its handlers
 # ----------------------------------------------------------------------
-def test_all_nine_tabs_are_built(app):
-    assert app._tab_names == ["train", "image", "gen", "chat", "model", "quant",
-                              "eval", "export", "console"]
+def test_all_eleven_tabs_are_built(app):
+    # 2.26: Start and Fine-tune, as the Studio has them
+    assert app._tab_names == ["start", "train", "finetune", "image", "gen", "chat", "model",
+                              "quant", "eval", "export", "console"]
     for name in app._tab_names:
         assert hasattr(app, f"tab_{name}"), f"tab_{name} missing"
-    assert app.notebook.add.call_count == 9
+    assert app.notebook.add.call_count == 11
     assert app.notebook.pack.called
 
 

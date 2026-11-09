@@ -48,13 +48,13 @@ SPEC = HERE / "auralite_app.spec"
 REQUIREMENTS = HERE / "requirements.txt"
 #: The longest path inside the zip, its top folder included, that still unzips everywhere:
 #: Windows allows 260 characters, and a deep destination such as
-#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.25.0-windows-x64\ takes about 90.
+#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.26.0-windows-x64\ takes about 90.
 PATH_BUDGET = 160
 #: The distributions the app runs with (their dependencies follow); their licenses ship.
 RUNTIME_ROOTS = ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "safetensors",
-                 "tokenizers", "zstandard", "psutil")
+                 "tokenizers", "zstandard", "psutil", "pillow")      # 2.26: Pillow
 #: Required by a root but left out of the app (the spec's LEFT_OUT): no license to ship.
-NOT_BUNDLED = {"matplotlib", "huggingface-hub", "pillow"}
+NOT_BUNDLED = {"matplotlib", "huggingface-hub"}
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 

@@ -13,15 +13,17 @@ from Hugging Face.
 *The Start tab on a 4-core i5-2400 with 8 GB (the example computer of these
 screenshots).*
 
-Everything the classic interface (`auralite-gui`, tkinter) does is moving into the
-Studio, in parts: since 2.24 its Train, Generate and Export tabs ([the Train tab's
-expert settings](#everything-the-train-tab-sets-224), [the Generate
-tab](#the-generate-tab-224)), since 2.25 its Quant, Eval and Model tabs ([the Model,
-Quantize and Evaluate tabs](#the-model-quantize-and-evaluate-tabs-225)); images and the
-chat's agent mode follow in 2.26. Until then *Tools → Classic interface* opens it (in
-AuraLite installed with Python; the Windows app leaves it out). The classic interface
-stays, and what the Studio has goes into it as well ([docs/classic.md](classic.md),
-with the table of what is where).
+Everything the classic interface (`auralite-gui`, tkinter) does is in the Studio too,
+moved in parts: in 2.24 its Train, Generate and Export tabs ([the Train tab's expert
+settings](#everything-the-train-tab-sets-224), [the Generate
+tab](#the-generate-tab-224)), in 2.25 its Quant, Eval and Model tabs ([the Model,
+Quantize and Evaluate tabs](#the-model-quantize-and-evaluate-tabs-225)), in 2.26 its
+Image tab and the chat's agent mode and insights ([the Images tab](#the-images-tab-226),
+[agent mode and insights](#the-chats-agent-mode-and-insights-226)). *Tools → Classic
+interface* opens it (in AuraLite installed with Python; the Windows app leaves it out).
+The classic interface stays, and what the Studio has goes into it as well — since 2.26
+its own Start and Fine-tune tabs ([docs/classic.md](classic.md), with the table of what
+is where).
 
 ## Install and start
 
@@ -60,8 +62,9 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | **Start** | this computer (memory, processor, GPU, disk, a one-second speed test), the model that fits it best, recent models, and the three ways in: fine-tune a ready model, train a new one, open a model |
 | **Train** | a new model from scratch, from your texts: the size (sized to the memory and the data) or a shape of your own, the tokenizer (or one of your own), the window, a time limit; a prepared dataset for big data, several computers, the model in memory trained further, settings files (2.24) |
 | **Fine-tune** | everything for models that already exist: the base, your data, the method (QLoRA, LoRA, every weight), dialogs written by a teacher model, the LoRA adapters |
-| **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog. A model trained on plain text continues what you write (*continue the text*, 2.21.3) |
+| **Chat** | talk to the model in memory, reply by reply as it writes; save the chat as a `.jsonl` dialog. A model trained on plain text continues what you write (*continue the text*, 2.21.3). Since 2.26 the agent mode (the model calls tools: Python, commands, files, a web search) and the insights (the reply's tokens, an attention map) |
 | **Generate** (2.24) | the model writes on from a prompt with every sampling setting: temperature, top-k, top-p, min-p, the repetition penalty; several prompts in a batch, a draft first (thinking), web snippets as context; save, append or copy the text |
+| **Images** (2.26) | an image generator of your own, trained from scratch on a folder of images: diffusion, flow matching or a GAN, every setting; samples, the images and the model saved, a model opened, the quality measured |
 | **Model** (2.25) | what the model in memory is; GGUF files with llama.cpp's settings; a Hugging Face model imported into AuraLite or run by transformers (4-bit, 8-bit, LoRA adapters, a fine-tune), the Hub; AuraLite's own LoRA adapters merged, saved, loaded |
 | **Quantize** (2.25) | the model made smaller: dynamic and static INT8, QAT, GPTQ, AWQ, HQQ, FP16/BF16/FP8, with their settings and calibration text; the benchmark, every method compared, the weights saved, the original back |
 | **Evaluate** (2.25) | a chat model on dialogs it did not train on (stopped by itself, exact replies, the loss of the replies); benchmarks of lm-evaluation-harness (ARC, HellaSwag, MMLU, …) |
@@ -212,6 +215,72 @@ of the reference replies — with examples; *Save the results…* keeps them as 
 common ones), few-shot, batch and a limit per task — it needs `pip install lm_eval` and
 downloads its datasets.
 
+## The Images tab (2.26)
+
+The classic interface's Image tab: an image generator of your own, trained from scratch
+on a folder of images — no pretrained weights, and small sizes train on a CPU
+([docs/image.md](image.md) has the engine and how it was measured).
+
+- **The model type**: *Diffusion (DDPM)* (the reference: stable, 10–50 network calls per
+  image), *Flow matching* (a straight path from noise to the image, as in Stable
+  Diffusion 3) or *GAN* (R3GAN: one network call per image). *Preset* fills the form —
+  *Tiny (CPU-friendly)*, *Small (default)*, larger ones for a GPU, and the flow and GAN
+  presets.
+- **Every setting**, in four groups, each shown for the types it applies to: the network
+  (the image size — 16 to 128 pixels —, colour or grayscale, the width, the res-blocks,
+  the channel multipliers and attention resolutions: *auto* or a comma list), the
+  diffusion or flow process (the steps, the noise schedule, what the network predicts,
+  Min-SNR, the flow's time sampling, mixed precision, EMA, gradient checkpointing,
+  `torch.compile`, mirrored images, *classes from sub-folders*), the GAN (the latent size,
+  the loss, both learning rates, the R1/R2 penalty, the adaptive augmentation) and the
+  optimization (epochs, batch, learning rate and schedule, warm-up, accumulation, weight
+  decay, clipping, the seed, autosave, the validation share, early stopping).
+- **Train**: *Choose the image folder…* counts the images (PNG, JPEG, BMP, WebP, GIF,
+  TIFF; one sub-folder per class for a model that learns classes), *Start training* shows
+  the setup's stages on the bar, then the loss per epoch on the chart (the validation as
+  dots; for a GAN the generator's and the discriminator's); *Stop* keeps the weights so
+  far, and *Continue training the model in memory* trains them further.
+- **Generate**: up to 36 images with the type's sampler (DPM-Solver++; DDIM and DDPM
+  for diffusion, Euler and Heun for flow matching), the steps, η, a seed and the EMA
+  weights; for a model with classes the class (or one of each) and the guidance, for a
+  GAN the truncation.
+  *Save the images…* writes `sample_000.png`… and a `grid.png`; *Save the model…* and
+  *Open a model…* (`.pt`, `.safetensors`). *Measure the quality* generates up to 256
+  images and compares them with the folder's (patch SWD: lower is better, next to what
+  two sets of real images score).
+
+Training and measuring the quality read image files, which needs Pillow (`pip install
+pillow`; the Windows app brings it since 2.26) — without it the tab says so, and
+generating, saving and opening a generator still work. An image run is a job like a
+training: other tabs wait while it runs, and closing the Studio, or opening another
+generator, asks first when the trained one is not saved.
+
+## The chat's agent mode and insights (2.26)
+
+The classic Chat tab's two extras, below the chat (drag the bar between them):
+
+**Agent mode** (*Agent mode: the model may use tools*): the model calls tools — Python,
+a shell command, reading, writing and listing files, installing a package, a web search,
+a calculator — reads their results and then answers. The tools run on this computer, with
+your permissions, in a temporary folder that is deleted afterwards: that limits the
+damage of a mistake, it is not a security boundary, and the Studio says so the first
+time agent mode is turned on in a session. *Agent mode: tools and the sandbox log*
+lists the tools — turn on only the ones you need; the agent can call nothing else —,
+the steps an answer may take (1–30, 8 by default), the seconds a tool may run (1–600,
+15) and the log of every call and its result. One chat keeps one temporary folder, so a
+file the agent wrote is there for the next message; *New chat* and turning agent mode
+off delete it. In the Windows app, which has no Python of its own, the Python tools use
+a Python found on the PATH, and are off when there is none. Agent mode suits models
+trained or fine-tuned for tool calls: a small model of your own mostly answers without
+them.
+
+**Insights** (*Insights: the reply's tokens and the model's attention*): *Token
+frequencies* shows the 20 most frequent tokens of the model's last reply; *Attention
+map* shows where each token of the last exchange looked in one layer — the average of
+the heads or one head, over the last 8–256 tokens (64 by default; up to 48 get a label;
+brighter is more attention). They read AuraLite's own models: a GGUF file or a model run
+by transformers has no attention to look into.
+
 ## Chatting with a model you trained from scratch (2.21.3)
 
 A model trained on plain text — a story, your notes — has learned to write on from
@@ -274,8 +343,9 @@ the computer, the models that fit and the `auralite train` command;
 
 ## The Library: runs, models, datasets (2.20)
 
-Every training run is kept: the runs of the Train and Fine-tune tabs, and of
-`auralite train` in a terminal. *Tools → Library* (Ctrl+L) opens them.
+Every training run is kept: the runs of the Train and Fine-tune tabs, of the classic
+interface's Fine-tune tab (2.26), and of `auralite train` in a terminal. *Tools →
+Library* (Ctrl+L) opens them.
 
 **Runs.** Each run has its name (*Fine-tune SmolLM2-135M-Instruct on
 chats.jsonl* — rename it), its status, its curve (the training loss as a line,

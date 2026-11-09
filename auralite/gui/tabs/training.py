@@ -1135,41 +1135,7 @@ class TrainTabMixin:
                     "number of other computers to 0.")
                 return
 
-        self.stop_event.clear()
-        self.finish_event.clear()
-        self.stop_btn.config(text="🛑 Stop")
-        self.loss_history = []
-        # Reset ETA tracking
-        self.train_start_time = time.time()
-        self.epoch_times = []
-        self._last_epoch_ts = self.train_start_time
-        self._set_progress_bar(0.0)
-        self._progress_ui_last_ts = 0.0
-        self._progress_ui_pending = None
-        try:
-            self.progress_detail_var.set("Preparing for training…")
-        except Exception:
-            pass
-        self._train_phase = "setup"
-        self.status_label.config(text="Status: Starting… ⏳")
-        self._set_tokenizer_buttons(tk.DISABLED)
-        self.train_btn.config(state=tk.DISABLED)
-        self.file_btn.config(state=tk.DISABLED)
-        self.folder_btn.config(state=tk.DISABLED)
-        self.gen_btn.config(state=tk.DISABLED)
-        self.load_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-
-        if gui_common.HAS_MATPLOTLIB:
-            self.ax.clear()
-            self.ax.set_xlabel("Epoch")
-            self.ax.set_ylabel("Loss")
-            self.ax.set_title("Training Loss")
-            self.canvas.draw()
-        else:
-            self.loss_text.config(state=tk.NORMAL)
-            self.loss_text.delete("1.0", tk.END)
-            self.loss_text.config(state=tk.DISABLED)
+        self._begin_train_ui()
 
         def run():
             try:
@@ -1397,6 +1363,45 @@ class TrainTabMixin:
         """Stop after the current prompt; the same output file resumes later."""
         self._distill_stop.set()
         self.distill_status.config(text="Stopping after this prompt…")
+
+    def _begin_train_ui(self):
+        """A run begins on this tab: the bar, the buttons, the chart (2.26: a run the Start
+        tab continues begins here too)."""
+        self.stop_event.clear()
+        self.finish_event.clear()
+        self.stop_btn.config(text="🛑 Stop")
+        self.loss_history = []
+        # Reset ETA tracking
+        self.train_start_time = time.time()
+        self.epoch_times = []
+        self._last_epoch_ts = self.train_start_time
+        self._set_progress_bar(0.0)
+        self._progress_ui_last_ts = 0.0
+        self._progress_ui_pending = None
+        try:
+            self.progress_detail_var.set("Preparing for training…")
+        except Exception:
+            pass
+        self._train_phase = "setup"
+        self.status_label.config(text="Status: Starting… ⏳")
+        self._set_tokenizer_buttons(tk.DISABLED)
+        self.train_btn.config(state=tk.DISABLED)
+        self.file_btn.config(state=tk.DISABLED)
+        self.folder_btn.config(state=tk.DISABLED)
+        self.gen_btn.config(state=tk.DISABLED)
+        self.load_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+
+        if gui_common.HAS_MATPLOTLIB:
+            self.ax.clear()
+            self.ax.set_xlabel("Epoch")
+            self.ax.set_ylabel("Loss")
+            self.ax.set_title("Training Loss")
+            self.canvas.draw()
+        else:
+            self.loss_text.config(state=tk.NORMAL)
+            self.loss_text.delete("1.0", tk.END)
+            self.loss_text.config(state=tk.DISABLED)
 
     def _reset_train_buttons(self):
         self._train_phase = ""

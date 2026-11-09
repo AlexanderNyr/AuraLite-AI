@@ -1,3 +1,69 @@
+# 📦 v2.26.0 — The Studio makes images, runs the agent and shows the insights; the classic interface gets Start and Fine-tune
+
+Part 3, the last, of moving everything the classic interface (tkinter) does into AuraLite
+Studio — the Studio now has all of it — and the second step the other way: the classic
+interface gets the Studio's Start and Fine-tune tabs. Both run the same code for them
+(`auralite/studio/runner.py`, `finetuneform.py`, `settingsfile.py`, `startinfo.py`,
+`agentmode.py`, `insights.py`, `imagegen.py`: no toolkit inside), so they show the same
+choices, say the same things and read each other's settings files.
+[docs/classic.md](docs/classic.md) has the table of what is where.
+
+- **The Images tab** (Studio): an image generator of one's own, trained from scratch on a
+  folder of images — diffusion, flow matching or a GAN, the presets and every setting of
+  the classic Image tab (the network, the diffusion or flow process, the GAN, the
+  optimization with validation, early stopping and autosave, classes from sub-folders).
+  The setup's stages on the bar, the loss per epoch on the chart (a GAN's generator and
+  discriminator), *Stop* keeps the weights so far. Samples with each type's samplers,
+  steps, η, a seed, EMA weights, a class with guidance or the GAN's truncation; the images
+  saved (with a grid), the model saved and opened, the quality measured against the folder
+  (patch SWD). Generating, saving and opening need no Pillow (Qt writes the PNG files);
+  training and the quality say when Pillow is missing. Closing the Studio or opening
+  another generator asks first when the trained one is not saved.
+- **The chat's agent mode** (Studio): the model calls tools — Python, commands, files in
+  a temporary folder, a web search, a calculator — and reads their results before it
+  answers. A warning the first time in a session (it is not a security boundary), a check
+  box per tool, the steps an answer may take (1–30) and the seconds a tool may run
+  (1–600), the log of every call and its result. One temporary folder per chat (a file
+  the agent wrote is there for the next message), deleted by *New chat* or turning agent
+  mode off. In the Windows app the Python tools use a Python on the PATH, or are off.
+- **The chat's insights** (Studio): the 20 most frequent tokens of the last reply, and one
+  layer's attention over the last exchange — the heads' average or one head, over the last
+  8–256 tokens — drawn by the Studio itself (no matplotlib). AuraLite's own models only;
+  a GGUF or transformers model says why not.
+- **The classic interface's Start tab**: this computer, what fits it (the same lines as
+  the Studio's), the speed test, the three ways in, the recent models, and a card for an
+  interrupted run that continues it from its checkpoint exactly where it stood — a new
+  model's run on the Train tab, a fine-tune on the Fine-tune tab — or dismisses it.
+- **The classic interface's Fine-tune tab**: the base from the catalog (fits / tight /
+  too big, the recommended one starred), a Hugging Face name or folder, an AuraLite file
+  or the model in memory; the data's report; QLoRA, LoRA or every weight with the
+  advanced settings, preference pairs' objective, beta and passes; the advisor's estimate;
+  *Start*, *Finish*, *Stop*; save, chat, export, merge, save and load adapters afterwards;
+  settings files the Studio reads too. Its runs are recorded in the library (the source
+  shows as *the classic interface*) with a checkpoint every 10 minutes.
+- **The classic Chat tab** chooses the agent's tools, its steps and the seconds per tool,
+  warns once a session, keeps one temporary folder per chat (*Clear* deletes it) and puts
+  the message back when the agent cannot start (no tool on); the attention map takes a
+  head (or the average) and how many tokens it covers. The agent's fields start from
+  `AURALITE_AGENT_MAX_ITERATIONS` and `AURALITE_AGENT_TOOL_TIMEOUT` in both interfaces.
+- **The agent runs only the tools it was given.** `AuraLiteAgent(enabled_tools=...)` used
+  the list for the system prompt only: a model that wrote a call to a tool left out of it
+  still had it run. Such a call now gets an error naming the enabled tools. In streaming
+  mode each step reports the call its result answers (every call of the turn before).
+- **Fixed in the classic interface:** the attention map failed for every model (the
+  engine returns one map per head, the plot wanted one); the agent's history left out the
+  model's last reply; the session restored the first tab instead of the one shown last;
+  merging LoRA adapters into a 4-bit base now asks first, as the Studio does (merged, every
+  weight is float32).
+- **Both interfaces:** "Training complete · 12 s. Saved in the library" (the period was
+  missing), and an interrupted run whose checkpoint's step is unknown reads as two
+  sentences.
+- **The Windows app brings Pillow** (13.0.0), so the Images tab trains there; the app's
+  smoke test has an eighth step: an image generator trained on a folder of PNG files
+  writes its samples.
+- Next: 2.27 brings the library, the setup wizard, recorded Train runs, explained errors
+  and log files to the classic interface; then the Russian interface.
+
 # 📦 v2.25.0 — The Studio quantizes, evaluates and opens every kind of model; the classic interface gets the Studio's menu
 
 Part 2 of moving everything the classic interface (tkinter) does into AuraLite Studio, and

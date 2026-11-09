@@ -1035,8 +1035,8 @@ class TrainTab(QWidget):
         saved = run is not None and self.studio.run_saved(run)
         text = summary_text(summary, time.time() - self._started, stopped)
         if run is not None and saved:
-            text += (tr(" Saved in the library: it can continue from there.")
-                     if run.continue_state()[0] else tr(" Saved in the library."))
+            text += (tr(". Saved in the library: it can continue from there.")
+                     if run.continue_state()[0] else tr(". Saved in the library."))
         self.panel.end(text, complete=ended_by_itself(summary, stopped))
         self.studio.end(model_dirty=not saved)
         self._model_changed()

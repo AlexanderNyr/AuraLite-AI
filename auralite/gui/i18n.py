@@ -25,7 +25,9 @@ LANGUAGES = {"en": "English"}
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         # tabs
+        "tab.start": " Start ",              # 2.26
         "tab.train": " Train ",
+        "tab.finetune": " Fine-tune ",       # 2.26
         "tab.image": " Image ",
         "tab.gen": " Generate ",
         "tab.chat": " Chat ",
@@ -45,6 +47,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "btn.attention": "🔥 Attention map",
         "lbl.tokens": "Tokens",
         "lbl.attention_layer": "Layer",
+        "lbl.attention_head": "Head (avg or 1…)",   # 2.26
         "lbl.status": "Status",
         # app messages
         "msg.session_restored": "Session restored: {what}",

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["model_info_lines"]
+__all__ = ["merge_question", "model_info_lines"]
 
 
 def model_info_lines(engine: Any) -> list[str]:
@@ -98,3 +98,25 @@ def model_info_lines(engine: Any) -> list[str]:
             for k, v in engine.params_used.items():
                 lines.append(f"  {k} = {v}")
     return lines
+
+
+def merge_question(engine: Any) -> str:
+    """2.26: what to ask before merging LoRA adapters into a base stored in 4 bits (merged,
+    every weight is a float32 one); "" when there is nothing to ask. The Studio and the
+    classic interface ask the same."""
+    from .hardware import format_gb
+    model = getattr(engine, "model", None)
+    if model is None:
+        return ""
+    native = getattr(model, "module", model)
+    try:
+        from auralite.engine.nf4 import nf4_layers
+        quantized = bool(nf4_layers(native))
+    except Exception:
+        quantized = False
+    if not quantized:
+        return ""
+    need = int(native.count_parameters()) * 4
+    return (f"The base is stored in 4 bits. Merged, every weight is a float32 one: about "
+            f"{format_gb(need)} of memory and a bigger file, but fast replies. Save the "
+            f"adapters first to keep the small version.\n\nMerge now?")

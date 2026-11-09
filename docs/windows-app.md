@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.25.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.25.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.26.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.26.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -110,14 +110,15 @@ remove your models, runs and settings.
 ## What the app leaves out
 
 The app carries what the Studio needs — the engine, Hugging Face downloads and
-export, GGUF export, the fast `tokenizers` package, `.zst` data — and leaves out
-the large optional parts. Each comes with AuraLite installed with Python
-(`pip install "auralite-ai[EXTRA]"`, [quickstart](quickstart.md)); the app says so
-when you reach one.
+export, GGUF export, the fast `tokenizers` package, `.zst` data and (2.26) Pillow,
+with which the Images tab trains its picture generator on a folder of pictures and
+measures its quality — and leaves out the large optional parts. Each comes with
+AuraLite installed with Python (`pip install "auralite-ai[EXTRA]"`,
+[quickstart](quickstart.md)); the app says so when you reach one.
 
 | Left out | What it is for | With Python |
 |---|---|---|
-| the classic interface | `auralite-gui` (tkinter): images, quantization, evaluation, the transformers backend | `pip install auralite-ai`, then `auralite-gui` |
+| the classic interface | `auralite-gui` (tkinter): the same tabs as the Studio, in the older look | `pip install auralite-ai`, then `auralite-gui` |
 | transformers, PEFT | models AuraLite's own engine does not import, through transformers | `[hf]` |
 | Hugging Face datasets, Parquet | `hf:NAME` datasets and `.parquet` files as data | `[data]` |
 | the server | `auralite serve`, the OpenAI-compatible API | `[serve]` |
@@ -165,7 +166,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.25.0-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.26.0-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins
@@ -197,8 +198,9 @@ on many Russian Windows computers (2.21.1): `auralite.exe --version`,
 `auralite.exe doctor --studio`, the Studio's own program with `--self-test`, a
 real start of `AuraLite Studio.exe` with no console that closes itself after a few
 seconds (`AURALITE_STUDIO_SMOKE_SECONDS`), a training run with `auralite.exe
-train`, and `auralite.exe data prepare --workers 2` (worker processes of a frozen
-program). CI's `windows-app` job builds and checks the app on every push and keeps
+train`, `auralite.exe data prepare --workers 2` (worker processes of a frozen
+program) and (2.26) `auralite.exe image-train` on a folder of PNG files (Pillow inside
+the app). CI's `windows-app` job builds and checks the app on every push and keeps
 the zip for a week as the run's artifact; the Release workflow builds it from the
 tag, checks it the same way and attaches it to the release
 ([docs/releasing.md](releasing.md)). A failed check also leaves an annotation with
