@@ -25,6 +25,27 @@ The classic interface stays, and what the Studio has goes into it as well — si
 its own Start and Fine-tune tabs ([docs/classic.md](classic.md), with the table of what
 is where).
 
+## The interface's language (2.28)
+
+The Studio and the classic interface speak English and Russian. At the first start they
+follow the computer's language — Windows' display language, `$LANG` (or `LANGUAGE`,
+`LC_ALL`) elsewhere — and *View → Language* changes it: *Automatic (the computer's
+language)*, *English* or Russian. The choice is saved (the Studio's in `studio.json` in
+the AuraLite folder, the classic interface's in `gui_config.json`, where its footer has
+the same switch) and spoken from the next start: the window offers to restart now, and
+closing asks what closing always asks (a run going on, a model not saved).
+`AURALITE_LANG=ru` or `en` sets the language for a start when none is chosen in the menu.
+
+Both interfaces take their words from one catalogue, `auralite/locale/ru.json`, keyed by
+the English text: what they share — the advisor, the data check, the explained errors,
+the Library's facts, the wizard's plan, the progress of a run — reads the same in both.
+Numbers follow Russian: thousands parted by a space, plurals in their three forms, counts
+that read right with any number. What stays English: the `auralite` commands, the log
+files and the console, the engine's own lines in the log, and what goes to a model (the
+agent's tool descriptions). A run named in Russian keeps its name in the library.
+Russian tab titles are longer: both windows open wide enough for all their tabs when the
+screen has room (the Studio widens a smaller size saved earlier too).
+
 ## Install and start
 
 **Windows without Python (2.21):** download `AuraLite-Studio-<version>-windows-x64.zip`

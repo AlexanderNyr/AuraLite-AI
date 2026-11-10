@@ -9,23 +9,24 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
 from typing import Any
+from .i18n import N_, tr
 
 __all__ = ["BITS", "CALIBRATED", "CALIBRATION_CHARS", "FP8_NOTE", "METHODS", "QuantSettings",
            "bits_for", "bits_note", "calibration_text", "describe_method", "runnable",
            "read_calibration_file", "uses"]
 
 #: method -> its label; the order of the menu
-METHODS = (("dynamic", "Dynamic INT8 - no calibration text needed"),
-           ("static", "Static INT8 - weights and activations"),
-           ("qat", "QAT - trained a little to get used to INT8"),
-           ("gptq", "GPTQ - weights in 2 to 8 bits"),
-           ("awq", "AWQ - 4 or 8 bits, the important weights protected"),
-           ("hqq", "HQQ - 2 to 8 bits, no calibration text needed"),
-           ("half", "Half precision - FP16, BF16 or FP8"))
+METHODS = (("dynamic", N_("Dynamic INT8 - no calibration text needed")),
+           ("static", N_("Static INT8 - weights and activations")),
+           ("qat", N_("QAT - trained a little to get used to INT8")),
+           ("gptq", N_("GPTQ - weights in 2 to 8 bits")),
+           ("awq", N_("AWQ - 4 or 8 bits, the important weights protected")),
+           ("hqq", N_("HQQ - 2 to 8 bits, no calibration text needed")),
+           ("half", N_("Half precision - FP16, BF16 or FP8")))
 
 #: bit width -> its label
-BITS = {"int2": "2-bit integers", "int3": "3-bit integers", "int4": "4-bit integers",
-        "int8": "8-bit integers", "fp16": "FP16", "bf16": "BF16", "fp8_e4m3": "FP8 (E4M3)",
+BITS = {"int2": N_("2-bit integers"), "int3": N_("3-bit integers"), "int4": N_("4-bit integers"),
+        "int8": N_("8-bit integers"), "fp16": "FP16", "bf16": "BF16", "fp8_e4m3": "FP8 (E4M3)",
         "fp8_e5m2": "FP8 (E5M2)"}
 
 #: the methods that read calibration text (QAT trains on it)
@@ -56,13 +57,13 @@ def bits_for(method: str) -> list[str]:
 def describe_method(method: str) -> str:
     """The engine's description of `method`."""
     from auralite.quantization import METHOD_DESCRIPTIONS, QuantMethod
-    return str(METHOD_DESCRIPTIONS.get(QuantMethod(method), ""))
+    return tr(str(METHOD_DESCRIPTIONS.get(QuantMethod(method), "")))
 
 
 #: PyTorch stores float8 but a processor cannot compute in it (no matrix products, not even
 #: a multiplication): a model in FP8 is a file to keep, not one to run
-FP8_NOTE = ("FP8 is for storage only: a processor cannot compute in it, so the model cannot "
-            "chat or be measured in FP8 - save it, then go back to the original.")
+FP8_NOTE = N_("FP8 is for storage only: a processor cannot compute in it, so the model cannot "
+              "chat or be measured in FP8 - save it, then go back to the original.")
 
 
 def runnable(bits: str) -> bool:
@@ -72,7 +73,7 @@ def runnable(bits: str) -> bool:
 
 def bits_note(bits: str) -> str:
     """What to know about `bits` before quantizing ("" for most)."""
-    return "" if runnable(bits) else FP8_NOTE
+    return "" if runnable(bits) else tr(FP8_NOTE)
 
 
 @dataclass
@@ -143,5 +144,5 @@ def calibration_text(paths: list[str], limit: int = CALIBRATION_CHARS) -> str:
     text = getattr(data, "text", None)
     if isinstance(text, str):
         return text[:limit]
-    raise ValueError("this data holds no text to calibrate on (a prepared dataset is token "
-                     "ids): choose a text file")
+    raise ValueError(tr("this data holds no text to calibrate on (a prepared dataset is token "
+                     "ids): choose a text file"))

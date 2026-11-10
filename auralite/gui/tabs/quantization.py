@@ -4,6 +4,7 @@ Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
 from ..common import (BitWidth, METHOD_DESCRIPTIONS, METHOD_SUPPORTED_BITS, QuantConfig, QuantMethod, QuantizationEngine, compare_quantizations, filedialog, format_comparison_table, messagebox, os, threading, tk, ttk)
+from ..i18n import tr
 
 class QuantizationTabMixin:
     def _build_quantization_tab(self):
@@ -11,19 +12,19 @@ class QuantizationTabMixin:
 
         if not gui_common.HAS_QUANTIZATION:
             ttk.Label(tab,
-                      text="⚠ Quantization module not found (quantization.py missing).",
+                      text=tr("⚠ Quantization module not found (quantization.py missing)."),
                       font=("Segoe UI", 12, "bold")).pack(pady=40)
             return
 
         # ---- Method & Bits selection ---------------------------------
-        method_frame = ttk.LabelFrame(tab, text="  ⚡  Method & Precision  ",
+        method_frame = ttk.LabelFrame(tab, text=tr("  ⚡  Method & Precision  "),
                                       padding="10")
         method_frame.pack(fill=tk.X, pady=(0, 6))
 
         row1 = ttk.Frame(method_frame)
         row1.pack(fill=tk.X, pady=2)
 
-        ttk.Label(row1, text="Method:").pack(side=tk.LEFT, padx=4)
+        ttk.Label(row1, text=tr("Method:")).pack(side=tk.LEFT, padx=4)
         self.q_method_var = tk.StringVar(value="dynamic")
         method_names = [
             ("Dynamic INT8", "dynamic"),
@@ -42,7 +43,7 @@ class QuantizationTabMixin:
         self.q_method_combo.bind("<<ComboboxSelected>>",
                                   self._on_quant_method_changed)
 
-        ttk.Label(row1, text="Bits:").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Label(row1, text=tr("Bits:")).pack(side=tk.LEFT, padx=(16, 4))
         self.q_bits_var = tk.StringVar(value="int8")
         self.q_bits_combo = ttk.Combobox(
             row1, textvariable=self.q_bits_var,
@@ -59,7 +60,7 @@ class QuantizationTabMixin:
         self._update_quant_description()
 
         # ---- Advanced Options ----------------------------------------
-        opts_frame = ttk.LabelFrame(tab, text="  🔧  Advanced Options  ",
+        opts_frame = ttk.LabelFrame(tab, text=tr("  🔧  Advanced Options  "),
                                     padding="8")
         opts_frame.pack(fill=tk.X, pady=(0, 6))
 
@@ -67,68 +68,68 @@ class QuantizationTabMixin:
         opts_grid.pack(fill=tk.X)
 
         # Row 1: GPTQ options
-        ttk.Label(opts_grid, text="Group size:").grid(
+        ttk.Label(opts_grid, text=tr("Group size:")).grid(
             row=0, column=0, sticky=tk.W, padx=4, pady=2)
         self.q_group_var = tk.StringVar(value="128")
         ttk.Entry(opts_grid, textvariable=self.q_group_var,
                   width=6).grid(row=0, column=1, sticky=tk.W, padx=4, pady=2)
 
-        ttk.Label(opts_grid, text="Block size:").grid(
+        ttk.Label(opts_grid, text=tr("Block size:")).grid(
             row=0, column=2, sticky=tk.W, padx=(12, 4), pady=2)
         self.q_block_var = tk.StringVar(value="128")
         ttk.Entry(opts_grid, textvariable=self.q_block_var,
                   width=6).grid(row=0, column=3, sticky=tk.W, padx=4, pady=2)
 
-        ttk.Label(opts_grid, text="Percdamp:").grid(
+        ttk.Label(opts_grid, text=tr("Percdamp:")).grid(
             row=0, column=4, sticky=tk.W, padx=(12, 4), pady=2)
         self.q_percdamp_var = tk.StringVar(value="0.01")
         ttk.Entry(opts_grid, textvariable=self.q_percdamp_var,
                   width=6).grid(row=0, column=5, sticky=tk.W, padx=4, pady=2)
 
         # Row 2: AWQ / QAT / calibration options
-        ttk.Label(opts_grid, text="Calib. samples:").grid(
+        ttk.Label(opts_grid, text=tr("Calib. samples:")).grid(
             row=1, column=0, sticky=tk.W, padx=4, pady=2)
         self.q_calib_n_var = tk.StringVar(value="128")
         ttk.Entry(opts_grid, textvariable=self.q_calib_n_var,
                   width=6).grid(row=1, column=1, sticky=tk.W, padx=4, pady=2)
 
-        ttk.Label(opts_grid, text="Calib. seq_len:").grid(
+        ttk.Label(opts_grid, text=tr("Calib. seq_len:")).grid(
             row=1, column=2, sticky=tk.W, padx=(12, 4), pady=2)
         self.q_calib_seq_var = tk.StringVar(value="64")
         ttk.Entry(opts_grid, textvariable=self.q_calib_seq_var,
                   width=6).grid(row=1, column=3, sticky=tk.W, padx=4, pady=2)
 
-        ttk.Label(opts_grid, text="AWQ alpha:").grid(
+        ttk.Label(opts_grid, text=tr("AWQ alpha:")).grid(
             row=1, column=4, sticky=tk.W, padx=(12, 4), pady=2)
         self.q_awq_alpha_var = tk.StringVar(value="0.5")
         ttk.Entry(opts_grid, textvariable=self.q_awq_alpha_var,
                   width=6).grid(row=1, column=5, sticky=tk.W, padx=4, pady=2)
 
         # Row 3: QAT options
-        ttk.Label(opts_grid, text="QAT epochs:").grid(
+        ttk.Label(opts_grid, text=tr("QAT epochs:")).grid(
             row=2, column=0, sticky=tk.W, padx=4, pady=2)
         self.q_qat_epochs_var = tk.StringVar(value="5")
         ttk.Entry(opts_grid, textvariable=self.q_qat_epochs_var,
                   width=6).grid(row=2, column=1, sticky=tk.W, padx=4, pady=2)
 
-        ttk.Label(opts_grid, text="QAT LR:").grid(
+        ttk.Label(opts_grid, text=tr("QAT LR:")).grid(
             row=2, column=2, sticky=tk.W, padx=(12, 4), pady=2)
         self.q_qat_lr_var = tk.StringVar(value="1e-5")
         ttk.Entry(opts_grid, textvariable=self.q_qat_lr_var,
                   width=8).grid(row=2, column=3, sticky=tk.W, padx=4, pady=2)
 
         self.q_symmetric_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts_grid, text="Symmetric",
+        ttk.Checkbutton(opts_grid, text=tr("Symmetric"),
                         variable=self.q_symmetric_var).grid(
             row=2, column=4, sticky=tk.W, padx=(12, 4), pady=2)
 
         self.q_perchannel_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts_grid, text="Per-channel",
+        ttk.Checkbutton(opts_grid, text=tr("Per-channel"),
                         variable=self.q_perchannel_var).grid(
             row=2, column=5, sticky=tk.W, padx=4, pady=2)
 
         # ---- Calibration Data ----------------------------------------
-        calib_frame = ttk.LabelFrame(tab, text="  📋  Calibration Data  ",
+        calib_frame = ttk.LabelFrame(tab, text=tr("  📋  Calibration Data  "),
                                      padding="8")
         calib_frame.pack(fill=tk.X, pady=(0, 6))
 
@@ -136,16 +137,16 @@ class QuantizationTabMixin:
         calib_btn_row.pack(fill=tk.X, pady=2)
 
         self.q_calib_btn = ttk.Button(
-            calib_btn_row, text="📂 Select Calibration File",
+            calib_btn_row, text=tr("📂 Select Calibration File"),
             command=self._select_calib_file)
         self.q_calib_btn.pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(calib_btn_row, text="📝 Use Training File",
+        ttk.Button(calib_btn_row, text=tr("📝 Use Training File"),
                    command=self._use_training_file_for_calib).pack(
             side=tk.LEFT, padx=4)
 
         self.q_calib_label = ttk.Label(calib_frame,
-                                       text="No calibration data loaded",
+                                       text=tr("No calibration data loaded"),
                                        foreground="gray")
         self.q_calib_label.pack(anchor=tk.W, pady=2)
 
@@ -156,27 +157,27 @@ class QuantizationTabMixin:
         action_frame.pack(fill=tk.X, pady=(0, 6))
 
         self.q_quantize_btn = ttk.Button(
-            action_frame, text="⚡ Quantize Model",
+            action_frame, text=tr("⚡ Quantize Model"),
             command=self._quantize_model, state=tk.DISABLED)
         self.q_quantize_btn.pack(side=tk.LEFT, padx=4)
 
         self.q_benchmark_btn = ttk.Button(
-            action_frame, text="📊 Benchmark",
+            action_frame, text=tr("📊 Benchmark"),
             command=self._benchmark_quantized, state=tk.DISABLED)
         self.q_benchmark_btn.pack(side=tk.LEFT, padx=4)
 
         self.q_compare_btn = ttk.Button(
-            action_frame, text="🔄 Compare All Methods",
+            action_frame, text=tr("🔄 Compare All Methods"),
             command=self._compare_all_methods, state=tk.DISABLED)
         self.q_compare_btn.pack(side=tk.LEFT, padx=4)
 
         self.q_save_btn = ttk.Button(
-            action_frame, text="💾 Save Quantized",
+            action_frame, text=tr("💾 Save Quantized"),
             command=self._save_quantized, state=tk.DISABLED)
         self.q_save_btn.pack(side=tk.LEFT, padx=4)
 
         self.q_revert_btn = ttk.Button(
-            action_frame, text="↩ Revert to Original",
+            action_frame, text=tr("↩ Revert to Original"),
             command=self._revert_model, state=tk.DISABLED)
         self.q_revert_btn.pack(side=tk.LEFT, padx=4)
 
@@ -187,18 +188,18 @@ class QuantizationTabMixin:
                                                maximum=100)
         self.q_progress_bar.pack(fill=tk.X, pady=(0, 4))
 
-        self.q_status_label = ttk.Label(tab, text="Status: Load a model to begin")
+        self.q_status_label = ttk.Label(tab, text=tr("Status: Load a model to begin"))
         self.q_status_label.pack(anchor=tk.W, pady=(0, 4))
 
         # ---- Results Display -----------------------------------------
-        result_frame = ttk.LabelFrame(tab, text="  📊  Results  ", padding="6")
+        result_frame = ttk.LabelFrame(tab, text=tr("  📊  Results  "), padding="6")
         result_frame.pack(fill=tk.BOTH, expand=True)
 
         result_toolbar = ttk.Frame(result_frame)
         result_toolbar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(result_toolbar, text="📋 Copy",
+        ttk.Button(result_toolbar, text=tr("📋 Copy"),
                    command=self._copy_quant_result).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(result_toolbar, text="🗑 Clear",
+        ttk.Button(result_toolbar, text=tr("🗑 Clear"),
                    command=self._clear_quant_result).pack(side=tk.RIGHT, padx=2)
 
         q_ysb = ttk.Scrollbar(result_frame, orient=tk.VERTICAL)
@@ -242,7 +243,7 @@ class QuantizationTabMixin:
         method = self.q_method_var.get()
         try:
             m = QuantMethod(method)
-            desc = METHOD_DESCRIPTIONS.get(m, "")
+            desc = tr(METHOD_DESCRIPTIONS.get(m, ""))
             # 2.25: FP8 is for storage - the Studio's note
             from auralite.studio.quantize import bits_note
             note = bits_note(str(self.q_bits_var.get()))
@@ -253,8 +254,8 @@ class QuantizationTabMixin:
 
     def _select_calib_file(self):
         path = filedialog.askopenfilename(
-            title="Select Calibration File",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            title=tr("Select Calibration File"),
+            filetypes=[(tr("Text files"), "*.txt"), (tr("All files"), "*.*")])
         if not path:
             return
         try:
@@ -262,11 +263,11 @@ class QuantizationTabMixin:
                 self.q_calib_text = f.read()
             n = len(self.q_calib_text)
             self.q_calib_label.config(
-                text=f"Loaded: {os.path.basename(path)} ({n:,} chars)",
+                text=tr("Loaded: {name} ({n:,} chars)", name=os.path.basename(path), n=n),
                 foreground="black")
             self._update_quant_buttons()
         except Exception as e:
-            self.report_error(e, "reading the file", title="File Error")
+            self.report_error(e, tr("reading the file"), title=tr("File Error"))
 
 
     def _use_training_file_for_calib(self):
@@ -282,16 +283,16 @@ class QuantizationTabMixin:
                         self.q_calib_text = f.read()
                 n = len(self.q_calib_text)
                 self.q_calib_label.config(
-                    text=f"Using training file: "
-                         f"{os.path.basename(self.selected_file_path)} "
-                         f"({n:,} chars)",
+                    text=tr("Using training file: "
+                         "{name} "
+                         "({n:,} chars)", name=os.path.basename(self.selected_file_path), n=n),
                     foreground="black")
                 self._update_quant_buttons()
             except Exception as e:
-                self.report_error(e, "reading the file", title="File Error")
+                self.report_error(e, tr("reading the file"), title=tr("File Error"))
         else:
-            messagebox.showinfo("No File",
-                                "Select a training file first on the Training tab.")
+            messagebox.showinfo(tr("No File"),
+                                tr("Select a training file first on the Training tab."))
 
 
     def _update_quant_buttons(self):
@@ -343,27 +344,27 @@ class QuantizationTabMixin:
             pct = 0
         self.root.after(0, lambda: (
             self.q_progress_var.set(pct),
-            self.q_status_label.config(text=f"Status: {message}")))
+            self.q_status_label.config(text=tr("Status: {message}", message=message))))
 
 
     def _quantize_model(self):
         if not gui_common.HAS_QUANTIZATION:
-            messagebox.showerror("Error", "Quantization module not available.")
+            messagebox.showerror(tr("Error"), tr("Quantization module not available."))
             return
         if self.engine.model is None or self.engine.is_gguf_model():
-            messagebox.showwarning("No Model",
-                                   "Load a native AuraLite .pt model first.")
+            messagebox.showwarning(tr("No Model"),
+                                   tr("Load a native AuraLite .pt model first."))
             return
 
         try:
             config = self._build_quant_config()
         except (ValueError, KeyError) as e:
-            self.report_error(e, "reading the settings", title="Config Error")
+            self.report_error(e, tr("reading the settings"), title=tr("Config Error"))
             return
 
         errors = config.validate()
         if errors:
-            messagebox.showerror("Validation Error",
+            messagebox.showerror(tr("Validation Error"),
                                  "\n".join(f"• {e}" for e in errors))
             return
 
@@ -373,9 +374,9 @@ class QuantizationTabMixin:
             QuantMethod.AWQ, QuantMethod.QAT)
         if needs_calib and not self.q_calib_text:
             messagebox.showwarning(
-                "Calibration Needed",
-                f"{config.method.value} requires calibration data.\n"
-                "Load a calibration file or use the training file.")
+                tr("Calibration Needed"),
+                tr("{value} requires calibration data.\n"
+                "Load a calibration file or use the training file.", value=config.method.value))
             return
 
         import copy
@@ -384,7 +385,7 @@ class QuantizationTabMixin:
 
         self.q_quantize_btn.config(state=tk.DISABLED)
         self.q_compare_btn.config(state=tk.DISABLED)
-        self.q_status_label.config(text="Status: Quantizing…")
+        self.q_status_label.config(text=tr("Status: Quantizing…"))
 
         def run():
             try:
@@ -405,17 +406,17 @@ class QuantizationTabMixin:
                     self.q_result_text.insert(tk.END, result.summary())
                     if result.errors:
                         self.q_status_label.config(
-                            text="Status: Quantization FAILED ✗")
+                            text=tr("Status: Quantization FAILED ✗"))
                         for e in result.errors:
                             self.q_result_text.insert(tk.END, f"\n✗ {e}",
                                                        "error")
                     else:
                         self.q_status_label.config(
-                            text=f"Status: Quantized ✅ "
-                                 f"({result.compression_ratio:.2f}× compression)")
+                            text=tr("Status: Quantized ✅ "
+                                 "({compression_ratio:.2f}× compression)", compression_ratio=result.compression_ratio))
                         self.param_label.config(
-                            text=f"Parameters: {result.quantized_params:,} "
-                                 f"(quantized)")
+                            text=tr("Parameters: {quantized_params:,} "
+                                 "(quantized)", quantized_params=result.quantized_params))
                     self._refresh_model_info()
                     self._update_quant_buttons()
 
@@ -423,7 +424,7 @@ class QuantizationTabMixin:
 
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the quantization", title="Quantization Error"))
+                    exc, tr("the quantization"), title=tr("Quantization Error")))
             finally:
                 self.root.after(0, lambda: (
                     self.q_quantize_btn.config(state=tk.NORMAL),
@@ -437,12 +438,12 @@ class QuantizationTabMixin:
         if (self._q_original_model is None or self.engine.model is None
                 or not self.q_calib_text):
             messagebox.showwarning(
-                "Cannot Benchmark",
-                "Need both original and quantized model, plus calibration data.")
+                tr("Cannot Benchmark"),
+                tr("Need both original and quantized model, plus calibration data."))
             return
 
         self.q_benchmark_btn.config(state=tk.DISABLED)
-        self.q_status_label.config(text="Status: Benchmarking…")
+        self.q_status_label.config(text=tr("Status: Benchmarking…"))
 
         def run():
             try:
@@ -464,14 +465,14 @@ class QuantizationTabMixin:
                     self.q_result_text.insert(tk.END, "─" * 50 + "\n")
                     self.q_result_text.insert(tk.END, result.summary())
                     self.q_status_label.config(
-                        text=f"Status: Benchmark complete ✅  "
-                             f"(PPL Δ{result.perplexity_delta:+.2f}, "
-                             f"speed {result.speedup:.2f}×)")
+                        text=tr("Status: Benchmark complete ✅  "
+                             "(PPL Δ{perplexity_delta:+.2f}, "
+                             "speed {speedup:.2f}×)", perplexity_delta=result.perplexity_delta, speedup=result.speedup))
 
                 self.root.after(0, update_ui)
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the benchmark", title="Benchmark Error"))
+                    exc, tr("the benchmark"), title=tr("Benchmark Error")))
             finally:
                 self.root.after(0, lambda: (
                     self.q_benchmark_btn.config(state=tk.NORMAL),
@@ -482,12 +483,12 @@ class QuantizationTabMixin:
 
     def _compare_all_methods(self):
         if self.engine.model is None or not self.q_calib_text:
-            messagebox.showwarning("Cannot Compare",
-                                   "Need a loaded model and calibration data.")
+            messagebox.showwarning(tr("Cannot Compare"),
+                                   tr("Need a loaded model and calibration data."))
             return
 
         self.q_compare_btn.config(state=tk.DISABLED)
-        self.q_status_label.config(text="Status: Comparing all methods…")
+        self.q_status_label.config(text=tr("Status: Comparing all methods…"))
 
         def run():
             try:
@@ -509,13 +510,13 @@ class QuantizationTabMixin:
                                               "header")
                     self.q_result_text.insert(tk.END, table)
                     self.q_status_label.config(
-                        text=f"Status: Comparison complete ✅ "
-                             f"({len(results)} methods tested)")
+                        text=tr("Status: Comparison complete ✅ "
+                             "({n_results} methods tested)", n_results=len(results)))
 
                 self.root.after(0, update_ui)
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the comparison", title="Compare Error"))
+                    exc, tr("the comparison"), title=tr("Compare Error")))
             finally:
                 self.root.after(0, lambda: (
                     self.q_compare_btn.config(state=tk.NORMAL),
@@ -528,9 +529,9 @@ class QuantizationTabMixin:
         if self.engine.model is None:
             return
         path = filedialog.asksaveasfilename(
-            title="Save Quantized Model",
+            title=tr("Save Quantized Model"),
             defaultextension=".pt",
-            filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")])
+            filetypes=[(tr("PyTorch model"), "*.pt"), (tr("All files"), "*.*")])
         if not path:
             return
         try:
@@ -540,12 +541,12 @@ class QuantizationTabMixin:
                 tokenizer=self.engine.tokenizer,
                 params_used=self.engine.params_used,
                 result=self._q_last_result)
-            messagebox.showinfo("Saved",
-                                f"Quantized model saved to:\n{path}")
+            messagebox.showinfo(tr("Saved"),
+                                tr("Quantized model saved to:\n{path}", path=path))
             self.q_status_label.config(
-                text=f"Status: Saved ✅ ({os.path.basename(path)})")
+                text=tr("Status: Saved ✅ ({name})", name=os.path.basename(path)))
         except Exception as e:
-            self.report_error(e, "saving the model", title="Save Error")
+            self.report_error(e, tr("saving the model"), title=tr("Save Error"))
 
 
     def _revert_model(self):
@@ -555,12 +556,12 @@ class QuantizationTabMixin:
         self._q_original_model = None
         self._q_last_result = None
         self._q_last_config = None
-        self.q_status_label.config(text="Status: Reverted to original model ↩")
+        self.q_status_label.config(text=tr("Status: Reverted to original model ↩"))
         self._refresh_model_info()
         self._update_quant_buttons()
         if self.engine.model is not None:
             n = self.engine.model.count_parameters()
-            self.param_label.config(text=f"Parameters: {n:,}")
+            self.param_label.config(text=tr("Parameters: {n:,}", n=n))
 
 
     def _copy_quant_result(self):
@@ -568,7 +569,7 @@ class QuantizationTabMixin:
         if text.strip():
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
-            self.q_status_label.config(text="Status: Results copied ✅")
+            self.q_status_label.config(text=tr("Status: Results copied ✅"))
 
 
     def _clear_quant_result(self):

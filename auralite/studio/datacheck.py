@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from auralite.i18n import N_, tr, trn
+
 __all__ = ["DataReport", "estimate_tokens", "inspect_data", "text_script"]
 
 #: Characters per token of a modern BPE (Qwen, Llama 3) by script - an estimate.
@@ -21,9 +23,11 @@ _TOKENS_PER_MESSAGE = 5
 _FEW_DIALOGS = 50
 _FEW_PAIRS = 100
 
-_KIND_LABELS = {"dialogs": "chat dialogs", "preferences": "preference pairs",
-                "text": "plain text", "big": "big text data (tokenized to disk first)",
-                "shards": "a prepared dataset (token shards)", "": "unusable"}
+_KIND_LABELS = {"dialogs": N_("chat dialogs"), "preferences": N_("preference pairs"),
+                "text": N_("plain text"), "big": N_("big text data (tokenized to disk first)"),
+                "shards": N_("a prepared dataset (token shards)"), "": N_("unusable")}
+#: 2.28: the scripts as the interfaces name them
+SCRIPT_WORDS = (N_("latin"), N_("cyrillic"), N_("cjk"), N_("mixed"))
 
 
 def text_script(text: str) -> str:
@@ -82,7 +86,7 @@ class DataReport:
 
     @property
     def kind_label(self) -> str:
-        return _KIND_LABELS.get(self.kind, self.kind)
+        return tr(_KIND_LABELS.get(self.kind, self.kind))
 
     @property
     def for_finetune(self) -> bool:
@@ -91,20 +95,26 @@ class DataReport:
 
     def summary_lines(self) -> list[str]:
         if not self.kind:
-            return ["Data: cannot be used"] + [f"Problem: {p}" for p in self.problems]
-        size = f"{self.bytes / (1 << 20):,.1f} MB" if self.bytes else "size unknown"
-        what = {"dialogs": "dialogs", "preferences": "pairs", "text": "documents",
-                "big": "files", "shards": "documents"}.get(self.kind, "records")
+            return [tr("Data: cannot be used")] + [tr("Problem: {problem}", problem=p)
+                                                   for p in self.problems]
+        size = tr("{mb:,.1f} MB", mb=self.bytes / (1 << 20)) if self.bytes else \
+            tr("size unknown")
         count = self.records or self.files
-        lines = [f"Data: {self.kind_label} - {count:,} {what}, {size}, "
-                 f"about {self.tokens:,} tokens"]
+        what = {"dialogs": trn("{n:,} dialog", "{n:,} dialogs", count),
+                "preferences": trn("{n:,} pair", "{n:,} pairs", count),
+                "text": trn("{n:,} document", "{n:,} documents", count),
+                "big": trn("{n:,} file", "{n:,} files", count),
+                "shards": trn("{n:,} document", "{n:,} documents", count)}.get(
+            self.kind, trn("{n:,} record", "{n:,} records", count))
+        lines = [tr("Data: {kind} - {count}, {size}, about {tokens:,} tokens",
+                    kind=self.kind_label, count=what, size=size, tokens=self.tokens)]
         if self.kind in ("dialogs", "preferences") and self.turns:
-            lines.append(f"Messages per dialog: {self.turns:.1f}; a long one: about "
-                         f"{self.longest_tokens:,} tokens")
+            lines.append(tr("Messages per dialog: {turns:.1f}; a long one: about {tokens:,} "
+                            "tokens", turns=self.turns, tokens=self.longest_tokens))
         if self.script:
-            lines.append(f"Script: {self.script}")
-        lines += [f"Problem: {p}" for p in self.problems]
-        lines += [f"Note: {w}" for w in self.warnings]
+            lines.append(tr("Script: {script}", script=tr(self.script)))
+        lines += [tr("Problem: {problem}", problem=p) for p in self.problems]
+        lines += [tr("Note: {note}", note=w) for w in self.warnings]
         return lines
 
 
@@ -183,29 +193,32 @@ def _records_report(report: DataReport, data: Any) -> None:
 
 def _advice(report: DataReport) -> None:
     if report.skipped:
-        where = f" (the first: {report.first_skipped})" if report.first_skipped else ""
-        report.warnings.append(f"{report.skipped:,} records will be skipped{where}: no reply, "
-                               f"an unknown format or an empty text")
+        where = " " + tr("(the first: {record})", record=report.first_skipped) \
+            if report.first_skipped else ""
+        report.warnings.append(tr("{n:,} records will be skipped{where}: no reply, an unknown "
+                                  "format or an empty text", n=report.skipped, where=where))
     if report.kind == "dialogs":
         if report.records < _FEW_DIALOGS:
-            report.warnings.append(f"only {report.records} dialogs: the model may learn them by "
-                                   f"heart; 200 or more are better, 1,000+ good")
+            report.warnings.append(tr("only {n} dialogs: the model may learn them by heart; 200 "
+                                      "or more are better, 1,000+ good", n=report.records))
         if report.longest_tokens > 2048:
-            report.warnings.append(f"long dialogs (about {report.longest_tokens:,} tokens): "
-                                   f"windows cut them, and longer windows need more memory")
+            report.warnings.append(tr("long dialogs (about {n:,} tokens): windows cut them, and "
+                                      "longer windows need more memory",
+                                      n=report.longest_tokens))
     elif report.kind == "preferences":
-        report.warnings.append("preference pairs (DPO / SimPO) polish a chat model that already "
-                               "answers in its template: fine-tune it on dialogs first")
+        report.warnings.append(tr("preference pairs (DPO / SimPO) polish a chat model that "
+                                  "already answers in its template: fine-tune it on dialogs "
+                                  "first"))
         if report.records < _FEW_PAIRS:
-            report.warnings.append(f"only {report.records} pairs: 500 or more give a clearer "
-                                   f"signal")
+            report.warnings.append(tr("only {n} pairs: 500 or more give a clearer signal",
+                                      n=report.records))
     elif report.kind == "text":
-        report.warnings.append("plain text teaches style and knowledge (continued "
-                               "pretraining); to make a model answer questions, fine-tune it "
-                               "on dialogs (.jsonl)")
+        report.warnings.append(tr("plain text teaches style and knowledge (continued "
+                                  "pretraining); to make a model answer questions, fine-tune it "
+                                  "on dialogs (.jsonl)"))
         if report.tokens < 20_000:
-            report.warnings.append("very little text for training a model from scratch: "
-                                   "it will only learn its letters and common words")
+            report.warnings.append(tr("very little text for training a model from scratch: it "
+                                      "will only learn its letters and common words"))
 
 
 def inspect_data(paths: Any) -> DataReport:
@@ -216,12 +229,12 @@ def inspect_data(paths: Any) -> DataReport:
     names = [os.fspath(p) for p in items if str(p).strip()]
     report = DataReport(paths=names)
     if not names:
-        report.problems.append("choose a data file or folder")
+        report.problems.append(tr("choose a data file or folder"))
         return report
     missing = [n for n in names if not n.lower().startswith("hf:") and not os.path.exists(n)
                and not any(ch in n for ch in "*?[")]
     if missing:
-        report.problems.append(f"not found: {', '.join(missing)}")
+        report.problems.append(tr("not found: {path}", path=", ".join(missing)))
         return report
     report.files, report.bytes = _local_size(names)
     kind = data_kind(names)
@@ -230,17 +243,18 @@ def inspect_data(paths: Any) -> DataReport:
         try:
             shards = TokenShards.open(names[0])
         except (OSError, ValueError) as err:
-            report.problems.append(f"the prepared dataset cannot be read: {err}")
+            report.problems.append(tr("the prepared dataset cannot be read: {error}",
+                                      error=err))
             return report
         report.kind = "shards"
         report.records = int(shards.documents)
         report.chars = int(shards.chars)
         report.tokens = int(shards.train_tokens + shards.val_tokens)
         if not shards.complete:
-            report.warnings.append("the dataset was not prepared to the end: it trains on "
-                                   "what is there")
-        report.warnings.append("a prepared dataset trains a model from scratch with its own "
-                               "tokenizer (the Train tab)")
+            report.warnings.append(tr("the dataset was not prepared to the end: it trains on "
+                                      "what is there"))
+        report.warnings.append(tr("a prepared dataset trains a model from scratch with its own "
+                                  "tokenizer (the Train tab)"))
         return report
     if kind == "big":
         report.kind = "big"
@@ -257,8 +271,8 @@ def inspect_data(paths: Any) -> DataReport:
         report.chars = report.bytes
         report.tokens = estimate_tokens(report.bytes, report.script) if report.bytes else 0
         report.sample = _shorten(sample)
-        report.warnings.append("big data: it is tokenized into shards on disk first (once; the "
-                               "next run reuses them)")
+        report.warnings.append(tr("big data: it is tokenized into shards on disk first (once; "
+                                  "the next run reuses them)"))
         return report
     try:
         data = load_training_data(names)

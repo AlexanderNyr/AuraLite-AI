@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import importlib
 
-__version__ = "2.27.0"
+__version__ = "2.28.0"
 
 #: Public name → module that defines it (resolved on first attribute access).
 _LAZY = {

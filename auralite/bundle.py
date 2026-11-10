@@ -3,7 +3,7 @@
 ``packaging/app/build_app.py`` freezes AuraLite with PyInstaller into one folder
 that holds two programs and a note saying which build it is::
 
-    AuraLite-Studio-2.27.0/
+    AuraLite-Studio-2.28.0/
         AuraLite Studio.exe     the Studio, no console: double-click it
         auralite.exe            the ``auralite`` command, for a console
         auralite-app.json       this build: version, Python, PyTorch, Qt, date, commit
@@ -82,7 +82,7 @@ def platform_tag(system: str | None = None, machine: str | None = None) -> str:
 
 
 def zip_name(version: str, tag: str | None = None) -> str:
-    """``AuraLite-Studio-2.27.0-windows-x64.zip``: what the release attaches."""
+    """``AuraLite-Studio-2.28.0-windows-x64.zip``: what the release attaches."""
     return f"AuraLite-Studio-{version}-{tag or platform_tag()}.zip"
 
 
@@ -221,21 +221,24 @@ def describe() -> str:
 def missing_part(module: str, extra: str = "") -> list[str]:
     """What to do about an optional package that is not installed: the pip command, or
     inside the app, that the app leaves it out and where it comes with."""
+    from auralite.i18n import tr
     pip = f'pip install "auralite-ai[{extra}]"' if extra else f"pip install {module}"
     if not packaged():
-        return [pip, "then start AuraLite again"]
-    return [f"The {APP_NAME} app does not include «{module}». AuraLite installed with "
-            f"Python has it: {pip}",
-            f"How to install it that way: {GUIDE_URL}#what-the-app-leaves-out"]
+        return [pip, tr("then start AuraLite again")]
+    return [tr("The {app} app does not include «{module}». AuraLite installed with Python has "
+               "it: {pip}", app=APP_NAME, module=module, pip=pip),
+            tr("How to install it that way: {url}",
+               url=f"{GUIDE_URL}#what-the-app-leaves-out")]
 
 
 def update_hint(download: str = "", *, app: bool | None = None) -> str:
     """How to update: the new zip for the app (`app`, default: when this is the app) - your
     models and runs stay where they are - and pip elsewhere."""
+    from auralite.i18n import tr
     if not (packaged() if app is None else app):
-        return 'Update: pip install -U "auralite-ai[studio]"'
+        return tr('Update: pip install -U "auralite-ai[studio]"')
     root = os.environ.get("AURALITE_HOME")
     home = Path(root).expanduser() if root else Path.home() / ".auralite"
-    return (f"Download the new app: {download or DOWNLOAD_URL}\n"
-            f"Unzip it into a new folder and start it from there; your models, runs and "
-            f"settings stay in {home}.")
+    return (tr("Download the new app: {url}", url=download or DOWNLOAD_URL) + "\n"
+            + tr("Unzip it into a new folder and start it from there; your models, runs and "
+                 "settings stay in {home}.", home=home))

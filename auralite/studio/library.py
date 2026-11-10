@@ -22,6 +22,7 @@ from typing import Any
 from auralite import runs as runlib
 
 from .hardware import auralite_home
+from .i18n import N_, tr
 
 __all__ = ["LibraryItem", "delete_item", "disk_summary", "forget", "list_datasets",
            "list_models", "load_index", "remember_dataset", "remember_model"]
@@ -30,9 +31,10 @@ INDEX_FILE = "library.json"
 #: How many remembered models and datasets the index keeps.
 MAX_ITEMS = 200
 
-MODEL_KINDS = {"download": "Downloaded", "result": "Run result", "saved": "Saved model",
-               "adapter": "LoRA adapters", "export": "Export", "opened": "Opened model"}
-DATA_KINDS = {"data": "Data file", "shards": "Prepared dataset"}
+MODEL_KINDS = {"download": N_("Downloaded"), "result": N_("Run result"),
+               "saved": N_("Saved model"), "adapter": N_("LoRA adapters"), "export": N_("Export"),
+               "opened": N_("Opened model")}
+DATA_KINDS = {"data": N_("Data file"), "shards": N_("Prepared dataset")}
 
 
 @dataclass
@@ -52,7 +54,7 @@ class LibraryItem:
 
     @property
     def kind_label(self) -> str:
-        return MODEL_KINDS.get(self.kind) or DATA_KINDS.get(self.kind) or self.kind
+        return tr(MODEL_KINDS.get(self.kind) or DATA_KINDS.get(self.kind) or self.kind)
 
     @property
     def remembered(self) -> bool:
@@ -167,11 +169,11 @@ def _mtime(path: Path) -> float:
 
 def format_size(n: float) -> str:
     """``"1.4 GB"``, ``"145 MB"``, ``"12 KB"``."""
-    for unit, scale in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+    for unit, scale in ((N_("GB"), 1 << 30), (N_("MB"), 1 << 20), (N_("KB"), 1 << 10)):
         if n >= scale:
             value = n / scale
-            return f"{value:.1f} {unit}" if value < 100 else f"{value:,.0f} {unit}"
-    return f"{int(n)} B"
+            return f"{value:.1f} {tr(unit)}" if value < 100 else f"{value:,.0f} {tr(unit)}"
+    return f"{int(n)} {tr('B')}"
 
 
 # ----------------------------------------------------------------------
@@ -196,11 +198,11 @@ def _downloads(home: Path) -> list[LibraryItem]:
             spec = f"hf:{repo}" + ("" if rev_dir.name == "main" else f"@{rev_dir.name}")
             complete = (rev_dir / ".auralite-complete.json").is_file()
             model = find_model(repo)
-            detail = model.name if model is not None else "Hugging Face model"
+            detail = model.name if model is not None else tr("Hugging Face model")
             if model is not None and not model.commercial:
-                detail += f" ({model.license}: not for commercial use)"
+                detail += " " + tr("({license}: not for commercial use)", license=model.license)
             if not complete:
-                detail += " - the download is not finished"
+                detail += " - " + tr("the download is not finished")
             items.append(LibraryItem(
                 kind="download", name=repo + ("" if rev_dir.name == "main" else
                                               f" @{rev_dir.name}"),
@@ -216,10 +218,12 @@ def _run_results(runs: list[runlib.Run]) -> list[LibraryItem]:
         if path is None:
             continue
         inside = run.folder in path.parents
-        loss = f", best validation loss {run.best_val:.4f}" if run.best_val is not None else ""
+        detail = tr("{kind} run, {status}", kind=run.kind_label, status=tr(run.status))
+        if run.best_val is not None:
+            detail += ", " + tr("best validation loss {loss:.4f}", loss=run.best_val)
         items.append(LibraryItem(
             kind="result", name=run.name, path=str(path), bytes=_size(path),
-            modified=_mtime(path), detail=f"{run.kind_label} run, {run.status}{loss}",
+            modified=_mtime(path), detail=detail,
             run_id=run.id, owned=inside))
     return items
 
@@ -245,14 +249,14 @@ def list_models(home: Path | None = None, *, runs: list[runlib.Run] | None = Non
         known.add(key)
         exists = path.exists()
         kind = str(entry.get("kind") or "saved")
-        detail = {"adapter": "LoRA adapters (apply them to their base model)",
-                  "export": "GGUF file" if path.suffix.lower() == ".gguf" else
-                  "Hugging Face folder"}.get(kind, "AuraLite model" if path.suffix == ".pt"
-                                             else "GGUF model (chat only)")
+        detail = {"adapter": tr("LoRA adapters (apply them to their base model)"),
+                  "export": tr("GGUF file") if path.suffix.lower() == ".gguf" else
+                  tr("Hugging Face folder")}.get(kind, tr("AuraLite model") if path.suffix == ".pt"
+                                                 else tr("GGUF model (chat only)"))
         if entry.get("note"):
             detail += f" - {entry['note']}"
         if not exists:
-            detail = "not found any more"
+            detail = tr("not found any more")
         items.append(LibraryItem(
             kind=kind if kind in MODEL_KINDS else "saved", name=path.name or str(path),
             path=str(path), bytes=_size(path) if exists else 0,
@@ -270,12 +274,13 @@ _COUNT_WORDS = {"dialogs": "dialogs", "preferences": "pairs", "text": "documents
 
 def _report_detail(report: dict) -> str:
     kind = str(report.get("kind") or "")
-    parts = [{"dialogs": "Dialogs", "preferences": "Preference pairs", "text": "Text",
-              "big": "Big text", "shards": "Prepared dataset"}.get(kind, kind or "Data")]
+    parts = [{"dialogs": tr("Dialogs"), "preferences": tr("Preference pairs"),
+              "text": tr("Text"), "big": tr("Big text"),
+              "shards": tr("Prepared dataset")}.get(kind, kind or tr("Data"))]
     if report.get("records") and kind in _COUNT_WORDS:
         parts.append(runlib.count_words(int(report["records"]), kind))   # 2.27: "1 dialog"
     if report.get("tokens"):
-        parts.append(f"about {int(report['tokens']):,} tokens")
+        parts.append(tr("about {n:,} tokens", n=int(report["tokens"])))
     return ", ".join(parts)
 
 
@@ -293,9 +298,9 @@ def _prepared(home: Path) -> list[LibraryItem]:
         tokens = stats.get("tokens") or 0
         sources = [str(s.get("spec")) for s in data.get("sources") or [] if isinstance(s, dict)]
         tok = (data.get("tokenizer") or {}).get("description") or ""
-        detail = f"{int(tokens):,} tokens" + (f", {tok}" if tok else "")
+        detail = tr("{n:,} tokens", n=int(tokens)) + (f", {tok}" if tok else "")
         if not data.get("complete"):
-            detail += " - not finished (the next run goes on with it)"
+            detail += " - " + tr("not finished (the next run goes on with it)")
         items.append(LibraryItem(
             kind="shards", name=runlib.data_label(sources) or folder.name, path=str(folder),
             bytes=_size(folder), modified=_mtime(manifest), detail=detail, owned=True,
@@ -332,14 +337,14 @@ def list_datasets(home: Path | None = None, *,
         known.add(key)
         if path_text.lower().startswith("hf:"):
             items.append(LibraryItem(kind="data", name=path_text, path=path_text,
-                                     detail="Hugging Face dataset", modified=added,
+                                     detail=tr("Hugging Face dataset"), modified=added,
                                      extra={"runs": used.get(key, []),
                                             "remembered": remembered}))
             continue
         exists = path.exists()
         detail = _report_detail(report if isinstance(report, dict) else {})
         if not exists:
-            detail = "not found any more"
+            detail = tr("not found any more")
         runs_of = used.get(key, [])
         items.append(LibraryItem(
             kind="data", name=path.name or path_text, path=str(path),

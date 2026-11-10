@@ -17,11 +17,12 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
 # 2.25: the choice itself is toolkit-free, shared with the classic interface's dialog
 from ..benchchoice import METHODS, BenchChoice, check_choice, default_choice, describe
 from .common import DIALOGS, ask_dir, ask_open, hint
+from ..i18n import N_, tr
 
 __all__ = ["CHECKPOINTS", "METHODS", "BenchChoice", "BenchDialog", "choose_benchmark",
            "default_choice", "describe"]
 
-CHECKPOINTS = "AuraLite checkpoints (*.pt *.safetensors);;All files (*)"
+CHECKPOINTS = N_("AuraLite checkpoints (*.pt *.safetensors);;All files (*)")
 
 
 class BenchDialog(QDialog):
@@ -31,49 +32,50 @@ class BenchDialog(QDialog):
         from auralite import bench
         from auralite.studio.catalog import CATALOG, find_model
         super().__init__(parent)
-        self.setWindowTitle("Benchmark")
+        self.setWindowTitle(tr("Benchmark"))
         start = start or default_choice()
         self.sizes = list(bench.SIZES)
         layout = QVBoxLayout(self)
         layout.addWidget(hint(
-            f"Measures how fast this computer trains and writes: three sizes of a new model "
-            f"({', '.join(self.sizes)}), offline. Close other programs: they slow it down. "
-            f"The report (Markdown and JSON) goes to {bench.default_folder()}."))
+            tr("Measures how fast this computer trains and writes: three sizes of a new model "
+            "({join}), offline. Close other programs: they slow it down. "
+            "The report (Markdown and JSON) goes to {default_folder}.", join=', '.join(self.sizes), default_folder=bench.default_folder())))
         form = QFormLayout()
         self.seconds = QSpinBox()
         self.seconds.setRange(15, 600)
         self.seconds.setSingleStep(15)
         self.seconds.setSuffix(" s")
         self.seconds.setValue(int(round(start.seconds)))
-        form.addRow("Training for each size:", self.seconds)
+        form.addRow(tr("Training for each size:"), self.seconds)
         layout.addLayout(form)
 
-        self.finetune = QCheckBox("Also measure fine-tuning a model (LoRA / QLoRA)")
+        self.finetune = QCheckBox(tr("Also measure fine-tuning a model (LoRA / QLoRA)"))
         self.finetune.setChecked(bool(start.finetune))
         layout.addWidget(self.finetune)
-        self.group = QGroupBox("The model to fine-tune")
+        self.group = QGroupBox(tr("The model to fine-tune"))
         inner = QVBoxLayout(self.group)
-        self.from_catalog = QRadioButton("From the catalog (downloaded once into "
-                                         "~/.auralite/hf):")
+        self.from_catalog = QRadioButton(tr("From the catalog (downloaded once into "
+                                         "~/.auralite/hf):"))
         self.catalog = QComboBox()
         for model in CATALOG:
-            self.catalog.addItem(f"{model.display_name} - {model.size_label}, "
-                                 f"{model.download_gb:.1f} GB to download", model.spec)
-        self.from_disk = QRadioButton("Already downloaded - a Hugging Face model folder "
-                                      "or an AuraLite checkpoint:")
+            self.catalog.addItem(tr("{name} - {size}, {gb:.1f} GB to download",
+                                    name=model.display_name, size=model.size_label,
+                                    gb=model.download_gb), model.spec)
+        self.from_disk = QRadioButton(tr("Already downloaded - a Hugging Face model folder "
+                                      "or an AuraLite checkpoint:"))
         self.path = QLineEdit()
-        self.path.setPlaceholderText("A folder with config.json, or a .pt / .safetensors file")
-        self.pick_folder = QPushButton("Folder…")
-        self.pick_file = QPushButton("File…")
+        self.path.setPlaceholderText(tr("A folder with config.json, or a .pt / .safetensors file"))
+        self.pick_folder = QPushButton(tr("Folder…"))
+        self.pick_file = QPushButton(tr("File…"))
         line = QHBoxLayout()
         line.addWidget(self.path, 1)
         line.addWidget(self.pick_folder)
         line.addWidget(self.pick_file)
         self.method = QComboBox()
         for key, label in METHODS:
-            self.method.addItem(label, key)
+            self.method.addItem(tr(label), key)
         methods = QFormLayout()
-        methods.addRow("Method:", self.method)
+        methods.addRow(tr("Method:"), self.method)
         for widget in (self.from_catalog, self.catalog, self.from_disk):
             inner.addWidget(widget)
         inner.addLayout(line)
@@ -87,7 +89,7 @@ class BenchDialog(QDialog):
         layout.addWidget(self.problem)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                         | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(tr("Start"))
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -119,14 +121,14 @@ class BenchDialog(QDialog):
         self._update()
 
     def _choose_folder(self) -> None:
-        path = ask_dir(self, "The downloaded model's folder (with config.json)",
+        path = ask_dir(self, tr("The downloaded model's folder (with config.json)"),
                        self.path.text().strip())
         if path:
             self.path.setText(path)
             self.from_disk.setChecked(True)
 
     def _choose_file(self) -> None:
-        path = ask_open(self, "An AuraLite checkpoint to fine-tune", CHECKPOINTS,
+        path = ask_open(self, tr("An AuraLite checkpoint to fine-tune"), tr(CHECKPOINTS),
                         self.path.text().strip())
         if path:
             self.path.setText(path)
@@ -140,8 +142,8 @@ class BenchDialog(QDialog):
         for widget in (self.path, self.pick_folder, self.pick_file):
             widget.setEnabled(on and self.from_disk.isChecked())
         minutes = bench.estimated_minutes(self.sizes, float(self.seconds.value()), finetune=on)
-        self.estimate.setText(f"About {minutes:,.0f} minutes"
-                              + (" (and the download, the first time)"
+        self.estimate.setText(tr("About {minutes:,.0f} minutes", minutes=minutes)
+                              + (tr(" (and the download, the first time)")
                                  if on and self.from_catalog.isChecked() else ""))
         self.problem.setText(self.check() or "")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not self.check())

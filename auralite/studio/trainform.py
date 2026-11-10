@@ -24,6 +24,7 @@ from typing import Any
 
 from .recipes import CUSTOM, ROPE_SCALINGS, TrainSettings
 from .settingsfile import SETTINGS_FORMAT
+from .i18n import tr
 
 __all__ = ["FORM_DEFAULTS", "config_from_form", "form_from_config", "form_from_params",
            "form_from_settings", "read_train_settings", "settings_from_form",
@@ -347,14 +348,14 @@ def read_train_settings(path: str) -> dict[str, Any]:
         try:
             doc = json.load(f)
         except ValueError as err:
-            raise ValueError(f"{os.path.basename(path)} is not a settings file: {err}") from None
+            raise ValueError(tr("{name} is not a settings file: {error}", name=os.path.basename(path), error=err)) from None
     name = os.path.basename(path)
     if not isinstance(doc, dict):
-        raise ValueError(f"{name} is not a settings file of AuraLite")
+        raise ValueError(tr("{name} is not a settings file of AuraLite", name=name))
     studio = doc.get("format") == SETTINGS_FORMAT
     if studio and doc.get("tab") != "train":
-        raise ValueError(f"{name} holds settings of the {doc.get('tab')} tab, not of the "
-                         f"train tab")
+        raise ValueError(tr("{name} holds settings of the {value} tab, not of the "
+                         "train tab", name=name, value=doc.get('tab')))
     if studio and isinstance(doc.get("settings"), dict):
         settings = dict(doc["settings"])
         form = form_from_settings(settings)
@@ -365,6 +366,6 @@ def read_train_settings(path: str) -> dict[str, Any]:
         form = form_from_config(doc)
         settings = settings_from_form(form)
     else:
-        raise ValueError(f"{name} is not a settings file of AuraLite's Train tab")
+        raise ValueError(tr("{name} is not a settings file of AuraLite's Train tab", name=name))
     data = [p for p in doc.get("data") or [] if isinstance(p, str)]
     return {"form": form, "settings": settings, "data": data}

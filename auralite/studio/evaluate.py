@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .i18n import tr
+
 __all__ = ["COMMON_TASKS", "chat_eval_rows", "lm_eval_lines", "parse_tasks"]
 
 #: the classic Eval tab's quick picks
@@ -17,19 +19,19 @@ COMMON_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "winogrande", "gsm8k",
 
 
 def _fmt(value: Any, pattern: str) -> str:
-    return "n/a" if value is None else pattern.format(value)
+    return tr("n/a") if value is None else pattern.format(value)
 
 
 def chat_eval_rows(result: dict[str, Any]) -> list[tuple[str, str]]:
     """``(metric, value)`` rows of a chat evaluation, then a few replies as samples
     (marked ✓ exact, · stopped by itself, … cut at the length)."""
     rows = [
-        ("Stopped by itself", _fmt(result.get("stop_rate"), "{:.1%}")),
-        ("Exact replies", _fmt(result.get("exact"), "{:.1%}")),
-        ("No stray template markers", _fmt(result.get("clean_rate"), "{:.1%}")),
-        ("Reply loss (nats per token)", _fmt(result.get("reply_loss"), "{:.4f}")),
-        ("Reply bits per byte", _fmt(result.get("reply_bpb"), "{:.4f}")),
-        ("New tokens per reply", _fmt(result.get("mean_new_tokens"), "{:.1f}")),
+        (tr("Stopped by itself"), _fmt(result.get("stop_rate"), "{:.1%}")),
+        (tr("Exact replies"), _fmt(result.get("exact"), "{:.1%}")),
+        (tr("No stray template markers"), _fmt(result.get("clean_rate"), "{:.1%}")),
+        (tr("Reply loss (nats per token)"), _fmt(result.get("reply_loss"), "{:.4f}")),
+        (tr("Reply bits per byte"), _fmt(result.get("reply_bpb"), "{:.4f}")),
+        (tr("New tokens per reply"), _fmt(result.get("mean_new_tokens"), "{:.1f}")),
     ]
     for sample in result.get("samples", []) or []:
         mark = "✓" if sample.get("exact") else ("·" if sample.get("stopped") else "…")

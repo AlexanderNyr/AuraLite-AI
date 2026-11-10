@@ -23,6 +23,7 @@ from auralite.studio import libraryview as view
 from .. import common as gui_common
 from ..common import messagebox, threading, tk, ttk
 from ..menu import open_folder
+from ..i18n import N_, tr
 
 _RUN_KEYS = ("name", "status", "kind", "best", "time", "started")
 _MODEL_KEYS = ("name", "kind", "size", "changed", "about")
@@ -34,9 +35,13 @@ def _tree(parent: Any, keys: tuple[str, ...], titles: tuple[str, ...], height: i
     tree = ttk.Treeview(parent, columns=keys, show="headings", height=height,
                         selectmode=selectmode)
     for key, title in zip(keys, titles, strict=True):
-        tree.heading(key, text=title)
+        text = tr(title)
+        tree.heading(key, text=text)
         wide = key in ("name", "about")
-        tree.column(key, width=260 if wide else max(90, 8 * len(title) + 16), stretch=wide,
+        # 2.28: the width of the heading in the interface's language (a status reads
+        # "stopped" in English, a longer word in Russian)
+        tree.column(key, width=260 if wide else gui_common.heading_width(
+            text, 110 if key == "status" else 90), stretch=wide,
                     anchor=tk.E if key in ("best", "time", "size", "runs") else tk.W)
     return tree
 
@@ -65,18 +70,19 @@ class LibraryTabMixin:
 
         top = ttk.Frame(tab)
         top.pack(fill=tk.X)
-        ttk.Label(top, text="Library", style="Header.TLabel").pack(side=tk.LEFT)
-        ttk.Button(top, text="Refresh", command=self._lib_refresh).pack(side=tk.RIGHT)
+        ttk.Label(top, text=tr("Library"), style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Button(top, text=tr("Refresh"), command=self._lib_refresh).pack(side=tk.RIGHT)
         self.lib_disk_label = ttk.Label(top, text="", style="Sub.TLabel")
         self.lib_disk_label.pack(side=tk.RIGHT, padx=8)
         self.lib_pages = ttk.Notebook(tab)
         self.lib_pages.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         pages = []
-        for title, build in (("Runs", self._lib_build_runs), ("Models", self._lib_build_models),
-                             ("Datasets", self._lib_build_datasets)):
+        for title, build in ((N_("Runs"), self._lib_build_runs),
+                             (N_("Models"), self._lib_build_models),
+                             (N_("Datasets"), self._lib_build_datasets)):
             page = ttk.Frame(self.lib_pages, padding="6")
             build(page)
-            self.lib_pages.add(page, text=title)
+            self.lib_pages.add(page, text=tr(title))
             pages.append(page)
         self.lib_page_frames = pages
         self._lib_refresh()
@@ -86,17 +92,17 @@ class LibraryTabMixin:
     def _lib_build_runs(self, page: Any) -> None:
         tools = ttk.Frame(page)
         tools.pack(fill=tk.X)
-        ttk.Label(tools, text="Find:").pack(side=tk.LEFT)
+        ttk.Label(tools, text=tr("Find:")).pack(side=tk.LEFT)
         self.lib_search_var = tk.StringVar(value="")
         search = ttk.Entry(tools, textvariable=self.lib_search_var, width=48)
         search.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         search.bind("<KeyRelease>", lambda _e: self._lib_fill_runs())
-        ttk.Button(tools, text="Runs folder",
+        ttk.Button(tools, text=tr("Runs folder"),
                    command=lambda: open_folder(str(runlib.runs_root()))).pack(side=tk.RIGHT)
-        self.lib_compare_btn = ttk.Button(tools, text="Compare",
+        self.lib_compare_btn = ttk.Button(tools, text=tr("Compare"),
                                           command=self.lib_compare_selected)
         self.lib_compare_btn.pack(side=tk.RIGHT, padx=4)
-        ttk.Label(page, text=f"{view.SEARCH_PLACEHOLDER}. {view.COMPARE_TIP}.",
+        ttk.Label(page, text=f"{tr(view.SEARCH_PLACEHOLDER)}. {tr(view.COMPARE_TIP)}.",
                   style="Sub.TLabel").pack(anchor=tk.W)
         self.lib_runs_tree = _tree(page, _RUN_KEYS, view.RUN_COLUMNS, height=8,
                                    selectmode="extended")
@@ -105,29 +111,29 @@ class LibraryTabMixin:
             self.lib_runs_tree.tag_configure(status, foreground=color)
         self.lib_runs_tree.bind("<<TreeviewSelect>>", lambda _e: self._lib_run_selected())
         self.lib_runs_tree.bind("<Double-1>", lambda _e: self.lib_open_result())
-        self.lib_empty_label = ttk.Label(page, text=view.EMPTY_RUNS, wraplength=740,
+        self.lib_empty_label = ttk.Label(page, text=tr(view.EMPTY_RUNS), wraplength=740,
                                          justify=tk.LEFT, style="Sub.TLabel")
         self._lib_empty_shown = False
 
-        details = ttk.LabelFrame(page, text="  The selected run  ", padding="8")
+        details = ttk.LabelFrame(page, text=tr("  The selected run  "), padding="8")
         details.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.lib_details_frame = details
         row = ttk.Frame(details)
         row.pack(fill=tk.X)
-        ttk.Label(row, text="Name:").pack(side=tk.LEFT)
+        ttk.Label(row, text=tr("Name:")).pack(side=tk.LEFT)
         self.lib_name_var = tk.StringVar(value="")
         self.lib_name_entry = ttk.Entry(row, textvariable=self.lib_name_var)
         self.lib_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        self.lib_save_btn = ttk.Button(row, text="Save the name and notes",
+        self.lib_save_btn = ttk.Button(row, text=tr("Save the name and notes"),
                                        command=self.lib_save_notes)
         self.lib_save_btn.pack(side=tk.LEFT)
         body = ttk.Frame(details)
         body.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         left = ttk.Frame(body)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.lib_facts = ttk.Label(left, text="Select a run.", justify=tk.LEFT, wraplength=420)
+        self.lib_facts = ttk.Label(left, text=tr("Select a run."), justify=tk.LEFT, wraplength=420)
         self.lib_facts.pack(anchor=tk.W, fill=tk.X)
-        ttk.Label(left, text="Notes: what you tried, what you saw",
+        ttk.Label(left, text=tr("Notes: what you tried, what you saw"),
                   style="Sub.TLabel").pack(anchor=tk.W, pady=(6, 0))
         self.lib_notes = tk.Text(left, height=3, width=48, wrap=tk.WORD)
         self.lib_notes.pack(fill=tk.X)
@@ -148,14 +154,14 @@ class LibraryTabMixin:
         buttons.pack(fill=tk.X, pady=(8, 0))
         self.lib_run_buttons: dict[str, Any] = {}
         for key, text, command in (
-                ("continue", "▶ Continue", self.lib_continue_selected),
-                ("open", "Open the result", self.lib_open_result),
-                ("evaluate", "Evaluate", self.lib_evaluate_selected),
-                ("more", "Train more", self.lib_train_more),
-                ("repeat", "Repeat", self.lib_repeat),
-                ("files", "Show files", self.lib_show_files),
-                ("delete", "Delete…", self.lib_delete_menu)):
-            button = ttk.Button(buttons, text=text, command=command)
+                ("continue", N_("▶ Continue"), self.lib_continue_selected),
+                ("open", N_("Open the result"), self.lib_open_result),
+                ("evaluate", N_("Evaluate"), self.lib_evaluate_selected),
+                ("more", N_("Train more"), self.lib_train_more),
+                ("repeat", N_("Repeat"), self.lib_repeat),
+                ("files", N_("Show files"), self.lib_show_files),
+                ("delete", N_("Delete…"), self.lib_delete_menu)):
+            button = ttk.Button(buttons, text=tr(text), command=command)
             button.pack(side=tk.LEFT, padx=(0, 4))
             self.lib_run_buttons[key] = button
         self.lib_hint = ttk.Label(details, text="", style="Sub.TLabel", wraplength=740,
@@ -166,7 +172,7 @@ class LibraryTabMixin:
         self.lib_task_label = ttk.Label(task, text="", style="Sub.TLabel", wraplength=640,
                                         justify=tk.LEFT)
         self.lib_task_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.lib_task_stop = ttk.Button(task, text="🛑 Stop", command=self.lib_stop_task,
+        self.lib_task_stop = ttk.Button(task, text=tr("🛑 Stop"), command=self.lib_stop_task,
                                         state=tk.DISABLED)
         self.lib_task_stop.pack(side=tk.RIGHT)
 
@@ -292,7 +298,7 @@ class LibraryTabMixin:
             self._lib_shown_id = ""
             self.lib_name_var.set("")
             self.lib_notes.delete("1.0", tk.END)
-            self.lib_facts.config(text="Select a run." if self.lib_runs else "")
+            self.lib_facts.config(text=tr("Select a run.") if self.lib_runs else "")
             self._lib_draw_curve(None)
         else:
             if run.id != self._lib_shown_id:
@@ -311,13 +317,13 @@ class LibraryTabMixin:
             ax = self.lib_ax
             ax.clear()
             if train:                          # a short run's few points stay visible
-                ax.plot([s for s, _ in train], [v for _, v in train], label="training",
+                ax.plot([s for s, _ in train], [v for _, v in train], label=tr("training"),
                         marker="." if len(train) < 30 else None)
             if val:
-                ax.plot([s for s, _ in val], [v for _, v in val], "o", label="validation")
+                ax.plot([s for s, _ in val], [v for _, v in val], "o", label=tr("validation"))
             if train or val:
-                ax.set_xlabel("Step")
-                ax.set_ylabel("Loss")
+                ax.set_xlabel(tr("Step"))
+                ax.set_ylabel(tr("Loss"))
                 ax.legend()
             try:
                 self.lib_fig.tight_layout()                    # type: ignore[union-attr]
@@ -326,11 +332,13 @@ class LibraryTabMixin:
                 pass
         elif self.lib_curve_label is not None:
             if not train and not val:
-                text = "" if run is None else "No curve recorded."
+                text = "" if run is None else tr("No curve recorded.")
             else:
-                text = f"Curve: {len(train)} points" + (
-                    f", the last training loss {train[-1][1]:.4f}" if train else "") + (
-                    f", the best validation loss {min(v for _, v in val):.4f}" if val else "")
+                text = tr("Curve: {n} points", n=len(train)) + (
+                    ", " + tr("the last training loss {loss:.4f}", loss=train[-1][1])
+                    if train else "") + (
+                    ", " + tr("the best validation loss {loss:.4f}",
+                              loss=min(v for _, v in val)) if val else "")
             self.lib_curve_label.config(text=text)
 
     def _lib_update_run_buttons(self, run: runlib.Run | None = None) -> None:
@@ -353,7 +361,7 @@ class LibraryTabMixin:
         try:
             runlib.update_run(run, name=name, notes=notes)
         except (OSError, ValueError) as err:
-            self.report_error(err, "saving the run's notes")    # type: ignore[attr-defined]
+            self.report_error(err, tr("saving the run's notes"))    # type: ignore[attr-defined]
             return
         self._lib_shown_id = ""
         self._lib_refresh()
@@ -366,7 +374,7 @@ class LibraryTabMixin:
     def _lib_check_idle(self) -> bool:
         busy = self._busy_with()                               # type: ignore[attr-defined]
         if busy:
-            messagebox.showinfo("One thing at a time", f"Wait until {busy} ends, or stop it.")
+            messagebox.showinfo(tr("One thing at a time"), tr("Wait until {busy} ends, or stop it.", busy=busy))
             return False
         return True
 
@@ -406,9 +414,9 @@ class LibraryTabMixin:
         menu = getattr(self, "lib_delete_popup", None)
         if menu is None:                       # made once, shown under the button
             menu = self.lib_delete_popup = tk.Menu(self.root, tearoff=0)
-            menu.add_command(label="Delete its model files (keep the record and curve)",
+            menu.add_command(label=tr("Delete its model files (keep the record and curve)"),
                              command=lambda: self.lib_delete_selected(files_only=True))
-            menu.add_command(label="Delete the run",
+            menu.add_command(label=tr("Delete the run"),
                              command=lambda: self.lib_delete_selected(files_only=False))
         button = self.lib_run_buttons["delete"]
         try:
@@ -420,12 +428,12 @@ class LibraryTabMixin:
         run = self.lib_current_run()
         if run is None or run.status == "running":
             return
-        if not messagebox.askyesno("Delete", view.delete_run_question(run, files_only)):
+        if not messagebox.askyesno(tr("Delete"), view.delete_run_question(run, files_only)):
             return
         try:
             runlib.delete_run(run, files_only=files_only)
         except (OSError, ValueError) as err:
-            self.report_error(err, "deleting the run")          # type: ignore[attr-defined]
+            self.report_error(err, tr("deleting the run"))          # type: ignore[attr-defined]
         self._lib_shown_id = ""
         self._lib_refresh()
         refresh = getattr(self, "_start_refresh_interrupted", None)
@@ -435,7 +443,7 @@ class LibraryTabMixin:
     def lib_compare_selected(self) -> None:
         runs = self.lib_selected_runs()
         if len(runs) < 2:
-            messagebox.showinfo("Compare runs", view.SELECT_TWO)
+            messagebox.showinfo(tr("Compare runs"), tr(view.SELECT_TWO))
             return
         if self.lib_compare_window is not None:
             try:
@@ -448,7 +456,7 @@ class LibraryTabMixin:
         """Two runs or more side by side: their curves and what differs (bold)."""
         comparison = runlib.compare_runs(runs)
         win = tk.Toplevel(self.root)
-        win.title(f"Compare {len(runs)} runs")
+        win.title(tr("Compare {n_runs} runs", n_runs=len(runs)))
         win.geometry("940x640")
         outer = ttk.Frame(win, padding="10")
         outer.pack(fill=tk.BOTH, expand=True)
@@ -464,8 +472,8 @@ class LibraryTabMixin:
                     color = None
                 if val:
                     ax.plot([s for s, _ in val], [v for _, v in val], "o", color=color)
-            ax.set_xlabel("Step")
-            ax.set_ylabel("Loss")
+            ax.set_xlabel(tr("Step"))
+            ax.set_ylabel(tr("Loss"))
             ax.legend()
             try:
                 fig.tight_layout()
@@ -474,7 +482,7 @@ class LibraryTabMixin:
             canvas = gui_common.FigureCanvasTkAgg(fig, master=outer)
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             canvas.draw_idle()
-        ttk.Label(outer, text=view.COMPARE_HINT, style="Sub.TLabel").pack(anchor=tk.W,
+        ttk.Label(outer, text=tr(view.COMPARE_HINT), style="Sub.TLabel").pack(anchor=tk.W,
                                                                        pady=(4, 0))
         keys = tuple(f"run{i}" for i in range(len(runs)))
         table = ttk.Treeview(outer, columns=keys, show="tree headings",
@@ -489,7 +497,7 @@ class LibraryTabMixin:
             table.insert("", tk.END, text=label, values=[str(v) for v in values],
                          tags=("differs",) if differs else ())
         table.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-        ttk.Button(outer, text="Close", command=win.destroy).pack(anchor=tk.E, pady=(8, 0))
+        ttk.Button(outer, text=tr("Close"), command=win.destroy).pack(anchor=tk.E, pady=(8, 0))
         self.lib_compare_table = table
         self.lib_comparison = comparison
         return win
@@ -501,23 +509,23 @@ class LibraryTabMixin:
         if run is None or run.result_path is None:
             return False
         if str(run.data.get("kind")) not in ("dialogs", "preferences"):
-            messagebox.showinfo("Evaluate", view.EVAL_TEXT_ONLY)
+            messagebox.showinfo(tr("Evaluate"), tr(view.EVAL_TEXT_ONLY))
             return False
         if not self._lib_check_idle():
             return False
         if self.engine.model is not None and not messagebox.askyesno(
-                "Evaluate", "The evaluation loads the run's result in place of the model in "
-                            "memory.\n\nEvaluate?"):
+                tr("Evaluate"), tr("The evaluation loads the run's result in place of the model in "
+                            "memory.\n\nEvaluate?")):
             return False
         engine = self.engine
         path = str(run.result_path)
         self.lib_eval_stop.clear()
-        self.lib_task_label.config(text=f"Loading {run.name}…")
+        self.lib_task_label.config(text=tr("Loading {name}…", name=run.name))
         self.lib_task_stop.config(state=tk.NORMAL)
 
         def progress(done: int, total: int) -> None:
             self.root.after(0, lambda: self.lib_task_label.config(
-                text=f"Evaluating: {done} of {total} dialogs"))
+                text=tr("Evaluating: {done} of {total} dialogs", done=done, total=total)))
 
         def work() -> None:
             try:
@@ -528,7 +536,7 @@ class LibraryTabMixin:
                 dialogs = runlib.held_out_dialogs(run)
                 total = min(view.EVAL_DIALOGS, len(dialogs))
                 self.root.after(0, lambda: self.lib_task_label.config(
-                    text=f"Replying to {total} held-out dialogs…"))
+                    text=tr("Replying to {total} held-out dialogs…", total=total)))
                 started = time.time()
                 result = engine.evaluate_chat(dialogs, limit=view.EVAL_DIALOGS,
                                               max_new_tokens=view.EVAL_TOKENS,
@@ -559,19 +567,19 @@ class LibraryTabMixin:
     def _lib_eval_failed(self, exc: BaseException) -> None:
         self._lib_eval_thread = None
         self.lib_task_stop.config(state=tk.DISABLED)
-        self.lib_task_label.config(text="The evaluation failed - see the message.")
+        self.lib_task_label.config(text=tr("The evaluation failed - see the message."))
         self._model_in_memory_changed()                        # type: ignore[attr-defined]
         self._lib_update_run_buttons(self.lib_current_run())
-        self.report_error(exc, "the evaluation", title="Evaluate")  # type: ignore[attr-defined]
+        self.report_error(exc, tr("the evaluation"), title=tr("Evaluate"))  # type: ignore[attr-defined]
 
     def lib_stop_task(self) -> None:
         if self._lib_eval_thread is not None:
             self.lib_eval_stop.set()
-            self.lib_task_label.config(text="Stopping after this reply…")
+            self.lib_task_label.config(text=tr("Stopping after this reply…"))
 
     # ==== models ==========================================================================
     def _lib_build_models(self, page: Any) -> None:
-        ttk.Label(page, text=view.MODELS_HINT, wraplength=740, justify=tk.LEFT,
+        ttk.Label(page, text=tr(view.MODELS_HINT), wraplength=740, justify=tk.LEFT,
                   style="Sub.TLabel").pack(anchor=tk.W)
         self.lib_models_tree = _tree(page, _MODEL_KEYS, view.MODEL_COLUMNS, height=12)
         self.lib_models_tree.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -582,14 +590,14 @@ class LibraryTabMixin:
         buttons.pack(fill=tk.X, pady=(6, 0))
         self.lib_model_buttons: dict[str, Any] = {}
         for key, text, command in (
-                ("chat", "💬 Chat with it", self.lib_chat_with_model),
-                ("finetune", "🎯 Fine-tune it", self.lib_finetune_model),
-                ("export", "📦 Export…", self.lib_export_model),
-                ("show", "Show in folder", lambda: self._lib_show(self.lib_selected_model())),
-                ("forget", "Remove from the list",
+                ("chat", N_("💬 Chat with it"), self.lib_chat_with_model),
+                ("finetune", N_("🎯 Fine-tune it"), self.lib_finetune_model),
+                ("export", N_("📦 Export…"), self.lib_export_model),
+                ("show", N_("Show in folder"), lambda: self._lib_show(self.lib_selected_model())),
+                ("forget", N_("Remove from the list"),
                  lambda: self._lib_forget(self.lib_selected_model())),
-                ("delete", "Delete…", lambda: self._lib_delete(self.lib_selected_model()))):
-            button = ttk.Button(buttons, text=text, command=command)
+                ("delete", N_("Delete…"), lambda: self._lib_delete(self.lib_selected_model()))):
+            button = ttk.Button(buttons, text=tr(text), command=command)
             button.pack(side=tk.LEFT, padx=(0, 4))
             self.lib_model_buttons[key] = button
 
@@ -642,9 +650,9 @@ class LibraryTabMixin:
             spec = str(item.extra.get("spec") or item.path)
             self.hf_model_var.set(spec)                        # type: ignore[attr-defined]
             self._lib_after_import = "chat"
-            self.lib_task_label.config(text=f"Importing {item.name}: the Chat tab opens when it "
-                                            f"is in memory (the Train tab's status shows how far "
-                                            f"it is).")
+            self.lib_task_label.config(text=tr("Importing {name}: the Chat tab opens when it "
+                                            "is in memory (the Train tab's status shows how far "
+                                            "it is).", name=item.name))
             self._import_hf_native()                           # type: ignore[attr-defined]
             return
         self.load_model(item.path)                             # type: ignore[attr-defined]
@@ -691,17 +699,17 @@ class LibraryTabMixin:
     def _lib_delete(self, item: library.LibraryItem | None) -> None:
         if item is None or not item.exists or not self._lib_check_idle():
             return
-        if not messagebox.askyesno("Delete", view.delete_item_question(item)):
+        if not messagebox.askyesno(tr("Delete"), view.delete_item_question(item)):
             return
         try:
             library.delete_item(item)
         except (OSError, ValueError) as err:
-            self.report_error(err, "deleting it")               # type: ignore[attr-defined]
+            self.report_error(err, tr("deleting it"))               # type: ignore[attr-defined]
         self._lib_refresh()
 
     # ==== datasets ========================================================================
     def _lib_build_datasets(self, page: Any) -> None:
-        ttk.Label(page, text=view.DATASETS_HINT, wraplength=740, justify=tk.LEFT,
+        ttk.Label(page, text=tr(view.DATASETS_HINT), wraplength=740, justify=tk.LEFT,
                   style="Sub.TLabel").pack(anchor=tk.W)
         self.lib_data_tree = _tree(page, _DATA_KEYS, view.DATA_COLUMNS, height=12)
         self.lib_data_tree.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -711,13 +719,13 @@ class LibraryTabMixin:
         buttons.pack(fill=tk.X, pady=(6, 0))
         self.lib_data_buttons: dict[str, Any] = {}
         for key, text, command in (
-                ("finetune", "🎯 Fine-tune on it", lambda: self.lib_use_data("finetune")),
-                ("train", "🧠 Train on it", lambda: self.lib_use_data("train")),
-                ("show", "Show in folder", lambda: self._lib_show(self.lib_selected_dataset())),
-                ("forget", "Remove from the list",
+                ("finetune", N_("🎯 Fine-tune on it"), lambda: self.lib_use_data("finetune")),
+                ("train", N_("🧠 Train on it"), lambda: self.lib_use_data("train")),
+                ("show", N_("Show in folder"), lambda: self._lib_show(self.lib_selected_dataset())),
+                ("forget", N_("Remove from the list"),
                  lambda: self._lib_forget(self.lib_selected_dataset())),
-                ("delete", "Delete…", lambda: self._lib_delete(self.lib_selected_dataset()))):
-            button = ttk.Button(buttons, text=text, command=command)
+                ("delete", N_("Delete…"), lambda: self._lib_delete(self.lib_selected_dataset()))):
+            button = ttk.Button(buttons, text=tr(text), command=command)
             button.pack(side=tk.LEFT, padx=(0, 4))
             self.lib_data_buttons[key] = button
 

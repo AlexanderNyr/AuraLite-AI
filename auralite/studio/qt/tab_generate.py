@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFormLay
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..i18n import tr
+from ..i18n import N_, tr
 from .common import Job, ask_save, compact_spins, heading, hint, primary, show_error
 
 if TYPE_CHECKING:
@@ -213,7 +213,7 @@ class GenerateTab(QWidget):
             engine.set_context_window("full" if self.full_context.isChecked() else "auto")
         except Exception:                     # an engine without the 2.11 API
             pass
-        if not self.studio.begin("writing", quiet=True):
+        if not self.studio.begin(N_("writing"), quiet=True):
             return
         length = int(self.length.value())
         options = self.sampling()
@@ -284,7 +284,7 @@ class GenerateTab(QWidget):
         self.speed.setText("")
         self.studio.end(model_dirty=None)
         self._update_buttons()
-        self.studio.report_error(exc, "the generation")
+        self.studio.report_error(exc, tr("the generation"))
 
     def stop(self) -> None:
         if self.job is not None:
@@ -308,7 +308,7 @@ class GenerateTab(QWidget):
             with open(path, "a" if append else "w", encoding="utf-8") as f:
                 f.write(("\n\n" if append else "") + text)
         except OSError as err:
-            show_error(self, err, "saving the text")
+            show_error(self, err, tr("saving the text"))
             return
         self.speed.setText(tr("Appended to {path}", path=path) if append else
                            tr("Saved: {path}", path=path))

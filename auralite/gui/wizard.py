@@ -13,15 +13,16 @@ from auralite.studio import wizardplan as steps
 
 from . import common as gui_common
 from .common import filedialog, messagebox, threading, tk, ttk
+from .i18n import N_, tr
 
 __all__ = ["SetupWizard", "WizardMixin"]
 
 PAGES = ("goal", "computer", "data", "model", "plan")
-TITLES = {"goal": "What do you want to do?", "computer": "This computer",
-          "data": "Your data", "model": "The model", "plan": "The plan"}
+TITLES = {"goal": N_("What do you want to do?"), "computer": N_("This computer"),
+          "data": N_("Your data"), "model": N_("The model"), "plan": N_("The plan")}
 GOAL_KEYS = tuple(key for key, _title, _text in steps.GOALS)
-PLAN_NOTE = ("You can stop at any time: Finish ends the run well and keeps the model; the "
-             "Console tab shows everything.")
+PLAN_NOTE = N_("You can stop at any time: Finish ends the run well and keeps the model; the "
+               "Console tab shows everything.")
 
 
 class SetupWizard:
@@ -35,7 +36,7 @@ class SetupWizard:
         self.page = 0
         self._inspected_paths: list[str] = []
         win = self.window = tk.Toplevel(app.root)
-        win.title("Set up a training run")
+        win.title(tr("Set up a training run"))
         win.geometry("820x600")
         win.transient(app.root)
         outer = ttk.Frame(win, padding="14")
@@ -56,13 +57,13 @@ class SetupWizard:
         self._build_plan(self.frames["plan"])
         buttons = ttk.Frame(outer)
         buttons.pack(fill=tk.X, pady=(10, 0))
-        self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.cancel)
+        self.cancel_button = ttk.Button(buttons, text=tr("Cancel"), command=self.cancel)
         self.cancel_button.pack(side=tk.LEFT)
-        self.finish_button = ttk.Button(buttons, text="Finish", command=self.finish)
+        self.finish_button = ttk.Button(buttons, text=tr("Finish"), command=self.finish)
         self.finish_button.pack(side=tk.RIGHT)
-        self.next_button = ttk.Button(buttons, text="Next ▸", command=self.go_next)
+        self.next_button = ttk.Button(buttons, text=tr("Next ▸"), command=self.go_next)
         self.next_button.pack(side=tk.RIGHT, padx=4)
-        self.back_button = ttk.Button(buttons, text="◂ Back", command=self.go_back)
+        self.back_button = ttk.Button(buttons, text=tr("◂ Back"), command=self.go_back)
         self.back_button.pack(side=tk.RIGHT)
         self.problem_label = ttk.Label(outer, text="", foreground="#d93025", wraplength=760)
         self.problem_label.pack(anchor=tk.W)
@@ -77,15 +78,16 @@ class SetupWizard:
     # ---- the pages ---------------------------------------------------------------
     def _build_goal(self, page: Any) -> None:
         for key, title, text in steps.GOALS:
-            ttk.Radiobutton(page, text=title, value=key, variable=self.goal_var).pack(
+            ttk.Radiobutton(page, text=tr(title), value=key, variable=self.goal_var).pack(
                 anchor=tk.W, pady=(6, 0))
-            ttk.Label(page, text=text, wraplength=720, justify=tk.LEFT,
+            ttk.Label(page, text=tr(text), wraplength=720, justify=tk.LEFT,
                       style="Sub.TLabel").pack(anchor=tk.W, padx=(24, 0))
 
     def _build_computer(self, page: Any) -> None:
         self.computer_label = ttk.Label(page, text="", justify=tk.LEFT, wraplength=740)
         self.computer_label.pack(anchor=tk.W)
-        self.speed_button = ttk.Button(page, text=steps.SPEED_BUTTON, command=self._speed_test)
+        self.speed_button = ttk.Button(page, text=tr(steps.SPEED_BUTTON),
+                                       command=self._speed_test)
         self.speed_button.pack(anchor=tk.W, pady=(10, 0))
 
     def _build_data(self, page: Any) -> None:
@@ -96,9 +98,9 @@ class SetupWizard:
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         entry.bind("<Return>", lambda _e: self.inspect())
         entry.bind("<FocusOut>", lambda _e: self._inspect_if_changed())
-        ttk.Button(row, text="File…", command=self._pick_file).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="Folder…", command=self._pick_folder).pack(side=tk.LEFT)
-        self.data_report = ttk.Label(page, text="No data chosen yet.", wraplength=740,
+        ttk.Button(row, text=tr("File…"), command=self._pick_file).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text=tr("Folder…"), command=self._pick_folder).pack(side=tk.LEFT)
+        self.data_report = ttk.Label(page, text=tr("No data chosen yet."), wraplength=740,
                                      justify=tk.LEFT)
         self.data_report.pack(anchor=tk.W, pady=(6, 0))
         self.data_explain = ttk.Label(page, text="", wraplength=740, justify=tk.LEFT,
@@ -109,15 +111,15 @@ class SetupWizard:
         self.model_tree = ttk.Treeview(page, columns=("c0",), show="headings", height=8,
                                        selectmode="browse")
         self.model_tree.pack(fill=tk.BOTH, expand=True)
-        self.other_label = ttk.Label(page, text=steps.OTHER_LABEL)
+        self.other_label = ttk.Label(page, text=tr(steps.OTHER_LABEL))
         self.other_var = tk.StringVar(value="")
         self.other_entry = ttk.Entry(page, textvariable=self.other_var)
         self.file_row = ttk.Frame(page)
-        ttk.Label(self.file_row, text=steps.FILE_PLACEHOLDER).pack(anchor=tk.W)
+        ttk.Label(self.file_row, text=tr(steps.FILE_PLACEHOLDER)).pack(anchor=tk.W)
         self.file_var = tk.StringVar(value="")
         ttk.Entry(self.file_row, textvariable=self.file_var).pack(side=tk.LEFT, fill=tk.X,
                                                                   expand=True)
-        ttk.Button(self.file_row, text="File…", command=self._pick_model).pack(side=tk.LEFT,
+        ttk.Button(self.file_row, text=tr("File…"), command=self._pick_model).pack(side=tk.LEFT,
                                                                                padx=4)
         self.model_note = ttk.Label(page, text="", wraplength=740, justify=tk.LEFT,
                                     style="Sub.TLabel")
@@ -127,9 +129,9 @@ class SetupWizard:
         self.plan_label = ttk.Label(page, text="", justify=tk.LEFT, wraplength=740)
         self.plan_label.pack(anchor=tk.W)
         self.start_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(page, text="Start training right away", variable=self.start_var).pack(
+        ttk.Checkbutton(page, text=tr("Start training right away"), variable=self.start_var).pack(
             anchor=tk.W, pady=(10, 0))
-        ttk.Label(page, text=PLAN_NOTE, wraplength=740, justify=tk.LEFT,
+        ttk.Label(page, text=tr(PLAN_NOTE), wraplength=740, justify=tk.LEFT,
                   style="Sub.TLabel").pack(anchor=tk.W, pady=(6, 0))
 
     # ---- moving between pages ---------------------------------------------------------
@@ -142,10 +144,10 @@ class SetupWizard:
             frame.pack_forget()
         self.page = max(0, min(index, len(PAGES) - 1))
         name = PAGES[self.page]
-        self.title_label.config(text=TITLES[name])
+        self.title_label.config(text=tr(TITLES[name]))
         subtitle = ""
         if name == "computer":
-            subtitle = steps.COMPUTER_SUBTITLE
+            subtitle = tr(steps.COMPUTER_SUBTITLE)
             self._refresh_computer()
         elif name == "data":
             subtitle, explanation = steps.data_texts(self.goal())
@@ -153,7 +155,7 @@ class SetupWizard:
         elif name == "model":
             subtitle = self._fill_model()
         elif name == "plan":
-            subtitle = steps.PLAN_SUBTITLE
+            subtitle = tr(steps.PLAN_SUBTITLE)
             self.plan_label.config(text="\n".join(steps.plan_lines(self.goal(), self.choice(),
                                                                    self.report)))
         self.subtitle_label.config(text=subtitle)
@@ -172,16 +174,19 @@ class SetupWizard:
             if self.report is not None and self.report.problems:
                 return self.report.problems[0]
             if self.report is not None and self.report.ok:
-                return (f"{self.report.kind_label} does not fit this goal: "
-                        + ("a new model trains on texts" if goal == "pretrain" else
-                           "fine-tuning learns from dialogs, preference pairs or texts"))
-            return "Choose the data first (File… or Folder…)."
+                return tr("{kind} does not fit this goal: {why}",
+                          kind=self.report.kind_label,
+                          why=(tr("a new model trains on texts") if goal == "pretrain" else
+                               tr("fine-tuning learns from dialogs, preference pairs or "
+                                  "texts")))
+            return tr("Choose the data first (File… or Folder…).")
         if name == "model" and not steps.model_complete(goal, self.selected_row(),
                                                         self.table.recommendation,
                                                         str(self.other_var.get() or ""),
                                                         str(self.file_var.get() or "")):
-            return ("Choose your model file (.pt)." if goal == "continue" else
-                    "Select a model in the list (this computer may still be being looked at).")
+            return (tr("Choose your model file (.pt).") if goal == "continue" else
+                    tr("Select a model in the list (this computer may still be being looked "
+                       "at)."))
         return ""
 
     def go_next(self) -> bool:
@@ -212,14 +217,14 @@ class SetupWizard:
     # ---- the data ---------------------------------------------------------------------
     def _pick_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose the training data", parent=self.window,
-            filetypes=[("Data", "*.jsonl *.json *.txt *.md *.parquet *.zst *.gz"),
-                       ("All files", "*.*")])
+            title=tr("Choose the training data"), parent=self.window,
+            filetypes=[(tr("Data"), "*.jsonl *.json *.txt *.md *.parquet *.zst *.gz"),
+                       (tr("All files"), "*.*")])
         if path:
             self.set_data(path)
 
     def _pick_folder(self) -> None:
-        path = filedialog.askdirectory(title="Choose a folder of training data",
+        path = filedialog.askdirectory(title=tr("Choose a folder of training data"),
                                        parent=self.window)
         if path:
             self.set_data(path)
@@ -242,9 +247,9 @@ class SetupWizard:
         self._inspected_paths = list(paths)
         if not paths:
             self.report = None
-            self.data_report.config(text="No data chosen yet.")
+            self.data_report.config(text=tr("No data chosen yet."))
             return
-        self.data_report.config(text="Reading the data…")
+        self.data_report.config(text=tr("Reading the data…"))
 
         def work() -> None:
             from auralite.studio.datacheck import DataReport, inspect_data
@@ -281,7 +286,7 @@ class SetupWizard:
             tree.config(columns=keys)
             for key, title in zip(keys, table.headers, strict=True):
                 tree.heading(key, text=title)
-                tree.column(key, width=220 if key == "c0" else max(80, 8 * len(title) + 16),
+                tree.column(key, width=220 if key == "c0" else gui_common.heading_width(title),
                             stretch=key == "c0")
         tree.tag_configure("unusable", foreground="#888888")
         for i, (cells, _recommended, usable) in enumerate(table.rows):
@@ -317,9 +322,9 @@ class SetupWizard:
         return self.table.chosen if self.table.rows else -1
 
     def _pick_model(self) -> None:
-        path = filedialog.askopenfilename(title="Choose your model", parent=self.window,
-                                          filetypes=[("AuraLite models", "*.pt"),
-                                                     ("All files", "*.*")])
+        path = filedialog.askopenfilename(title=tr("Choose your model"), parent=self.window,
+                                          filetypes=[(tr("AuraLite models"), "*.pt"),
+                                                     (tr("All files"), "*.*")])
         if path:
             self.file_var.set(path)
 
@@ -356,7 +361,7 @@ class WizardMixin:
         """Tools -> Setup wizard… (Ctrl+N), the Start tab's way in."""
         busy = self._busy_with()                               # type: ignore[attr-defined]
         if busy:
-            messagebox.showinfo("AuraLite is busy", f"Wait until {busy} ends, or stop it.")
+            messagebox.showinfo(tr("AuraLite is busy"), tr("Wait until {busy} ends, or stop it.", busy=busy))
             return None
         try:
             return SetupWizard(self, goal)

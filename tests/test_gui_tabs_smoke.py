@@ -204,23 +204,33 @@ def test_chat_insights_hint_when_matplotlib_is_missing(app):
     app._plot_attention_map()
 
 
-def test_language_switch_relabels_tabs(app):
+def test_language_choice_is_saved_for_the_next_start(app, monkeypatch):
+    """2.28: a language picked is saved and spoken from the next start (a restart is
+    offered); until then the window keeps its language."""
+    import tkinter.messagebox as mb
+
     from auralite.gui.i18n import tr
 
-    app.notebook.tab.reset_mock()
-    app._on_language_change("English")
-    assert app.language == "en"
-    assert app.gui_config.language == "en"
-    assert tr("tab.train") == " Train "
-    assert app.notebook.tab.call_count == len(app._tab_names)
-    for call in app.notebook.tab.call_args_list:
-        assert call.kwargs["text"].startswith(" ")
+    asked = []
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: asked.append(a) or False)
+    russian = "\u0420\u0443\u0441\u0441\u043a\u0438\u0439"
+    app._on_language_change(russian)
+    assert app.gui_config.language == "ru" and app.gui_config.language_chosen
+    assert app.language == "en" and tr("tab.train") == " Train "
+    assert len(asked) == 1                                     # restart now? - no
+    app._on_language_change("en")                              # back: nothing to restart
+    assert app.gui_config.language == "en" and len(asked) == 1
+    restarted = []
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    monkeypatch.setattr(type(app), "restart", lambda self: restarted.append(True) or True)
+    app._on_language_change("ru")
+    assert restarted == [True]
 
 
-def test_language_switch_unknown_name_falls_back_to_english(app):
+def test_language_switch_unknown_name_means_the_computers(app):
     app._on_language_change("Klingon")
     assert app.language == "en"
-    assert app.gui_config.language == "en"
+    assert app.gui_config.language == "" and app.gui_config.language_chosen
 
 
 # ----------------------------------------------------------------------

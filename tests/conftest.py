@@ -36,6 +36,10 @@ os.environ["AURALITE_HOME"] = _TEST_HOME
 for _override in ("AURALITE_GUI_CONFIG", "AURALITE_GUI_SESSION"):
     os.environ.pop(_override, None)
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+# 2.28: the interfaces speak the computer's language; the suite checks the English texts
+# whatever the computer's language is (tests of the translations switch on their own).
+os.environ["AURALITE_LANG"] = "en"
+os.environ.pop("AURALITE_GUI_LANG", None)
 
 TINY_TEXT = (
     "AuraLite trains small language models on CPU. "
@@ -81,6 +85,15 @@ def _deterministic_rng():
     if torch is not None:
         torch.manual_seed(TEST_SEED)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _english_interface():
+    """2.28: every test starts and ends with the English interface."""
+    from auralite import i18n
+    i18n.set_language("en")
+    yield
+    i18n.set_language("en")
 
 
 @pytest.fixture(autouse=True)

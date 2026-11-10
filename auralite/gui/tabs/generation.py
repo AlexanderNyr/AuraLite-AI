@@ -3,19 +3,20 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from ..common import (build_web_context, messagebox, threading, tk, ttk)
+from ..i18n import tr
 
 class GenerationTabMixin:
     def _build_generation_tab(self):
         tab = self.tab_gen
 
         # --- Sampling settings ---
-        gen_settings = ttk.LabelFrame(tab, text="  🎛️  Sampling  ", padding="10")
+        gen_settings = ttk.LabelFrame(tab, text=tr("  🎛️  Sampling  "), padding="10")
         gen_settings.pack(fill=tk.X, pady=(0, 8))
 
         srow = ttk.Frame(gen_settings)
         srow.pack(fill=tk.X)
 
-        ttk.Label(srow, text="🌡️ Temperature:").grid(row=0, column=0,
+        ttk.Label(srow, text=tr("🌡️ Temperature:")).grid(row=0, column=0,
                                                      sticky=tk.W, padx=4)
         self.temp_var = tk.DoubleVar(value=0.8)
         self.temp_scale = ttk.Scale(srow, from_=0.1, to=2.0,
@@ -26,33 +27,33 @@ class GenerationTabMixin:
         self.temp_display.grid(row=0, column=2, padx=2)
         self.temp_var.trace_add("write", self._update_temp_display)
 
-        ttk.Label(srow, text="Top-K:").grid(row=0, column=3,
+        ttk.Label(srow, text=tr("Top-K:")).grid(row=0, column=3,
                                             sticky=tk.W, padx=(14, 4))
         self.topk_var = tk.StringVar(value="50")
         ttk.Entry(srow, textvariable=self.topk_var,
                   width=6).grid(row=0, column=4, padx=4)
 
-        ttk.Label(srow, text="Top-P:").grid(row=0, column=5,
+        ttk.Label(srow, text=tr("Top-P:")).grid(row=0, column=5,
                                             sticky=tk.W, padx=(14, 4))
         self.topp_var = tk.StringVar(value="0.9")
         ttk.Entry(srow, textvariable=self.topp_var,
                   width=6).grid(row=0, column=6, padx=4)
 
-        ttk.Label(srow, text="Rep. Penalty:").grid(row=1, column=0,
+        ttk.Label(srow, text=tr("Rep. Penalty:")).grid(row=1, column=0,
                                                    sticky=tk.W, padx=4,
                                                    pady=(6, 0))
         self.rep_var = tk.StringVar(value="1.1")
         ttk.Entry(srow, textvariable=self.rep_var,
                   width=6).grid(row=1, column=1, sticky=tk.W, padx=4,
                                 pady=(6, 0))
-        ttk.Label(srow, text="Min-P:").grid(row=1, column=2,
+        ttk.Label(srow, text=tr("Min-P:")).grid(row=1, column=2,
                                             sticky=tk.W, padx=(14, 4),
                                             pady=(6, 0))
         self.minp_var = tk.StringVar(value="0.0")
         ttk.Entry(srow, textvariable=self.minp_var,
                   width=6).grid(row=1, column=3, sticky=tk.W, padx=4,
                                 pady=(6, 0))
-        ttk.Label(srow, text="(1.0 = off, 1.1–1.3 fights loops)",
+        ttk.Label(srow, text=tr("(1.0 = off, 1.1–1.3 fights loops)"),
                   style="Sub.TLabel").grid(row=1, column=4, columnspan=3,
                                            sticky=tk.W, pady=(6, 0))
 
@@ -60,7 +61,7 @@ class GenerationTabMixin:
         ctx_row = ttk.Frame(gen_settings)
         ctx_row.pack(fill=tk.X, pady=(6, 0))
         self.full_context_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ctx_row, text="Full context (no window)",
+        ttk.Checkbutton(ctx_row, text=tr("Full context (no window)"),
                         variable=self.full_context_var,
                         command=self._update_context_hint).pack(side=tk.LEFT, padx=4)
         self.context_hint = ttk.Label(ctx_row, text="", style="Sub.TLabel")
@@ -68,17 +69,17 @@ class GenerationTabMixin:
         self._update_context_hint()
 
         # --- Seed + length ---
-        seed_frame = ttk.LabelFrame(tab, text="  🌱  Prompt  ", padding="10")
+        seed_frame = ttk.LabelFrame(tab, text=tr("  🌱  Prompt  "), padding="10")
         seed_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(seed_frame, text="Seed phrase:").pack(anchor=tk.W)
+        ttk.Label(seed_frame, text=tr("Seed phrase:")).pack(anchor=tk.W)
         self.seed_entry = ttk.Entry(seed_frame, font=("Segoe UI", 11))
         self.seed_entry.pack(fill=tk.X, pady=4)
         self.seed_entry.insert(0, "The quick")
 
         len_row = ttk.Frame(seed_frame)
         len_row.pack(fill=tk.X, pady=2)
-        ttk.Label(len_row, text="Length (tokens):").pack(side=tk.LEFT, padx=4)
+        ttk.Label(len_row, text=tr("Length (tokens):")).pack(side=tk.LEFT, padx=4)
         self.len_scale = ttk.Scale(len_row, from_=10, to=1000,
                                    orient=tk.HORIZONTAL)
         self.len_scale.set(100)
@@ -87,28 +88,28 @@ class GenerationTabMixin:
         self.len_display.pack(side=tk.LEFT, padx=4)
         self.len_scale.configure(command=self._update_len_display)
 
-        ttk.Button(len_row, text="🎯 Auto",
+        ttk.Button(len_row, text=tr("🎯 Auto"),
                    command=self._auto_gen_length, width=8).pack(side=tk.LEFT, padx=4)
 
         # NEW: Batch generation
         self.batch_row = ttk.Frame(seed_frame)
         self.batch_row.pack(fill=tk.X, pady=2)
         self.batch_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.batch_row, text="Batch mode (multiple prompts)",
+        ttk.Checkbutton(self.batch_row, text=tr("Batch mode (multiple prompts)"),
                         variable=self.batch_var).pack(side=tk.LEFT, padx=4)
         self.batch_entry = ttk.Entry(self.batch_row, font=("Segoe UI", 10))
         self.batch_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         self.batch_entry.insert(0, "Prompt 1 | Prompt 2 | Prompt 3")
         self.batch_entry.pack_forget()  # Hidden by default
 
-        self.gen_btn = ttk.Button(seed_frame, text="📝 Generate Text",
+        self.gen_btn = ttk.Button(seed_frame, text=tr("📝 Generate Text"),
                                   command=self.generate_text,
                                   state=tk.DISABLED)
         self.gen_btn.pack(pady=6)
 
         self.stream_var = tk.BooleanVar(value=False)
         self.stream_cb = ttk.Checkbutton(seed_frame,
-            text="Streaming output (token-by-token)",
+            text=tr("Streaming output (token-by-token)"),
             variable=self.stream_var)
         self.stream_cb.pack(pady=2)
 
@@ -121,18 +122,18 @@ class GenerationTabMixin:
 
         self.thinking_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(smart_row,
-            text="🧠 Thinking mode (two-pass draft → answer)",
+            text=tr("🧠 Thinking mode (two-pass draft → answer)"),
             variable=self.thinking_var).pack(side=tk.LEFT, padx=4)
 
         self.websearch_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(smart_row,
-            text="🌐 Web search (DuckDuckGo)",
+            text=tr("🌐 Web search (DuckDuckGo)"),
             variable=self.websearch_var,
             command=self._toggle_web_query).pack(side=tk.LEFT, padx=12)
 
         self.web_query_row = ttk.Frame(seed_frame)
         ttk.Label(self.web_query_row,
-                  text="Search query (empty = use seed):").pack(
+                  text=tr("Search query (empty = use seed):")).pack(
             side=tk.LEFT, padx=4)
         self.web_query_entry = ttk.Entry(self.web_query_row,
                                          font=("Segoe UI", 10))
@@ -140,23 +141,23 @@ class GenerationTabMixin:
                                   expand=True, padx=4)
 
         # --- Output ---
-        out_frame = ttk.LabelFrame(tab, text="  📄  Output  ", padding="6")
+        out_frame = ttk.LabelFrame(tab, text=tr("  📄  Output  "), padding="6")
         out_frame.pack(fill=tk.BOTH, expand=True)
 
         # Toolbar above the result widget
         out_toolbar = ttk.Frame(out_frame)
         out_toolbar.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Label(out_toolbar, text="Generated text",
+        ttk.Label(out_toolbar, text=tr("Generated text"),
                   style="Sub.TLabel").pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(out_toolbar, text="🗑 Clear",
+        ttk.Button(out_toolbar, text=tr("🗑 Clear"),
                    command=self._clear_result).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(out_toolbar, text="💾 Save…",
+        ttk.Button(out_toolbar, text=tr("💾 Save…"),
                    command=self._save_result).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(out_toolbar, text="➕ Append to file…",
+        ttk.Button(out_toolbar, text=tr("➕ Append to file…"),
                    command=self._append_result).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(out_toolbar, text="📋 Copy",
+        ttk.Button(out_toolbar, text=tr("📋 Copy"),
                    command=self._copy_result).pack(side=tk.RIGHT, padx=2)
 
         # Text + scrollbar
@@ -174,17 +175,17 @@ class GenerationTabMixin:
 
         # Right-click context menu on the result widget
         self._result_menu = tk.Menu(self.root, tearoff=0)
-        self._result_menu.add_command(label="Copy selection",
+        self._result_menu.add_command(label=tr("Copy selection"),
                                       command=self._copy_selection_result)
-        self._result_menu.add_command(label="Copy all",
+        self._result_menu.add_command(label=tr("Copy all"),
                                       command=self._copy_result)
         self._result_menu.add_separator()
-        self._result_menu.add_command(label="Save to file…",
+        self._result_menu.add_command(label=tr("Save to file…"),
                                       command=self._save_result)
-        self._result_menu.add_command(label="Append to file…",
+        self._result_menu.add_command(label=tr("Append to file…"),
                                       command=self._append_result)
         self._result_menu.add_separator()
-        self._result_menu.add_command(label="Clear",
+        self._result_menu.add_command(label=tr("Clear"),
                                       command=self._clear_result)
         # bind right click (Button-3 on Linux/Win, Button-2 on macOS)
         self.result_text.bind("<Button-3>", self._show_result_menu)
@@ -234,12 +235,13 @@ class GenerationTabMixin:
         model = getattr(self.engine, "model", None)
         trained = getattr(model, "max_seq_len", None)
         if self.full_context_var.get():
-            text = ("whole history: past the trained length "
-                    f"({trained} tokens) the output degrades" if trained else
-                    "whole history: past the trained length the output degrades")
+            text = (tr("whole history: past the trained length ({n} tokens) the output "
+                       "degrades", n=trained) if trained else
+                    tr("whole history: past the trained length the output degrades"))
         else:
-            text = (f"each token sees the newest {trained} tokens (the trained length)"
-                    if trained else "each token sees as many tokens as the model was trained on")
+            text = (tr("each token sees the newest {n} tokens (the trained length)", n=trained)
+                    if trained else
+                    tr("each token sees as many tokens as the model was trained on"))
         self.context_hint.config(text=text)
 
     def _apply_context_choice(self):
@@ -284,17 +286,17 @@ class GenerationTabMixin:
             rep_pen = float(self.rep_var.get())
             min_p = float(self.minp_var.get())
         except ValueError:
-            messagebox.showwarning("Warning",
-                                   "Invalid generation settings!")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Invalid generation settings!"))
             return
 
         if not seed:
-            messagebox.showwarning("Warning",
-                                   "Please enter a seed phrase.")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Please enter a seed phrase."))
             return
 
         self.result_text.delete("1.0", tk.END)
-        self.result_text.insert(tk.END, "Generating… please wait…\n")
+        self.result_text.insert(tk.END, tr("Generating… please wait…") + "\n")
         self.gen_btn.config(state=tk.DISABLED)
 
         def run():
@@ -306,7 +308,7 @@ class GenerationTabMixin:
                 self.root.after(0, self._display_result, res)
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "generating", title="Gen Error"))
+                    exc, tr("generating"), title=tr("Gen Error")))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -324,13 +326,13 @@ class GenerationTabMixin:
             rep_pen = float(self.rep_var.get())
             min_p = float(self.minp_var.get())
         except ValueError:
-            messagebox.showwarning("Warning",
-                                   "Invalid generation settings!")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Invalid generation settings!"))
             return
 
         if not seed:
-            messagebox.showwarning("Warning",
-                                   "Please enter a seed phrase.")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Please enter a seed phrase."))
             return
 
         use_web = self.websearch_var.get()
@@ -339,10 +341,10 @@ class GenerationTabMixin:
         self.result_text.delete("1.0", tk.END)
         steps = []
         if use_web:
-            steps.append("🌐 searching the web")
+            steps.append(tr("🌐 searching the web"))
         if use_thinking:
-            steps.append("🧠 thinking")
-        steps.append("✍️ generating")
+            steps.append(tr("🧠 thinking"))
+        steps.append(tr("✍️ generating"))
         self.result_text.insert(tk.END, " → ".join(steps) + " …\n")
         self.gen_btn.config(state=tk.DISABLED)
 
@@ -366,17 +368,17 @@ class GenerationTabMixin:
 
                 parts = []
                 if web_ctx:
-                    parts.append("🌐 WEB CONTEXT\n──────────────\n"
+                    parts.append(tr("🌐 WEB CONTEXT") + "\n──────────────\n"
                                  + web_ctx)
                 if thoughts:
-                    parts.append("🧠 THINKING (draft pass)\n"
+                    parts.append(tr("🧠 THINKING (draft pass)") + "\n"
                                  "──────────────\n" + thoughts)
-                parts.append("✅ ANSWER\n──────────────\n" + final)
+                parts.append(tr("✅ ANSWER") + "\n──────────────\n" + final)
                 self.root.after(0, self._display_result,
                                 "\n\n".join(parts))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "generating", title="Gen Error"))
+                    exc, tr("generating"), title=tr("Gen Error")))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -394,17 +396,17 @@ class GenerationTabMixin:
             rep_pen = float(self.rep_var.get())
             min_p = float(self.minp_var.get())
         except ValueError:
-            messagebox.showwarning("Warning",
-                                   "Invalid generation settings!")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Invalid generation settings!"))
             return
 
         if not seed:
-            messagebox.showwarning("Warning",
-                                   "Please enter a seed phrase.")
+            messagebox.showwarning(tr("Warning"),
+                                   tr("Please enter a seed phrase."))
             return
 
         self.result_text.delete("1.0", tk.END)
-        self.result_text.insert(tk.END, "Generating…\n")
+        self.result_text.insert(tk.END, tr("Generating…") + "\n")
         self.gen_btn.config(state=tk.DISABLED)
 
         def run():
@@ -423,7 +425,7 @@ class GenerationTabMixin:
                     tk.END, "\n\n✅ Generation complete."))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "generating", title="Gen Error"))
+                    exc, tr("generating"), title=tr("Gen Error")))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -434,12 +436,12 @@ class GenerationTabMixin:
     def _generate_batch(self):
         batch_text = self.batch_entry.get()
         if not batch_text.strip():
-            messagebox.showwarning("Warning", "Please enter prompts separated by '|'")
+            messagebox.showwarning(tr("Warning"), tr("Please enter prompts separated by '|'"))
             return
 
         prompts = [p.strip() for p in batch_text.split("|") if p.strip()]
         if not prompts:
-            messagebox.showwarning("Warning", "No valid prompts found")
+            messagebox.showwarning(tr("Warning"), tr("No valid prompts found"))
             return
 
         length = int(self.len_scale.get())
@@ -450,11 +452,12 @@ class GenerationTabMixin:
             rep_pen = float(self.rep_var.get())
             min_p = float(self.minp_var.get())
         except ValueError:
-            messagebox.showwarning("Warning", "Invalid generation settings!")
+            messagebox.showwarning(tr("Warning"), tr("Invalid generation settings!"))
             return
 
         self.result_text.delete("1.0", tk.END)
-        self.result_text.insert(tk.END, f"Generating {len(prompts)} prompts in batch…\n")
+        self.result_text.insert(tk.END, tr("Generating {n} prompts in batch…", n=len(prompts))
+                                + "\n")
         self.gen_btn.config(state=tk.DISABLED)
 
         def run():
@@ -471,7 +474,7 @@ class GenerationTabMixin:
                     tk.END, f"\n✅ Batch generation complete ({len(prompts)} prompts)"))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the batch generation", title="Gen Error"))
+                    exc, tr("the batch generation"), title=tr("Gen Error")))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))

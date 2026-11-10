@@ -41,6 +41,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from .i18n import N_, tr, trc, trn
+
 __all__ = ["CHECKPOINT_FILE", "CHECKPOINT_MINUTES", "METRICS_FILE", "MODEL_FILE", "NO_RUNS_ENV",
            "RUN_FILE", "Run", "RunRecorder", "base_label", "compare_runs", "continue_point",
            "count_words", "data_label", "delete_run", "describe_run", "evaluation_summary",
@@ -69,8 +71,11 @@ METRIC_SECONDS = 2.0
 NO_RUNS_ENV = "AURALITE_NO_RUNS"
 
 KINDS = ("train", "finetune", "preference")
-KIND_LABELS = {"train": "Train", "finetune": "Fine-tune", "preference": "Preferences"}
+KIND_LABELS = {"train": N_("Train"), "finetune": N_("Fine-tune"),
+               "preference": N_("Preferences")}
 STATUSES = ("running", "finished", "stopped", "failed", "interrupted")
+#: 2.28: a status as the interfaces show it (the record keeps the English word)
+STATUS_WORDS = (N_("running"), N_("finished"), N_("stopped"), N_("failed"), N_("interrupted"))
 
 #: Runs this process records now (their status is "running" for sure).
 _ACTIVE: set[str] = set()
@@ -198,8 +203,8 @@ def base_label(spec: str, kind: str = "finetune", preset: str = "") -> str:
     text = str(spec or "").strip()
     if not text:
         if kind == "train":
-            return f"a new {preset} model" if preset else "a new model"
-        return "the model in memory"
+            return tr("a new {preset} model", preset=preset) if preset else tr("a new model")
+        return tr("the model in memory")
     if text.lower().startswith("hf:"):
         text = text[3:]
     text = text.split("@", 1)[0].rstrip("/\\")
@@ -212,19 +217,19 @@ def data_label(paths: Iterable[str]) -> str:
              for p in paths if str(p)]
     if not names:
         return ""
-    return names[0] if len(names) == 1 else f"{names[0]} and {len(names) - 1} more"
+    return names[0] if len(names) == 1 else trn("{name} and {n} more", "{name} and {n} more",
+                                                len(names) - 1, name=names[0])
 
 
 def _auto_name(kind: str, method: str, base: dict, data: dict) -> str:
-    verb = {"train": "Train", "finetune": "Fine-tune"}.get(kind) or (
-        str(method).upper() if method in ("dpo", "simpo") else "Preference-tune")
-    parts = [verb]
+    verb = {"train": tr("Train"), "finetune": tr("Fine-tune")}.get(kind) or (
+        str(method).upper() if method in ("dpo", "simpo") else tr("Preference-tune"))
     label = str(base.get("label") or "")
-    if label:
-        parts.append(label)
+    # 2.28: one string, so that a language can join the two its own way
+    parts = [tr("{verb} {label}", verb=verb, label=label) if label else verb]
     what = data_label(data.get("paths") or [])
     if what:
-        parts.append(f"on {what}")
+        parts.append(tr("on {data}", data=what))
     return " ".join(parts)
 
 
@@ -284,7 +289,7 @@ class Run:
 
     @property
     def kind_label(self) -> str:
-        return KIND_LABELS.get(self.kind, self.kind)
+        return tr(KIND_LABELS.get(self.kind, self.kind))
 
     @property
     def source(self) -> str:
@@ -408,11 +413,11 @@ class Run:
         "checkpoint", or "result and checkpoint" for one file that is both."""
         result, checkpoint = self.result_path, self.checkpoint_path
         out: list[tuple[str, Path, int]] = []
-        for label, path in (("result", result), ("checkpoint", checkpoint)):
+        for label, path in ((N_("result"), result), (N_("checkpoint"), checkpoint)):
             if path is None:
                 continue
             if label == "checkpoint" and result is not None and path == result:
-                out[0] = ("result and checkpoint", path, out[0][2])
+                out[0] = (N_("result and checkpoint"), path, out[0][2])
                 continue
             try:
                 size = path.stat().st_size
@@ -494,17 +499,17 @@ class Run:
         continues from its checkpoint exactly where it stood."""
         status = self.status
         if status == "running":
-            return False, "it is training now"
+            return False, tr("it is training now")
         if self.kind == "preference":
-            return False, "preference runs (DPO, SimPO) are short and start anew"
+            return False, tr("preference runs (DPO, SimPO) are short and start anew")
         if status == "finished":
-            return False, "it has finished: train on from its result instead"
+            return False, tr("it has finished: train on from its result instead")
         if self.checkpoint_path is None:
             if self.record.get("checkpoint"):
-                return False, "its checkpoint file is gone"
-            return False, "it saved no checkpoint before it ended"
+                return False, tr("its checkpoint file is gone")
+            return False, tr("it saved no checkpoint before it ended")
         if self.summary.get("restored_best") and self._path("checkpoint") == self._path("result"):
-            return False, "its checkpoint holds the best epoch's weights, not where it stood"
+            return False, tr("its checkpoint holds the best epoch's weights, not where it stood")
         return True, ""
 
 
@@ -543,17 +548,17 @@ def find_run(key: str, root: str | os.PathLike | None = None) -> Run:
     text = str(key).strip()
     if text.lower() in ("last", "latest"):
         if not runs:
-            raise KeyError("there are no runs yet")
+            raise KeyError(tr("there are no runs yet"))
         return runs[0]
     exact = [r for r in runs if r.id == text]
     if exact:
         return exact[0]
     matches = [r for r in runs if r.id.startswith(text)]
     if not matches:
-        raise KeyError(f"no run {text!r} (auralite runs lists them)")
+        raise KeyError(tr("no run {text!r} (auralite runs lists them)", text=text))
     if len(matches) > 1:
-        raise ValueError(f"{len(matches)} runs start with {text!r}: "
-                         f"{', '.join(r.id for r in matches[:5])}")
+        raise ValueError(tr("{n_matches} runs start with {text!r}: "
+                         "{join}", n_matches=len(matches), text=text, join=', '.join(r.id for r in matches[:5])))
     return matches[0]
 
 
@@ -576,7 +581,7 @@ def update_run(run: Run, **changes: Any) -> Run:
     allowed = {"name", "notes", "evaluation", "dismissed"}
     unknown = set(changes) - allowed
     if unknown:
-        raise ValueError(f"cannot change {', '.join(sorted(unknown))}")
+        raise ValueError(tr("cannot change {join}", join=', '.join(sorted(unknown))))
     record = _read_json(run.folder / RUN_FILE) or dict(run.record)
     for key, value in changes.items():
         record[key] = _json_safe(value)
@@ -594,9 +599,9 @@ def delete_run(run: Run, *, files_only: bool = False,
     never deleted here."""
     folder = run.folder.resolve()
     if not (folder / RUN_FILE).is_file() or folder.name != run.id:
-        raise ValueError(f"{folder} is not a run's folder")
+        raise ValueError(tr("{folder} is not a run's folder", folder=folder))
     if root is not None and runs_root(root).resolve() not in folder.parents:
-        raise ValueError(f"{folder} is not a run of {runs_root(root)}")
+        raise ValueError(tr("{folder} is not a run of {runs_root}", folder=folder, runs_root=runs_root(root)))
     if not files_only:
         freed = run.disk_bytes()
         shutil.rmtree(folder)
@@ -624,7 +629,7 @@ def continue_point(run: Run) -> Path:
     ok, why = run.continue_state()
     path = run.checkpoint_path
     if not ok or path is None:
-        raise ValueError(f"{run.name} cannot continue: {why}")
+        raise ValueError(tr("{name} cannot continue: {why}", name=run.name, why=why))
     return path
 
 
@@ -634,10 +639,10 @@ def load_run_data(run: Run) -> Any:
     data = run.data
     paths = [str(p) for p in data.get("paths") or []]
     if not paths:
-        raise ValueError(f"{run.name} has no data files to read again")
+        raise ValueError(tr("{name} has no data files to read again", name=run.name))
     missing = [p for p in paths if not p.lower().startswith("hf:") and not os.path.exists(p)]
     if missing:
-        raise FileNotFoundError(f"the run's data is gone: {missing[0]}")
+        raise FileNotFoundError(tr("the run's data is gone: {missing}", missing=missing[0]))
     given = data.get("options")
     options: dict = given if isinstance(given, dict) else {}
     loaded = load_training_data(paths, stream=options.get("stream"))
@@ -657,11 +662,11 @@ def held_out_dialogs(run: Run) -> Any:
     from auralite.engine.recipe import DEFAULT_RECIPE
     data = load_run_data(run)
     if not isinstance(data, DialogSet):
-        raise ValueError(f"{run.name} did not train on dialogs")
+        raise ValueError(tr("{name} did not train on dialogs", name=run.name))
     val_split = run.params.get("val_split", DEFAULT_RECIPE["val_split"])
     _train, val_index = data.split(float(val_split or 0.0))
     if not val_index:
-        raise ValueError(f"{run.name} held no dialogs out (val_split 0)")
+        raise ValueError(tr("{name} held no dialogs out (val_split 0)", name=run.name))
     return DialogSet([data.dialogs[i] for i in val_index], sources=list(data.sources))
 
 
@@ -686,18 +691,18 @@ def _duration(seconds: float | None) -> str:
         return ""
     seconds = max(0.0, float(seconds))
     if seconds < 60:
-        return f"{seconds:.0f} s"
+        return tr("{s:.0f} s", s=seconds)
     minutes = seconds / 60
     if minutes < 60:
-        return f"{minutes:.0f} min"
-    return f"{int(minutes // 60)} h {int(minutes % 60):02d} min"
+        return tr("{m:.0f} min", m=minutes)
+    return tr("{h} h {m:02d} min", h=int(minutes // 60), m=int(minutes % 60))
 
 
 def _rate(run: Run) -> str:
     s = run.summary
     tokens, seconds = s.get("tokens"), s.get("seconds")
     if isinstance(tokens, (int, float)) and isinstance(seconds, (int, float)) and seconds > 0:
-        return f"{tokens / seconds:,.0f} tokens/s"
+        return tr("{speed:,.0f} tokens/s", speed=tokens / seconds)
     return ""
 
 
@@ -705,8 +710,8 @@ def _learning_rate(run: Run) -> str:
     p = run.params
     if p.get("lora_rank"):
         value = p.get("lora_lr") or (10.0 * float(p["lr"]) if p.get("lr") else None)
-        return f"{_number(value)} (LoRA)" if value else "auto (LoRA)"
-    return _number(p.get("lr")) if p.get("lr") else "the recipe's"
+        return f"{_number(value)} (LoRA)" if value else tr("auto (LoRA)")
+    return _number(p.get("lr")) if p.get("lr") else tr("the recipe's")
 
 
 def _eval(run: Run, key: str) -> str:
@@ -717,23 +722,31 @@ def _eval(run: Run, key: str) -> str:
     return ""
 
 
-METHOD_LABELS = {"qlora": "QLoRA (a 4-bit base with LoRA adapters)", "lora": "LoRA adapters",
-                 "full": "every weight", "new": "a new model", "dpo": "DPO", "simpo": "SimPO",
-                 "more": "the model in memory, trained further"}      # 2.27: "more" read "more"
+METHOD_LABELS = {"qlora": N_("QLoRA (a 4-bit base with LoRA adapters)"),
+                 "lora": N_("LoRA adapters"), "full": N_("every weight"),
+                 "new": N_("a new model"), "dpo": "DPO", "simpo": "SimPO",
+                 "more": N_("the model in memory, trained further")}  # 2.27: "more" read "more"
 _COUNT_WORDS = {"dialogs": "dialogs", "preferences": "pairs", "text": "documents"}
-_ONE_WORDS = {"dialogs": "dialog", "preferences": "pair", "text": "document"}
+#: 2.28: the kinds of data, as the catalogue keys them ("data kind|dialogs": English says
+#: "dialogs" for the kind and the unit alike, Russian two ways)
+DATA_KINDS = tuple(_COUNT_WORDS)
 
 
 def count_words(count: int, kind: str) -> str:
-    """``"1,200 dialogs"``, ``"1 document"`` (2.27: it read "1 documents")."""
-    return f"{count:,} {(_ONE_WORDS if count == 1 else _COUNT_WORDS)[kind]}"
+    """``"1,200 dialogs"``, ``"1 document"`` (2.27: it read "1 documents"); 2.28: in the
+    interface's language, with its plural forms."""
+    if kind == "dialogs":
+        return trn("{n:,} dialog", "{n:,} dialogs", count)
+    if kind == "preferences":
+        return trn("{n:,} pair", "{n:,} pairs", count)
+    return trn("{n:,} document", "{n:,} documents", count)
 
 
 def _bytes(n: float) -> str:
-    for unit, scale in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+    for unit, scale in ((N_("GB"), 1 << 30), (N_("MB"), 1 << 20), (N_("KB"), 1 << 10)):
         if n >= scale:
-            return f"{n / scale:,.1f} {unit}"
-    return f"{int(n)} B"
+            return f"{n / scale:,.1f} {tr(unit)}"
+    return f"{int(n)} {tr('B')}"
 
 
 def describe_run(run: Run) -> list[tuple[str, str]]:
@@ -743,95 +756,108 @@ def describe_run(run: Run) -> list[tuple[str, str]]:
     status = run.status
     progress = run.progress
     step, steps = progress.get("step"), progress.get("steps")
-    text = status
+    text = tr(status)
     if status in ("stopped", "interrupted", "failed", "running") and step:
-        text += f" at step {int(step):,}" + (f" of {int(steps):,}" if steps else "")
+        text += " " + (tr("at step {step:,} of {steps:,}", step=int(step), steps=int(steps))
+                       if steps else tr("at step {step:,}", step=int(step)))
     if status == "interrupted":
-        text += " (the program or the computer stopped during the run)"
+        text += " " + tr("(the program or the computer stopped during the run)")
     if run.summary.get("stopped_during"):
-        text += f" before training began ({run.summary['stopped_during']})"
-    lines.append(("Status", text))
+        text += " " + tr("before training began ({stage})",
+                         stage=run.summary["stopped_during"])
+    lines.append((tr("Status"), text))
     error = run.record.get("error") or {}
     if isinstance(error, dict) and error.get("message"):
         kind = f"{error['type']}: " if error.get("type") else ""
-        lines.append(("Error", kind + str(error["message"]).strip().splitlines()[0]))
+        lines.append((tr("Error"), kind + str(error["message"]).strip().splitlines()[0]))
     source = {"studio": "AuraLite Studio", "cli": "auralite train",
-              "gui": "the classic interface"}.get(run.source, run.source)
+              "gui": tr("the classic interface")}.get(run.source, run.source)
     when = format_when(run.created)
     if run.seconds is not None:
         sessions = run.record.get("sessions") or []
-        when += f", {_duration(run.seconds)} of training" + (
-            f" in {len(sessions)} sessions" if len(sessions) > 1 else "")
+        when += ", " + (trn("{time} of training in {n} session", "{time} of training in {n} "
+                            "sessions", len(sessions), time=_duration(run.seconds))
+                        if len(sessions) > 1 else
+                        tr("{time} of training", time=_duration(run.seconds)))
     host = run.record.get("host")
-    where = f", on {host}" if host and host != _host() else ""
-    lines.append(("Started", f"{when} ({source}{where})" if source else when))
+    where = ", " + tr("on {host}", host=host) if host and host != _host() else ""
+    lines.append((tr("Started"), f"{when} ({source}{where})" if source else when))
     base = run.base
     if base.get("label") or base.get("spec"):
         label, spec = str(base.get("label") or ""), str(base.get("spec") or "")
-        lines.append(("Base model", label + (f" ({spec})" if spec and spec != label else "")))
+        lines.append((tr("Base model"),
+                      label + (f" ({spec})" if spec and spec != label else "")))
     if run.method:
-        lines.append(("Method", METHOD_LABELS.get(run.method, run.method)))
+        lines.append((tr("Method"), tr(METHOD_LABELS.get(run.method, run.method))))
     data = run.data
     if data.get("paths"):
         kind = str(data.get("kind") or "")
-        extra = [kind] if kind else []
+        extra = [trc("data kind", kind)] if kind else []
         if data.get("records") and kind in _COUNT_WORDS:
             extra.append(count_words(int(data["records"]), kind))
-        lines.append(("Data", data_label(data["paths"]) + (f" ({', '.join(extra)})"
-                                                          if extra else "")))
+        lines.append((tr("Data"), data_label(data["paths"]) + (f" ({', '.join(extra)})"
+                                                              if extra else "")))
     p = run.params
     settings = []
-    for key, label in (("epochs", "epochs"), ("max_tokens", "tokens"), ("seq_length", "context"),
-                       ("batch_size", "batch"), ("lora_rank", "LoRA rank")):
+    for key, label in (("epochs", N_("epochs {value}")), ("max_tokens", N_("tokens {value}")),
+                       ("seq_length", N_("context {value}")),
+                       ("batch_size", N_("batch {value}")),
+                       ("lora_rank", N_("LoRA rank {value}"))):
         if p.get(key):
-            settings.append(f"{label} {_number(p[key])}")
-    settings.append(f"learning rate {_learning_rate(run)}")
+            settings.append(tr(label, value=_number(p[key])))
+    settings.append(tr("learning rate {value}", value=_learning_rate(run)))
     if p.get("optimizer"):
-        settings.append(f"optimizer {p['optimizer']}")
+        settings.append(tr("optimizer {value}", value=p["optimizer"]))
     if p.get("time_budget_s"):
-        settings.append(f"time limit {_duration(float(p['time_budget_s']))}")
-    lines.append(("Settings", ", ".join(settings)))
+        settings.append(tr("time limit {value}", value=_duration(float(p["time_budget_s"]))))
+    lines.append((tr("Settings"), ", ".join(settings)))
     s = run.summary
     losses = []
     if isinstance(s.get("train_loss"), (int, float)):
-        losses.append(f"training {s['train_loss']:.4f}")
+        losses.append(tr("training {loss:.4f}", loss=s["train_loss"]))
     if run.best_val is not None:
-        losses.append(f"best validation {run.best_val:.4f}" + (
-            f" ({run.val_bpb:.4f} bits/byte)" if run.val_bpb is not None else ""))
+        losses.append(tr("best validation {loss:.4f}", loss=run.best_val) + (
+            " " + tr("({bpb:.4f} bits/byte)", bpb=run.val_bpb) if run.val_bpb is not None
+            else ""))
     if losses:
-        lines.append(("Loss", ", ".join(losses)))
+        lines.append((tr("Loss"), ", ".join(losses)))
     if s.get("optimizer_steps"):
-        trained = f"{int(s['optimizer_steps']):,} steps"
+        trained = trn("{n:,} step", "{n:,} steps", int(s["optimizer_steps"]))
         if s.get("tokens"):
-            trained += f", {int(s['tokens']):,} tokens"
+            trained += ", " + tr("{n:,} tokens", n=int(s["tokens"]))
         rate = _rate(run)
-        lines.append(("Trained", trained + (f", {rate}" if rate else "")))
+        lines.append((tr("Trained"), trained + (f", {rate}" if rate else "")))
     e = run.evaluation
     if e:
-        parts = [f"{label} {_eval(run, key)}" for key, label in
-                 (("stop_rate", "replies that stop"), ("exact", "exact replies"),
-                  ("reply_loss", "reply loss")) if _eval(run, key)]
+        parts = [tr(label, value=_eval(run, key)) for key, label in
+                 (("stop_rate", N_("replies that stop {value}")),
+                  ("exact", N_("exact replies {value}")),
+                  ("reply_loss", N_("reply loss {value}"))) if _eval(run, key)]
         if e.get("dialogs"):
-            parts.append(f"on {int(e['dialogs']):,} held-out dialogs")
-        lines.append(("Evaluation", ", ".join(parts)))
-    files = [f"{label}: {path.name} ({_bytes(size)})" for label, path, size in run.files()]
+            parts.append(trn("on {n:,} held-out dialog", "on {n:,} held-out dialogs",
+                             int(e["dialogs"])))
+        lines.append((tr("Evaluation"), ", ".join(parts)))
+    files = [f"{tr(label)}: {path.name} ({_bytes(size)})" for label, path, size in run.files()]
     if files:
-        lines.append(("Files", "; ".join(files)))
+        lines.append((tr("Files"), "; ".join(files)))
     elif run.record.get("files_deleted"):
-        lines.append(("Files", "deleted (the record and the curve stay)"))
+        lines.append((tr("Files"), tr("deleted (the record and the curve stay)")))
     if run.record.get("save_error"):
-        lines.append(("Not saved", str(run.record["save_error"])))
+        lines.append((tr("Not saved"), str(run.record["save_error"])))
     ok, why = run.continue_state()
     if ok:
         saved = run.record.get("checkpoint_saved") or {}
-        at = ""
-        if saved.get("step"):
-            at = f" from about step {int(saved['step']):,}"
-            if saved.get("time"):
-                at += f" (saved {format_when(saved['time'])})"
-        lines.append(("Continue", f"it can continue where it stood{at}"))
+        if saved.get("step") and saved.get("time"):
+            text = tr("it can continue where it stood from about step {step:,} (saved {when})",
+                      step=int(saved["step"]), when=format_when(saved["time"]))
+        elif saved.get("step"):
+            text = tr("it can continue where it stood from about step {step:,}",
+                      step=int(saved["step"]))
+        else:
+            text = tr("it can continue where it stood")
+        lines.append((tr("Continue"), text))
     elif status != "finished" and status != "running":
-        lines.append(("Continue", f"it cannot: {why}"))
+        lines.append((tr("Continue"), tr("it cannot: {why}", why=why)))
     return lines
 
 
@@ -849,29 +875,29 @@ def evaluation_summary(result: dict) -> dict:
 
 #: The rows of :func:`compare_runs`: a label and how to read it from a run.
 COMPARE_ROWS: list[tuple[str, Callable[[Run], str]]] = [
-    ("Kind", lambda r: r.kind_label),
-    ("Status", lambda r: r.status),
-    ("Started", lambda r: format_when(r.created)),
-    ("Base model", lambda r: str(r.base.get("label") or "")),
-    ("Method", lambda r: r.method),
-    ("Data", lambda r: data_label(r.data.get("paths") or [])),
-    ("Records", lambda r: _number(r.data.get("records")) if r.data.get("records") else ""),
-    ("Epochs", lambda r: _number(r.params.get("epochs"))),
-    ("Context (tokens)", lambda r: _number(r.params.get("seq_length"))),
-    ("Batch", lambda r: _number(r.params.get("batch_size"))),
-    ("Learning rate", _learning_rate),
-    ("LoRA rank", lambda r: _number(r.params.get("lora_rank"))),
-    ("Optimizer", lambda r: str(r.params.get("optimizer") or "")),
-    ("Optimizer steps", lambda r: _number(r.summary.get("optimizer_steps"))),
-    ("Tokens trained", lambda r: _number(r.summary.get("tokens"))),
-    ("Time", lambda r: _duration(r.seconds)),
-    ("Speed", _rate),
-    ("Training loss", lambda r: _number(r.summary.get("train_loss"))),
-    ("Best validation loss", lambda r: _number(r.best_val)),
-    ("Validation bits/byte", lambda r: _number(r.val_bpb)),
-    ("Replies that stop", lambda r: _eval(r, "stop_rate")),
-    ("Exact replies", lambda r: _eval(r, "exact")),
-    ("Reply loss", lambda r: _eval(r, "reply_loss")),
+    (N_("Kind"), lambda r: r.kind_label),
+    (N_("Status"), lambda r: tr(r.status)),
+    (N_("Started"), lambda r: format_when(r.created)),
+    (N_("Base model"), lambda r: str(r.base.get("label") or "")),
+    (N_("Method"), lambda r: r.method),
+    (N_("Data"), lambda r: data_label(r.data.get("paths") or [])),
+    (N_("Records"), lambda r: _number(r.data.get("records")) if r.data.get("records") else ""),
+    (N_("Epochs"), lambda r: _number(r.params.get("epochs"))),
+    (N_("Context (tokens)"), lambda r: _number(r.params.get("seq_length"))),
+    (N_("Batch"), lambda r: _number(r.params.get("batch_size"))),
+    (N_("Learning rate"), _learning_rate),
+    (N_("LoRA rank"), lambda r: _number(r.params.get("lora_rank"))),
+    (N_("Optimizer"), lambda r: str(r.params.get("optimizer") or "")),
+    (N_("Optimizer steps"), lambda r: _number(r.summary.get("optimizer_steps"))),
+    (N_("Tokens trained"), lambda r: _number(r.summary.get("tokens"))),
+    (N_("Time"), lambda r: _duration(r.seconds)),
+    (N_("Speed"), _rate),
+    (N_("Training loss"), lambda r: _number(r.summary.get("train_loss"))),
+    (N_("Best validation loss"), lambda r: _number(r.best_val)),
+    (N_("Validation bits/byte"), lambda r: _number(r.val_bpb)),
+    (N_("Replies that stop"), lambda r: _eval(r, "stop_rate")),
+    (N_("Exact replies"), lambda r: _eval(r, "exact")),
+    (N_("Reply loss"), lambda r: _eval(r, "reply_loss")),
 ]
 
 
@@ -889,7 +915,7 @@ def compare_runs(runs: list[Run]) -> dict:
                 values.append("")
         if not any(values):
             continue
-        rows.append((label, values, len(set(values)) > 1))
+        rows.append((tr(label), values, len(set(values)) > 1))
     series = []
     for run in runs:
         train, val = run.curve()
@@ -935,7 +961,7 @@ class RunRecorder:
                  hardware: dict | None = None, root: str | os.PathLike | None = None,
                  parent: str = "", files: str = "folder"):
         if kind not in KINDS:
-            raise ValueError(f"kind must be one of {', '.join(KINDS)}, got {kind!r}")
+            raise ValueError(tr("kind must be one of {join}, got {kind!r}", join=', '.join(KINDS), kind=kind))
         from auralite import __version__
         self.root = runs_root(root)
         self.root.mkdir(parents=True, exist_ok=True)

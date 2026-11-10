@@ -24,6 +24,7 @@ from typing import Any
 from .catalog import CATALOG, BaseModel
 from .datacheck import DataReport
 from .hardware import Hardware, format_gb
+from .i18n import tr
 
 __all__ = ["EFFICIENCY", "ModelFit", "PresetFit", "Recommendation", "estimate_finetune",
            "memory_budget", "preset_label", "recommend_finetune", "recommend_pretrain",
@@ -137,13 +138,15 @@ class ModelFit:
 
     @property
     def method_label(self) -> str:
-        return {"qlora": "QLoRA (4-bit base)", "lora": "LoRA", "full": "every weight"}[self.method]
+        return {"qlora": tr("QLoRA (4-bit base)"), "lora": "LoRA",
+                "full": tr("every weight")}[self.method]
 
     def line(self) -> str:
-        speed = (f"~{self.tokens_per_second:,.0f} tok/s" if self.tokens_per_second
-                 else "speed unknown")
+        speed = (tr("~{speed:,.0f} tok/s", speed=self.tokens_per_second)
+                 if self.tokens_per_second else tr("speed unknown"))
         time = f", ~{_hours_text(self.hours)}" if self.hours is not None else ""
-        verdict = "fits" if self.fits else ("tight" if self.tight else "does not fit")
+        verdict = tr("fits") if self.fits else (tr("tight") if self.tight else
+                                                tr("does not fit"))
         return (f"{self.model.display_name} ({self.model.size_label}): {self.method_label}, "
                 f"{format_gb(self.memory)} - {verdict}; {speed}{time}")
 
@@ -178,11 +181,12 @@ def small_text_note(fit: PresetFit, data: DataReport | None) -> str:
     need = fit.params / PARAMS_PER_TOKEN
     per_token = data.bytes / data.tokens if data.bytes else 4.0
     megabytes = max(1, round(need * per_token / 1e6))
-    return (f"the text is small for this size: about {data.tokens:,} tokens for "
-            f"{size_text(fit.params)} parameters. The model learns it by heart within minutes "
-            f"and then stops improving (early stopping keeps its best point), and what it "
-            f"writes reads like the text only in snatches. Text of this kind that the size can "
-            f"learn from: about {megabytes:,} MB - several books, not one story")
+    return tr("the text is small for this size: about {tokens:,} tokens for {size} "
+              "parameters. The model learns it by heart within minutes and then stops "
+              "improving (early stopping keeps its best point), and what it writes reads like "
+              "the text only in snatches. Text of this kind that the size can learn from: "
+              "about {mb:,} MB - several books, not one story", tokens=data.tokens,
+              size=size_text(fit.params), mb=megabytes)
 
 
 def size_text(params: float) -> str:
@@ -203,9 +207,10 @@ def preset_label(fit: PresetFit) -> str:
     contradicts it ("25m: 7M parameters"); the Studio shows it as the tooltip."""
     from auralite.engine.sizing import MODEL_PRESETS
     dims = MODEL_PRESETS.get(fit.preset) or {}
-    shape = f" - {dims['n_layers']} layers, width {dims['d_model']}" \
-        if "n_layers" in dims and "d_model" in dims else ""
-    return f"{size_text(fit.params)} parameters{shape}"
+    if "n_layers" in dims and "d_model" in dims:
+        return tr("{size} parameters - {layers} layers, width {width}",
+                  size=size_text(fit.params), layers=dims["n_layers"], width=dims["d_model"])
+    return tr("{size} parameters", size=size_text(fit.params))
 
 
 @dataclass
@@ -225,33 +230,38 @@ class Recommendation:
     warnings: list[str] = field(default_factory=list)
 
     def lines(self) -> list[str]:
-        out = [f"Memory for training: {format_gb(self.budget)} "
-               f"({'GPU' if self.hardware.accelerator == 'cuda' else 'RAM'})"]
+        out = [tr("Memory for training: {size} ({where})", size=format_gb(self.budget),
+                  where="GPU" if self.hardware.accelerator == "cuda" else "RAM")]
         if self.goal == "finetune":
             if self.choice is None:
-                out.append("Recommended: none of the catalog's models fits - add memory, or "
-                           "train a small model from scratch")
+                out.append(tr("Recommended: none of the catalog's models fits - add memory, or "
+                              "train a small model from scratch"))
             else:
                 c = self.choice
-                out.append(f"Recommended: {c.model.name} ({c.model.repo}), {c.method_label}")
-                out.append(f"  memory ~{format_gb(c.memory)}"
-                           + (f", ~{c.tokens_per_second:,.0f} tokens/s"
+                out.append(tr("Recommended: {model} ({repo}), {method}", model=c.model.name,
+                              repo=c.model.repo, method=c.method_label))
+                out.append("  " + tr("memory ~{size}", size=format_gb(c.memory))
+                           + (", " + tr("~{speed:,.0f} tokens/s", speed=c.tokens_per_second)
                               if c.tokens_per_second else "")
-                           + (f", ~{_hours_text(c.hours)} for {c.tokens:,} tokens"
+                           + (", " + tr("~{time} for {tokens:,} tokens",
+                                        time=_hours_text(c.hours), tokens=c.tokens)
                               if c.hours is not None else ""))
-                out.append(f"  license: {c.model.license}"
-                           + ("; gated: accept it on huggingface.co" if c.model.gated else ""))
+                out.append("  " + tr("license: {license}", license=c.model.license)
+                           + ("; " + tr("gated: accept it on huggingface.co")
+                              if c.model.gated else ""))
         elif self.preset is not None:
             p = self.preset
-            out.append(f"Recommended: a {size_text(p.params)} model from scratch "
-                       f"(preset {p.preset}), memory ~{format_gb(p.memory)}"
-                       + (f", ~{p.tokens_per_second:,.0f} tokens/s"
+            out.append(tr("Recommended: a {size} model from scratch (preset {preset}), memory "
+                          "~{memory}", size=size_text(p.params), preset=p.preset,
+                          memory=format_gb(p.memory))
+                       + (", " + tr("~{speed:,.0f} tokens/s", speed=p.tokens_per_second)
                           if p.tokens_per_second else ""))
             if p.epoch_hours is not None:
-                out.append(f"  one pass over the data: ~{_hours_text(p.epoch_hours)}")
+                out.append("  " + tr("one pass over the data: ~{time}",
+                                     time=_hours_text(p.epoch_hours)))
         if not self.measured:
-            out.append("Speeds are a rough guess: run the speed test for a better one")
-        out += [f"Note: {w}" for w in self.warnings]
+            out.append(tr("Speeds are a rough guess: run the speed test for a better one"))
+        out += [tr("Note: {note}", note=w) for w in self.warnings]
         return out
 
 
@@ -259,12 +269,12 @@ def _hours_text(hours: float | None) -> str:
     if hours is None:
         return "?"
     if hours < 1 / 60:
-        return "under a minute"
+        return tr("under a minute")
     if hours < 1:
-        return f"{hours * 60:.0f} min"
+        return tr("{n:.0f} min", n=hours * 60)
     if hours < 48:
-        return f"{hours:.1f} h"
-    return f"{hours / 24:.1f} days"
+        return tr("{n:.1f} h", n=hours)
+    return tr("{n:.1f} days", n=hours / 24)
 
 
 def _qlora_weight_bytes(model: BaseModel) -> int:
@@ -305,13 +315,13 @@ def estimate_finetune(model: BaseModel, method: str, hw: Hardware, *, seq_length
     hours = tokens / speed / 3600 if speed else None
     notes = []
     if model.gated:
-        notes.append("gated: accept the license on huggingface.co and set HF_TOKEN")
+        notes.append(tr("gated: accept the license on huggingface.co and set HF_TOKEN"))
     if not model.commercial:
-        notes.append("license: no commercial use")
+        notes.append(tr("license: no commercial use"))
     if hw.disk_free and model.download_gb * (1 << 30) > hw.disk_free:
-        notes.append(f"needs {model.download_gb:.1f} GB of disk for the download")
+        notes.append(tr("needs {gb:.1f} GB of disk for the download", gb=model.download_gb))
     if tight:
-        notes.append("tight: close other programs while it trains")
+        notes.append(tr("tight: close other programs while it trains"))
     return ModelFit(model, method, memory, fits, checkpointing, speed, hours, int(tokens), notes,
                     tight)
 
@@ -355,10 +365,11 @@ def recommend_finetune(hw: Hardware, data: DataReport | None = None, *,
     rec = Recommendation("finetune", hw, budget, options=options, data=data,
                          measured=_gflops(hw)[1])
     if not fitting:
-        rec.warnings.append(f"even {options[0].model.name} needs about "
-                            f"{format_gb(min(f.memory for f in options))}; this computer has "
-                            f"{format_gb(budget)} for training" if options else
-                            "no model to choose from")
+        rec.warnings.append(tr("even {model} needs about {need}; this computer has {have} for "
+                               "training", model=options[0].model.name,
+                               need=format_gb(min(f.memory for f in options)),
+                               have=format_gb(budget)) if options else
+                            tr("no model to choose from"))
     else:
         best_rank = max(preference(f) for f in fitting)
         preferred = [f for f in fitting if preference(f) == best_rank]
@@ -371,26 +382,29 @@ def recommend_finetune(hw: Hardware, data: DataReport | None = None, *,
             rec.choice = max(pool, key=lambda f: f.model.params)
         else:
             rec.choice = min(preferred, key=lambda f: f.hours or 0.0)
-            rec.warnings.append(f"every model takes longer than {max_hours:g} h on this "
-                                f"computer: {rec.choice.model.name} is the quickest "
-                                f"(~{_hours_text(rec.choice.hours)}); fewer epochs or less "
-                                f"data shorten it")
+            rec.warnings.append(tr("every model takes longer than {hours:g} h on this "
+                                   "computer: {model} is the quickest (~{time}); fewer epochs "
+                                   "or less data shorten it", hours=max_hours,
+                                   model=rec.choice.model.name,
+                                   time=_hours_text(rec.choice.hours)))
     if rec.choice is not None and rec.choice.tight:
-        rec.warnings.append(f"{rec.choice.model.name} fits only just "
-                            f"(~{format_gb(rec.choice.memory)} of {format_gb(budget)}): close "
-                            f"other programs while it trains")
+        rec.warnings.append(tr("{model} fits only just (~{need} of {have}): close other "
+                               "programs while it trains", model=rec.choice.model.name,
+                               need=format_gb(rec.choice.memory), have=format_gb(budget)))
     elif hw.memory_available and hw.accelerator == "cpu" and rec.choice is not None \
             and rec.choice.memory > hw.memory_available:
-        rec.warnings.append(f"only {format_gb(hw.memory_available)} is free right now: close "
-                            f"other programs before training")
+        rec.warnings.append(tr("only {size} is free right now: close other programs before "
+                               "training", size=format_gb(hw.memory_available)))
     if non_english and rec.choice is not None:
         script = data.script if data is not None else ""
         if rec.choice.model.multilingual:
-            rec.warnings.append(f"the data is {script}: a model good beyond English is chosen")
+            rec.warnings.append(tr("the data is {script}: a model good beyond English is "
+                                   "chosen", script=tr(script)))
         else:
-            rec.warnings.append(f"the data is {script}, but no multilingual model (Qwen) fits "
-                                f"this computer: {rec.choice.model.name} knows mostly English, "
-                                f"so its replies in this language will be weak")
+            rec.warnings.append(tr("the data is {script}, but no multilingual model (Qwen) fits "
+                                   "this computer: {model} knows mostly English, so its replies "
+                                   "in this language will be weak", script=tr(script),
+                                   model=rec.choice.model.name))
     if rec.choice is not None:
         c = rec.choice
         rec.settings = {"base": c.model.spec, "method": c.method, "lora_rank": LORA_RANK,
@@ -458,11 +472,11 @@ def recommend_pretrain(hw: Hardware, data: DataReport | None = None, *,
         choice = fit
     rec.preset = choice
     if not choice.fits:
-        rec.warnings.append(f"even the {choice.preset} model needs about "
-                            f"{format_gb(choice.memory)}: close programs or use a computer with "
-                            f"more memory")
+        rec.warnings.append(tr("even the {preset} model needs about {size}: close programs or "
+                               "use a computer with more memory", preset=choice.preset,
+                               size=format_gb(choice.memory)))
     if not tokens:
-        rec.warnings.append("choose the training text to size the model to it")
+        rec.warnings.append(tr("choose the training text to size the model to it"))
     elif small_text_note(choice, data):
         rec.warnings.append(small_text_note(choice, data))           # 2.21.3
     rec.settings = {"preset": choice.preset, "time_limit_min": int(max_hours * 60),

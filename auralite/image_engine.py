@@ -77,6 +77,7 @@ from auralite.image_gan import (GAN_AUGMENTS, GAN_LOSSES, AdaptiveAugment, GanDi
                                 GanGenerator, discriminator_loss, gan_widths, generator_loss,
                                 sample_latents, zero_centered_penalty)
 from auralite.image_metrics import sliced_wasserstein_distance
+from auralite.i18n import N_
 
 logger = logging.getLogger("auralite.image")
 
@@ -2312,21 +2313,21 @@ class ImageGenEngine:
 #  Presets (mirrors the text engine's CONFIG_PRESETS)
 # ======================================================================
 IMAGE_PRESETS = {
-    "Tiny (CPU-friendly)": dict(
+    N_("Tiny (CPU-friendly)"): dict(
         model_type="diffusion",
         img_size=16, base_channels=32, num_res_blocks=1, attn_heads=0, timesteps=200,
         schedule="linear", prediction_type="eps", min_snr_gamma=0.0,
         epochs=60, batch_size=32, lr=2e-3, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.995, lr_schedule="constant",
     ),
-    "Small (default)": dict(
+    N_("Small (default)"): dict(
         model_type="diffusion",
         img_size=32, base_channels=48, num_res_blocks=2, attn_heads=0, timesteps=400,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
         epochs=80, batch_size=32, lr=6e-4, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.999, lr_schedule="warmup_cosine", warmup_steps=200,
     ),
-    "Medium (GPU recommended)": dict(
+    N_("Medium (GPU recommended)"): dict(
         model_type="diffusion",
         img_size=48, base_channels=64, num_res_blocks=2, attn_heads=0, timesteps=600,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
@@ -2334,7 +2335,7 @@ IMAGE_PRESETS = {
         use_ema=True, ema_decay=0.9995, lr_schedule="warmup_cosine", warmup_steps=500,
         use_gradient_checkpointing=True,
     ),
-    "Large (powerful GPU)": dict(
+    N_("Large (powerful GPU)"): dict(
         model_type="diffusion",
         img_size=64, base_channels=96, num_res_blocks=2, attn_heads=0, timesteps=1000,
         schedule="cosine", prediction_type="v", min_snr_gamma=5.0,
@@ -2343,27 +2344,27 @@ IMAGE_PRESETS = {
         use_gradient_checkpointing=True,
     ),
     # 2.14.2: flow matching on the same U-Nets
-    "Flow Tiny (CPU-friendly)": dict(
+    N_("Flow Tiny (CPU-friendly)"): dict(
         model_type="flow", flow_time_sampling="logit_normal",
         img_size=16, base_channels=32, num_res_blocks=1, attn_heads=0,
         epochs=60, batch_size=32, lr=2e-3, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.995, lr_schedule="constant",
     ),
-    "Flow Small": dict(
+    N_("Flow Small"): dict(
         model_type="flow", flow_time_sampling="logit_normal",
         img_size=32, base_channels=48, num_res_blocks=2, attn_heads=0,
         epochs=80, batch_size=32, lr=6e-4, dropout=0.0, amp_dtype="none",
         use_ema=True, ema_decay=0.999, lr_schedule="warmup_cosine", warmup_steps=200,
     ),
     # 2.14.2: the GAN (R3GAN-style); its learning rates are gan_lr_g / gan_lr_d
-    "GAN Tiny (CPU-friendly)": dict(
+    N_("GAN Tiny (CPU-friendly)"): dict(
         model_type="gan", img_size=16, base_channels=32, num_res_blocks=1, latent_dim=64,
         gan_loss="rpgan", gan_lr_g=1e-3, gan_lr_d=1e-3, gan_gamma=0.5, gan_reg_every=1,
         gan_augment="off", gan_ada_target=0.6,
         epochs=60, batch_size=32, amp_dtype="none", use_ema=True, ema_decay=0.999,
         lr_schedule="constant",
     ),
-    "GAN Small": dict(
+    N_("GAN Small"): dict(
         model_type="gan", img_size=32, base_channels=32, num_res_blocks=2, latent_dim=64,
         gan_loss="rpgan", gan_lr_g=5e-4, gan_lr_d=5e-4, gan_gamma=0.5, gan_reg_every=1,
         gan_augment="off", gan_ada_target=0.6,

@@ -6,6 +6,7 @@ matplotlib).
 from __future__ import annotations
 
 from typing import Any
+from .i18n import tr
 
 __all__ = ["DEFAULT_TOKENS", "MAX_LABELLED", "TOKENS_RANGE", "attention_caption",
            "attention_view", "inspectable", "last_exchange", "last_reply", "layer_count",
@@ -43,11 +44,11 @@ def last_exchange(messages: list[dict[str, str]]) -> str:
 def inspectable(engine: Any) -> str:
     """"" when the model in `engine` can show its insights, else why not."""
     if getattr(engine, "model", None) is None:
-        return "There is no model in memory."
+        return tr("There is no model in memory.")
     gguf = getattr(engine, "is_gguf_model", None)
     if (callable(gguf) and gguf()) or getattr(engine, "hf_proxy", None) is not None:
-        return ("The insights read AuraLite's own models: a GGUF or Hugging Face model has "
-                "no attention layers to look into.")
+        return tr("The insights read AuraLite's own models: a GGUF or Hugging Face model has "
+                  "no attention layers to look into.")
     return ""
 
 
@@ -79,7 +80,7 @@ def attention_view(engine: Any, text: str, layer: int = 0, head: int | None = No
     if maps.ndim == 3:
         if head is not None:
             if not 0 <= int(head) < heads:
-                raise ValueError(f"head must be from 1 to {heads} for this layer")
+                raise ValueError(tr("head must be from 1 to {heads} for this layer", heads=heads))
             matrix = maps[int(head)]
         else:
             matrix = maps.mean(axis=0)
@@ -100,9 +101,9 @@ def parse_head(text: Any) -> int | None:
     try:
         head = int(value)
     except ValueError:
-        raise ValueError("the head is a number from 1, or avg for the heads' average") from None
+        raise ValueError(tr("the head is a number from 1, or avg for the heads' average")) from None
     if head < 1:
-        raise ValueError("the head is a number from 1, or avg for the heads' average")
+        raise ValueError(tr("the head is a number from 1, or avg for the heads' average"))
     return head - 1
 
 
@@ -115,12 +116,14 @@ def parse_tokens(text: Any) -> int:
     try:
         tokens = int(value)
     except ValueError:
-        raise ValueError(f"the tokens are a number from {TOKENS_RANGE[0]} to "
-                         f"{TOKENS_RANGE[1]}") from None
+        raise ValueError(tr("the tokens are a number from {low} to {high}",
+                            low=TOKENS_RANGE[0], high=TOKENS_RANGE[1])) from None
     return max(TOKENS_RANGE[0], min(TOKENS_RANGE[1], tokens))
 
 
 def attention_caption(layer: int, head: int | None, heads: int) -> str:
     """What an attention map shows, in words."""
-    which = f"head {head + 1} of {heads}" if head is not None else f"the average of {heads} heads"
-    return f"Layer {layer}, {which}: each row is where that token looked"
+    which = tr("head {head} of {heads}", head=head + 1, heads=heads) if head is not None else \
+        tr("the average of {heads} heads", heads=heads)
+    return tr("Layer {layer}, {which}: each row is where that token looked", layer=layer,
+              which=which)

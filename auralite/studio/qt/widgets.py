@@ -15,6 +15,7 @@ from ..insights import MAX_LABELLED
 from ..progress import ProgressTracker, ProgressView
 from .common import Job, ask_dir, ask_open, hint, primary
 from .theme import ACCENT
+from ..i18n import N_, number, tr
 
 _VAL_COLOR = "#e67e22"
 #: The colors of the runs a comparison draws (2.20).
@@ -54,7 +55,7 @@ class LossChart(QWidget):
         painter.setPen(QPen(text, 1))
         if not values:
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter,
-                             "The loss appears here while the model trains")
+                             tr("The loss appears here while the model trains"))
             painter.end()
             return
         low, high = min(values), max(values)
@@ -78,7 +79,7 @@ class LossChart(QWidget):
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              f"{y:.3g}")
         painter.drawText(QRectF(area.left(), area.bottom() + 4, area.width(), 18),
-                         Qt.AlignmentFlag.AlignCenter, "progress of the run")
+                         Qt.AlignmentFlag.AlignCenter, tr("progress of the run"))
         for points, color in ((self.losses, ACCENT), (self.val_losses, _VAL_COLOR)):
             if not points:
                 continue
@@ -92,8 +93,8 @@ class LossChart(QWidget):
                 for x, y in points:
                     painter.drawEllipse(point(x, y), 3, 3)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-        legend = [("training", ACCENT)] + ([("validation", _VAL_COLOR)] if self.val_losses
-                                           else [])
+        legend = [(tr("training"), ACCENT)] + ([(tr("validation"), _VAL_COLOR)]
+                                               if self.val_losses else [])
         x = area.right() - 10
         for label, color in reversed(legend):
             width = painter.fontMetrics().horizontalAdvance(label) + 22
@@ -114,7 +115,7 @@ class CurveChart(QWidget):
     """
 
     def __init__(self, parent: QWidget | None = None,
-                 empty_text: str = "This run has no curve yet", x_label: str = "step"):
+                 empty_text: str = N_("This run has no curve yet"), x_label: str = N_("step")):
         super().__init__(parent)
         self.series: list[tuple[str, list[tuple[float, float]], list[tuple[float, float]]]] = []
         self.empty_text = empty_text
@@ -148,7 +149,7 @@ class CurveChart(QWidget):
         points = [p for _name, train, val in self.series for p in train + val]
         painter.setPen(QPen(text, 1))
         if not points:
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, self.empty_text)
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, tr(self.empty_text))
             painter.end()
             return
         low = min(y for _x, y in points)
@@ -176,10 +177,10 @@ class CurveChart(QWidget):
         for x in (0.0, right / 2, right):
             p = point(x, low)
             painter.drawText(QRectF(p.x() - 40, area.bottom() + 3, 80, 16),
-                             Qt.AlignmentFlag.AlignCenter, f"{x:,.0f}")
+                             Qt.AlignmentFlag.AlignCenter, number(x, ",.0f"))
         painter.drawText(QRectF(area.left(), area.bottom() + 3, area.width() / 2 - 44, 16),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         f"   {self.x_label}")
+                         f"   {tr(self.x_label)}")
         for (_name, train, val), (train_color, val_color) in zip(self.series, self.colors(),
                                                                  strict=True):
             if train:
@@ -203,8 +204,8 @@ class CurveChart(QWidget):
                     painter.drawEllipse(point(x, y), 3, 3)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
         if len(self.series) == 1:
-            legend = [("training", ACCENT)] + ([("validation", _VAL_COLOR)]
-                                               if self.series[0][2] else [])
+            legend = [(tr("training"), ACCENT)] + ([(tr("validation"), _VAL_COLOR)]
+                                                   if self.series[0][2] else [])
         else:
             legend = [(name if len(name) <= 28 else name[:26] + "...", color)
                       for (name, _t, _v), (color, _c) in zip(self.series, self.colors(),
@@ -239,7 +240,7 @@ class InsightView(QWidget):
     attention as a heatmap - drawn here, without matplotlib."""
 
     def __init__(self, parent: QWidget | None = None,
-                 empty_text: str = "Token frequencies and attention maps appear here"):
+                 empty_text: str = N_("Token frequencies and attention maps appear here")):
         super().__init__(parent)
         self.mode = ""                                   # "", "bars" or "heatmap"
         self.bars: list[tuple[str, int]] = []
@@ -280,7 +281,7 @@ class InsightView(QWidget):
         elif self.mode == "heatmap" and self.matrix is not None and self.matrix.size:
             self._paint_heatmap(painter, rect, text)
         else:
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.empty_text)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, tr(self.empty_text))
         painter.end()
 
     def _paint_title(self, painter: QPainter, rect: QRectF) -> QRectF:
@@ -295,7 +296,7 @@ class InsightView(QWidget):
         metrics = painter.fontMetrics()
         label_width = min(160.0, max(metrics.horizontalAdvance(label) for label, _ in self.bars)
                           + 8.0)
-        count_width = metrics.horizontalAdvance(f"{max(c for _, c in self.bars):,}") + 10.0
+        count_width = metrics.horizontalAdvance(number(max(c for _, c in self.bars))) + 10.0
         row = max(10.0, min(20.0, rect.height() / max(1, len(self.bars))))
         top_count = max(1, max(c for _, c in self.bars))
         span = max(10.0, rect.width() - label_width - count_width)
@@ -310,7 +311,7 @@ class InsightView(QWidget):
                              QColor(ACCENT))
             painter.drawText(QRectF(rect.left() + label_width + width + 4, y, count_width, row),
                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                             f"{count:,}")
+                             number(count))
 
     def _paint_heatmap(self, painter: QPainter, rect: QRectF, text: QColor) -> None:
         rect = self._paint_title(painter, rect)
@@ -353,19 +354,19 @@ class RunPanel(QWidget):
     finish_clicked = Signal()
     stop_clicked = Signal()
 
-    def __init__(self, start_text: str = "Start", parent: QWidget | None = None):
+    def __init__(self, start_text: str = N_("Start"), parent: QWidget | None = None):
         super().__init__(parent)
         self.tracker = ProgressTracker()
-        self.start_button = primary(QPushButton(start_text))
-        self.finish_button = QPushButton("Finish")
-        self.finish_button.setToolTip("End the run well: the learning rate cools down for a "
-                                      "short while, then the model is kept")
-        self.stop_button = QPushButton("Stop now")
-        self.stop_button.setToolTip("Stop at the next step; the weights learned so far stay")
+        self.start_button = primary(QPushButton(tr(start_text)))
+        self.finish_button = QPushButton(tr("Finish"))
+        self.finish_button.setToolTip(tr("End the run well: the learning rate cools down for a "
+                                      "short while, then the model is kept"))
+        self.stop_button = QPushButton(tr("Stop now"))
+        self.stop_button.setToolTip(tr("Stop at the next step; the weights learned so far stay"))
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setFormat("%p%")
-        self.status = QLabel("Ready")
+        self.status = QLabel(tr("Ready"))
         self.status.setWordWrap(True)
         self.detail = hint("")
         self.chart = LossChart()
@@ -388,7 +389,7 @@ class RunPanel(QWidget):
 
     def _finish(self) -> None:
         self.finish_button.setEnabled(False)
-        self.status.setText("Finishing: cooling the learning rate down…")
+        self.status.setText(tr("Finishing: cooling the learning rate down…"))
         self.finish_clicked.emit()
 
     def set_running(self, running: bool) -> None:
@@ -396,11 +397,11 @@ class RunPanel(QWidget):
         self.finish_button.setEnabled(running)
         self.stop_button.setEnabled(running)
 
-    def begin(self, text: str = "Starting…") -> None:
+    def begin(self, text: str = N_("Starting…")) -> None:
         self.tracker = ProgressTracker()
         self.chart.clear()
         self.bar.setValue(0)
-        self.status.setText(text)
+        self.status.setText(tr(text))
         self.detail.setText("")
         self.set_running(True)
 
@@ -445,13 +446,13 @@ class DataPicker(QWidget):
         self.report: DataReport | None = None
         self._job: Job | None = None
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("A .jsonl of dialogs, a .txt file, a folder - or hf:NAME"
+        self.edit.setPlaceholderText(tr("A .jsonl of dialogs, a .txt file, a folder - or hf:NAME")
                                      if purpose == "finetune" else
-                                     "A .txt file, a folder of documents, a prepared dataset - "
-                                     "or hf:NAME")
-        self.file_button = QPushButton("File…")
-        self.folder_button = QPushButton("Folder…")
-        self.summary = hint("No data chosen yet.")
+                                     tr("A .txt file, a folder of documents, a prepared dataset - "
+                                     "or hf:NAME"))
+        self.file_button = QPushButton(tr("File…"))
+        self.folder_button = QPushButton(tr("Folder…"))
+        self.summary = hint(tr("No data chosen yet."))
         self.summary.setTextFormat(Qt.TextFormat.RichText)
         line = QHBoxLayout()
         line.setContentsMargins(0, 0, 0, 0)
@@ -480,15 +481,15 @@ class DataPicker(QWidget):
         self._inspected(report)
 
     def _pick_file(self) -> None:
-        path = ask_open(self, "Choose the training data",
-                        "Data (*.jsonl *.json *.txt *.md *.parquet *.zst *.gz);;All files (*)",
+        path = ask_open(self, tr("Choose the training data"),
+                        tr("Data (*.jsonl *.json *.txt *.md *.parquet *.zst *.gz);;All files (*)"),
                         self.start_dir)
         if path:
             self.start_dir = os.path.dirname(path)
             self.set_path(path)
 
     def _pick_folder(self) -> None:
-        path = ask_dir(self, "Choose a folder of training data", self.start_dir)
+        path = ask_dir(self, tr("Choose a folder of training data"), self.start_dir)
         if path:
             self.start_dir = path
             self.set_path(path)
@@ -497,10 +498,10 @@ class DataPicker(QWidget):
         paths = self.paths()
         if not paths:
             self.report = None
-            self.summary.setText("No data chosen yet.")
+            self.summary.setText(tr("No data chosen yet."))
             self.changed.emit(None)
             return
-        self.summary.setText("Reading the data…")
+        self.summary.setText(tr("Reading the data…"))
         job = Job("inspect-data", lambda _job: inspect_data(paths), self)
         job.finished.connect(self._inspected)
         job.failed.connect(self._failed)
@@ -524,5 +525,6 @@ class DataPicker(QWidget):
 
     def _failed(self, exc: BaseException) -> None:
         self.report = DataReport(paths=self.paths(), problems=[str(exc)])
-        self.summary.setText(f"<span style='color:#c0392b'>Problem: {exc}</span>")
+        problem = tr("Problem: {error}", error=exc)
+        self.summary.setText(f"<span style='color:#c0392b'>{problem}</span>")
         self.changed.emit(self.report)

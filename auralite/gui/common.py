@@ -30,6 +30,7 @@ from auralite.engine.dialogs import SFT_TEMPLATES, DialogSet, dialog_plain_text
 from auralite.engine.preference import PreferenceSet
 from auralite.engine.distill import EngineTeacher, distill_dialogs, load_teacher, read_prompts
 from auralite.web_tools import build_web_context
+from auralite.i18n import N_
 # Agent framework (optional)
 try:
     from auralite.agent import AuraLiteAgent, Sandbox
@@ -108,21 +109,21 @@ except ImportError:
 # ======================================================================
 
 CONFIG_PRESETS = {
-    "Tiny (CPU-friendly)": {
+    N_("Tiny (CPU-friendly)"): {
         "d_model": 64, "d_ff": 128, "n_heads": 2, "n_layers": 2,
         "seq_length": 32, "batch_size": 16, "lr": 0.001, "epochs": 200,
         "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
     },
-    "Small (default)": {
+    N_("Small (default)"): {
         "d_model": 128, "d_ff": 256, "n_heads": 4, "n_layers": 4,
         "seq_length": 64, "batch_size": 32, "lr": 0.001, "epochs": 100,
         "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": False,
         "rope_scaling": None,
     },
-    "Medium (GPU recommended)": {
+    N_("Medium (GPU recommended)"): {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
@@ -133,14 +134,14 @@ CONFIG_PRESETS = {
         # measurement (docs/engine.md § 9); generation keeps the trained length.
         "rope_scaling": None,
     },
-    "Large (powerful GPU)": {
+    N_("Large (powerful GPU)"): {
         "d_model": 512, "d_ff": 1024, "n_heads": 8, "n_layers": 8,
         "seq_length": 256, "batch_size": 32, "lr": 0.0001, "epochs": 30,
         "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 0,
         "use_gradient_checkpointing": True,
         "rope_scaling": None,
     },
-    "GQA-efficient (Medium)": {
+    N_("GQA-efficient (Medium)"): {
         "d_model": 256, "d_ff": 512, "n_heads": 8, "n_layers": 6,
         "seq_length": 128, "batch_size": 64, "lr": 0.0003, "epochs": 50,
         "dropout": "auto", "grad_clip": 1.0, "n_kv_heads": 2,
@@ -157,10 +158,10 @@ def _big_presets() -> dict:
     except Exception:                            # pragma: no cover - torch missing
         return {}
     presets = {}
-    for name, label, lr in (("125m", "Big 125M (big data, GPU or patience)", 0.0006),
-                            ("350m", "Big 350M (big data, GPU)", 0.0003),
-                            ("700m", "Big 700M (big data, GPU 16 GB+)", 0.0003),
-                            ("1.2b", "Big 1.2B (big data, GPU 24 GB+)", 0.0002)):
+    for name, label, lr in (("125m", N_("Big 125M (big data, GPU or patience)"), 0.0006),
+                            ("350m", N_("Big 350M (big data, GPU)"), 0.0003),
+                            ("700m", N_("Big 700M (big data, GPU 16 GB+)"), 0.0003),
+                            ("1.2b", N_("Big 1.2B (big data, GPU 24 GB+)"), 0.0002)):
         preset = MODEL_PRESETS[name]
         presets[label] = {
             "d_model": preset["d_model"], "d_ff": preset["d_ff"], "n_heads": preset["n_heads"],
@@ -173,6 +174,12 @@ def _big_presets() -> dict:
 
 
 CONFIG_PRESETS.update(_big_presets())
+
+
+def preset_key(table: dict, shown: str) -> str:
+    """2.28: the key of a preset that a list shows in the interface's language."""
+    from auralite.i18n import tr
+    return next((key for key in table if shown in (key, tr(key))), shown)
 
 
 class ConsoleRedirector(io.TextIOBase):
@@ -278,18 +285,32 @@ class ConsoleRedirector(io.TextIOBase):
             pass
 
 
-def _fmt_duration(seconds: float) -> str:
-    """Format seconds as a compact human-readable string."""
+def _fmt_duration(seconds: float, *, english: bool = False) -> str:
+    """Format seconds as a compact human-readable string (2.28: in the interface's
+    language; `english` for the console's lines, which stay English)."""
     if seconds is None or seconds < 0 or seconds != seconds:  # NaN check
         return "—"
+    from auralite.i18n import tr as _tr
+
+    def tr(text: str, **values) -> str:
+        return text.format(**values) if english else _tr(text, **values)
     seconds = int(seconds)
     if seconds < 60:
-        return f"{seconds}s"
+        return tr("{s}s", s=seconds)
     if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60:02d}s"
+        return tr("{m}m {s:02d}s", m=seconds // 60, s=seconds % 60)
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
-    return f"{h}h {m:02d}m {s:02d}s"
+    return tr("{h}h {m:02d}m {s:02d}s", h=h, m=m, s=s)
 
 
+def heading_width(text: str, minimum: int = 80) -> int:
+    """2.28: a table column wide enough for its heading in the interface's language - the
+    Russian words are longer than the English ones the widths were made for."""
+    try:
+        import tkinter.font as tkfont
+        width = int(tkfont.nametofont("TkHeadingFont").measure(text)) + 24
+    except Exception:                 # no Tk yet, or a test double
+        width = 8 * len(text) + 16
+    return max(minimum, width)

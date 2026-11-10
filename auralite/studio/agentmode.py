@@ -12,6 +12,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from typing import Any
+from .i18n import N_, tr
 
 __all__ = ["DEFAULTS", "STEPS", "TIMEOUTS", "WARNING", "AgentOptions", "ToolRow", "form_defaults",
            "make_agent", "make_sandbox", "options_from_form", "python_for_tools", "step_lines",
@@ -25,11 +26,21 @@ STEPS = (1, 30)
 TIMEOUTS = (1, 600)
 #: Tools that need a Python interpreter of their own.
 PYTHON_TOOLS = ("python", "install")
-WARNING = ("In agent mode the model can run Python code and commands on this computer, "
-           "with your permissions, in a temporary folder that is deleted afterwards; it can "
-           "also read files elsewhere and use the network. That limits the damage of a "
-           "mistake - it is not a security boundary. Turn on only the tools you need, and "
-           "use agent mode with models you trust.")
+#: 2.28: the tools' descriptions, which the interfaces show in their language (the model
+#: reads them in English, from the agent's registry)
+TOOL_WORDS = (N_("Execute Python code in a sandboxed subprocess."),
+              N_("Run a whitelisted shell command (ls, git, curl, etc.)."),
+              N_("Write text content to a file inside the sandbox workspace."),
+              N_("Read a file from the sandbox workspace."),
+              N_("List files in a sandbox directory."),
+              N_("Install a Python package with pip."),
+              N_("Search the web and return relevant snippets."),
+              N_("Evaluate a mathematical expression safely."))
+WARNING = N_("In agent mode the model can run Python code and commands on this computer, "
+             "with your permissions, in a temporary folder that is deleted afterwards; it can "
+             "also read files elsewhere and use the network. That limits the damage of a "
+             "mistake - it is not a security boundary. Turn on only the tools you need, and "
+             "use agent mode with models you trust.")
 
 
 def form_defaults() -> tuple[int, float]:
@@ -89,10 +100,10 @@ def tool_rows(python: str | None | bool = False) -> list[ToolRow]:
         if name in PYTHON_TOOLS:
             if not interpreter:
                 available = False
-                note = ("needs Python: the app has none of its own - install Python, or "
-                        "AuraLite with pip")
+                note = tr("needs Python: the app has none of its own - install Python, or "
+                          "AuraLite with pip")
             elif bundle.packaged():
-                note = f"runs {interpreter}"
+                note = tr("runs {interpreter}", interpreter=interpreter)
         rows.append(ToolRow(name, str(tool.description), available, note))
     return rows
 
@@ -119,16 +130,16 @@ def options_from_form(tools: Any, steps: Any = DEFAULTS["max_iterations"],
     except ValueError:
         steps_value = 0
     if not STEPS[0] <= steps_value <= STEPS[1]:
-        raise ValueError(f"the steps are a whole number from {STEPS[0]} to {STEPS[1]}")
+        raise ValueError(tr("the steps are a whole number from {STEPS} to {STEPS2}", STEPS=STEPS[0], STEPS2=STEPS[1]))
     try:
         seconds = float(str(timeout).strip())
     except ValueError:
         seconds = 0.0
     if not TIMEOUTS[0] <= seconds <= TIMEOUTS[1]:
-        raise ValueError(f"the seconds a tool may run are from {TIMEOUTS[0]} to {TIMEOUTS[1]}")
+        raise ValueError(tr("the seconds a tool may run are from {TIMEOUTS} to {TIMEOUTS2}", TIMEOUTS=TIMEOUTS[0], TIMEOUTS2=TIMEOUTS[1]))
     chosen = tuple(str(name) for name in tools or ())
     if not chosen:
-        raise ValueError("turn on at least one tool the agent can use here")
+        raise ValueError(tr("turn on at least one tool the agent can use here"))
     return AgentOptions(tools=chosen, max_iterations=steps_value, timeout=seconds, **more)
 
 
@@ -152,7 +163,7 @@ def make_agent(engine: Any, options: AgentOptions, python: str | None | bool = F
     runnable = {row.name for row in tool_rows(interpreter) if row.available}
     tools = [name for name in options.tools if name in runnable]
     if not tools:
-        raise ValueError("turn on at least one tool the agent can use here")
+        raise ValueError(tr("turn on at least one tool the agent can use here"))
     if sandbox is None:
         sandbox = make_sandbox(options.timeout, interpreter)
     else:
@@ -173,7 +184,7 @@ def step_lines(step: Any, limit: int = 300) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
     for call in getattr(step, "tool_calls", None) or []:
         name = call.get("name", "?") if isinstance(call, dict) else str(call)
-        lines.append((f"→ Tool: {name}", "tool"))
+        lines.append(("→ " + tr("Tool: {name}", name=name), "tool"))
     for result in getattr(step, "tool_results", None) or []:
         try:
             text = str(result.to_text())

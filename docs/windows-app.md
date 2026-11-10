@@ -22,7 +22,8 @@ the new files; later starts take seconds. The app is not signed, so Windows may 
 
 The setup wizard opens on the first start: it looks at the computer, asks what you
 want to train and on what, and recommends a model and settings that fit — from here
-on everything is as in [docs/studio.md](studio.md).
+on everything is as in [docs/studio.md](studio.md). On a Windows set to Russian the app
+speaks Russian (2.28); *View → Language* switches it from the next start.
 
 **Requirements.** Windows 10 (version 1809 or newer) or Windows 11, 64-bit. Any
 64-bit Intel or AMD processor — the app's Qt is 6.9, which also runs on processors
@@ -41,8 +42,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.27.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.27.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.28.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.28.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -166,7 +167,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.27.0-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.28.0-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins

@@ -16,6 +16,7 @@ from typing import Any
 from auralite import runs as runlib
 
 from . import library
+from .i18n import N_, tr, trn
 
 __all__ = ["DATASETS_HINT", "EMPTY_RUNS", "EVAL_DIALOGS", "EVAL_TOKENS", "MODELS_HINT",
            "REFRESH_MS", "RUN_ACTIONS", "RUN_COLUMNS", "STATUS_COLORS", "continue_tip",
@@ -30,32 +31,34 @@ EVAL_TOKENS = 48
 #: How often the runs refresh while one of them trains (milliseconds).
 REFRESH_MS = 3000
 
-RUN_COLUMNS = ("Name", "Status", "Kind", "Best val. loss", "Time", "Started")
-MODEL_COLUMNS = ("Name", "Kind", "Size", "Changed", "About")
-DATA_COLUMNS = ("Name", "Kind", "Size", "Changed", "Runs", "About")
+RUN_COLUMNS = (N_("Name"), N_("Status"), N_("Kind"), N_("Best val. loss"), N_("Time"),
+               N_("Started"))
+MODEL_COLUMNS = (N_("Name"), N_("Kind"), N_("Size"), N_("Changed"), N_("About"))
+DATA_COLUMNS = (N_("Name"), N_("Kind"), N_("Size"), N_("Changed"), N_("Runs"), N_("About"))
 STATUS_COLORS = {"finished": "#1e8e3e", "stopped": "#b06000", "interrupted": "#d93025",
                  "failed": "#d93025", "running": "#2f6fdb"}
 
-SEARCH_PLACEHOLDER = "Find a run: a name, a model, data, a status"
-EMPTY_RUNS = ("No runs yet. Every training run of the Train and Fine-tune tabs (and of "
-              "`auralite train`) appears here with its curve; a stopped or interrupted one "
-              "continues where it stood.")
-MODELS_HINT = ("Downloaded models, the results of runs, and the models, adapters and exports "
-               "saved here. Deleting a download or a run's files only frees room: a download "
-               "comes back on the next use.")
-DATASETS_HINT = ("The data you checked or trained on, and the datasets `auralite data "
-                 "prepare` made (prepared once, reused by later runs).")
-COMPARE_TIP = "Select two runs or more (Ctrl+click), then compare their curves and settings"
-CONTINUE_TIP = ("Go on exactly where the run stood: the same data order, learning-rate "
-                "schedule and counters")
-EVALUATE_TIP = (f"A chat model answers up to {EVAL_DIALOGS} of the dialogs its run held out: "
-                f"how often it stops by itself, how often it answers exactly")
-MORE_TIP = "Fine-tune the run's result further (a new run)"
-REPEAT_TIP = "Open the run's tab with its settings, base and data"
-COMPARE_HINT = "Bold: what differs. Lines: the training loss; dots: the validation loss."
-EVAL_TEXT_ONLY = ("The evaluation measures chat models on the dialogs their run held out; "
-                  "this run trained on text.")
-SELECT_TWO = "Select two runs or more (Ctrl+click) to compare them."
+SEARCH_PLACEHOLDER = N_("Find a run: a name, a model, data, a status")
+EMPTY_RUNS = N_("No runs yet. Every training run of the Train and Fine-tune tabs (and of "
+                "`auralite train`) appears here with its curve; a stopped or interrupted one "
+                "continues where it stood.")
+MODELS_HINT = N_("Downloaded models, the results of runs, and the models, adapters and "
+                 "exports saved here. Deleting a download or a run's files only frees room: a "
+                 "download comes back on the next use.")
+DATASETS_HINT = N_("The data you checked or trained on, and the datasets `auralite data "
+                   "prepare` made (prepared once, reused by later runs).")
+COMPARE_TIP = N_("Select two runs or more (Ctrl+click), then compare their curves and settings")
+CONTINUE_TIP = N_("Go on exactly where the run stood: the same data order, learning-rate "
+                  "schedule and counters")
+#: 2.28: a template - ``tr(EVALUATE_TIP, n=EVAL_DIALOGS)``
+EVALUATE_TIP = N_("A chat model answers up to {n} of the dialogs its run held out: how often it "
+                  "stops by itself, how often it answers exactly")
+MORE_TIP = N_("Fine-tune the run's result further (a new run)")
+REPEAT_TIP = N_("Open the run's tab with its settings, base and data")
+COMPARE_HINT = N_("Bold: what differs. Lines: the training loss; dots: the validation loss.")
+EVAL_TEXT_ONLY = N_("The evaluation measures chat models on the dialogs their run held out; "
+                    "this run trained on text.")
+SELECT_TWO = N_("Select two runs or more (Ctrl+click) to compare them.")
 
 
 # ----------------------------------------------------------------------
@@ -64,7 +67,7 @@ SELECT_TWO = "Select two runs or more (Ctrl+click) to compare them."
 def run_matches(run: runlib.Run, words: list[str]) -> bool:
     """True when every word of the search is in the run's name, id, status, kind, method,
     base, data or notes."""
-    text = " ".join([run.name, run.id, run.status, run.kind_label, run.method,
+    text = " ".join([run.name, run.id, run.status, tr(run.status), run.kind_label, run.method,
                      str(run.base.get("label") or ""),
                      runlib.data_label(run.data.get("paths") or []), run.notes]).lower()
     return all(word in text for word in words)
@@ -73,14 +76,14 @@ def run_matches(run: runlib.Run, words: list[str]) -> bool:
 def run_row(run: runlib.Run) -> tuple[str, str, str, str, str, str]:
     """The cells of a run in the table (see :data:`RUN_COLUMNS`)."""
     best = f"{run.best_val:.4f}" if run.best_val is not None else ""
-    return (run.name, run.status, run.kind_label, best, runlib._duration(run.seconds),
+    return (run.name, tr(run.status), run.kind_label, best, runlib._duration(run.seconds),
             runlib.format_when(run.created))
 
 
 def continue_tip(run: runlib.Run) -> str:
     """The *Continue* button's tooltip: what it does, or why the run cannot continue."""
     ok, why = run.continue_state()
-    return CONTINUE_TIP if ok else f"It cannot continue: {why}"
+    return tr(CONTINUE_TIP) if ok else tr("It cannot continue: {why}", why=why)
 
 
 RUN_ACTIONS = ("continue", "open", "evaluate", "more", "repeat", "files", "notes", "delete")
@@ -112,14 +115,16 @@ def delete_run_question(run: runlib.Run, files_only: bool) -> str:
     """The question before a run (or only its model files) is deleted."""
     size = library.format_size(run.disk_bytes())
     if files_only:
-        question = (f"Delete the model files of {run.name} ({size} with its record)? Its "
-                    f"record and curve stay; it cannot continue or be opened after this.")
+        question = tr("Delete the model files of {name} ({size} with its record)? Its record "
+                      "and curve stay; it cannot continue or be opened after this.",
+                      name=run.name, size=size)
     else:
-        question = f"Delete the run {run.name} and its folder ({size})?"
+        question = tr("Delete the run {name} and its folder ({size})?", name=run.name, size=size)
     outside = [str(path) for _label, path, _size in run.files()
                if run.folder not in path.parents]
     if outside:
-        question += f"\n\nFiles outside its folder stay: {', '.join(outside)}"
+        question += "\n\n" + tr("Files outside its folder stay: {files}",
+                                 files=", ".join(outside))
     return question
 
 
@@ -127,17 +132,20 @@ def evaluation_line(summary: dict) -> str:
     """The line after *Evaluate*: how many replies stop by themselves, how many are exact."""
     stop = summary.get("stop_rate")
     exact = summary.get("exact")
-    return (f"Evaluated on {summary.get('dialogs', 0)} held-out dialogs"
-            + (f": {stop:.0%} of the replies stop by themselves" if stop is not None else "")
-            + (f", {exact:.0%} are exact" if exact is not None else "") + ".")
+    return (trn("Evaluated on {n} held-out dialog", "Evaluated on {n} held-out dialogs",
+                int(summary.get("dialogs", 0) or 0))
+            + (": " + tr("{share:.0%} of the replies stop by themselves", share=stop)
+               if stop is not None else "")
+            + (", " + tr("{share:.0%} are exact", share=exact) if exact is not None else "")
+            + ".")
 
 
 def saved_note(run: Any) -> str:
     """What a status line adds after a recorded run: where its model is kept."""
     if run is None or run.result_path is None or run.record.get("save_error"):
         return ""
-    return (". Saved in the library: it can continue from there."
-            if run.continue_state()[0] else ". Saved in the library.")
+    return ". " + (tr("Saved in the library: it can continue from there.")
+                   if run.continue_state()[0] else tr("Saved in the library."))
 
 
 # ----------------------------------------------------------------------
@@ -154,7 +162,7 @@ def item_cells(item: library.LibraryItem, columns: tuple[str, ...]) -> list[str]
         elif key == "runs":
             cells.append(str(len(item.extra.get("runs") or [])) or "")
         else:
-            cells.append(str(getattr(item, key)))
+            cells.append(tr(str(getattr(item, key))))
     return cells
 
 
@@ -191,25 +199,26 @@ def delete_item_question(item: library.LibraryItem) -> str:
     """The question before a model or a dataset is deleted from the disk."""
     size = library.format_size(item.bytes)
     if item.owned:
-        question = f"Delete {item.name} ({size})?"
+        question = tr("Delete {name} ({size})?", name=item.name, size=size)
         if item.kind == "download":
-            question += " It is downloaded again when it is used next time."
+            question += " " + tr("It is downloaded again when it is used next time.")
         elif item.kind == "result":
-            question += " The run's checkpoint goes too; its record and curve stay."
+            question += " " + tr("The run's checkpoint goes too; its record and curve stay.")
         return question
-    return (f"Delete {item.path} ({size}) from the disk? This is your file: it cannot be "
-            f"brought back.")
+    return tr("Delete {path} ({size}) from the disk? This is your file: it cannot be brought "
+              "back.", path=item.path, size=size)
 
 
 def disk_line(summary: dict) -> str:
     """``AuraLite's files: 1.2 GB (runs 400 MB, downloads 800 MB) · 40 GB free on the
     disk`` from :func:`auralite.studio.library.disk_summary`."""
-    parts = [f"AuraLite's files: {library.format_size(summary['total'])}"]
-    detail = [f"{label} {library.format_size(summary[key])}" for key, label in
-              (("runs", "runs"), ("downloads", "downloads"), ("datasets", "prepared data"))
+    parts = [tr("AuraLite's files: {size}", size=library.format_size(summary["total"]))]
+    detail = [tr(label, size=library.format_size(summary[key])) for key, label in
+              (("runs", N_("runs {size}")), ("downloads", N_("downloads {size}")),
+               ("datasets", N_("prepared data {size}")))
               if summary.get(key)]
     if detail:
         parts[0] += f" ({', '.join(detail)})"
     if summary.get("free") is not None:
-        parts.append(f"{library.format_size(summary['free'])} free on the disk")
+        parts.append(tr("{size} free on the disk", size=library.format_size(summary["free"])))
     return " · ".join(parts)

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFormLayout, QGroupBox, 
                                QLabel, QLineEdit, QPlainTextEdit, QPushButton, QRadioButton,
                                QSpinBox, QVBoxLayout, QWidget)
 
-from ..i18n import tr
+from ..i18n import N_, tr
 from ..modelinfo import model_info_lines
 from ..recipes import SettingsError
 from .common import (Job, ask_dir, ask_open, ask_text, compact_spins, confirm, heading, hint,
@@ -55,9 +55,9 @@ def import_text(info: dict) -> str:
     if info.get("stage") == "download":
         total = info.get("all_total") or info.get("total") or 0
         done = info.get("all_bytes") or info.get("bytes") or 0
-        return (tr("Downloading {file}: {done}", file=info.get("file"),
-                   done=f"{done / 1e6:,.0f}")
-                + (f" / {total / 1e6:,.0f} MB" if total else " MB"))
+        size = (tr("{done:,.0f} / {total:,.0f} MB", done=done / 1e6, total=total / 1e6)
+                if total else tr("{done:,.0f} MB", done=done / 1e6))
+        return tr("Downloading {file}: {done}", file=info.get("file"), done=size)
     return tr("Converting the weights {done}/{total}…", done=info.get("done"),
               total=info.get("total"))
 
@@ -355,7 +355,7 @@ class ModelTab(QWidget):
         if not self.studio.confirm_replace_model(tr("Importing a model replaces the one in "
                                                     "memory.")):
             return
-        if not self.studio.begin("importing a model"):
+        if not self.studio.begin(N_("importing a model")):
             return
         engine = self.studio.engine
 
@@ -367,7 +367,7 @@ class ModelTab(QWidget):
 
         self.status.setText(tr("Importing {name} into AuraLite…", name=name))
         self._run("hf-import", work, lambda info: self._imported(source, info),
-                  "importing the model", progress=self._import_progress)
+                  tr("importing the model"), progress=self._import_progress)
 
     def _import_progress(self, info: Any) -> None:
         if isinstance(info, dict):
@@ -410,7 +410,7 @@ class ModelTab(QWidget):
         if not self.studio.confirm_replace_model(tr("Loading a model replaces the one in "
                                                     "memory.")):
             return
-        if not self.studio.begin("loading a model"):
+        if not self.studio.begin(N_("loading a model")):
             return
         kind = self.load_kind()
         options = {"load_in_4bit": kind == "4bit", "load_in_8bit": kind == "8bit",
@@ -427,7 +427,7 @@ class ModelTab(QWidget):
             return name
 
         self.status.setText(tr("Loading {name} with transformers…", name=name))
-        self._run("hf-load", work, self._loaded, "loading the model")
+        self._run("hf-load", work, self._loaded, tr("loading the model"))
 
     def _loaded(self, name: str) -> None:
         self.job = None
@@ -451,7 +451,7 @@ class ModelTab(QWidget):
         try:
             engine.apply_lora_to_hf(rank=int(self.lora_rank.value()))
         except Exception as err:
-            self.studio.report_error(err, "adding LoRA adapters")
+            self.studio.report_error(err, tr("adding LoRA adapters"))
             return
         self.status.setText(tr("LoRA adapters added (rank {r}): ready to fine-tune",
                                r=int(self.lora_rank.value())))
@@ -465,7 +465,7 @@ class ModelTab(QWidget):
         try:
             self.studio.engine.save_hf_lora(path)
         except Exception as err:
-            self.studio.report_error(err, "saving the adapter")
+            self.studio.report_error(err, tr("saving the adapter"))
             return
         self.status.setText(tr("The adapter is saved: {path}", path=path))
 
@@ -476,7 +476,7 @@ class ModelTab(QWidget):
         try:
             self.studio.engine.load_hf_lora(path)
         except Exception as err:
-            self.studio.report_error(err, "loading the adapter")
+            self.studio.report_error(err, tr("loading the adapter"))
             return
         self.status.setText(tr("The adapter is loaded: {path}", path=path))
         self.studio.model_changed.emit()
@@ -491,7 +491,7 @@ class ModelTab(QWidget):
         if not repo:
             return
         private = confirm(self, tr("Private?"), tr("Make the repository private?"))
-        if not self.studio.begin("uploading the model"):
+        if not self.studio.begin(N_("uploading the model")):
             return
 
         def work(_job: Job) -> Any:
@@ -500,7 +500,7 @@ class ModelTab(QWidget):
             return repo
 
         self.status.setText(tr("Pushing to {repo}…", repo=repo))
-        self._run("hf-push", work, self._pushed, "uploading the model")
+        self._run("hf-push", work, self._pushed, tr("uploading the model"))
 
     def _pushed(self, repo: str) -> None:
         self.job = None
@@ -531,7 +531,7 @@ class ModelTab(QWidget):
         out_dir = ask_dir(self, tr("A folder for the fine-tuned LoRA adapter"))
         if not out_dir:
             return
-        if not self.studio.begin("fine-tuning"):
+        if not self.studio.begin(N_("fine-tuning")):
             return
         options = {"epochs": int(self.ft_epochs.value()), "learning_rate": lr,
                    "batch_size": int(self.ft_batch.value()),
@@ -545,7 +545,7 @@ class ModelTab(QWidget):
                                       stop_event=job.stop_event, **options)
 
         self.status.setText(tr("Fine-tuning on {n} examples…", n=len(texts)))
-        self._run("hf-finetune", work, self._finetuned, "the fine-tune",
+        self._run("hf-finetune", work, self._finetuned, tr("the fine-tune"),
                   progress=self._finetune_progress)
 
     def _finetune_data(self) -> list[str] | None:
@@ -559,7 +559,7 @@ class ModelTab(QWidget):
             try:
                 return finetune_texts(calibration_text(paths, limit=1 << 28))
             except (OSError, ValueError) as err:
-                show_error(self, err, "reading the training data")
+                show_error(self, err, tr("reading the training data"))
                 return None
         path = ask_open(self, tr("A text to fine-tune on"), tr("Text (*.txt *.md);;All files "
                                                                "(*)"),
@@ -569,16 +569,16 @@ class ModelTab(QWidget):
         try:
             return finetune_texts(read_calibration_file(path, limit=1 << 28))
         except OSError as err:
-            show_error(self, err, "reading the text")
+            show_error(self, err, tr("reading the text"))
             return None
 
     def _finetune_progress(self, event: tuple) -> None:
         epoch, total, loss = event
         try:
-            self.status.setText(tr("Fine-tuning… pass {e} of {t}, loss {loss}", e=epoch,
+            self.status.setText(tr("Fine-tuning… pass {error} of {t}, loss {loss}", error=epoch,
                                    t=total, loss=f"{float(loss):.4f}"))
         except (TypeError, ValueError):
-            self.status.setText(tr("Fine-tuning… pass {e} of {t}", e=epoch, t=total))
+            self.status.setText(tr("Fine-tuning… pass {error} of {t}", error=epoch, t=total))
 
     def _finetuned(self, saved: Any) -> None:
         stopped = self.job is not None and self.job.stop_event.is_set()

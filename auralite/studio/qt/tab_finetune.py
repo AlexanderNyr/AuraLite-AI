@@ -33,13 +33,15 @@ from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spin
                      heading, hint, inform, job_events, load_settings_file, run_training,
                      save_settings_file, show_error, training_callback)
 from .widgets import DataPicker, RunPanel
+from ..i18n import N_, tr, trn
 
 if TYPE_CHECKING:
     from .window import MainWindow
 
 # 2.26: the form's choices are the classic Fine-tune tab's too (studio/finetuneform.py)
-JUDGES = (("none", "none"), ("exact", "exact answer"), ("contains", "contains the answer"),
-          ("number", "same number"), ("teacher", "the teacher judges"))
+JUDGES = (("none", N_("none")), ("exact", N_("exact answer")),
+          ("contains", N_("contains the answer")), ("number", N_("same number")),
+          ("teacher", N_("the teacher judges")))
 
 
 class FineTuneTab(QWidget):
@@ -57,18 +59,18 @@ class FineTuneTab(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
-        layout.addWidget(heading("Fine-tune a model"))
-        layout.addWidget(hint("A ready model learns to answer your way from your dialogs - or "
+        layout.addWidget(heading(tr("Fine-tune a model")))
+        layout.addWidget(hint(tr("A ready model learns to answer your way from your dialogs - or "
                               "your style and knowledge from texts. Only small adapters train "
-                              "(LoRA), so a PC is enough."))
+                              "(LoRA), so a PC is enough.")))
 
         # ---- 1. base model
-        base_box = QGroupBox("1. Base model")
+        base_box = QGroupBox(tr("1. Base model"))
         grid = QGridLayout(base_box)
         self.source_group = QButtonGroup(self)
         self.source_buttons: dict[str, QRadioButton] = {}
         for row_index, key in enumerate(SOURCES):
-            button = QRadioButton(SOURCE_LABELS[key])
+            button = QRadioButton(tr(SOURCE_LABELS[key]))
             self.source_group.addButton(button)
             self.source_buttons[key] = button
             grid.addWidget(button, row_index, 0)
@@ -77,17 +79,17 @@ class FineTuneTab(QWidget):
             self.catalog.addItem(f"{model.display_name} - {model.size_label}", model.repo)
         grid.addWidget(self.catalog, 0, 1, 1, 2)
         self.hub = QLineEdit()
-        self.hub.setPlaceholderText("hf:ORG/NAME (Llama, Mistral, Qwen2 / Qwen2.5, Qwen3) or a "
-                                    "downloaded folder")
-        self.hub_folder = QPushButton("Folder…")
+        self.hub.setPlaceholderText(tr("hf:ORG/NAME (Llama, Mistral, Qwen2 / Qwen2.5, Qwen3) or a "
+                                    "downloaded folder"))
+        self.hub_folder = QPushButton(tr("Folder…"))
         grid.addWidget(self.hub, 1, 1)
         grid.addWidget(self.hub_folder, 1, 2)
         self.file = QLineEdit()
-        self.file.setPlaceholderText("An AuraLite checkpoint: a model you trained or imported")
-        self.file_button = QPushButton("File…")
+        self.file.setPlaceholderText(tr("An AuraLite checkpoint: a model you trained or imported"))
+        self.file_button = QPushButton(tr("File…"))
         grid.addWidget(self.file, 2, 1)
         grid.addWidget(self.file_button, 2, 2)
-        self.memory_label = hint("none")
+        self.memory_label = hint(tr("none"))
         grid.addWidget(self.memory_label, 3, 1, 1, 2)
         self.base_info = hint("")
         grid.addWidget(self.base_info, 4, 0, 1, 3)
@@ -96,167 +98,167 @@ class FineTuneTab(QWidget):
         layout.addWidget(base_box)
 
         # ---- 2. data
-        data_box = QGroupBox("2. Your data")
+        data_box = QGroupBox(tr("2. Your data"))
         data_layout = QVBoxLayout(data_box)
         self.data = DataPicker("finetune", window.settings.last_data_dir)
         data_layout.addWidget(self.data)
-        data_layout.addWidget(hint("Dialogs: a .jsonl file, one {\"messages\": [{\"role\": "
+        data_layout.addWidget(hint(tr("Dialogs: a .jsonl file, one {\"messages\": [{\"role\": "
                                    "\"user\", ...}, {\"role\": \"assistant\", ...}]} per line "
                                    "(ShareGPT, Alpaca and prompt/completion records work too). "
-                                   "Preference pairs: prompt, chosen, rejected."))
+                                   "Preference pairs: prompt, chosen, rejected.")))
         layout.addWidget(data_box)
 
         # ---- 3. method and training
-        how_box = QGroupBox("3. How to train")
+        how_box = QGroupBox(tr("3. How to train"))
         how = QFormLayout(how_box)
         self.method_group = QButtonGroup(self)
         self.method_buttons: dict[str, QRadioButton] = {}
         methods = QVBoxLayout()
         for key, label in METHODS:
-            button = QRadioButton(label)
+            button = QRadioButton(tr(label))
             self.method_group.addButton(button)
             self.method_buttons[key] = button
             methods.addWidget(button)
         self.method_buttons["qlora"].setChecked(True)
-        how.addRow("Method:", methods)
+        how.addRow(tr("Method:"), methods)
         self.rank = QSpinBox()
         self.rank.setRange(1, 512)
         self.rank.setValue(16)
-        self.rank.setToolTip("The adapters' size: 8-16 for style and format, 32-64 for more "
-                             "new knowledge")
-        self.adam8 = QCheckBox("8-bit AdamW (a quarter of the optimizer's memory)")
+        self.rank.setToolTip(tr("The adapters' size: 8-16 for style and format, 32-64 for more "
+                             "new knowledge"))
+        self.adam8 = QCheckBox(tr("8-bit AdamW (a quarter of the optimizer's memory)"))
         self.adam8.setChecked(True)
         rank_row = QHBoxLayout()
         rank_row.addWidget(self.rank)
         rank_row.addWidget(self.adam8, 1)
-        how.addRow("LoRA rank:", rank_row)
+        how.addRow(tr("LoRA rank:"), rank_row)
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 100)
         self.epochs.setValue(2)
-        how.addRow("Passes over the data:", self.epochs)
+        how.addRow(tr("Passes over the data:"), self.epochs)
         self.seq = QSpinBox()
         self.seq.setRange(64, 32768)
         self.seq.setSingleStep(128)
         self.seq.setValue(512)
-        self.seq.setToolTip("The longest piece of a dialog the model sees at once; longer "
-                            "dialogs are split at turns")
-        how.addRow("Window (tokens):", self.seq)
+        self.seq.setToolTip(tr("The longest piece of a dialog the model sees at once; longer "
+                            "dialogs are split at turns"))
+        how.addRow(tr("Window (tokens):"), self.seq)
         self.time_limit = QSpinBox()
         self.time_limit.setRange(0, 100_000)
-        self.time_limit.setSuffix(" min")
-        self.time_limit.setSpecialValueText("no limit")
-        how.addRow("Time limit:", self.time_limit)
+        self.time_limit.setSuffix(tr(" min"))
+        self.time_limit.setSpecialValueText(tr("no limit"))
+        how.addRow(tr("Time limit:"), self.time_limit)
         self.objective = QComboBox()
         for key, label in OBJECTIVES:
-            self.objective.addItem(label, key)
-        self.objective_label = QLabel("Preference pairs:")
+            self.objective.addItem(tr(label), key)
+        self.objective_label = QLabel(tr("Preference pairs:"))
         # 2.24: the classic interface's beta and epochs of preference training
         self.beta = QLineEdit("auto")
         self.beta.setMaximumWidth(80)
-        self.beta.setToolTip("How far the model may move from where it started: auto is 0.1 "
-                             "for DPO, 2.0 for SimPO")
+        self.beta.setToolTip(tr("How far the model may move from where it started: auto is 0.1 "
+                             "for DPO, 2.0 for SimPO"))
         self.pref_epochs = QSpinBox()
         self.pref_epochs.setRange(0, 1000)
-        self.pref_epochs.setSpecialValueText("auto (3)")
+        self.pref_epochs.setSpecialValueText(tr("auto (3)"))
         self.objective_row = QWidget()
         pref_row = QHBoxLayout(self.objective_row)
         pref_row.setContentsMargins(0, 0, 0, 0)
         pref_row.addWidget(self.objective, 1)
-        pref_row.addWidget(QLabel("beta:"))
+        pref_row.addWidget(QLabel(tr("beta:")))
         pref_row.addWidget(self.beta)
-        pref_row.addWidget(QLabel("passes:"))
+        pref_row.addWidget(QLabel(tr("passes:")))
         pref_row.addWidget(self.pref_epochs)
         how.addRow(self.objective_label, self.objective_row)
         self.how_form = how
         self.template = QComboBox()
         for key, label in TEMPLATES:
-            self.template.addItem(label, key)
-        how.addRow("Chat template:", self.template)
+            self.template.addItem(tr(label), key)
+        how.addRow(tr("Chat template:"), self.template)
         self.estimate = hint("")
         how.addRow("", self.estimate)
 
-        self.advanced = Collapsible("Advanced settings")
+        self.advanced = Collapsible(tr("Advanced settings"))
         adv = QFormLayout()
         self.lora_lr = QLineEdit("0.001")
-        adv.addRow("LoRA learning rate:", self.lora_lr)
+        adv.addRow(tr("LoRA learning rate:"), self.lora_lr)
         # 2.24: which layers LoRA trains (the classic interface's LoRA targets)
         self.lora_targets = QComboBox()
         for key, label in LORA_TARGETS:
-            self.lora_targets.addItem(label, key)
-        adv.addRow("LoRA trains:", self.lora_targets)
+            self.lora_targets.addItem(tr(label), key)
+        adv.addRow(tr("LoRA trains:"), self.lora_targets)
         self.full_lr = QLineEdit("3e-5")
-        adv.addRow("Learning rate (every weight):", self.full_lr)
+        adv.addRow(tr("Learning rate (every weight):"), self.full_lr)
         self.batch = QSpinBox()
         self.batch.setRange(1, 1024)
         self.batch.setValue(8)
-        adv.addRow("Windows per step (batch):", self.batch)
+        adv.addRow(tr("Windows per step (batch):"), self.batch)
         self.prompt_weight = QLineEdit("auto")
-        self.prompt_weight.setToolTip("How much the prompt counts in the loss: 0 = only the "
-                                      "replies, auto = 0.1 (0 with LoRA)")
-        adv.addRow("Prompt weight:", self.prompt_weight)
-        self.pack = QCheckBox("Whole dialogs per window")
+        self.prompt_weight.setToolTip(tr("How much the prompt counts in the loss: 0 = only the "
+                                      "replies, auto = 0.1 (0 with LoRA)"))
+        adv.addRow(tr("Prompt weight:"), self.prompt_weight)
+        self.pack = QCheckBox(tr("Whole dialogs per window"))
         self.pack.setChecked(True)
         adv.addRow("", self.pack)
         self.val_split = QDoubleSpinBox()
         self.val_split.setRange(0.01, 0.5)
         self.val_split.setSingleStep(0.01)
         self.val_split.setValue(0.05)
-        adv.addRow("Held out for validation:", self.val_split)
-        self.memory_plan = QCheckBox("Fit the memory automatically (memory plan)")
+        adv.addRow(tr("Held out for validation:"), self.val_split)
+        self.memory_plan = QCheckBox(tr("Fit the memory automatically (memory plan)"))
         self.memory_plan.setChecked(True)
         adv.addRow("", self.memory_plan)
         self.max_steps = QSpinBox()
         self.max_steps.setRange(0, 10_000_000)
-        self.max_steps.setSpecialValueText("no limit")
-        adv.addRow("Steps (at most):", self.max_steps)
+        self.max_steps.setSpecialValueText(tr("no limit"))
+        adv.addRow(tr("Steps (at most):"), self.max_steps)
         self.advanced.body_layout.addLayout(adv)
         how.addRow(self.advanced)
         layout.addWidget(how_box)
 
         # ---- teacher
-        self.teacher_box = Collapsible("No dialogs yet? Let a bigger model write them (teacher)")
+        self.teacher_box = Collapsible(tr("No dialogs yet? Let a bigger model write them (teacher)"))
         teacher = QFormLayout()
         self.teacher = QLineEdit()
-        self.teacher.setPlaceholderText("A .gguf / .pt file, a model folder, http://host:port of "
-                                        "a llama.cpp server - or empty: the model in memory")
-        self.teacher_button = QPushButton("File…")
+        self.teacher.setPlaceholderText(tr("A .gguf / .pt file, a model folder, http://host:port of "
+                                        "a llama.cpp server - or empty: the model in memory"))
+        self.teacher_button = QPushButton(tr("File…"))
         teacher_row = QHBoxLayout()
         teacher_row.addWidget(self.teacher, 1)
         teacher_row.addWidget(self.teacher_button)
-        teacher.addRow("Teacher:", teacher_row)
+        teacher.addRow(tr("Teacher:"), teacher_row)
         self.prompts = QLineEdit()
-        self.prompts.setPlaceholderText("Questions: one per line (.txt), or a .jsonl of prompts")
-        self.prompts_button = QPushButton("File…")
+        self.prompts.setPlaceholderText(tr("Questions: one per line (.txt), or a .jsonl of prompts"))
+        self.prompts_button = QPushButton(tr("File…"))
         prompts_row = QHBoxLayout()
         prompts_row.addWidget(self.prompts, 1)
         prompts_row.addWidget(self.prompts_button)
-        teacher.addRow("Questions:", prompts_row)
+        teacher.addRow(tr("Questions:"), prompts_row)
         self.samples = QSpinBox()
         self.samples.setRange(1, 16)
         self.judge = QComboBox()
         for key, label in JUDGES:
-            self.judge.addItem(label, key)
+            self.judge.addItem(tr(label), key)
         judge_row = QHBoxLayout()
         judge_row.addWidget(self.samples)
-        judge_row.addWidget(QLabel("Judge:"))
+        judge_row.addWidget(QLabel(tr("Judge:")))
         judge_row.addWidget(self.judge, 1)
-        teacher.addRow("Answers per question:", judge_row)
+        teacher.addRow(tr("Answers per question:"), judge_row)
         self.system = QLineEdit()
-        self.system.setPlaceholderText("Optional instructions for the teacher (system prompt)")
-        teacher.addRow("System prompt:", self.system)
+        self.system.setPlaceholderText(tr("Optional instructions for the teacher (system prompt)"))
+        teacher.addRow(tr("System prompt:"), self.system)
         self.max_answer = QSpinBox()
         self.max_answer.setRange(16, 8192)
         self.max_answer.setValue(256)
-        self.keep_cut = QCheckBox("Keep answers cut at this length")
+        self.keep_cut = QCheckBox(tr("Keep answers cut at this length"))
         answer_row = QHBoxLayout()
         answer_row.addWidget(self.max_answer)
         answer_row.addWidget(self.keep_cut, 1)
-        teacher.addRow("Longest answer (tokens):", answer_row)
-        self.distill_button = QPushButton("Write the dialogs…")
-        self.distill_stop = QPushButton("Stop")
+        teacher.addRow(tr("Longest answer (tokens):"), answer_row)
+        self.distill_button = QPushButton(tr("Write the dialogs…"))
+        self.distill_stop = QPushButton(tr("Stop"))
         self.distill_stop.setEnabled(False)
-        self.distill_status = hint("A judge keeps only right answers and also writes preference "
-                                   "pairs; a stopped run continues where it stopped.")
+        self.distill_status = hint(tr("A judge keeps only right answers and also writes preference "
+                                   "pairs; a stopped run continues where it stopped."))
         distill_row = QHBoxLayout()
         distill_row.addWidget(self.distill_button)
         distill_row.addWidget(self.distill_stop)
@@ -266,17 +268,17 @@ class FineTuneTab(QWidget):
         layout.addWidget(self.teacher_box)
 
         # ---- run
-        self.panel = RunPanel("Start fine-tuning")
+        self.panel = RunPanel(tr("Start fine-tuning"))
         layout.addWidget(self.panel)
         after = QHBoxLayout()
-        self.save_button = QPushButton("Save the model…")
-        self.chat_button = QPushButton("Chat with it")
-        self.export_button = QPushButton("Export…")
-        self.merge_button = QPushButton("Merge the adapters")
-        self.merge_button.setToolTip("Write the LoRA adapters into the weights: faster replies, "
-                                     "no further LoRA training on them")
-        self.save_adapter_button = QPushButton("Save the adapters…")
-        self.load_adapter_button = QPushButton("Load adapters…")
+        self.save_button = QPushButton(tr("Save the model…"))
+        self.chat_button = QPushButton(tr("Chat with it"))
+        self.export_button = QPushButton(tr("Export…"))
+        self.merge_button = QPushButton(tr("Merge the adapters"))
+        self.merge_button.setToolTip(tr("Write the LoRA adapters into the weights: faster replies, "
+                                     "no further LoRA training on them"))
+        self.save_adapter_button = QPushButton(tr("Save the adapters…"))
+        self.load_adapter_button = QPushButton(tr("Load adapters…"))
         for button in (self.save_button, self.chat_button, self.export_button, self.merge_button,
                        self.save_adapter_button, self.load_adapter_button):
             after.addWidget(button)
@@ -285,8 +287,8 @@ class FineTuneTab(QWidget):
         # 2.24: settings files (the classic interface's Save Config / Load Config)
         files = QHBoxLayout()
         files.addStretch(1)
-        self.save_settings_button = QPushButton("Save settings…")
-        self.load_settings_button = QPushButton("Load settings…")
+        self.save_settings_button = QPushButton(tr("Save settings…"))
+        self.load_settings_button = QPushButton(tr("Load settings…"))
         files.addWidget(self.save_settings_button)
         files.addWidget(self.load_settings_button)
         layout.addLayout(files)
@@ -364,13 +366,13 @@ class FineTuneTab(QWidget):
         return ""
 
     def _pick_hub_folder(self) -> None:
-        path = ask_dir(self, "Choose a downloaded Hugging Face model folder")
+        path = ask_dir(self, tr("Choose a downloaded Hugging Face model folder"))
         if path:
             self.hub.setText(path)
             self._choose_base("hub")
 
     def _pick_file(self) -> None:
-        path = ask_open(self, "Choose an AuraLite model", "AuraLite models (*.pt);;All files (*)",
+        path = ask_open(self, tr("Choose an AuraLite model"), tr("AuraLite models (*.pt);;All files (*)"),
                         self.studio.settings.last_model_dir)
         if path:
             self.file.setText(path)
@@ -452,7 +454,7 @@ class FineTuneTab(QWidget):
         has_model = engine.model is not None
         self.source_buttons["memory"].setEnabled(has_model)
         self.memory_label.setText(self.studio.model_description() if has_model else
-                                  "none - choose one above")
+                                  tr("none - choose one above"))
         busy = self.job is not None
         has_lora = has_model and bool(getattr(engine, "has_lora", lambda: False)())
         for button in (self.save_button, self.chat_button, self.export_button):
@@ -546,7 +548,7 @@ class FineTuneTab(QWidget):
         try:
             doc = load_settings_file(self, "finetune")
         except (OSError, ValueError) as err:
-            show_error(self, err, "reading the settings")
+            show_error(self, err, tr("reading the settings"))
             return
         if doc is None:
             return
@@ -593,9 +595,9 @@ class FineTuneTab(QWidget):
         report = self.data.report
         if report is None or not report.for_finetune:
             problem = (report.problems[0] if report is not None and report.problems else
-                       "choose dialogs, preference pairs or a text to fine-tune on"
+                       tr("choose dialogs, preference pairs or a text to fine-tune on")
                        if report is None or report.ok else
-                       f"{report.kind_label} trains a new model (the Train tab)")
+                       tr("{kind} trains a new model (the Train tab)", kind=tr(report.kind_label)))
             show_error(self, SettingsError(problem))
             return
         try:
@@ -608,18 +610,19 @@ class FineTuneTab(QWidget):
         spec = self.base_spec()
         engine = self.studio.engine
         if source == "memory" and engine.model is None:
-            show_error(self, SettingsError("there is no model in memory: choose a base model"))
+            show_error(self, SettingsError(tr("there is no model in memory: choose a base model")))
             return
         if source != "memory" and not spec:
-            show_error(self, SettingsError("choose the base model: a name, a folder or a file"))
+            show_error(self, SettingsError(tr("choose the base model: a name, a folder or a "
+                                              "file")))
             return
         if source == "file" and not os.path.isfile(spec):
-            show_error(self, FileNotFoundError(f"not found: {spec}"))
+            show_error(self, FileNotFoundError(tr("not found: {path}", path=spec)))
             return
         if source != "memory" and not self.studio.confirm_replace_model(
-                "The base model replaces the one in memory."):
+                tr("The base model replaces the one in memory.")):
             return
-        if not self.studio.begin("fine-tuning"):
+        if not self.studio.begin(N_("fine-tuning")):
             return
         paths = list(report.paths)
         # 2.20: the run goes into the library (a checkpoint every 10 minutes);
@@ -649,21 +652,21 @@ class FineTuneTab(QWidget):
         except ValueError as err:
             show_error(self, SettingsError(str(err)))
             return
-        if not self.studio.confirm_replace_model("Continuing the run loads it in place of the "
-                                                 "model in memory."):
+        if not self.studio.confirm_replace_model(tr("Continuing the run loads it in place of "
+                                                    "the model in memory.")):
             return
-        if not self.studio.begin("fine-tuning"):
+        if not self.studio.begin(N_("fine-tuning")):
             return
         engine = self.studio.engine
         self.studio.goto("finetune")
 
         def work(job: Job) -> Any:
-            job.progress.emit(("stage", f"Loading {run.name}…", None))
+            job.progress.emit(("stage", tr("Loading {name}…", name=run.name), None))
             engine.unload_model()
             job.progress.emit(("unloaded", None))
             engine.load_model(str(path))
             job.progress.emit(("continued", run.name))
-            job.progress.emit(("stage", "Reading the data…", None))
+            job.progress.emit(("stage", tr("Reading the data…"), None))
             data = runlib.load_run_data(run)
             recorder = runlib.RunRecorder.resume(run)
             job.recorder = recorder                         # type: ignore[attr-defined]
@@ -680,7 +683,7 @@ class FineTuneTab(QWidget):
         self.job.finished.connect(self._finished)
         self.job.failed.connect(self._failed)
         self._started = time.time()
-        self.panel.begin("Starting…")
+        self.panel.begin(tr("Starting…"))
         self._model_changed()
         self.studio.runs_changed.emit()
         self.job.start()
@@ -694,11 +697,11 @@ class FineTuneTab(QWidget):
             if info.get("stage") == "download":
                 done, total = int(info.get("all_bytes") or 0), int(info.get("all_total") or 0)
                 percent = 100.0 * done / total if total else None
-                self.panel.show_stage(f"Downloading {info.get('file', '')}: "
-                                      f"{done / 1e6:,.0f} of {total / 1e6:,.0f} MB", percent)
+                self.panel.show_stage(tr("Downloading {value3}: "
+                                      "{value:,.0f} of {value2:,.0f} MB", value3=info.get('file', ''), value=done / 1e6, value2=total / 1e6), percent)
             elif info.get("stage") == "convert":
                 done, total = int(info.get("done") or 0), int(info.get("total") or 0)
-                self.panel.show_stage(f"Converting the weights: {done}/{total}",
+                self.panel.show_stage(tr("Converting the weights: {done}/{total}", done=done, total=total),
                                       100.0 * done / total if total else None)
         elif kind == "loaded":
             self.studio.model_loaded(str(event[1]))
@@ -719,8 +722,8 @@ class FineTuneTab(QWidget):
         saved = run is not None and self.studio.run_saved(run)
         text = summary_text(summary, time.time() - self._started, stopped)
         if run is not None and saved:
-            text += (". Saved in the library: it can continue from there."
-                     if run.continue_state()[0] else ". Saved in the library.")
+            text += ". " + (tr("Saved in the library: it can continue from there.")
+                            if run.continue_state()[0] else tr("Saved in the library."))
         self.panel.end(text, complete=ended_by_itself(summary, stopped))
         self.studio.end(model_dirty=not saved and self.studio.engine.model is not None)
         self._model_changed()
@@ -728,11 +731,11 @@ class FineTuneTab(QWidget):
 
     def _failed(self, exc: BaseException) -> None:
         self.job = None
-        self.panel.end("The fine-tuning failed - see the message.")
+        self.panel.end(tr("The fine-tuning failed - see the message."))
         self.studio.end(model_dirty=self.studio.engine.model is not None)
         self._model_changed()
         self.studio.runs_changed.emit()
-        self.studio.report_error(exc, "fine-tuning")
+        self.studio.report_error(exc, tr("fine-tuning"))
 
     def finish(self) -> None:
         if self.job is not None:
@@ -741,25 +744,25 @@ class FineTuneTab(QWidget):
     def stop(self) -> None:
         if self.job is not None:
             self.job.stop_event.set()
-            self.panel.status.setText("Stopping at the next step…")
+            self.panel.status.setText(tr("Stopping at the next step…"))
 
     # ---- adapters -----------------------------------------------------------------------
     def merge_adapters(self) -> None:
         engine = self.studio.engine
         question = merge_question(engine)          # 2.26: the classic interface asks it too
-        if question and not confirm(self, "Merge into full precision?", question):
+        if question and not confirm(self, tr("Merge into full precision?"), question):
             return
         try:
             merged = engine.merge_lora()
         except Exception as err:
-            self.studio.report_error(err, "merging the adapters")
+            self.studio.report_error(err, tr("merging the adapters"))
             return
         self.studio.end(model_dirty=True)
         self._model_changed()
-        inform(self, "Adapters merged", f"{merged} adapter layers were written into the weights.")
+        inform(self, tr("Adapters merged"), tr("{merged} adapter layers were written into the weights.", merged=merged))
 
     def save_adapters(self) -> None:
-        path = ask_save(self, "Save the LoRA adapters", "LoRA adapters (*.pt)",
+        path = ask_save(self, tr("Save the LoRA adapters"), tr("LoRA adapters (*.pt)"),
                         os.path.join(self.studio.settings.last_model_dir, "adapter.pt"))
         if not path:
             return
@@ -767,34 +770,34 @@ class FineTuneTab(QWidget):
             info = self.studio.engine.save_adapter(path)
             remember_model(path, "adapter")
         except Exception as err:
-            self.studio.report_error(err, "saving the adapters")
+            self.studio.report_error(err, tr("saving the adapters"))
             return
-        inform(self, "Adapters saved", f"Saved to {path}\n"
-                                       f"({int(info.get('bytes', 0) or 0) / 1e6:,.1f} MB)")
+        inform(self, tr("Adapters saved"), tr("Saved to {path}\n"
+                                       "({value:,.1f} MB)", path=path, value=int(info.get('bytes', 0) or 0) / 1e6))
 
     def load_adapters(self) -> None:
-        path = ask_open(self, "Load LoRA adapters", "LoRA adapters (*.pt);;All files (*)",
+        path = ask_open(self, tr("Load LoRA adapters"), tr("LoRA adapters (*.pt);;All files (*)"),
                         self.studio.settings.last_model_dir)
         if not path:
             return
         try:
             self.studio.engine.load_adapter(path)
         except Exception as err:
-            self.studio.report_error(err, "loading the adapters")
+            self.studio.report_error(err, tr("loading the adapters"))
             return
         self.studio.end(model_dirty=True)
         self._model_changed()
 
     # ---- teacher dialogs ------------------------------------------------------------------
     def _pick_teacher(self) -> None:
-        path = ask_open(self, "Choose the teacher model",
-                        "Models (*.gguf *.pt);;All files (*)", self.studio.settings.last_model_dir)
+        path = ask_open(self, tr("Choose the teacher model"),
+                        tr("Models (*.gguf *.pt);;All files (*)"), self.studio.settings.last_model_dir)
         if path:
             self.teacher.setText(path)
 
     def _pick_prompts(self) -> None:
-        path = ask_open(self, "Choose the questions", "Questions (*.txt *.jsonl *.json);;"
-                                                     "All files (*)",
+        path = ask_open(self, tr("Choose the questions"), tr("Questions (*.txt *.jsonl *.json);;"
+                                                     "All files (*)"),
                         self.studio.settings.last_data_dir)
         if path:
             self.prompts.setText(path)
@@ -806,29 +809,29 @@ class FineTuneTab(QWidget):
         teacher_spec = self.teacher.text().strip()
         engine = self.studio.engine
         if not prompts_path or not os.path.isfile(prompts_path):
-            show_error(self, SettingsError("choose a file of questions: one per line (.txt), "
-                                           "or a .jsonl of prompts or dialogs"))
+            show_error(self, SettingsError(tr("choose a file of questions: one per line "
+                                              "(.txt), or a .jsonl of prompts or dialogs")))
             return
         if not teacher_spec and engine.model is None:
-            show_error(self, SettingsError("choose a teacher model, or load one to use the model "
-                                           "in memory"))
+            show_error(self, SettingsError(tr("choose a teacher model, or load one to use the "
+                                              "model in memory")))
             return
         try:
             prompts, _skipped = read_prompts(prompts_path)
         except (OSError, ValueError) as err:
-            self.studio.report_error(err, "reading the questions")
+            self.studio.report_error(err, tr("reading the questions"))
             return
         if not prompts:
-            show_error(self, SettingsError(f"no questions in {prompts_path}"))
+            show_error(self, SettingsError(tr("no questions in {path}", path=prompts_path)))
             return
         stem = os.path.splitext(prompts_path)[0]
-        out = ask_save(self, "Save the dialogs as", "Dialogs (*.jsonl)", stem + "_dialogs.jsonl")
+        out = ask_save(self, tr("Save the dialogs as"), tr("Dialogs (*.jsonl)"), stem + "_dialogs.jsonl")
         if not out:
             return
         judge = str(self.judge.currentData())
         judge_value = None if judge == "none" else judge
         pairs = os.path.splitext(out)[0] + "_pairs.jsonl" if judge_value else None
-        if not teacher_spec and not self.studio.begin("writing dialogs"):
+        if not teacher_spec and not self.studio.begin(N_("writing dialogs")):
             return
         settings = {"samples": int(self.samples.value()), "judge": judge_value,
                     "system": self.system.text().strip() or None,
@@ -853,15 +856,17 @@ class FineTuneTab(QWidget):
         self.distill_job.failed.connect(lambda exc: self._distill_failed(exc, not teacher_spec))
         self.distill_button.setEnabled(False)
         self.distill_stop.setEnabled(True)
-        self.distill_status.setText("Loading the teacher…")
+        self.distill_status.setText(tr("Loading the teacher…"))
         self.distill_job.start()
 
     def _distill_progress(self, info: dict) -> None:
         eta = info.get("eta_seconds")
-        self.distill_status.setText(
-            f"{int(info.get('done', 0)):,}/{int(info.get('total', 0)):,} questions · "
-            f"{int(info.get('kept', 0)):,} dialogs"
-            + (f" · about {format_duration(float(eta))} left" if eta else ""))
+        text = tr("{done:,}/{total:,} questions · {kept:,} dialogs",
+                  done=int(info.get("done", 0)), total=int(info.get("total", 0)),
+                  kept=int(info.get("kept", 0)))
+        if eta:
+            text += " · " + tr("about {time} left", time=format_duration(float(eta)))
+        self.distill_status.setText(text)
 
     def _distill_done(self, meta: dict, out: str, used_memory: bool) -> None:
         self.distill_job = None
@@ -870,21 +875,23 @@ class FineTuneTab(QWidget):
         if used_memory:
             self.studio.end(model_dirty=False)
         records = int(((meta.get("files") or {}).get("dialogs") or {}).get("records", 0))
-        text = f"Saved {records:,} dialogs to {os.path.basename(out)}"
+        text = trn("Saved {n:,} dialog to {file}", "Saved {n:,} dialogs to {file}", records,
+                   file=os.path.basename(out))
         counts = meta.get("counts") or {}
         if not records and counts.get("replies"):
             reasons = []
             if counts.get("truncated"):
-                reasons.append(f"{counts['truncated']} cut at the length limit (the teacher did "
-                               f"not end them: a chat model, a longer limit or «keep answers "
-                               f"cut» helps)")
+                reasons.append(tr("{n} cut at the length limit (the teacher did not end them: "
+                                  "a chat model, a longer limit or «keep answers cut» helps)",
+                                  n=counts["truncated"]))
             if counts.get("empty"):
-                reasons.append(f"{counts['empty']} empty")
+                reasons.append(tr("{n} empty", n=counts["empty"]))
             if counts.get("rejected"):
-                reasons.append(f"{counts['rejected']} rejected by the judge")
-            text = "No dialog kept: " + "; ".join(reasons or ["no usable answer"])
+                reasons.append(tr("{n} rejected by the judge", n=counts["rejected"]))
+            text = tr("No dialog kept: {reasons}",
+                      reasons="; ".join(reasons or [tr("no usable answer")]))
         if meta.get("stopped"):
-            text += " - stopped; write again with the same file to continue"
+            text += " - " + tr("stopped; write again with the same file to continue")
         self.distill_status.setText(text)
         if records:
             self.data.set_path(out)
@@ -893,12 +900,12 @@ class FineTuneTab(QWidget):
         self.distill_job = None
         self.distill_button.setEnabled(True)
         self.distill_stop.setEnabled(False)
-        self.distill_status.setText("Failed - see the message.")
+        self.distill_status.setText(tr("Failed - see the message."))
         if used_memory:
             self.studio.end(model_dirty=False)
-        self.studio.report_error(exc, "writing the dialogs")
+        self.studio.report_error(exc, tr("writing the dialogs"))
 
     def _stop_distill(self) -> None:
         if self.distill_job is not None:
             self.distill_job.stop_event.set()
-            self.distill_status.setText("Stopping after this question…")
+            self.distill_status.setText(tr("Stopping after this question…"))

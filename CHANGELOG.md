@@ -1,3 +1,42 @@
+# 📦 v2.28.0 — AuraLite in Russian: both interfaces, one catalogue
+
+The Studio and the classic interface (tkinter) speak English and Russian. They follow the
+computer's language — Windows' display language, `$LANG` elsewhere — and *View → Language*
+changes it: *Automatic (the computer's language)*, English or Russian, saved and spoken
+from the next start; the window offers to restart now (the classic one waits while it is
+busy and asks to save the model first). `AURALITE_LANG=ru` (or `en`) sets it for a start.
+One catalogue, `auralite/locale/ru.json` (2,343 strings, keyed by the English text), serves
+both interfaces and the texts they share — the advisor, the data check, the explained
+errors, the Library, the wizard, the progress lines — so the two say the same thing in the
+same words. Commands, the log and the console stay English, and so does what goes to a
+model (the agent's tool descriptions).
+
+- **Everything shown** is translated: the tabs, the menus, every label, button, hint and
+  tooltip, the messages and their titles, the statuses and the progress of a run (the
+  engine's English lines are translated where they are shown), the Library's facts and
+  tables, the wizard, the explained errors with what to try. Qt's own buttons (Yes, No,
+  Cancel, the wizard's) come from Qt's Russian translation.
+- **Russian as it is written:** its three plural forms (one for 1, 21, 101; one for 2-4,
+  22-24; one for 5-20), thousands parted by a space ("1,200" reads as one and a fifth
+  there), counts written so that they read right with any number, the units in Russian
+  (megabytes, tokens per second, minutes). A string the catalogue lacks stays English; a
+  broken translation shows the English instead of breaking a window.
+- **New run names** are made in the interface's language (a fine-tune of Qwen3.5-0.8B on
+  chats.jsonl is named in Russian in the Russian interface) and kept with the run.
+- **Both windows open wide enough for their tabs** when the screen has room — Russian titles
+  are longer. The Studio widens its window (a size saved by an earlier session as well, when
+  it is narrower than the tabs) instead of hiding tabs behind the scroll arrows. The classic
+  window does the same (at 800 px even its English titles were squeezed), and on a screen
+  too narrow for the row its titles move closer together before ttk clips them. The
+  Library's and the wizard's columns fit their headings in either language.
+- **A language saved before 2.28 is not a choice**: until one is picked in *View →
+  Language*, both interfaces follow the computer (there was only English to choose).
+- **Packaging:** the wheel and the sdist carry `auralite/locale/*.json`, the Windows app's
+  spec copies it (PyInstaller does not take package data by itself), and the app's
+  self-test names the languages it has — `smoke_app.py` checks that line.
+- **Smaller:** the Libraries write sizes in the interface's language; the wizard's table
+  writes "1.1B", not "1,084M"; the Studio's agent tools are described in it too.
+
 # 📦 v2.27.0 — The classic interface gets the Library, the setup wizard, recorded Train runs and explained errors
 
 The third step of bringing the Studio's features to the classic interface (tkinter): with it

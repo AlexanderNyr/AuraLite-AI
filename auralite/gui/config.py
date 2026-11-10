@@ -50,7 +50,10 @@ SESSION_PATH = _default_session_path()
 class GuiConfig:
     """User-visible GUI settings, persisted between runs."""
 
-    language: str = field(default_factory=lambda: os.environ.get("AURALITE_GUI_LANG", "en"))
+    # 2.28: "" = the computer's language. Before 2.28 there was only English to choose, so a
+    # language saved then is not a choice: only one picked in View -> Language counts.
+    language: str = field(default_factory=lambda: os.environ.get("AURALITE_GUI_LANG", ""))
+    language_chosen: bool = False
     theme: str = "light"                 # "light" | "dark"
     geometry: str = ""                   # "1200x800", empty → computed from the screen
     active_tab: str = "train"

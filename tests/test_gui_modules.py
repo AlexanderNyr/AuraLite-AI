@@ -39,7 +39,9 @@ def test_config_roundtrip(tmp_path):
 
 def test_config_missing_or_corrupt_file_yields_defaults(tmp_path):
     missing = gui_config.load_config(tmp_path / "nope.json")
-    assert missing.language in i18n.available_languages()
+    # 2.28: "" is the computer's language, until a language is chosen in the interface
+    assert missing.language in ("", *i18n.available_languages())
+    assert missing.language_chosen is False
     assert missing.restore_session is True
 
     broken = tmp_path / "broken.json"
@@ -207,11 +209,18 @@ def test_restore_tolerates_a_broken_widget(tmp_path):
 #  gui/i18n.py
 # ----------------------------------------------------------------------
 def test_catalogues_are_in_sync():
+    """2.28: the named messages are English only; every other language is a catalogue file
+    shared with the Studio, keyed by the English text, and translates all of them."""
+    from auralite import i18n as shared
+
     en = i18n.MESSAGES["en"]
-    assert set(i18n.MESSAGES) == set(i18n.LANGUAGES)
-    for code, catalogue in i18n.MESSAGES.items():
-        assert set(catalogue) == set(en), f"{code}: missing {set(en) ^ set(catalogue)}"
-        assert all(text.strip() for text in catalogue.values())
+    assert set(i18n.MESSAGES) == {"en"}
+    assert all(text.strip() for text in en.values())
+    for code in shared.LANGUAGES:
+        if code == "en":
+            continue
+        missing = [text for text in en.values() if shared._lookup(code, text) is None]
+        assert not missing, f"{code}: missing {missing}"
 
 
 def test_tab_keys_match_the_app_tab_names():
@@ -238,7 +247,11 @@ def test_set_language_switches_and_rejects_unknown():
         assert i18n.tr("btn.save") == "Save"
         assert i18n.set_language("klingon") == "en"
         assert i18n.language_name() == "English"
-        assert set(i18n.available_languages()) == {"en"}
+        assert set(i18n.available_languages()) == {"en", "ru"}       # 2.28
+        assert i18n.set_language("ru") == "ru"
+        assert i18n.tr("btn.save") == "\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c"
+        assert i18n.tr("btn.save", lang="en") == "Save"
+        assert i18n.language_name() == "\u0420\u0443\u0441\u0441\u043a\u0438\u0439"
     finally:
         i18n.set_language(original)
 

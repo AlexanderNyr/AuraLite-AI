@@ -18,15 +18,15 @@ class ChatTabMixin:
 
         if not HAS_CHAT_SUPPORT:
             ttk.Label(tab,
-                      text="⚠ Chat interface not available (chat_interface.py missing).",
+                      text=tr("⚠ Chat interface not available (chat_interface.py missing)."),
                       font=("Segoe UI", 12, "bold")).pack(pady=40)
             return
 
         # ---- Chat Template Selection ----
-        template_frame = ttk.LabelFrame(tab, text="  💬  Chat Template  ", padding="8")
+        template_frame = ttk.LabelFrame(tab, text=tr("  💬  Chat Template  "), padding="8")
         template_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(template_frame, text="Template:").pack(side=tk.LEFT, padx=4)
+        ttk.Label(template_frame, text=tr("Template:")).pack(side=tk.LEFT, padx=4)
         self.chat_template_var = tk.StringVar(value="chatml")
         templates = list(CHAT_TEMPLATES.keys()) if 'CHAT_TEMPLATES' in globals() else ["chatml", "llama2", "mistral", "simple"]
         self.chat_template_combo = ttk.Combobox(
@@ -36,12 +36,12 @@ class ChatTabMixin:
         self.chat_template_combo.pack(side=tk.LEFT, padx=4)
 
         self.chat_system_var = tk.StringVar(value="You are a helpful assistant.")
-        ttk.Label(template_frame, text="System prompt:").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Label(template_frame, text=tr("System prompt:")).pack(side=tk.LEFT, padx=(16, 4))
         ttk.Entry(template_frame, textvariable=self.chat_system_var,
                   width=40).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
         # ---- Chat History ----
-        history_frame = ttk.LabelFrame(tab, text="  📜  Conversation  ", padding="8")
+        history_frame = ttk.LabelFrame(tab, text=tr("  📜  Conversation  "), padding="8")
         history_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         # Chat display
@@ -74,19 +74,19 @@ class ChatTabMixin:
         self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self.chat_input.bind("<Return>", lambda e: self._send_chat_message())
 
-        self.chat_send_btn = ttk.Button(input_frame, text="Send", command=self._send_chat_message)
+        self.chat_send_btn = ttk.Button(input_frame, text=tr("Send"), command=self._send_chat_message)
         self.chat_send_btn.pack(side=tk.LEFT, padx=2)
 
         self.chat_stream_var = tk.BooleanVar(value=True)
-        self.chat_stream_cb = ttk.Checkbutton(input_frame, text="Stream",
+        self.chat_stream_cb = ttk.Checkbutton(input_frame, text=tr("Stream"),
                                               variable=self.chat_stream_var)
         self.chat_stream_cb.pack(side=tk.LEFT, padx=4)
 
-        self.chat_clear_btn = ttk.Button(input_frame, text="Clear History", command=self._clear_chat_history)
+        self.chat_clear_btn = ttk.Button(input_frame, text=tr("Clear History"), command=self._clear_chat_history)
         self.chat_clear_btn.pack(side=tk.LEFT, padx=2)
 
         # ── Agent Mode ──────────────────────────────────────────────────────
-        agent_frame = ttk.LabelFrame(tab, text="  🤖  Agent Mode (Tool-Calling Sandbox)  ", padding="6")
+        agent_frame = ttk.LabelFrame(tab, text=tr("  🤖  Agent Mode (Tool-Calling Sandbox)  "), padding="6")
         agent_frame.pack(fill=tk.X, pady=(4, 0))
 
         # Left column: enable toggle + tool list
@@ -94,7 +94,7 @@ class ChatTabMixin:
         agent_left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
 
         self.agent_mode_cb = ttk.Checkbutton(
-            agent_left, text="Enable Agent Mode",
+            agent_left, text=tr("Enable Agent Mode"),
             variable=self.agent_mode_var,
             command=self._on_agent_mode_toggle,
         )
@@ -107,7 +107,7 @@ class ChatTabMixin:
         self.agent_timeout_var = tk.StringVar(value=f"{seconds:g}")
         self._agent_accepted = False          # the warning is confirmed once a session
         if gui_common.HAS_AGENT:
-            ttk.Label(agent_left, text="Tools it may use:", font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
+            ttk.Label(agent_left, text=tr("Tools it may use:"), font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
             for row in agentmode.tool_rows():
                 var = tk.BooleanVar(value=row.available)
                 self.agent_tool_vars[row.name] = var
@@ -116,19 +116,19 @@ class ChatTabMixin:
                                 state=tk.NORMAL if row.available else tk.DISABLED).pack(anchor=tk.W)
             limits = ttk.Frame(agent_left)
             limits.pack(anchor=tk.W, pady=(4, 0))
-            ttk.Label(limits, text="Steps:").pack(side=tk.LEFT)
+            ttk.Label(limits, text=tr("Steps:")).pack(side=tk.LEFT)
             ttk.Entry(limits, textvariable=self.agent_steps_var, width=4).pack(side=tk.LEFT, padx=(2, 8))
-            ttk.Label(limits, text="Seconds per tool:").pack(side=tk.LEFT)
+            ttk.Label(limits, text=tr("Seconds per tool:")).pack(side=tk.LEFT)
             ttk.Entry(limits, textvariable=self.agent_timeout_var, width=5).pack(side=tk.LEFT, padx=2)
         else:
-            ttk.Label(agent_left, text="⚠ agent/ package not found.",
+            ttk.Label(agent_left, text=tr("⚠ agent/ package not found."),
                       foreground="red", font=("Segoe UI", 9)).pack(anchor=tk.W)
 
         # Right column: sandbox log
         agent_right = ttk.Frame(agent_frame)
         agent_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        ttk.Label(agent_right, text="Sandbox log:", font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
+        ttk.Label(agent_right, text=tr("Sandbox log:"), font=("Segoe UI", 9, "italic")).pack(anchor=tk.W)
         sb_scroll = ttk.Scrollbar(agent_right, orient=tk.VERTICAL)
         self.agent_sandbox_log = tk.Text(
             agent_right, height=5, font=("Consolas", 9),
@@ -146,7 +146,7 @@ class ChatTabMixin:
 
         # Stop agent button
         self.agent_stop_btn = ttk.Button(
-            agent_right, text="⏹ Stop Agent",
+            agent_right, text=tr("⏹ Stop Agent"),
             command=self._stop_agent, state=tk.DISABLED,
         )
         self.agent_stop_btn.pack(anchor=tk.E, pady=(2, 0))
@@ -155,7 +155,7 @@ class ChatTabMixin:
         self._build_chat_insights(tab)
 
         # Status
-        self.chat_status = ttk.Label(tab, text="Chat ready. Load a model to start.", style="Sub.TLabel")
+        self.chat_status = ttk.Label(tab, text=tr("Chat ready. Load a model to start."), style="Sub.TLabel")
         self.chat_status.pack(anchor=tk.W, pady=4)
 
         # Initialize chat history
@@ -175,7 +175,7 @@ class ChatTabMixin:
         Both plots need `matplotlib` (optional dependency); without it the panel
         explains how to enable it instead of failing at first click.
         """
-        frame = ttk.LabelFrame(tab, text="  📊  Insights  ", padding="6")
+        frame = ttk.LabelFrame(tab, text=tr("  📊  Insights  "), padding="6")
         frame.pack(fill=tk.X, pady=(4, 0))
 
         controls = ttk.Frame(frame)
@@ -236,7 +236,7 @@ class ChatTabMixin:
             top=int(getattr(self.gui_config, "plot_top_tokens", 20)),
             title=tr("msg.tokens_title"))
         self._refresh_chat_plot()
-        self.chat_status.config(text=f"{tr('lbl.tokens')}: {len(pairs)} unique / {len(text)} chars")
+        self.chat_status.config(text=tr("{label}: {n_pairs} unique / {n_text} chars", label=tr('lbl.tokens'), n_pairs=len(pairs), n_text=len(text)))
 
     def _plot_attention_map(self):
         """Heatmap of this layer's attention over the last user+assistant turn: one head
@@ -267,7 +267,7 @@ class ChatTabMixin:
             self.chat_plot_ax, matrix, tokens=tokens, max_labels=insights.MAX_LABELLED,
             title=insights.attention_caption(layer, head, heads))
         self._refresh_chat_plot()
-        self.chat_status.config(text=f"{len(tokens)} tokens; brighter is more attention.")
+        self.chat_status.config(text=tr("{n} tokens; brighter is more attention.", n=len(tokens)))
         self.gui_config = self.gui_config.update(attention_layer=layer)
 
     def _ensure_native_model(self, need_tokens: bool = False) -> bool:
@@ -292,7 +292,7 @@ class ChatTabMixin:
 
     def _send_chat_message(self):
         if not self.engine.model:
-            messagebox.showwarning("No Model", "Please load or train a model first.")
+            messagebox.showwarning(tr("No Model"), tr("Please load or train a model first."))
             return
 
         user_msg = self.chat_input.get().strip()
@@ -319,7 +319,7 @@ class ChatTabMixin:
 
         # Generate response
         self.chat_send_btn.config(state=tk.DISABLED)
-        self.chat_status.config(text="Generating response...")
+        self.chat_status.config(text=tr("Generating response..."))
 
         use_stream = bool(getattr(self, 'chat_stream_var', None) and self.chat_stream_var.get())
 
@@ -373,11 +373,11 @@ class ChatTabMixin:
 
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the reply", title="Chat Error"))
+                    exc, tr("the reply"), title=tr("Chat Error")))
             finally:
                 self.root.after(0, lambda: (
                     self.chat_send_btn.config(state=tk.NORMAL),
-                    self.chat_status.config(text="Ready")
+                    self.chat_status.config(text=tr("Ready"))
                 ))
 
         threading.Thread(target=run, daemon=True).start()
@@ -394,7 +394,7 @@ class ChatTabMixin:
     def _begin_chat_stream(self):
         """Insert the assistant prefix before streaming tokens arrive."""
         self.chat_text.config(state=tk.NORMAL)
-        self.chat_text.insert(tk.END, "🤖 Assistant: ", "assistant")
+        self.chat_text.insert(tk.END, tr("🤖 Assistant: "), "assistant")
         self.chat_text.config(state=tk.DISABLED)
 
 
@@ -414,10 +414,10 @@ class ChatTabMixin:
     def _append_chat_message(self, role: str, content: str):
         self.chat_text.config(state=tk.NORMAL)
         if role == "user":
-            self.chat_text.insert(tk.END, "👤 You: ", "user")
+            self.chat_text.insert(tk.END, tr("👤 You: "), "user")
             self.chat_text.insert(tk.END, content + "\n\n")
         elif role == "assistant":
-            self.chat_text.insert(tk.END, "🤖 Assistant: ", "assistant")
+            self.chat_text.insert(tk.END, tr("🤖 Assistant: "), "assistant")
             self.chat_text.insert(tk.END, content + "\n\n")
         else:
             self.chat_text.insert(tk.END, f"[{role}] {content}\n\n", role)
@@ -429,26 +429,27 @@ class ChatTabMixin:
         """Called when the Agent Mode checkbox is toggled."""
         if self.agent_mode_var.get():
             if not gui_common.HAS_AGENT:
-                messagebox.showwarning("Agent Not Available",
-                    "agent/ package not found. Make sure the agent/ directory is present.")
+                messagebox.showwarning(tr("Agent Not Available"),
+                    tr("agent/ package not found. Make sure the agent/ directory is present."))
                 self.agent_mode_var.set(False)
                 return
             # 2.26: the tools run on this computer - say so once a session (as the Studio)
             if not self._agent_accepted:
-                if not messagebox.askyesno("Turn agent mode on?",
-                                           agentmode.WARNING + "\n\nTurn agent mode on?"):
+                if not messagebox.askyesno(tr("Turn agent mode on?"),
+                                           tr(agentmode.WARNING) + "\n\n"
+                                           + tr("Turn agent mode on?")):
                     self.agent_mode_var.set(False)
                     return
                 self._agent_accepted = True
-            self._log_sandbox("Agent mode enabled. Sandbox initialised.", "info")
-            self.chat_status.config(text="🤖 Agent Mode ON — I have access to terminal, files, web search.")
+            self._log_sandbox(tr("Agent mode enabled. Sandbox initialised."), "info")
+            self.chat_status.config(text=tr("🤖 Agent Mode ON — I have access to terminal, files, web search."))
         else:
             if self._agent is not None:
                 self._agent.stop()
                 self._agent = None
             self._drop_agent_sandbox()
-            self.chat_status.config(text="Agent mode disabled.")
-            self._log_sandbox("Agent mode disabled.", "info")
+            self.chat_status.config(text=tr("Agent mode disabled."))
+            self._log_sandbox(tr("Agent mode disabled."), "info")
 
     def _agent_options(self):
         """2.26: the agent's options from the form (ValueError: a field out of range, or
@@ -474,19 +475,19 @@ class ChatTabMixin:
         try:
             options = self._agent_options()
         except ValueError as exc:
-            messagebox.showwarning("Agent mode", f"Cannot start the agent: {exc}.")
+            messagebox.showwarning(tr("Agent mode"), tr("Cannot start the agent: {error}.", error=exc))
             self.chat_input.insert(0, user_msg)        # the message is not lost
             return
         self._append_chat_message("user", user_msg)
         self.chat_send_btn.config(state=tk.DISABLED)
         self.agent_stop_btn.config(state=tk.NORMAL)
-        self.chat_status.config(text="🤖 Agent thinking...")
+        self.chat_status.config(text=tr("🤖 Agent thinking..."))
         self._agent_stop_event.clear()
 
         def run():
             try:
                 if not gui_common.HAS_AGENT:
-                    raise RuntimeError("Agent package not available")
+                    raise RuntimeError(tr("Agent package not available"))
 
                 # 2.26: one sandbox a chat, the tools turned on, the limits typed - the
                 # Studio's agent (studio/agentmode.py)
@@ -535,7 +536,7 @@ class ChatTabMixin:
                 self.root.after(0, lambda: (
                     self.chat_send_btn.config(state=tk.NORMAL),
                     self.agent_stop_btn.config(state=tk.DISABLED),
-                    self.chat_status.config(text="🤖 Agent done."),
+                    self.chat_status.config(text=tr("🤖 Agent done.")),
                 ))
 
         threading.Thread(target=run, daemon=True).start()
@@ -547,8 +548,8 @@ class ChatTabMixin:
         if self._agent is not None:
             self._agent.stop()
         self.agent_stop_btn.config(state=tk.DISABLED)
-        self.chat_status.config(text="Agent stopped by user.")
-        self._log_sandbox("Agent stopped.", "info")
+        self.chat_status.config(text=tr("Agent stopped by user."))
+        self._log_sandbox(tr("Agent stopped."), "info")
 
 
     def _log_sandbox(self, text: str, tag: str = ""):
@@ -571,5 +572,5 @@ class ChatTabMixin:
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.delete("1.0", tk.END)
         self.chat_text.config(state=tk.DISABLED)
-        self.chat_status.config(text="Chat history cleared.")
+        self.chat_status.config(text=tr("Chat history cleared."))
 

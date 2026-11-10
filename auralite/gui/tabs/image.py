@@ -11,30 +11,41 @@ measurement (patch SWD) and the stages of the setup on the progress bar.
 from .. import common as gui_common
 from ..common import (AMP_DTYPES, FLOW_TIME_SAMPLING, GAN_AUGMENTS, GAN_LOSSES, Figure, FigureCanvasTkAgg, IMAGE_PRESETS, LR_SCHEDULES, NOISE_SCHEDULES, PREDICTION_TYPES, SAMPLERS_BY_TYPE, _fmt_duration, filedialog, messagebox, os, threading, time, tk, ttk, validate_image_params)
 from .training import _stage_text
+from ..i18n import N_, tr
+from auralite.i18n import number
+from auralite.studio.progress import engine_text
 
 #: Sampler choices offered in the Generate row (engine names), per model type.
 IMAGE_SAMPLERS = ("dpm++2m", "ddim", "ddpm")
 SAMPLERS_IN_ROW = {"diffusion": IMAGE_SAMPLERS, "flow": ("dpm++2m", "euler", "heun"), "gan": ()}
 #: Model types: engine name → label of the radio button, and what it is.
-MODEL_TYPE_LABELS = {"diffusion": "Diffusion (DDPM)", "flow": "Flow matching", "gan": "GAN"}
+MODEL_TYPE_LABELS = {"diffusion": N_("Diffusion (DDPM)"), "flow": N_("Flow matching"),
+                     "gan": N_("GAN")}
 MODEL_TYPE_HINTS = {
-    "diffusion": ("Denoising diffusion (DDPM, v-prediction, Min-SNR): the reference — stable, "
-                  "good quality; sampling takes 10-50 network calls per image."),
-    "flow": ("Rectified flow / flow matching (as in Stable Diffusion 3): a straight path from "
-             "noise to the image, logit-normal training times; samples with DPM-Solver++, "
-             "Euler or Heun."),
-    "gan": ("A modern GAN (R3GAN: relativistic loss with R1 + R2, ResNet without "
-            "normalisation, adaptive augmentation, EMA generator): one network call per "
-            "image — instant sampling. Uses the GAN settings below."),
+    "diffusion": N_("Denoising diffusion (DDPM, v-prediction, Min-SNR): the reference — stable, "
+                    "good quality; sampling takes 10-50 network calls per image."),
+    "flow": N_("Rectified flow / flow matching (as in Stable Diffusion 3): a straight path from "
+               "noise to the image, logit-normal training times; samples with DPM-Solver++, "
+               "Euler or Heun."),
+    "gan": N_("A modern GAN (R3GAN: relativistic loss with R1 + R2, ResNet without "
+              "normalisation, adaptive augmentation, EMA generator): one network call per "
+              "image — instant sampling. Uses the GAN settings below."),
 }
 #: Plot titles per model type.
-_PLOT_TITLES = {"diffusion": "Diffusion training loss", "flow": "Flow-matching training loss",
-                "gan": "GAN training (G / D loss)"}
-#: Class-picker entries besides the class names of a class-conditional model.
-_ANY_CLASS, _ALL_CLASSES = "(any)", "(one of each)"
+_PLOT_TITLES = {"diffusion": N_("Diffusion training loss"),
+                "flow": N_("Flow-matching training loss"),
+                "gan": N_("GAN training (G / D loss)")}
+#: Class-picker entries besides the class names of a class-conditional model (2.28: shown in
+#: the interface's language, read back in either).
+_ANY_CLASS, _ALL_CLASSES = N_("(any)"), N_("(one of each)")
 #: Checkpoint file types for the save/load dialogs.
-_IMAGE_CKPT_TYPES = [("PyTorch checkpoint", "*.pt"), ("safetensors (no pickle)", "*.safetensors"),
-                     ("All files", "*.*")]
+_IMAGE_CKPT_TYPES = [(N_("PyTorch checkpoint"), "*.pt"),
+                     (N_("safetensors (no pickle)"), "*.safetensors"), (N_("All files"), "*.*")]
+
+
+def _ckpt_types(types=None):
+    """The checkpoint file types with their names in the interface's language."""
+    return [(tr(name), pattern) for name, pattern in (types or _IMAGE_CKPT_TYPES)]
 #: Images the quality measurement generates (at most; fewer if the folder is smaller).
 QUALITY_IMAGES = 256
 
@@ -43,10 +54,9 @@ class ImageTabMixin:
         tab = self.tab_image
 
         if not gui_common.HAS_IMAGEGEN or not gui_common.HAS_PIL:
-            msg = ("The image generator needs Pillow.\n\n"
-                   "Install it with:\n    pip install Pillow\n\n"
-                   "Then restart AuraLite.")
-            ttk.Label(tab, text="🖼️  Image Generator (unavailable)",
+            msg = (tr("The image generator needs Pillow.") + "\n\n" + tr("Install it with:")
+                   + "\n    pip install Pillow\n\n" + tr("Then restart AuraLite."))
+            ttk.Label(tab, text=tr("🖼️  Image Generator (unavailable)"),
                       style="Header.TLabel").pack(anchor=tk.W, padx=10, pady=(12, 4))
             ttk.Label(tab, text=msg, style="Sub.TLabel",
                       justify=tk.LEFT).pack(anchor=tk.W, padx=10)
@@ -54,33 +64,33 @@ class ImageTabMixin:
 
         ttk.Label(
             tab,
-            text=("Train your OWN image generator from scratch — diffusion, flow matching or a "
+            text=tr(("Train your OWN image generator from scratch — diffusion, flow matching or a "
                   "GAN — no pretrained weights. Full control over the architecture, the modern "
-                  "training stack and sampling. Small resolutions train even on CPU."),
+                  "training stack and sampling. Small resolutions train even on CPU.")),
             style="Sub.TLabel", wraplength=780, justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=10, pady=(10, 6))
 
         # ---- Model type (2.14.2) ----
-        mf = ttk.LabelFrame(tab, text="  🧬  Model Type  ", padding="8")
+        mf = ttk.LabelFrame(tab, text=tr("  🧬  Model Type  "), padding="8")
         mf.pack(fill=tk.X, pady=(0, 8))
         self.img_model_type_var = tk.StringVar(value="diffusion")
         mrow = ttk.Frame(mf); mrow.pack(fill=tk.X)
         for kind, label in MODEL_TYPE_LABELS.items():
-            ttk.Radiobutton(mrow, text=label, value=kind, variable=self.img_model_type_var,
+            ttk.Radiobutton(mrow, text=tr(label), value=kind, variable=self.img_model_type_var,
                             command=self._on_image_model_type).pack(side=tk.LEFT, padx=6)
-        self.img_model_hint = ttk.Label(mf, text=MODEL_TYPE_HINTS["diffusion"],
+        self.img_model_hint = ttk.Label(mf, text=tr(MODEL_TYPE_HINTS["diffusion"]),
                                         style="Sub.TLabel", wraplength=760, justify=tk.LEFT)
         self.img_model_hint.pack(anchor=tk.W, pady=(4, 0))
 
         # ---- Presets ----
-        pf = ttk.LabelFrame(tab, text="  📋  Configuration Presets  ", padding="8")
+        pf = ttk.LabelFrame(tab, text=tr("  📋  Configuration Presets  "), padding="8")
         pf.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(pf, text="Choose a preset:").pack(side=tk.LEFT, padx=4)
-        self.img_preset_var = tk.StringVar(value="Small (default)")
+        ttk.Label(pf, text=tr("Choose a preset:")).pack(side=tk.LEFT, padx=4)
+        self.img_preset_var = tk.StringVar(value=tr("Small (default)"))
         ttk.Combobox(pf, textvariable=self.img_preset_var,
-                     values=list(IMAGE_PRESETS.keys()), state="readonly",
+                     values=[tr(name) for name in IMAGE_PRESETS], state="readonly",
                      width=28).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pf, text="📥 Apply Preset",
+        ttk.Button(pf, text=tr("📥 Apply Preset"),
                    command=self._apply_image_preset).pack(side=tk.LEFT, padx=4)
 
         self.img_vars = {
@@ -138,7 +148,8 @@ class ImageTabMixin:
                                                    "gan": []}
 
         def _grid_field(parent, r, c, label, var, width=10, combo=None, group=None):
-            ttk.Label(parent, text=label).grid(row=r, column=c * 2, sticky=tk.W, padx=6, pady=3)
+            ttk.Label(parent, text=tr(label)).grid(row=r, column=c * 2, sticky=tk.W, padx=6,
+                                                   pady=3)
             if combo is not None:
                 w = ttk.Combobox(parent, textvariable=var, values=list(combo),
                                  state="readonly", width=width)
@@ -151,110 +162,110 @@ class ImageTabMixin:
             return w
 
         # ---- Architecture ----
-        arch = ttk.LabelFrame(tab, text="  🧱  Architecture (U-Net / GAN networks)  ",
+        arch = ttk.LabelFrame(tab, text=tr("  🧱  Architecture (U-Net / GAN networks)  "),
                               padding="10")
         arch.pack(fill=tk.X, pady=(0, 8))
         g = ttk.Frame(arch); g.pack(fill=tk.X)
-        _grid_field(g, 0, 0, "Image size (px)", self.img_vars["img_size"], 8,
+        _grid_field(g, 0, 0, N_("Image size (px)"), self.img_vars["img_size"], 8,
                     combo=("16", "24", "32", "48", "64", "96", "128"))
-        _grid_field(g, 0, 1, "Color", self.img_vars["color"], 10, combo=("RGB", "Grayscale"))
-        _grid_field(g, 1, 0, "Base channels", self.img_vars["base_channels"])
-        _grid_field(g, 1, 1, "Res-blocks / level", self.img_vars["num_res_blocks"])
-        _grid_field(g, 2, 0, "Channel mults", self.img_vars["channel_mults"])
-        _grid_field(g, 2, 1, "Attn resolutions", self.img_vars["attn_resolutions"], group="unet")
-        _grid_field(g, 3, 0, "Attention heads (0=auto)", self.img_vars["attn_heads"],
+        _grid_field(g, 0, 1, N_("Color"), self.img_vars["color"], 10, combo=("RGB", "Grayscale"))
+        _grid_field(g, 1, 0, N_("Base channels"), self.img_vars["base_channels"])
+        _grid_field(g, 1, 1, N_("Res-blocks / level"), self.img_vars["num_res_blocks"])
+        _grid_field(g, 2, 0, N_("Channel mults"), self.img_vars["channel_mults"])
+        _grid_field(g, 2, 1, N_("Attn resolutions"), self.img_vars["attn_resolutions"], group="unet")
+        _grid_field(g, 3, 0, N_("Attention heads (0=auto)"), self.img_vars["attn_heads"],
                     group="unet")
-        _grid_field(g, 3, 1, "Time-emb dim (0=auto)", self.img_vars["time_emb_dim"],
+        _grid_field(g, 3, 1, N_("Time-emb dim (0=auto)"), self.img_vars["time_emb_dim"],
                     group="unet")
-        _grid_field(g, 4, 0, "Dropout", self.img_vars["dropout"], group="unet")
-        ttk.Label(arch, text="channel mults / attn resolutions accept 'auto' or a comma list "
-                             "(e.g. 1,2,4  ·  16,8)", style="Sub.TLabel").pack(anchor=tk.W, pady=(4, 0))
+        _grid_field(g, 4, 0, N_("Dropout"), self.img_vars["dropout"], group="unet")
+        ttk.Label(arch, text=tr("channel mults / attn resolutions accept 'auto' or a comma list "
+                             "(e.g. 1,2,4  ·  16,8)"), style="Sub.TLabel").pack(anchor=tk.W, pady=(4, 0))
 
         # ---- Diffusion / flow & modern stack ----
-        diff = ttk.LabelFrame(tab, text="  🌫️  Diffusion / Flow & Modern Stack  ", padding="10")
+        diff = ttk.LabelFrame(tab, text=tr("  🌫️  Diffusion / Flow & Modern Stack  "), padding="10")
         diff.pack(fill=tk.X, pady=(0, 8))
         g2 = ttk.Frame(diff); g2.pack(fill=tk.X)
-        _grid_field(g2, 0, 0, "Diffusion steps (T)", self.img_vars["timesteps"],
+        _grid_field(g2, 0, 0, N_("Diffusion steps (T)"), self.img_vars["timesteps"],
                     group="diffusion")
-        _grid_field(g2, 0, 1, "Noise schedule", self.img_vars["schedule"], 12,
+        _grid_field(g2, 0, 1, N_("Noise schedule"), self.img_vars["schedule"], 12,
                     combo=NOISE_SCHEDULES, group="diffusion")
-        _grid_field(g2, 1, 0, "Prediction type", self.img_vars["prediction_type"], 12,
+        _grid_field(g2, 1, 0, N_("Prediction type"), self.img_vars["prediction_type"], 12,
                     combo=PREDICTION_TYPES, group="diffusion")
-        _grid_field(g2, 1, 1, "Min-SNR γ (0=off)", self.img_vars["min_snr_gamma"],
+        _grid_field(g2, 1, 1, N_("Min-SNR γ (0=off)"), self.img_vars["min_snr_gamma"],
                     group="diffusion")
-        _grid_field(g2, 2, 0, "AMP precision", self.img_vars["amp_dtype"], 12, combo=AMP_DTYPES)
-        _grid_field(g2, 2, 1, "EMA decay", self.img_vars["ema_decay"])
-        _grid_field(g2, 3, 0, "Flow time sampling", self.img_vars["flow_time_sampling"], 12,
+        _grid_field(g2, 2, 0, N_("AMP precision"), self.img_vars["amp_dtype"], 12, combo=AMP_DTYPES)
+        _grid_field(g2, 2, 1, N_("EMA decay"), self.img_vars["ema_decay"])
+        _grid_field(g2, 3, 0, N_("Flow time sampling"), self.img_vars["flow_time_sampling"], 12,
                     combo=FLOW_TIME_SAMPLING, group="flow")
         row = ttk.Frame(diff); row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Checkbutton(row, text="EMA weights", variable=self.img_use_ema_var).pack(side=tk.LEFT, padx=4)
-        ckpt_box = ttk.Checkbutton(row, text="Gradient checkpointing", variable=self.img_ckpt_var)
+        ttk.Checkbutton(row, text=tr("EMA weights"), variable=self.img_use_ema_var).pack(side=tk.LEFT, padx=4)
+        ckpt_box = ttk.Checkbutton(row, text=tr("Gradient checkpointing"), variable=self.img_ckpt_var)
         ckpt_box.pack(side=tk.LEFT, padx=8)
-        compile_box = ttk.Checkbutton(row, text="torch.compile", variable=self.img_compile_var)
+        compile_box = ttk.Checkbutton(row, text=tr("torch.compile"), variable=self.img_compile_var)
         compile_box.pack(side=tk.LEFT, padx=8)
         self._img_type_widgets["unet"] += [(ckpt_box, "normal"), (compile_box, "normal")]
-        ttk.Checkbutton(row, text="Augment (h-flip)", variable=self.img_augment_var).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(row, text="Classes from sub-folders",
+        ttk.Checkbutton(row, text=tr("Augment (h-flip)"), variable=self.img_augment_var).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(row, text=tr("Classes from sub-folders"),
                         variable=self.img_classes_var).pack(side=tk.LEFT, padx=8)
 
         # ---- GAN (2.14.2) ----
-        ganf = ttk.LabelFrame(tab, text="  ⚔️  GAN (generator vs discriminator)  ", padding="10")
+        ganf = ttk.LabelFrame(tab, text=tr("  ⚔️  GAN (generator vs discriminator)  "), padding="10")
         ganf.pack(fill=tk.X, pady=(0, 8))
         g4 = ttk.Frame(ganf); g4.pack(fill=tk.X)
-        _grid_field(g4, 0, 0, "Latent size", self.img_vars["latent_dim"], group="gan")
-        _grid_field(g4, 0, 1, "Loss", self.img_vars["gan_loss"], 14, combo=GAN_LOSSES,
+        _grid_field(g4, 0, 0, N_("Latent size"), self.img_vars["latent_dim"], group="gan")
+        _grid_field(g4, 0, 1, N_("Loss"), self.img_vars["gan_loss"], 14, combo=GAN_LOSSES,
                     group="gan")
-        _grid_field(g4, 1, 0, "G learning rate", self.img_vars["gan_lr_g"], group="gan")
-        _grid_field(g4, 1, 1, "D learning rate", self.img_vars["gan_lr_d"], group="gan")
-        _grid_field(g4, 2, 0, "R1/R2 penalty γ", self.img_vars["gan_gamma"], group="gan")
-        _grid_field(g4, 2, 1, "Penalty every N steps", self.img_vars["gan_reg_every"],
+        _grid_field(g4, 1, 0, N_("G learning rate"), self.img_vars["gan_lr_g"], group="gan")
+        _grid_field(g4, 1, 1, N_("D learning rate"), self.img_vars["gan_lr_d"], group="gan")
+        _grid_field(g4, 2, 0, N_("R1/R2 penalty γ"), self.img_vars["gan_gamma"], group="gan")
+        _grid_field(g4, 2, 1, N_("Penalty every N steps"), self.img_vars["gan_reg_every"],
                     group="gan")
-        _grid_field(g4, 3, 0, "Augmentation", self.img_vars["gan_augment"], 10,
+        _grid_field(g4, 3, 0, N_("Augmentation"), self.img_vars["gan_augment"], 10,
                     combo=GAN_AUGMENTS, group="gan")
-        _grid_field(g4, 3, 1, "ADA target", self.img_vars["gan_ada_target"], group="gan")
-        ttk.Label(ganf, text="rpgan = relativistic pairing (R3GAN) · augmentation: ada = "
+        _grid_field(g4, 3, 1, N_("ADA target"), self.img_vars["gan_ada_target"], group="gan")
+        ttk.Label(ganf, text=tr("rpgan = relativistic pairing (R3GAN) · augmentation: ada = "
                              "DiffAugment with an adaptive probability (for small folders "
                              "trained long, when the validation SWD rises), diffaug = always · "
                              "the GAN ignores the learning rate, weight decay, grad clip and "
-                             "accumulation below",
+                             "accumulation below"),
                   style="Sub.TLabel", wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
 
         # ---- Optimization ----
-        opt = ttk.LabelFrame(tab, text="  ⚙️  Optimization  ", padding="10")
+        opt = ttk.LabelFrame(tab, text=tr("  ⚙️  Optimization  "), padding="10")
         opt.pack(fill=tk.X, pady=(0, 8))
         g3 = ttk.Frame(opt); g3.pack(fill=tk.X)
-        _grid_field(g3, 0, 0, "Epochs", self.img_vars["epochs"])
-        _grid_field(g3, 0, 1, "Batch size", self.img_vars["batch_size"])
-        _grid_field(g3, 1, 0, "Learning rate", self.img_vars["lr"], group="unet")
-        _grid_field(g3, 1, 1, "LR schedule", self.img_vars["lr_schedule"], 14, combo=LR_SCHEDULES)
-        _grid_field(g3, 2, 0, "Warmup steps", self.img_vars["warmup_steps"])
-        _grid_field(g3, 2, 1, "Grad accumulation", self.img_vars["accumulation_steps"],
+        _grid_field(g3, 0, 0, N_("Epochs"), self.img_vars["epochs"])
+        _grid_field(g3, 0, 1, N_("Batch size"), self.img_vars["batch_size"])
+        _grid_field(g3, 1, 0, N_("Learning rate"), self.img_vars["lr"], group="unet")
+        _grid_field(g3, 1, 1, N_("LR schedule"), self.img_vars["lr_schedule"], 14, combo=LR_SCHEDULES)
+        _grid_field(g3, 2, 0, N_("Warmup steps"), self.img_vars["warmup_steps"])
+        _grid_field(g3, 2, 1, N_("Grad accumulation"), self.img_vars["accumulation_steps"],
                     group="unet")
-        _grid_field(g3, 3, 0, "Weight decay", self.img_vars["weight_decay"], group="unet")
-        _grid_field(g3, 3, 1, "Grad clip", self.img_vars["grad_clip"], group="unet")
-        _grid_field(g3, 4, 0, "Seed", self.img_vars["seed"])
-        _grid_field(g3, 4, 1, "Autosave every N epochs", self.img_vars["autosave_every"])
-        _grid_field(g3, 5, 0, "Validation split", self.img_vars["val_split"])
-        _grid_field(g3, 5, 1, "Early stop (epochs, 0=off)",
+        _grid_field(g3, 3, 0, N_("Weight decay"), self.img_vars["weight_decay"], group="unet")
+        _grid_field(g3, 3, 1, N_("Grad clip"), self.img_vars["grad_clip"], group="unet")
+        _grid_field(g3, 4, 0, N_("Seed"), self.img_vars["seed"])
+        _grid_field(g3, 4, 1, N_("Autosave every N epochs"), self.img_vars["autosave_every"])
+        _grid_field(g3, 5, 0, N_("Validation split"), self.img_vars["val_split"])
+        _grid_field(g3, 5, 1, N_("Early stop (epochs, 0=off)"),
                     self.img_vars["early_stopping_patience"])
         row2 = ttk.Frame(opt); row2.pack(fill=tk.X, pady=(6, 0))
-        ttk.Checkbutton(row2, text="Continue training current model",
+        ttk.Checkbutton(row2, text=tr("Continue training current model"),
                         variable=self.img_continue_var).pack(side=tk.LEFT, padx=4)
 
         # ---- Run ----
-        run = ttk.LabelFrame(tab, text="  🚀  Train  ", padding="10")
+        run = ttk.LabelFrame(tab, text=tr("  🚀  Train  "), padding="10")
         run.pack(fill=tk.X, pady=(0, 8))
         rr = ttk.Frame(run); rr.pack(fill=tk.X, pady=2)
-        self.img_folder_btn = ttk.Button(rr, text="📂 Select Image Folder",
+        self.img_folder_btn = ttk.Button(rr, text=tr("📂 Select Image Folder"),
                                          command=self.select_image_folder)
         self.img_folder_btn.pack(side=tk.LEFT, padx=4)
-        self.img_train_btn = ttk.Button(rr, text="🚀 Start Training",
+        self.img_train_btn = ttk.Button(rr, text=tr("🚀 Start Training"),
                                         command=self.start_image_training, state=tk.DISABLED)
         self.img_train_btn.pack(side=tk.LEFT, padx=4)
-        self.img_stop_btn = ttk.Button(rr, text="🛑 Stop",
+        self.img_stop_btn = ttk.Button(rr, text=tr("🛑 Stop"),
                                        command=self.stop_image_training, state=tk.DISABLED)
         self.img_stop_btn.pack(side=tk.LEFT, padx=4)
-        self.img_folder_label = ttk.Label(run, text="No folder selected", foreground="gray")
+        self.img_folder_label = ttk.Label(run, text=tr("No folder selected"), foreground="gray")
         self.img_folder_label.pack(pady=2, anchor=tk.W)
         # One bar: the stages of the setup (decoding the images, ...), then the run.
         self.img_progress_var = tk.DoubleVar()
@@ -263,79 +274,79 @@ class ImageTabMixin:
         self._img_bar_busy = False
         self.img_progress_detail = tk.StringVar(value="")
         ttk.Label(run, textvariable=self.img_progress_detail, style="Sub.TLabel").pack(fill=tk.X, anchor=tk.W)
-        self.img_status_label = ttk.Label(run, text="Status: waiting for a folder…")
+        self.img_status_label = ttk.Label(run, text=tr("Status: waiting for a folder…"))
         self.img_status_label.pack(pady=(0, 2), anchor=tk.W)
         if gui_common.HAS_MATPLOTLIB:
             self.img_fig = Figure(figsize=(6, 2.2), dpi=80)
             self.img_ax = self.img_fig.add_subplot(111)
-            self.img_ax.set_xlabel("Epoch"); self.img_ax.set_ylabel("Loss")
-            self.img_ax.set_title(_PLOT_TITLES["diffusion"])
+            self.img_ax.set_xlabel(tr("Epoch")); self.img_ax.set_ylabel(tr("Loss"))
+            self.img_ax.set_title(tr(_PLOT_TITLES["diffusion"]))
             self.img_canvas = FigureCanvasTkAgg(self.img_fig, master=run)
             self.img_canvas.get_tk_widget().pack(fill=tk.X, pady=(6, 0))
 
         # ---- Generate ----
-        gen = ttk.LabelFrame(tab, text="  ✨  Generate  ", padding="10")
+        gen = ttk.LabelFrame(tab, text=tr("  ✨  Generate  "), padding="10")
         gen.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         grow = ttk.Frame(gen); grow.pack(fill=tk.X, pady=2)
-        ttk.Label(grow, text="Samples").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(grow, text=tr("Samples")).pack(side=tk.LEFT, padx=(4, 2))
         self.img_n_var = tk.StringVar(value="4")
         ttk.Entry(grow, textvariable=self.img_n_var, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(grow, text="Sampler").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(grow, text=tr("Sampler")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_sampler_var = tk.StringVar(value="dpm++2m")
         self.img_sampler_combo = ttk.Combobox(grow, textvariable=self.img_sampler_var,
                                               values=IMAGE_SAMPLERS, state="readonly", width=8)
         self.img_sampler_combo.pack(side=tk.LEFT, padx=2)
-        ttk.Label(grow, text="Steps").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(grow, text=tr("Steps")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_steps_var = tk.StringVar(value="20")
         self.img_steps_entry = ttk.Entry(grow, textvariable=self.img_steps_var, width=5)
         self.img_steps_entry.pack(side=tk.LEFT, padx=2)
-        ttk.Label(grow, text="η (stochastic)").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(grow, text=tr("η (stochastic)")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_eta_var = tk.StringVar(value="0.0")
         self.img_eta_entry = ttk.Entry(grow, textvariable=self.img_eta_var, width=5)
         self.img_eta_entry.pack(side=tk.LEFT, padx=2)
-        ttk.Label(grow, text="Seed").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(grow, text=tr("Seed")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_seed_gen_var = tk.StringVar(value="")
         ttk.Entry(grow, textvariable=self.img_seed_gen_var, width=7).pack(side=tk.LEFT, padx=2)
         self.img_gen_ema_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grow, text="EMA weights", variable=self.img_gen_ema_var).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Checkbutton(grow, text=tr("EMA weights"), variable=self.img_gen_ema_var).pack(side=tk.LEFT, padx=(10, 2))
         crow = ttk.Frame(gen); crow.pack(fill=tk.X, pady=2)
-        ttk.Label(crow, text="Class").pack(side=tk.LEFT, padx=(4, 2))
-        self.img_class_var = tk.StringVar(value=_ANY_CLASS)
+        ttk.Label(crow, text=tr("Class")).pack(side=tk.LEFT, padx=(4, 2))
+        self.img_class_var = tk.StringVar(value=tr(_ANY_CLASS))
         self.img_class_combo = ttk.Combobox(crow, textvariable=self.img_class_var,
-                                            values=(_ANY_CLASS,), state="readonly", width=16)
+                                            values=(tr(_ANY_CLASS),), state="readonly", width=16)
         self.img_class_combo.pack(side=tk.LEFT, padx=2)
-        ttk.Label(crow, text="Guidance").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(crow, text=tr("Guidance")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_guidance_var = tk.StringVar(value="2.0")
         self.img_guidance_entry = ttk.Entry(crow, textvariable=self.img_guidance_var, width=5)
         self.img_guidance_entry.pack(side=tk.LEFT, padx=2)
-        ttk.Label(crow, text="Truncation (GAN, 0=off)").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(crow, text=tr("Truncation (GAN, 0=off)")).pack(side=tk.LEFT, padx=(10, 2))
         self.img_truncation_var = tk.StringVar(value="0")
         self.img_truncation_entry = ttk.Entry(crow, textvariable=self.img_truncation_var,
                                               width=5)
         self.img_truncation_entry.pack(side=tk.LEFT, padx=2)
 
         brow = ttk.Frame(gen); brow.pack(fill=tk.X, pady=4)
-        self.img_gen_btn = ttk.Button(brow, text="✨ Generate", state=tk.DISABLED,
+        self.img_gen_btn = ttk.Button(brow, text=tr("✨ Generate"), state=tk.DISABLED,
                                       command=self.generate_images)
         self.img_gen_btn.pack(side=tk.LEFT, padx=4)
-        self.img_save_samples_btn = ttk.Button(brow, text="💾 Save Samples", state=tk.DISABLED,
+        self.img_save_samples_btn = ttk.Button(brow, text=tr("💾 Save Samples"), state=tk.DISABLED,
                                                command=self.save_generated_images)
         self.img_save_samples_btn.pack(side=tk.LEFT, padx=4)
-        self.img_save_model_btn = ttk.Button(brow, text="💾 Save Model", state=tk.DISABLED,
+        self.img_save_model_btn = ttk.Button(brow, text=tr("💾 Save Model"), state=tk.DISABLED,
                                              command=self.save_image_model)
         self.img_save_model_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(brow, text="📂 Load Model", command=self.load_image_model).pack(side=tk.LEFT, padx=4)
-        self.img_quality_btn = ttk.Button(brow, text="📏 Measure Quality", state=tk.DISABLED,
+        ttk.Button(brow, text=tr("📂 Load Model"), command=self.load_image_model).pack(side=tk.LEFT, padx=4)
+        self.img_quality_btn = ttk.Button(brow, text=tr("📏 Measure Quality"), state=tk.DISABLED,
                                           command=self.measure_image_quality)
         self.img_quality_btn.pack(side=tk.LEFT, padx=4)
-        self.img_param_label = ttk.Label(gen, text="Parameters: —", style="Sub.TLabel")
+        self.img_param_label = ttk.Label(gen, text=tr("Parameters: —"), style="Sub.TLabel")
         self.img_param_label.pack(anchor=tk.W, pady=(0, 4))
         if gui_common.HAS_MATPLOTLIB:
             self.img_preview_fig = Figure(figsize=(6, 2.6), dpi=80)
             self.img_preview_canvas = FigureCanvasTkAgg(self.img_preview_fig, master=gen)
             self.img_preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         else:
-            ttk.Label(gen, text="(Install matplotlib to preview generated images)",
+            ttk.Label(gen, text=tr("(Install matplotlib to preview generated images)"),
                       style="Sub.TLabel").pack()
         self._on_image_model_type()
 
@@ -355,7 +366,7 @@ class ImageTabMixin:
     def _on_image_model_type(self):
         """Enable the settings of the selected model type, disable the others."""
         kind = self._image_model_type()
-        self.img_model_hint.config(text=MODEL_TYPE_HINTS[kind])
+        self.img_model_hint.config(text=tr(MODEL_TYPE_HINTS[kind]))
         active = {"diffusion": ("diffusion", "unet"), "flow": ("flow", "unet"),
                   "gan": ("gan",)}[kind]
         for group, widgets in self._img_type_widgets.items():
@@ -366,7 +377,7 @@ class ImageTabMixin:
                     pass
         self._refresh_image_generate_row()
         if gui_common.HAS_MATPLOTLIB and not self.image_loss_history:
-            self.img_ax.set_title(_PLOT_TITLES[kind])
+            self.img_ax.set_title(tr(_PLOT_TITLES[kind]))
             self.img_canvas.draw_idle()
 
     def _refresh_image_generate_row(self):
@@ -392,7 +403,7 @@ class ImageTabMixin:
             truncation.config(state=tk.NORMAL if kind == "gan" else tk.DISABLED)
 
     def _apply_image_preset(self):
-        preset = IMAGE_PRESETS.get(self.img_preset_var.get())
+        preset = IMAGE_PRESETS.get(gui_common.preset_key(IMAGE_PRESETS, self.img_preset_var.get()))
         if not preset:
             return
         for key, value in preset.items():
@@ -408,7 +419,7 @@ class ImageTabMixin:
                 self.img_model_type_var.set(str(value))
         self._on_image_model_type()
         self.img_status_label.config(
-            text=f"Status: preset '{self.img_preset_var.get()}' applied ✅")
+            text=tr("Status: preset '{value}' applied ✅", value=self.img_preset_var.get()))
 
 
     @staticmethod
@@ -426,7 +437,7 @@ class ImageTabMixin:
 
 
     def select_image_folder(self):
-        d = filedialog.askdirectory(title="Select a folder of training images")
+        d = filedialog.askdirectory(title=tr("Select a folder of training images"))
         if not d:
             return
         try:
@@ -435,19 +446,19 @@ class ImageTabMixin:
         except Exception:
             n = 0
         if n == 0:
-            messagebox.showwarning("No images",
-                                   "No supported image files found in that folder.")
+            messagebox.showwarning(tr("No images"),
+                                   tr("No supported image files found in that folder."))
             return
         self.image_dir = d
         self.img_folder_label.config(
-            text=f"{n} images · {os.path.basename(d.rstrip(os.sep)) or d}", foreground="black")
+            text=tr("{n} images · {value}", n=n, value=os.path.basename(d.rstrip(os.sep)) or d), foreground="black")
         self.img_train_btn.config(state=tk.NORMAL)
-        self.img_status_label.config(text=f"Status: ready — {n} images found.")
+        self.img_status_label.config(text=tr("Status: ready — {n} images found.", n=n))
 
 
     def stop_image_training(self):
         self.image_stop_event.set()
-        self.img_status_label.config(text="Status: stopping… 🛑")
+        self.img_status_label.config(text=tr("Status: stopping… 🛑"))
 
 
     def start_image_training(self):
@@ -502,12 +513,12 @@ class ImageTabMixin:
                     self.img_vars["early_stopping_patience"].get() or 0),
             }
         except ValueError:
-            messagebox.showerror("Params Error", "Please enter valid numbers.")
+            messagebox.showerror(tr("Params Error"), tr("Please enter valid numbers."))
             return
 
         errors = validate_image_params(params)
         if errors:
-            messagebox.showerror("Validation Error", "\n".join(f"• {e}" for e in errors))
+            messagebox.showerror(tr("Validation Error"), "\n".join(f"• {e}" for e in errors))
             return
 
         if params["autosave_every"] > 0:
@@ -524,9 +535,10 @@ class ImageTabMixin:
         self.image_d_history = []
         self._set_image_bar(0.0)
         self._img_progress_ui_last_ts = 0.0
-        note = (f" (continuing the {MODEL_TYPE_LABELS.get(run_type, run_type)} model in memory)"
+        note = (" " + tr("(continuing the {kind} model in memory)",
+                         kind=tr(MODEL_TYPE_LABELS.get(run_type, run_type)))
                 if continuing and run_type != model_type else "")
-        self.img_status_label.config(text=f"Status: starting… ⏳{note}")
+        self.img_status_label.config(text=tr("Status: starting… ⏳{note}", note=note))
         self.img_train_btn.config(state=tk.DISABLED)
         self.img_folder_btn.config(state=tk.DISABLED)
         self.img_stop_btn.config(state=tk.NORMAL)
@@ -534,8 +546,8 @@ class ImageTabMixin:
         self.img_quality_btn.config(state=tk.DISABLED)
         if gui_common.HAS_MATPLOTLIB:
             self.img_ax.clear()
-            self.img_ax.set_xlabel("Epoch"); self.img_ax.set_ylabel("Loss")
-            self.img_ax.set_title(_PLOT_TITLES.get(run_type, _PLOT_TITLES["diffusion"]))
+            self.img_ax.set_xlabel(tr("Epoch")); self.img_ax.set_ylabel(tr("Loss"))
+            self.img_ax.set_title(tr(_PLOT_TITLES.get(run_type, _PLOT_TITLES["diffusion"])))
             self.img_canvas.draw()
 
         def run():
@@ -548,12 +560,12 @@ class ImageTabMixin:
                 stopped = self.image_stop_event.is_set()
                 summary = getattr(self.image_engine, "last_train_summary", None)
                 if isinstance(summary, dict) and summary.get("stopped_during"):
-                    msg = ("Status: stopped while decoding the images 🛑 — the model in memory "
-                           "is unchanged.")
+                    msg = tr("Status: stopped while decoding the images 🛑 — the model in "
+                             "memory is unchanged.")
                 elif stopped:
-                    msg = "Status: stopped. 🛑 Weights kept — you can generate or save."
+                    msg = tr("Status: stopped. 🛑 Weights kept — you can generate or save.")
                 else:
-                    msg = "Status: training complete! ✅"
+                    msg = tr("Status: training complete! ✅")
                 if not stopped and isinstance(summary, dict) and summary:
                     msg += self._image_summary_text(summary)
                 self.root.after(0, lambda m=msg: self.img_status_label.config(text=m))
@@ -562,7 +574,7 @@ class ImageTabMixin:
                     self.root.after(0, self._image_model_ready)
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "training the image generator", title="Image Train Error"))
+                    exc, tr("training the image generator"), title=tr("Image Train Error")))
             finally:
                 self.root.after(0, self._reset_image_buttons)
 
@@ -576,10 +588,10 @@ class ImageTabMixin:
         self.img_save_model_btn.config(state=tk.NORMAL)
         self.img_quality_btn.config(state=tk.NORMAL)
         summary = getattr(engine, "parameter_summary", None)
-        text = summary() if callable(summary) else f"{engine.count_parameters():,}"
+        text = summary() if callable(summary) else number(engine.count_parameters())
         kind = str(getattr(engine, "model_type", "diffusion") or "diffusion")
         self.img_param_label.config(
-            text=f"Parameters: {text} · {MODEL_TYPE_LABELS.get(kind, kind)}")
+            text=tr("Parameters: {text} · {value}", text=text, value=tr(MODEL_TYPE_LABELS.get(kind, kind))))
         self._refresh_image_classes()
         self._refresh_image_generate_row()
 
@@ -587,37 +599,39 @@ class ImageTabMixin:
     def _refresh_image_classes(self):
         """Fill the class picker from the engine (a no-op for unconditional models)."""
         names = list(getattr(self.image_engine, "class_names", None) or [])
-        values = (_ANY_CLASS, _ALL_CLASSES, *names) if names else (_ANY_CLASS,)
+        values = ((tr(_ANY_CLASS), tr(_ALL_CLASSES), *names) if names
+                  else (tr(_ANY_CLASS),))
         combo = getattr(self, "img_class_combo", None)
         if combo is not None:
             combo.config(values=values)
         if self.img_class_var.get() not in values:
-            self.img_class_var.set(_ANY_CLASS)
+            self.img_class_var.set(tr(_ANY_CLASS))
         return names
 
     def _selected_image_class(self):
         choice = self.img_class_var.get()
-        if choice in ("", _ANY_CLASS):
+        if choice in ("", _ANY_CLASS, tr(_ANY_CLASS)):
             return None
-        return "all" if choice == _ALL_CLASSES else choice
+        return "all" if choice in (_ALL_CLASSES, tr(_ALL_CLASSES)) else choice
 
     @staticmethod
     def _image_summary_text(summary):
         """One status-line suffix from `ImageGenEngine.last_train_summary`."""
         parts = []
         if summary.get("steps") is not None:
-            parts.append(f"{summary['steps']} steps")
+            parts.append(tr("{n} steps", n=summary["steps"]))
         if summary.get("seconds") is not None:
             parts.append(_fmt_duration(float(summary["seconds"])))
         if summary.get("best_val_loss") is not None:
             metric = "SWD" if summary.get("val_metric") == "swd" else ""
-            parts.append(f"best val {metric + ' ' if metric else ''}"
-                         f"{summary['best_val_loss']:.4f} (epoch {summary.get('best_epoch')})")
+            parts.append(tr("best val {metric}{loss:.4f} (epoch {epoch})",
+                            metric=metric + " " if metric else "",
+                            loss=summary["best_val_loss"], epoch=summary.get("best_epoch")))
         if summary.get("stopped_early"):
-            parts.append("early stop" + (", best weights restored"
-                                         if summary.get("restored_best") else ""))
+            parts.append(tr("early stop, best weights restored") if summary.get("restored_best")
+                         else tr("early stop"))
         if summary.get("augment") == "ada":
-            parts.append(f"augmentation p {float(summary['augment_p']):.2f}")
+            parts.append(tr("augmentation p {p:.2f}", p=float(summary["augment_p"])))
         elif summary.get("augment") == "diffaug":
             parts.append("DiffAugment")
         return (" · " + " · ".join(parts)) if parts else ""
@@ -680,9 +694,11 @@ class ImageTabMixin:
             except (TypeError, ValueError):
                 percent = None
             self._set_image_bar(percent)
-            text = _stage_text(info) if info.get("stage") else str(info.get("message") or "")
-            self.img_progress_detail.set(text or "Preparing…")
-            self.img_status_label.config(text=f"Status: {info.get('message') or 'preparing…'}")
+            text = _stage_text(info) if info.get("stage") else engine_text(
+                str(info.get("message") or ""))
+            self.img_progress_detail.set(text or tr("Preparing…"))
+            self.img_status_label.config(text=tr("Status: {value}", value=engine_text(
+                str(info.get("message") or "")) or tr("preparing…")))
             return
         percent = info.get("percent")
         if percent is not None:
@@ -691,35 +707,36 @@ class ImageTabMixin:
             except (TypeError, ValueError):
                 pass
         if phase == "val":
-            self.img_progress_detail.set(_stage_text(info) or "Validation…")
+            self.img_progress_detail.set(_stage_text(info) or tr("Validation…"))
             return
         try:
             loss_f = float(loss)
         except (TypeError, ValueError):
             loss_f = 0.0
         eta = info.get("eta_seconds")
-        eta_str = f" · ETA {_fmt_duration(eta)}" if eta else ""
+        eta_str = " · " + tr("ETA {time}", time=_fmt_duration(eta)) if eta else ""
         lr = info.get("lr")
         lr_str = f" · lr {lr:.2e}" if lr else ""
         gan = info.get("d_loss") is not None
         if gan:
             aug = info.get("aug_p")
-            aug_str = f" · aug p {float(aug):.2f}" if aug is not None else ""
+            aug_str = " · " + tr("aug p {p:.2f}", p=float(aug)) if aug is not None else ""
             loss_str = f"G {loss_f:.4f} · D {float(info['d_loss']):.4f}{aug_str}"
         else:
-            loss_str = f"loss {loss_f:.4f}"
+            loss_str = tr("loss {loss:.4f}", loss=loss_f)
         rate = info.get("images_per_second")
-        rate_str = f" · {float(rate):.0f} img/s" if rate else ""
+        rate_str = " · " + tr("{rate:.0f} img/s", rate=float(rate)) if rate else ""
         self.img_progress_detail.set(
-            f"{info.get('message', '')} · {loss_str}{lr_str}{rate_str}{eta_str}")
+            f"{engine_text(str(info.get('message', '')))} · {loss_str}{lr_str}{rate_str}{eta_str}")
         if info.get("is_epoch_end"):
             val = info.get("val_loss")
             swd = info.get("val_metric") == "swd"
-            val_str = (f" · val {'SWD ' if swd else ''}{val:.4f}" if val is not None else "")
+            val_str = (" · " + tr("val {metric}{loss:.4f}", metric="SWD " if swd else "",
+                                  loss=val) if val is not None else "")
             head = (f"G {loss_f:.4f} · D {float(info['d_loss']):.4f}" if gan
-                    else f"loss {loss_f:.4f}")
+                    else tr("loss {loss:.4f}", loss=loss_f))
             self.img_status_label.config(
-                text=f"Status: epoch {epoch}/{total} · {head}{val_str}")
+                text=tr("Status: epoch {epoch}/{total} · {head}{val_str}", epoch=epoch, total=total, head=head, val_str=val_str))
             self.image_loss_history.append(loss_f)
             val_hist = getattr(self, "image_val_history", None)
             if val_hist is None:
@@ -740,20 +757,21 @@ class ImageTabMixin:
         val_hist = list(getattr(self, "image_val_history", None) or [])
         d_hist = list(getattr(self, "image_d_history", None) or [])
         self.img_ax.clear()
-        self.img_ax.set_xlabel("Epoch"); self.img_ax.set_ylabel("Loss")
-        title = _PLOT_TITLES.get(kind, _PLOT_TITLES["diffusion"])
+        self.img_ax.set_xlabel(tr("Epoch")); self.img_ax.set_ylabel(tr("Loss"))
+        title = tr(_PLOT_TITLES.get(kind, _PLOT_TITLES["diffusion"]))
         if d_hist:
             self.img_ax.plot(epochs, self.image_loss_history, marker="o", ms=3, label="G")
             self.img_ax.plot(range(1, len(d_hist) + 1), d_hist, marker="s", ms=3, label="D")
             if val_hist:
                 best = min(val_hist)
-                title += f" — best val SWD {best:.2f} (epoch {val_hist.index(best) + 1})"
+                title += " — " + tr("best val SWD {value:.2f} (epoch {epoch})", value=best,
+                                    epoch=val_hist.index(best) + 1)
             self.img_ax.legend(loc="upper right", fontsize=8)
         else:
-            self.img_ax.plot(epochs, self.image_loss_history, marker="o", ms=3, label="train")
+            self.img_ax.plot(epochs, self.image_loss_history, marker="o", ms=3, label=tr("train"))
             if val_hist and not swd:
                 self.img_ax.plot(range(1, len(val_hist) + 1), val_hist,
-                                 marker="s", ms=3, label="val (EMA)")
+                                 marker="s", ms=3, label=tr("val (EMA)"))
                 self.img_ax.legend(loc="upper right", fontsize=8)
         self.img_ax.set_title(title)
         self.img_ax.grid(True, alpha=0.3)
@@ -794,11 +812,11 @@ class ImageTabMixin:
         try:
             kwargs = self._generation_kwargs()
         except ValueError:
-            messagebox.showerror("Params Error", "Enter valid numbers for samples/steps/η/seed.")
+            messagebox.showerror(tr("Params Error"), tr("Enter valid numbers for samples/steps/η/seed."))
             return
 
         self.img_gen_btn.config(state=tk.DISABLED)
-        self.img_status_label.config(text="Status: sampling… 🎨")
+        self.img_status_label.config(text=tr("Status: sampling… 🎨"))
 
         def run():
             try:
@@ -807,10 +825,10 @@ class ImageTabMixin:
                 self.root.after(0, lambda: self._show_generated(imgs))
                 self.root.after(0, lambda: self.img_save_samples_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.img_status_label.config(
-                    text=f"Status: generated {len(imgs)} image(s). ✅"))
+                    text=tr("Status: generated {n} image(s). ✅", n=len(imgs))))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "generating the images", title="Generate Error"))
+                    exc, tr("generating the images"), title=tr("Generate Error")))
             finally:
                 self.root.after(0, lambda: self.img_gen_btn.config(state=tk.NORMAL))
 
@@ -823,36 +841,37 @@ class ImageTabMixin:
         if engine is None or engine.model is None:
             return
         if not self.image_dir:
-            messagebox.showinfo("Measure Quality",
-                                "Select the folder of real images to compare with "
-                                "(📂 Select Image Folder).")
+            messagebox.showinfo(tr("Measure Quality"),
+                                tr("Select the folder of real images to compare with "
+                                "(📂 Select Image Folder)."))
             return
         try:
             kwargs = self._generation_kwargs()
         except ValueError:
-            messagebox.showerror("Params Error", "Enter valid numbers for samples/steps/η/seed.")
+            messagebox.showerror(tr("Params Error"), tr("Enter valid numbers for samples/steps/η/seed."))
             return
         for key in ("n", "seed"):
             kwargs.pop(key, None)
         folder = self.image_dir
         self.img_quality_btn.config(state=tk.DISABLED)
         self.img_status_label.config(
-            text=f"Status: measuring quality — generating up to {QUALITY_IMAGES} images… 📏")
+            text=tr("Status: measuring quality — generating up to {QUALITY_IMAGES} images… 📏", QUALITY_IMAGES=QUALITY_IMAGES))
 
         def run():
             try:
                 result = engine.evaluate(folder, n=QUALITY_IMAGES, **kwargs)
                 floor = result.get("real_floor")
-                floor_txt = (f"; two sets of real images score {floor:.1f}"
-                             if floor is not None else "")
+                floor_txt = ("; " + tr("two sets of real images score {value:.1f}",
+                                       value=floor) if floor is not None else "")
                 levels = " / ".join(f"{k}px {v:.1f}" for k, v in result["levels"].items())
-                msg = (f"Status: quality — SWD {result['swd']:.1f} (lower is better{floor_txt}) "
-                       f"· {levels} · {result['images']} images · "
-                       f"{_fmt_duration(float(result['seconds']))}")
+                msg = tr("Status: quality — SWD {swd:.1f} (lower is better{floor}) · {levels} · "
+                         "{n} images · {time}", swd=result["swd"], floor=floor_txt,
+                         levels=levels, n=result["images"],
+                         time=_fmt_duration(float(result["seconds"])))
                 self.root.after(0, lambda m=msg: self.img_status_label.config(text=m))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "measuring the quality", title="Quality Error"))
+                    exc, tr("measuring the quality"), title=tr("Quality Error")))
             finally:
                 self.root.after(0, lambda: self.img_quality_btn.config(state=tk.NORMAL))
 
@@ -878,7 +897,7 @@ class ImageTabMixin:
     def save_generated_images(self):
         if not self._last_generated_images:
             return
-        d = filedialog.askdirectory(title="Save generated images to…")
+        d = filedialog.askdirectory(title=tr("Save generated images to…"))
         if not d:
             return
         try:
@@ -891,31 +910,31 @@ class ImageTabMixin:
                 save_image_grid(self._last_generated_images, os.path.join(d, "grid.png"))
                 extra = " + grid.png"
             self.img_status_label.config(
-                text=f"Status: saved {len(self._last_generated_images)} image(s){extra} to {d}")
+                text=tr("Status: saved {n} image(s){extra} to {folder}", n=len(self._last_generated_images), extra=extra, folder=d))
         except Exception as e:
-            self.report_error(e, "saving", title="Save Error")
+            self.report_error(e, tr("saving"), title=tr("Save Error"))
 
 
     def save_image_model(self):
         if self.image_engine is None or self.image_engine.model is None:
             return
         path = filedialog.asksaveasfilename(
-            title="Save image generator", defaultextension=".pt",
-            filetypes=_IMAGE_CKPT_TYPES[:2])
+            title=tr("Save image generator"), defaultextension=".pt",
+            filetypes=_ckpt_types(_IMAGE_CKPT_TYPES[:2]))
         if not path:
             return
         try:
             self.image_engine.save_model(path)
-            self.img_status_label.config(text=f"Status: model saved to {path}")
+            self.img_status_label.config(text=tr("Status: model saved to {path}", path=path))
         except Exception as e:
-            self.report_error(e, "saving", title="Save Error")
+            self.report_error(e, tr("saving"), title=tr("Save Error"))
 
 
     def load_image_model(self):
         if self.image_engine is None:
             return
         path = filedialog.askopenfilename(
-            title="Load image generator", filetypes=_IMAGE_CKPT_TYPES)
+            title=tr("Load image generator"), filetypes=_ckpt_types())
         if not path:
             return
         try:
@@ -923,18 +942,18 @@ class ImageTabMixin:
             self.image_is_trained = True
             self._image_model_ready()
             names = list(self.image_engine.class_names)
-            classes = f", {len(names)} classes" if names else ""
+            classes = ", " + tr("{n} classes", n=len(names)) if names else ""
             kind = str(cfg.get("model_type") or "diffusion")
             if kind == "gan":
-                detail = (f"GAN, latent {cfg.get('latent_dim')}, "
-                          f"{'with' if self.image_engine.discriminator is not None else 'no'} "
-                          f"discriminator")
+                detail = (tr("GAN, latent {n}, with discriminator", n=cfg.get("latent_dim"))
+                          if self.image_engine.discriminator is not None else
+                          tr("GAN, latent {n}, no discriminator", n=cfg.get("latent_dim")))
             elif kind == "flow":
-                detail = "flow matching"
+                detail = tr("flow matching")
             else:
                 detail = f"pred={cfg.get('prediction_type')}, {cfg.get('schedule')}"
             self.img_status_label.config(
-                text=f"Status: loaded {cfg.get('img_size')}px {cfg.get('channels')}ch model "
-                     f"({detail}{classes}).")
+                text=tr("Status: loaded {value}px {value2}ch model "
+                     "({detail}{classes}).", value=cfg.get('img_size'), value2=cfg.get('channels'), detail=detail, classes=classes))
         except Exception as e:
-            self.report_error(e, "loading the image generator", title="Load Error")
+            self.report_error(e, tr("loading the image generator"), title=tr("Load Error"))

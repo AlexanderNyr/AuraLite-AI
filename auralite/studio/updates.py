@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from auralite import bundle
+from auralite.i18n import tr
 
 __all__ = ["APP_UPDATE_URL", "UPDATE_URL", "UpdateInfo", "check_for_update", "version_tuple"]
 
@@ -46,18 +47,19 @@ class UpdateInfo:
 
     def message(self) -> str:
         if self.error:
-            return f"Could not check for updates ({self.error})."
+            return tr("Could not check for updates ({error}).", error=self.error)
         if self.newer:
             if not self.app:
                 how = bundle.update_hint(app=False)
             elif self.download:
                 how = bundle.update_hint(self.download, app=True)
             else:
-                how = (f"Its {bundle.platform_tag()} app is not on the download page yet - "
-                       f"check again later: {RELEASES_URL}")
-            return (f"AuraLite {self.latest} is out (you have {self.current}).\n\n"
-                    f"{how}\nWhat is new: {RELEASES_URL}")
-        return f"AuraLite {self.current} is the latest version."
+                how = tr("Its {platform} app is not on the download page yet - check again "
+                         "later: {url}", platform=bundle.platform_tag(), url=RELEASES_URL)
+            return (tr("AuraLite {latest} is out (you have {current}).", latest=self.latest,
+                       current=self.current) + "\n\n" + how + "\n"
+                    + tr("What is new: {url}", url=RELEASES_URL))
+        return tr("AuraLite {current} is the latest version.", current=self.current)
 
 
 def _fetch(url: str, timeout: float) -> dict:

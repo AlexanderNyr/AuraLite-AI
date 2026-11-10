@@ -13,6 +13,7 @@ from auralite import runs as runlib
 from ..hardware import Hardware
 from ..startinfo import fit_lines, interrupted_text
 from .common import heading, hint, primary
+from ..i18n import tr
 
 if TYPE_CHECKING:
     from .window import MainWindow
@@ -33,10 +34,10 @@ class StartTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
-        layout.addWidget(heading("Welcome to AuraLite Studio", 17))
-        layout.addWidget(hint("Train language models on your own computer: make a ready model "
+        layout.addWidget(heading(tr("Welcome to AuraLite Studio"), 17))
+        layout.addWidget(hint(tr("Train language models on your own computer: make a ready model "
                               "answer your way (fine-tuning), or grow a new one from your texts. "
-                              "Nothing leaves this computer."))
+                              "Nothing leaves this computer.")))
 
         # 2.20: a run that was interrupted (a crash, a power cut) continues from here
         self.interrupted, interrupted_layout = _card()
@@ -45,9 +46,9 @@ class StartTab(QWidget):
         self.interrupted_label.setTextFormat(Qt.TextFormat.RichText)
         interrupted_layout.addWidget(self.interrupted_label)
         line = QHBoxLayout()
-        self.continue_interrupted = primary(QPushButton("Continue it"))
-        self.show_interrupted = QPushButton("Show in the library")
-        self.dismiss_interrupted = QPushButton("Dismiss")
+        self.continue_interrupted = primary(QPushButton(tr("Continue it")))
+        self.show_interrupted = QPushButton(tr("Show in the library"))
+        self.dismiss_interrupted = QPushButton(tr("Dismiss"))
         for button in (self.continue_interrupted, self.show_interrupted,
                        self.dismiss_interrupted):
             line.addWidget(button)
@@ -60,32 +61,32 @@ class StartTab(QWidget):
         grid = QGridLayout()
         grid.setSpacing(12)
         actions, actions_layout = _card()
-        actions_layout.addWidget(heading("What do you want to do?", 12))
+        actions_layout.addWidget(heading(tr("What do you want to do?"), 12))
         self.finetune_button = self._choice(
-            "Fine-tune a ready model  (recommended)",
-            "Qwen, Llama, Mistral or SmolLM2 learns from your dialogs or texts")
+            tr("Fine-tune a ready model  (recommended)"),
+            tr("Qwen, Llama, Mistral or SmolLM2 learns from your dialogs or texts"))
         self.train_button = self._choice(
-            "Train a new model from scratch",
-            "A small model of your own, from your texts: architecture and tokenizer included")
-        self.open_button = self._choice("Open a model…",
-                                        "An AuraLite checkpoint (.pt) to chat with, train "
-                                        "further or export")
+            tr("Train a new model from scratch"),
+            tr("A small model of your own, from your texts: architecture and tokenizer included"))
+        self.open_button = self._choice(tr("Open a model…"),
+                                        tr("An AuraLite checkpoint (.pt) to chat with, train "
+                                           "further or export"))
         for button in (self.finetune_button, self.train_button, self.open_button):
             actions_layout.addWidget(button)
         actions_layout.addStretch(1)
         grid.addWidget(actions, 0, 0)
 
         computer, computer_layout = _card()
-        computer_layout.addWidget(heading("This computer", 12))
-        self.hardware_label = QLabel("Looking at this computer…")
+        computer_layout.addWidget(heading(tr("This computer"), 12))
+        self.hardware_label = QLabel(tr("Looking at this computer…"))
         self.hardware_label.setWordWrap(True)
         self.hardware_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         computer_layout.addWidget(self.hardware_label)
-        self.speed_button = QPushButton("Run the speed test (1 s)")
-        self.speed_button.setToolTip("Times a matrix product with the threads AuraLite trains "
-                                     "with: the time estimates use it")
+        self.speed_button = QPushButton(tr("Run the speed test (1 s)"))
+        self.speed_button.setToolTip(tr("Times a matrix product with the threads AuraLite trains "
+                                     "with: the time estimates use it"))
         computer_layout.addWidget(self.speed_button)
-        computer_layout.addWidget(heading("What fits", 12))
+        computer_layout.addWidget(heading(tr("What fits"), 12))
         self.fit_label = QLabel("…")
         self.fit_label.setWordWrap(True)
         self.fit_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -94,11 +95,11 @@ class StartTab(QWidget):
         grid.addWidget(computer, 0, 1)
 
         recent, recent_layout = _card()
-        recent_layout.addWidget(heading("Recent models", 12))
+        recent_layout.addWidget(heading(tr("Recent models"), 12))
         self.recent = QListWidget()
         self.recent.setMaximumHeight(130)
         recent_layout.addWidget(self.recent)
-        recent_layout.addWidget(hint("Double-click to open."))
+        recent_layout.addWidget(hint(tr("Double-click to open.")))
         grid.addWidget(recent, 1, 0, 1, 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -151,11 +152,11 @@ class StartTab(QWidget):
 
     def show_hardware(self, hw: Hardware | None) -> None:
         if hw is None:
-            self.hardware_label.setText("Could not look at this computer.")
+            self.hardware_label.setText(tr("Could not look at this computer."))
             return
         self.hardware_label.setText("\n".join(hw.summary_lines()))
-        self.speed_button.setText("Run the speed test again" if hw.gflops
-                                  else "Run the speed test (1 s)")
+        self.speed_button.setText(tr("Run the speed test again") if hw.gflops
+                                  else tr("Run the speed test (1 s)"))
         self.fit_label.setText("\n".join(fit_lines(hw)))         # 2.26: shared with tk
 
     def refresh_recent(self) -> None:
@@ -167,7 +168,7 @@ class StartTab(QWidget):
                 item.setForeground(self.palette().color(self.palette().ColorRole.PlaceholderText))
             self.recent.addItem(item)
         if not self.studio.settings.recent_models:
-            self.recent.addItem("No models yet - the ones you train, open or save appear here.")
+            self.recent.addItem(tr("No models yet - the ones you train, open or save appear here."))
 
     def _open_recent(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)

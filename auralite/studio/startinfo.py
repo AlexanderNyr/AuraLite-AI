@@ -6,6 +6,7 @@ from typing import Any
 
 from .advisor import Recommendation, recommend_finetune
 from .hardware import Hardware, format_gb
+from .i18n import tr
 from .progress import format_duration
 
 __all__ = ["fit_lines", "interrupted_text"]
@@ -16,30 +17,32 @@ def fit_lines(hw: Hardware, rec: Recommendation | None = None) -> list[str]:
     memory and time, the biggest that fits, the warnings - and whether the times are
     measured (the speed test) or rough."""
     rec = rec if rec is not None else recommend_finetune(hw)
-    lines = [f"Memory a run may use: {format_gb(rec.budget)}"]
+    lines = [tr("Memory a run may use: {size}", size=format_gb(rec.budget))]
     choice = rec.choice
     if choice is None:
-        lines.append("None of the catalog's models fits: a small model trained from "
-                     "scratch does")
+        lines.append(tr("None of the catalog's models fits: a small model trained from "
+                        "scratch does"))
     else:
-        lines.append(f"Recommended to fine-tune: {choice.model.name}, "
-                     f"{choice.method_label}")
-        speed = (f", ~{choice.tokens_per_second:,.0f} tokens/s"
-                 if choice.tokens_per_second else "")
-        hours = (f", ~{format_duration(choice.hours * 3600)} for 1,000 dialogs "
-                 f"(2 passes)" if choice.hours is not None else "")
-        lines.append(f"about {format_gb(choice.memory)} of memory{speed}{hours}")
+        lines.append(tr("Recommended to fine-tune: {model}, {method}", model=choice.model.name,
+                        method=choice.method_label))
+        line = tr("about {size} of memory", size=format_gb(choice.memory))
+        if choice.tokens_per_second:
+            line += ", " + tr("~{speed:,.0f} tokens/s", speed=choice.tokens_per_second)
+        if choice.hours is not None:
+            line += ", " + tr("~{time} for 1,000 dialogs (2 passes)",
+                              time=format_duration(choice.hours * 3600))
+        lines.append(line)
     usable = [f for f in rec.options if f.usable]
     if usable:
         biggest = max(usable, key=lambda f: f.model.params)
         if choice is None or biggest.model is not choice.model:
             took = (f", ~{format_duration(biggest.hours * 3600)}"
                     if biggest.hours is not None else "")
-            lines.append(f"The biggest that fits: {biggest.model.name} "
-                         f"({biggest.method_label}{took})")
+            lines.append(tr("The biggest that fits: {model} ({method}{time})",
+                            model=biggest.model.name, method=biggest.method_label, time=took))
     lines += rec.warnings
     if not rec.measured:
-        lines.append("Times are rough until the speed test runs.")
+        lines.append(tr("Times are rough until the speed test runs."))
     return lines
 
 
@@ -49,13 +52,14 @@ def interrupted_text(run: Any, others: int = 0) -> tuple[str, str]:
     from auralite import runs as runlib
     step = run.progress.get("step")
     saved = run.record.get("checkpoint_saved") or {}
-    rest = " " + str(run.name) + (f", at step {int(step):,}" if step else "") + ". "
+    rest = " " + str(run.name) + (", " + tr("at step {step:,}", step=int(step))
+                                  if step else "") + ". "
     if saved.get("step"):
-        rest += (f"Its checkpoint is from step {int(saved['step']):,} "
-                 f"({runlib.format_when(saved.get('time'))}); it continues from there "
-                 f"exactly as it would have gone on.")
+        rest += tr("Its checkpoint is from step {step:,} ({when}); it continues from there "
+                   "exactly as it would have gone on.", step=int(saved["step"]),
+                   when=runlib.format_when(saved.get("time")))
     else:                    # 2.26: a sentence of its own ("... step 24. it continues" before)
-        rest += "It continues from its checkpoint exactly as it would have gone on."
+        rest += tr("It continues from its checkpoint exactly as it would have gone on.")
     if others > 0:
-        rest += f" ({others} more in the library.)"
-    return "A run was interrupted:", rest
+        rest += " " + tr("({n} more in the library.)", n=others)
+    return tr("A run was interrupted:"), rest

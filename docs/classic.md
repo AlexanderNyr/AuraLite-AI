@@ -41,7 +41,10 @@ The menu bar the Studio has:
 - **File** — *Open a model…* (Ctrl+O; `.pt` and `.gguf`), *Save the model as…* (Ctrl+S),
   *Recent models* (the last eight opened or saved), *Quit* (Ctrl+Q).
 - **View** — *Dark theme*, remembered for the next start (the switch in the footer is
-  the same).
+  the same); *Language* (2.28): *Automatic (the computer's language)*, English or
+  Russian, spoken from the next start — it offers to restart now (not while a run goes on;
+  save the model first). The footer's language switch is the same:
+  [docs/studio.md](studio.md#the-interfaces-language-228).
 - **Tools** — *Benchmark…*: how fast this computer trains and writes three sizes of a new
   model and, if asked, a fine-tune of a catalog model or of one already downloaded (a
   folder or a checkpoint); the report goes to `~/.auralite/bench`
@@ -53,7 +56,7 @@ The menu bar the Studio has:
 - **Help** — *Guide* (F1: this page), *Check for updates…*, *About AuraLite*.
 
 The footer shows the memory the app uses (every five seconds) and the last speed test.
-The settings — the recent models, the theme, the speed test, the window's size — are in
+The settings — the recent models, the theme, the language, the speed test, the window's size — are in
 `gui_config.json` in the AuraLite folder (`~/.auralite`, or `AURALITE_HOME`).
 
 ## What is where

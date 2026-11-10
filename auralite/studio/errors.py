@@ -12,16 +12,17 @@ import traceback
 from dataclasses import dataclass, field
 
 from auralite import bundle
+from auralite.i18n import N_, tr
 
 __all__ = ["FriendlyError", "explain_error"]
 
 #: Optional packages and the extra that installs them (2.21: kept in auralite.bundle).
 _EXTRAS = bundle.EXTRAS
 
-_MEMORY_HINTS = ["Fine-tune with the 4-bit base (QLoRA) and 8-bit AdamW",
-                 "Keep «Memory plan» on auto: it splits the batch and recomputes activations",
-                 "Use shorter windows (sequence length) or a smaller model",
-                 "Close other programs - or train on a computer with more memory"]
+_MEMORY_HINTS = [N_("Fine-tune with the 4-bit base (QLoRA) and 8-bit AdamW"),
+                 N_("Keep «Memory plan» on auto: it splits the batch and recomputes activations"),
+                 N_("Use shorter windows (sequence length) or a smaller model"),
+                 N_("Close other programs - or train on a computer with more memory")]
 
 
 @dataclass
@@ -39,7 +40,7 @@ class FriendlyError:
         """Title, message and hints as plain text."""
         lines = [self.title, "", self.message]
         if self.hints:
-            lines += ["", "What to try:"] + [f"- {hint}" for hint in self.hints]
+            lines += ["", tr("What to try:")] + [f"- {hint}" for hint in self.hints]
         return "\n".join(lines)
 
 
@@ -87,23 +88,23 @@ def _library_hints(text: str) -> list[str]:
     if "shared object" in low:                              # Linux
         if any(s in low for s in ("xkbcommon", "libegl", "fontconfig", "libdbus", "qt6",
                                   "pyside")):
-            return ["Install what Qt needs: sudo apt install libxkbcommon0 libegl1 "
-                    "libfontconfig1 libdbus-1-3 (Debian / Ubuntu)"]
-        return ["Install the system package that has this library, then start AuraLite "
-                "again"]
-    hints = [f"Install the latest Microsoft Visual C++ Redistributable (x64) - {VC_REDIST} "
-             f"- then start AuraLite again"]
+            return [tr("Install what Qt needs: sudo apt install libxkbcommon0 libegl1 "
+                       "libfontconfig1 libdbus-1-3 (Debian / Ubuntu)")]
+        return [tr("Install the system package that has this library, then start AuraLite "
+                   "again")]
+    hints = [tr("Install the latest Microsoft Visual C++ Redistributable (x64) - {url} - then "
+                "start AuraLite again", url=VC_REDIST)]
     if bundle.packaged():                  # 2.21: the app brings its own Qt and PyTorch
-        return hints + ["Unzip the app again into a new, empty folder - a file may be missing "
-                        f"or blocked by an antivirus: {bundle.DOWNLOAD_URL}",
-                        "AuraLite Studio needs Windows 10 (version 1809) or newer"]
+        return hints + [tr("Unzip the app again into a new, empty folder - a file may be "
+                           "missing or blocked by an antivirus: {url}", url=bundle.DOWNLOAD_URL),
+                        tr("AuraLite Studio needs Windows 10 (version 1809) or newer")]
     if any(s in low for s in ("qt", "pyside", "shiboken")):
-        hints += ['Update Qt for Python: pip install -U "PySide6-Essentials>=6.9.3"',
-                  "Qt 6 needs Windows 10 (version 1809) or newer"]
+        hints += [tr('Update Qt for Python: pip install -U "PySide6-Essentials>=6.9.3"'),
+                  tr("Qt 6 needs Windows 10 (version 1809) or newer")]
     elif any(s in low for s in ("torch", "c10.dll")):
-        hints += ['Update Qt for Python, whose old runtime can stop PyTorch from loading: '
-                  'pip install -U "PySide6-Essentials>=6.9.3"',
-                  "Or reinstall PyTorch: pip install --force-reinstall torch"]
+        hints += [tr('Update Qt for Python, whose old runtime can stop PyTorch from loading: '
+                     'pip install -U "PySide6-Essentials>=6.9.3"'),
+                  tr("Or reinstall PyTorch: pip install --force-reinstall torch")]
     return hints
 
 
@@ -118,74 +119,80 @@ def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
         return FriendlyError(title, text, hints, kind, details)
 
     if isinstance(exc, KeyboardInterrupt):
-        return make("Stopped", "Stopped before it finished.", [], "stopped")
+        return make(tr("Stopped"), tr("Stopped before it finished."), [], "stopped")
     if any(_is_memory(e) for e in chain):
-        return make("Not enough memory",
-                    "The computer ran out of memory" + (f" during {action}" if action else "")
-                    + ".", list(_MEMORY_HINTS), "memory")
+        return make(tr("Not enough memory"),
+                    tr("The computer ran out of memory during {action}.", action=action)
+                    if action else tr("The computer ran out of memory."),
+                    [tr(hint) for hint in _MEMORY_HINTS], "memory")
     for e in chain:
         if _is_library(e):
-            return make("A library would not load", str(e).strip() or message,
+            return make(tr("A library would not load"), str(e).strip() or message,
                         _library_hints(str(e)), "library")
     for e in chain:
         if isinstance(e, ModuleNotFoundError) and e.name:
             top = e.name.split(".")[0]
             # 2.21: in the app, what it leaves out and where that comes with
-            return make("A package is missing", f"This needs the optional package «{top}».",
+            return make(tr("A package is missing"),
+                        tr("This needs the optional package «{package}».", package=top),
                         bundle.missing_part(top, _EXTRAS.get(top, "")), "missing_package")
     for e in chain:
         if isinstance(e, OSError) and getattr(e, "errno", None) == errno.ENOSPC:
-            return make("The disk is full", f"There is no space left on the disk: {e}",
-                        ["Free some space, or keep models on another disk "
-                         "(set AURALITE_HOME to a folder there)"], "disk")
+            return make(tr("The disk is full"),
+                        tr("There is no space left on the disk: {error}", error=e),
+                        [tr("Free some space, or keep models on another disk (set "
+                            "AURALITE_HOME to a folder there)")], "disk")
     low = message.lower()
     if "gated or private" in low or "http 401" in low or "http 403" in low:
-        return make("The model needs your permission",
+        return make(tr("The model needs your permission"),
                     message,
-                    ["Open the model's page on huggingface.co, sign in and accept its license",
-                     "Create a token at huggingface.co/settings/tokens and set it as HF_TOKEN "
-                     "(or run: huggingface-cli login)",
-                     "Or pick a model that is not gated (Qwen, SmolLM2)"], "gated")
+                    [tr("Open the model's page on huggingface.co, sign in and accept its "
+                        "license"),
+                     tr("Create a token at huggingface.co/settings/tokens and set it as "
+                        "HF_TOKEN (or run: huggingface-cli login)"),
+                     tr("Or pick a model that is not gated (Qwen, SmolLM2)")], "gated")
     for e in chain:
         name = type(e).__name__
         text = str(e).lower()
         if name in ("URLError", "ConnectionError", "TimeoutError", "timeout",
                     "gaierror", "RemoteDisconnected") or "could not download" in text \
                 or "name or service not known" in text or "timed out" in text:
-            return make("No connection",
-                        f"The download did not work: {e}",
-                        ["Check the internet connection and try again - the download "
-                         "continues where it stopped",
-                         "Or download the model folder elsewhere and choose it as a folder"],
+            return make(tr("No connection"),
+                        tr("The download did not work: {error}", error=e),
+                        [tr("Check the internet connection and try again - the download "
+                            "continues where it stopped"),
+                         tr("Or download the model folder elsewhere and choose it as a folder")],
                         "network")
     if isinstance(exc, PermissionError):
-        return make("No permission", f"AuraLite may not write or read here: {exc}",
-                    ["Choose a folder in your user folder (Documents, Desktop)",
-                     "Close programs that have the file open"], "permission")
+        return make(tr("No permission"),
+                    tr("AuraLite may not write or read here: {error}", error=exc),
+                    [tr("Choose a folder in your user folder (Documents, Desktop)"),
+                     tr("Close programs that have the file open")], "permission")
     if isinstance(exc, FileNotFoundError):
-        return make("Not found", message,
-                    ["Check the path or the model name (ORG/NAME on huggingface.co)"],
+        return make(tr("Not found"), message,
+                    [tr("Check the path or the model name (ORG/NAME on huggingface.co)")],
                     "not_found")
     kind_name = type(exc).__name__
     if kind_name == "HFModelError":
-        return make("This model cannot be used here", message,
-                    ["AuraLite's engine imports Llama, Mistral, Qwen2 / Qwen2.5 and Qwen3 "
-                     "models",
-                     "Other models run through transformers: the classic interface's "
-                     "Model tab (pip install \"auralite-ai[hf]\")"
-                     + (" - AuraLite installed with Python, not this app"
+        return make(tr("This model cannot be used here"), message,
+                    [tr("AuraLite's engine imports Llama, Mistral, Qwen2 / Qwen2.5 and Qwen3 "
+                        "models"),
+                     tr("Other models run through transformers: the classic interface's "
+                        "Model tab (pip install \"auralite-ai[hf]\")")
+                     + (" - " + tr("AuraLite installed with Python, not this app")
                         if bundle.packaged() else "")], "model")
     if kind_name == "DataFormatError":
-        return make("The data cannot be used", message,
-                    ["Dialogs: a .jsonl file with one {\"messages\": [...]} per line "
-                     "(OpenAI, ShareGPT and Alpaca records work too)",
-                     "Preference pairs: {\"prompt\", \"chosen\", \"rejected\"} per line",
-                     "Plain text: .txt files, or a folder of them (UTF-8)"], "data")
+        return make(tr("The data cannot be used"), message,
+                    [tr("Dialogs: a .jsonl file with one {\"messages\": [...]} per line "
+                        "(OpenAI, ShareGPT and Alpaca records work too)"),
+                     tr("Preference pairs: {\"prompt\", \"chosen\", \"rejected\"} per line"),
+                     tr("Plain text: .txt files, or a folder of them (UTF-8)")], "data")
     if kind_name in ("ParamValidationError", "SettingsError"):
-        return make("Check the settings", message, [], "settings")
+        return make(tr("Check the settings"), message, [], "settings")
     if kind_name == "TokenizerFormatError":
-        return make("The tokenizer cannot be read", message,
-                    ["Use the model's own tokenizer.json, or let AuraLite train one"], "data")
-    title = f"{action[:1].upper()}{action[1:]} failed" if action else "Something went wrong"
+        return make(tr("The tokenizer cannot be read"), message,
+                    [tr("Use the model's own tokenizer.json, or let AuraLite train one")], "data")
+    title = tr("{Action} failed", Action=action[:1].upper() + action[1:], action=action) \
+        if action else tr("Something went wrong")
     return make(title, message,
-                ["The log has the details (Tools → Open the log folder)"], "unknown")
+                [tr("The log has the details (Tools → Open the log folder)")], "unknown")

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBo
                                QPushButton, QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
 from .. import imagegen
-from ..i18n import tr
+from ..i18n import N_, tr
 from ..recipes import SettingsError
 from .common import (Job, ask_dir, ask_open, ask_save, compact_spins, confirm, heading, hint,
                      package_note, primary, show_error)
@@ -31,8 +31,8 @@ from .widgets import CurveChart
 if TYPE_CHECKING:
     from .window import MainWindow
 
-SAVE_FILTERS = "PyTorch checkpoint (*.pt);;safetensors, no pickle (*.safetensors)"
-OPEN_FILTERS = "Image generators (*.pt *.safetensors);;All files (*)"
+SAVE_FILTERS = N_("PyTorch checkpoint (*.pt);;safetensors, no pickle (*.safetensors)")
+OPEN_FILTERS = N_("Image generators (*.pt *.safetensors);;All files (*)")
 #: The widest the preview grows (pixels): small images are enlarged up to it.
 PREVIEW_WIDTH = 640
 
@@ -104,8 +104,9 @@ class ImagesTab(QWidget):
         preset_row.addWidget(QLabel(tr("Preset:")))
         self.preset = QComboBox()
         from auralite.image_engine import IMAGE_PRESETS
-        self.preset.addItems(list(IMAGE_PRESETS))
-        self.preset.setCurrentText("Small (default)")
+        for name in IMAGE_PRESETS:                      # 2.28: shown translated
+            self.preset.addItem(tr(name), name)
+        self.preset.setCurrentIndex(max(0, self.preset.findData("Small (default)")))
         preset_row.addWidget(self.preset)
         self.preset_button = QPushButton(tr("Apply the preset"))
         preset_row.addWidget(self.preset_button)
@@ -375,7 +376,7 @@ class ImagesTab(QWidget):
         self.class_choice.setCurrentIndex(max(0, index))
 
     def apply_preset(self) -> None:
-        name = self.preset.currentText()
+        name = str(self.preset.currentData() or self.preset.currentText())
         values = imagegen.preset_values(name)
         if not values:
             return
@@ -559,7 +560,7 @@ class ImagesTab(QWidget):
             self.unsaved = True
         if self.val_losses and self.d_losses:
             best = min(self.val_losses, key=lambda p: p[1])
-            text += " " + tr("Best validation SWD {v:.2f} (epoch {e}).", v=best[1], e=int(best[0]))
+            text += " " + tr("Best validation SWD {v:.2f} (epoch {error}).", v=best[1], error=int(best[0]))
         self._set_bar(100.0 if not stopped else self.bar.value() / 10.0)
         self.status.setText(text)
         if engine is not None and engine.model is not None:
@@ -685,13 +686,13 @@ class ImagesTab(QWidget):
             for i, image in enumerate(self.images):
                 path = os.path.join(folder, f"sample_{i:03d}.png")
                 if not to_qimage(image).save(path, "PNG"):
-                    raise OSError(f"could not write {path}")
+                    raise OSError(tr("could not write {path}", path=path))
                 written.append(path)
             if len(self.images) > 1:
                 from auralite.image_engine import make_image_grid
                 path = os.path.join(folder, "grid.png")
                 if not to_qimage(make_image_grid(self.images)).save(path, "PNG"):
-                    raise OSError(f"could not write {path}")
+                    raise OSError(tr("could not write {path}", path=path))
                 written.append(path)
         except OSError as err:
             show_error(self, err, tr("saving the images"))
@@ -704,7 +705,7 @@ class ImagesTab(QWidget):
     def save_model(self) -> None:
         if not self.has_model():
             return
-        path = ask_save(self, tr("Save the image generator"), SAVE_FILTERS, "image_model.pt")
+        path = ask_save(self, tr("Save the image generator"), tr(SAVE_FILTERS), "image_model.pt")
         if not path:
             return
         if not os.path.splitext(path)[1]:
@@ -718,7 +719,7 @@ class ImagesTab(QWidget):
         self.status.setText(tr("Saved the image generator in {path}.", path=path))
 
     def open_model(self) -> None:
-        path = ask_open(self, tr("Open an image generator"), OPEN_FILTERS)
+        path = ask_open(self, tr("Open an image generator"), tr(OPEN_FILTERS))
         if path:
             self.load_model(path)
 

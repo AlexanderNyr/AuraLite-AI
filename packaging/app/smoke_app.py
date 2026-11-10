@@ -1,7 +1,7 @@
 """Check a built AuraLite app the way a user meets it (2.21) - CI runs it after every build.
 
-    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.27.0-windows-x64.zip
-    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.27.0
+    python packaging/app/smoke_app.py dist/AuraLite-Studio-2.28.0-windows-x64.zip
+    python packaging/app/smoke_app.py dist/app/AuraLite-Studio-2.28.0
 
 A zip is unzipped first, into a folder whose path has a space and letters outside ASCII.
 Everything runs as under a Windows user name in Russian (2.21.1): the app's data
@@ -198,6 +198,8 @@ class Smoke:
         code, out = self.run([str(self.studio), "--self-test"], no_console=WINDOWS)
         text = self.log("studio-self-test.txt")
         ok = code == 0 and "RESULT: OK" in text and "Installed: the AuraLite Studio app" in text
+        # 2.28: the interface's Russian catalogue is in the app (the spec's datas)
+        ok = ok and "Languages: English, ru " in text and "ru 0 strings" not in text
         if WINDOWS:
             # the Visual C++ runtime is the app's own: msvcp140.dll loaded first from it, and
             # PyTorch's vcruntime140_threads.dll from its folder (rthook_vcruntime.py)

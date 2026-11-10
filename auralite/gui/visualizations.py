@@ -9,6 +9,7 @@ Matplotlib stays optional — :func:`available` reports whether it is importable
 and the GUI simply hides the buttons when it is not.
 """
 from __future__ import annotations
+from .i18n import tr
 
 __all__ = ["available", "plot_attention_heatmap", "plot_loss_curve",
            "plot_token_distribution"]
@@ -33,14 +34,14 @@ def plot_token_distribution(ax, pairs, top: int = 20, title: str | None = None):
     pairs = list(pairs or [])[: max(1, int(top))]
     ax.clear()
     if not pairs:
-        ax.set_title(title or "Token frequency (empty)")
+        ax.set_title(title or tr("Token frequency (empty)"))
         return ax
     labels = [_visible(token) for token, _ in pairs]
     values = [count for _, count in pairs]
     ax.bar(range(len(values)), values)
     ax.set_xticks(range(len(labels)), labels, rotation=90)
-    ax.set_ylabel("count")
-    ax.set_title(title or "Token frequency")
+    ax.set_ylabel(tr("count"))
+    ax.set_title(title or tr("Token frequency"))
     return ax
 
 
@@ -54,7 +55,7 @@ def plot_attention_heatmap(ax, matrix, tokens=None, title: str | None = None,
     """
     ax.clear()
     if matrix is None or getattr(matrix, "size", 0) == 0:
-        ax.set_title(title or "Attention (empty)")
+        ax.set_title(title or tr("Attention (empty)"))
         return ax
     import numpy as np
     data = np.asarray(matrix, dtype=float)
@@ -68,7 +69,7 @@ def plot_attention_heatmap(ax, matrix, tokens=None, title: str | None = None,
         labels = [_visible(t) for t in list(tokens)[:size]]
         ax.set_xticks(range(len(labels)), labels, rotation=90)
         ax.set_yticks(range(len(labels)), labels)
-    ax.set_title(title or "Attention heatmap")
+    ax.set_title(title or tr("Attention heatmap"))
     return ax
 
 
@@ -81,16 +82,16 @@ def plot_loss_curve(ax, history, val_history=None, title: str | None = None):
     ax.clear()
     train = _as_series(history)
     if not train and not val_history:
-        ax.set_title(title or "Loss (no data)")
+        ax.set_title(title or tr("Loss (no data)"))
         return ax
-    ax.plot(range(1, len(train) + 1), train, label="train")
+    ax.plot(range(1, len(train) + 1), train, label=tr("train"))
     val = _as_series(val_history) if val_history else []
     if val:
-        ax.plot(range(1, len(val) + 1), val, label="val")
+        ax.plot(range(1, len(val) + 1), val, label=tr("val"))
         ax.legend()
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("loss")
-    ax.set_title(title or "Training loss")
+    ax.set_xlabel(tr("epoch"))
+    ax.set_ylabel(tr("loss"))
+    ax.set_title(title or tr("Training loss"))
     return ax
 
 

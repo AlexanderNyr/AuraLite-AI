@@ -4,22 +4,23 @@ Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from .. import common as gui_common
 from ..common import (GGUFNotAvailableError, HFNotAvailableError, filedialog, messagebox, os, threading, tk, ttk)
+from ..i18n import N_, tr
 
 class ModelTabMixin:
     def _build_model_tab(self):
         tab = self.tab_model
 
-        io_frame = ttk.LabelFrame(tab, text="  💾  Save / Load  ", padding="12")
+        io_frame = ttk.LabelFrame(tab, text=tr("  💾  Save / Load  "), padding="12")
         io_frame.pack(fill=tk.X, pady=(0, 8))
 
         btn_row = ttk.Frame(io_frame)
         btn_row.pack(pady=4)
 
-        self.save_btn = ttk.Button(btn_row, text="💾 Save Model",
+        self.save_btn = ttk.Button(btn_row, text=tr("💾 Save Model"),
                                    command=self.save_model, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=6)
 
-        self.load_btn = ttk.Button(btn_row, text="📂 Load Model",
+        self.load_btn = ttk.Button(btn_row, text=tr("📂 Load Model"),
                                    command=self.load_model)
         self.load_btn.pack(side=tk.LEFT, padx=6)
 
@@ -27,28 +28,28 @@ class ModelTabMixin:
         # save them alone (a few percent of the model), put them on a base
         lora_row = ttk.Frame(io_frame)
         lora_row.pack(pady=2)
-        self.lora_merge_btn = ttk.Button(lora_row, text="🔗 Merge LoRA",
+        self.lora_merge_btn = ttk.Button(lora_row, text=tr("🔗 Merge LoRA"),
                                          command=self.merge_lora_adapters)
         self.lora_merge_btn.pack(side=tk.LEFT, padx=6)
-        self.lora_save_btn = ttk.Button(lora_row, text="💾 Save LoRA adapter…",
+        self.lora_save_btn = ttk.Button(lora_row, text=tr("💾 Save LoRA adapter…"),
                                         command=self.save_lora_adapter)
         self.lora_save_btn.pack(side=tk.LEFT, padx=6)
-        self.lora_load_btn = ttk.Button(lora_row, text="📂 Load LoRA adapter…",
+        self.lora_load_btn = ttk.Button(lora_row, text=tr("📂 Load LoRA adapter…"),
                                         command=self.load_lora_adapter)
         self.lora_load_btn.pack(side=tk.LEFT, padx=6)
 
-        self.model_file_label = ttk.Label(io_frame, text="No model loaded",
+        self.model_file_label = ttk.Label(io_frame, text=tr("No model loaded"),
                                           foreground="gray")
         self.model_file_label.pack(pady=2)
 
         # ==================================================================
         #  NEW: Hugging Face + LoRA / QLoRA section (any model)
         # ==================================================================
-        hf_frame = ttk.LabelFrame(tab, text="  🤗  Hugging Face — Any Model + LoRA / QLoRA  ",
+        hf_frame = ttk.LabelFrame(tab, text=tr("  🤗  Hugging Face — Any Model + LoRA / QLoRA  "),
                                   padding="12")
         hf_frame.pack(fill=tk.X, pady=(12, 8))
 
-        ttk.Label(hf_frame, text="Model name (HF Hub) or path to local folder:").pack(anchor=tk.W)
+        ttk.Label(hf_frame, text=tr("Model name (HF Hub) or path to local folder:")).pack(anchor=tk.W)
         self.hf_model_var = tk.StringVar(value="Qwen/Qwen2-0.5B-Instruct")
         hf_entry = ttk.Entry(hf_frame, textvariable=self.hf_model_var, font=("Segoe UI", 10))
         hf_entry.pack(fill=tk.X, pady=2)
@@ -57,68 +58,68 @@ class ModelTabMixin:
         browse_row = ttk.Frame(hf_frame)
         browse_row.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Button(browse_row, text="📁 Browse local folder (already downloaded model)",
+        ttk.Button(browse_row, text=tr("📁 Browse local folder (already downloaded model)"),
                    command=self._browse_local_hf_model).pack(side=tk.LEFT)
 
         self.hf_local_only_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(browse_row, text="Use local files only (offline, no internet)",
+        ttk.Checkbutton(browse_row, text=tr("Use local files only (offline, no internet)"),
                         variable=self.hf_local_only_var).pack(side=tk.LEFT, padx=12)
 
         hf_opts = ttk.Frame(hf_frame)
         hf_opts.pack(fill=tk.X, pady=4)
 
         self.hf_4bit_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(hf_opts, text="Load in 4-bit (QLoRA — best for fine-tuning)",
+        ttk.Checkbutton(hf_opts, text=tr("Load in 4-bit (QLoRA — best for fine-tuning)"),
                         variable=self.hf_4bit_var).pack(side=tk.LEFT)
 
         self.hf_8bit_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(hf_opts, text="8-bit", variable=self.hf_8bit_var).pack(side=tk.LEFT, padx=12)
+        ttk.Checkbutton(hf_opts, text=tr("8-bit"), variable=self.hf_8bit_var).pack(side=tk.LEFT, padx=12)
 
         self.hf_apply_lora_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(hf_opts, text="Apply LoRA on load", variable=self.hf_apply_lora_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(hf_opts, text=tr("Apply LoRA on load"), variable=self.hf_apply_lora_var).pack(side=tk.LEFT)
 
         # v2.6.6: off by default — on means "execute Python code from the repo".
         self.hf_trust_remote_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(hf_opts, text="Trust remote code (runs code from the repo)",
+        ttk.Checkbutton(hf_opts, text=tr("Trust remote code (runs code from the repo)"),
                         variable=self.hf_trust_remote_var).pack(side=tk.LEFT, padx=12)
 
         lora_row = ttk.Frame(hf_frame)
         lora_row.pack(fill=tk.X, pady=2)
-        ttk.Label(lora_row, text="LoRA rank:").pack(side=tk.LEFT)
+        ttk.Label(lora_row, text=tr("LoRA rank:")).pack(side=tk.LEFT)
         self.hf_lora_rank_var = tk.StringVar(value="16")
         ttk.Entry(lora_row, textvariable=self.hf_lora_rank_var, width=5).pack(side=tk.LEFT, padx=4)
-        ttk.Label(lora_row, text="(8–64 typical; higher = more capacity)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(lora_row, text=tr("(8–64 typical; higher = more capacity)")).pack(side=tk.LEFT, padx=6)
 
         hf_btn_row = ttk.Frame(hf_frame)
         hf_btn_row.pack(fill=tk.X, pady=6)
 
-        self.hf_load_btn = ttk.Button(hf_btn_row, text="📥 Load HF Model",
+        self.hf_load_btn = ttk.Button(hf_btn_row, text=tr("📥 Load HF Model"),
                                       command=self._load_hf_model)
         self.hf_load_btn.pack(side=tk.LEFT, padx=4)
         # 2.18.1: Llama / Mistral / Qwen2 / Qwen3 into AuraLite's own engine
         # (no transformers; 4-bit = NF4, QLoRA on CPU too)
-        self.hf_native_btn = ttk.Button(hf_btn_row, text="⚙ Import into AuraLite engine",
+        self.hf_native_btn = ttk.Button(hf_btn_row, text=tr("⚙ Import into AuraLite engine"),
                                         command=self._import_hf_native)
         self.hf_native_btn.pack(side=tk.LEFT, padx=4)
 
-        self.hf_apply_lora_btn = ttk.Button(hf_btn_row, text="🔧 Apply LoRA (for fine-tune)",
+        self.hf_apply_lora_btn = ttk.Button(hf_btn_row, text=tr("🔧 Apply LoRA (for fine-tune)"),
                                             command=self._apply_lora_to_hf, state=tk.DISABLED)
         self.hf_apply_lora_btn.pack(side=tk.LEFT, padx=4)
 
-        self.hf_save_lora_btn = ttk.Button(hf_btn_row, text="💾 Save LoRA Adapter",
+        self.hf_save_lora_btn = ttk.Button(hf_btn_row, text=tr("💾 Save LoRA Adapter"),
                                            command=self._save_hf_lora, state=tk.DISABLED)
         self.hf_save_lora_btn.pack(side=tk.LEFT, padx=4)
 
-        self.hf_load_lora_btn = ttk.Button(hf_btn_row, text="📂 Load LoRA Adapter",
+        self.hf_load_lora_btn = ttk.Button(hf_btn_row, text=tr("📂 Load LoRA Adapter"),
                                            command=self._load_hf_lora, state=tk.DISABLED)
         self.hf_load_lora_btn.pack(side=tk.LEFT, padx=4)
 
         # Fine-tune button (works on loaded HF model)
-        self.hf_finetune_btn = ttk.Button(hf_btn_row, text="🚀 Fine-tune (LoRA/QLoRA)",
+        self.hf_finetune_btn = ttk.Button(hf_btn_row, text=tr("🚀 Fine-tune (LoRA/QLoRA)"),
                                           command=self._finetune_hf_from_gui, state=tk.DISABLED)
         self.hf_finetune_btn.pack(side=tk.LEFT, padx=4)
 
-        self.hf_stop_ft_btn = ttk.Button(hf_btn_row, text="⏹ Stop fine-tune",
+        self.hf_stop_ft_btn = ttk.Button(hf_btn_row, text=tr("⏹ Stop fine-tune"),
                                          command=self._stop_hf_finetune, state=tk.DISABLED)
         self.hf_stop_ft_btn.pack(side=tk.LEFT, padx=4)
         self._hf_stop_event = threading.Event()
@@ -127,20 +128,20 @@ class ModelTabMixin:
         hub_row = ttk.Frame(hf_btn_row)
         hub_row.pack(fill=tk.X, pady=(8, 0))
 
-        self.hf_push_btn = ttk.Button(hub_row, text="☁️ Push to Hub",
+        self.hf_push_btn = ttk.Button(hub_row, text=tr("☁️ Push to Hub"),
                                       command=self._push_hf_to_hub, state=tk.DISABLED)
         self.hf_push_btn.pack(side=tk.LEFT, padx=4)
 
-        self.hf_pull_btn = ttk.Button(hub_row, text="📥 Load from Hub",
+        self.hf_pull_btn = ttk.Button(hub_row, text=tr("📥 Load from Hub"),
                                       command=self._load_hf_from_hub)
         self.hf_pull_btn.pack(side=tk.LEFT, padx=4)
 
         ttk.Label(hf_frame,
-                  text="Tip: Use small models first (0.5B–3B). 4-bit + LoRA lets you fine-tune on consumer GPUs.",
+                  text=tr("Tip: Use small models first (0.5B–3B). 4-bit + LoRA lets you fine-tune on consumer GPUs."),
                   style="Sub.TLabel", foreground="#666").pack(anchor=tk.W, pady=(4, 0))
 
         # --- Model info ---
-        info_frame = ttk.LabelFrame(tab, text="  ℹ️  Model Info  ", padding="6")
+        info_frame = ttk.LabelFrame(tab, text=tr("  ℹ️  Model Info  "), padding="6")
         info_frame.pack(fill=tk.BOTH, expand=True)
 
         self.model_info = tk.Text(info_frame, font=("Consolas", 10),
@@ -152,21 +153,21 @@ class ModelTabMixin:
         if self.engine.is_gguf_model():
             messagebox.showinfo(
                 "GGUF",
-                ".gguf is an external inference-only model file. It cannot be "
-                "saved as an AuraLite .pt checkpoint; keep/copy the original .gguf file."
+                tr(".gguf is an external inference-only model file. It cannot be "
+                "saved as an AuraLite .pt checkpoint; keep/copy the original .gguf file.")
             )
             return
         if self.engine.is_hf_model():
             messagebox.showinfo(
-                "Hugging Face",
-                "Hugging Face models are managed separately. Save adapters via 'Save LoRA Adapter' "
-                "or use the Hub / save_pretrained workflow instead of AuraLite .pt saving."
+                tr("Hugging Face"),
+                tr("Hugging Face models are managed separately. Save adapters via 'Save LoRA Adapter' "
+                "or use the Hub / save_pretrained workflow instead of AuraLite .pt saving.")
             )
             return
         path = filedialog.asksaveasfilename(
-            title="Save Model",
+            title=tr("Save Model"),
             defaultextension=".pt",
-            filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")],
+            filetypes=[(tr("PyTorch model"), "*.pt"), (tr("All files"), "*.*")],
         )
         if not path:
             return
@@ -176,17 +177,17 @@ class ModelTabMixin:
             if remember is not None:
                 remember(path)
             self.model_file_label.config(
-                text=f"Saved: {os.path.basename(path)}", foreground="black")
-            messagebox.showinfo("Saved",
-                                f"Model saved to:\n{path}")
+                text=tr("Saved: {name}", name=os.path.basename(path)), foreground="black")
+            messagebox.showinfo(tr("Saved"),
+                                tr("Model saved to:\n{path}", path=path))
         except Exception as e:
-            self.report_error(e, "saving the model", title="Save Error")
+            self.report_error(e, tr("saving the model"), title=tr("Save Error"))
 
 
     def _ask_gguf_options(self, path: str) -> dict | None:
         """Modal dialog for llama.cpp / GGUF loading options."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("GGUF / llama.cpp options")
+        dlg.title(tr("GGUF / llama.cpp options"))
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(False, False)
@@ -194,7 +195,7 @@ class ModelTabMixin:
         outer = ttk.Frame(dlg, padding="12")
         outer.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(outer, text=f"Model: {os.path.basename(path)}",
+        ttk.Label(outer, text=tr("Model: {name}", name=os.path.basename(path)),
                   font=("Segoe UI", 10, "bold")).grid(
             row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
 
@@ -211,26 +212,29 @@ class ModelTabMixin:
             value=os.environ.get("AURALITE_GGUF_USE_MLOCK", "0").lower() in {"1", "true", "yes", "on"})
 
         rows = [
-            ("Context (n_ctx):", n_ctx_var, "Max tokens in context; larger = more RAM/VRAM"),
-            ("GPU layers:", gpu_var, "-1 = offload as much as llama.cpp can; 0 = CPU only"),
-            ("CPU threads:", threads_var, "Usually number of physical/logical CPU cores"),
-            ("Batch (n_batch):", batch_var, "Prompt processing batch size"),
-            ("Chat format:", chat_format_var, "Optional: llama-2, chatml, mistral-instruct, ..."),
+            (N_("Context (n_ctx):"), n_ctx_var,
+             N_("Max tokens in context; larger = more RAM/VRAM")),
+            (N_("GPU layers:"), gpu_var, N_("-1 = offload as much as llama.cpp can; 0 = CPU only")),
+            (N_("CPU threads:"), threads_var, N_("Usually number of physical/logical CPU cores")),
+            (N_("Batch (n_batch):"), batch_var, N_("Prompt processing batch size")),
+            (N_("Chat format:"), chat_format_var,
+             N_("Optional: llama-2, chatml, mistral-instruct, ...")),
         ]
         for i, (label, var, hint) in enumerate(rows, start=1):
-            ttk.Label(outer, text=label).grid(row=i, column=0, sticky=tk.W, padx=(0, 8), pady=3)
+            ttk.Label(outer, text=tr(label)).grid(row=i, column=0, sticky=tk.W, padx=(0, 8),
+                                                  pady=3)
             ttk.Entry(outer, textvariable=var, width=18).grid(row=i, column=1, sticky=tk.W, pady=3)
-            ttk.Label(outer, text=hint, style="Sub.TLabel").grid(row=i, column=2, sticky=tk.W, padx=(8, 0), pady=3)
+            ttk.Label(outer, text=tr(hint), style="Sub.TLabel").grid(row=i, column=2, sticky=tk.W, padx=(8, 0), pady=3)
 
         opts_row = ttk.Frame(outer)
         opts_row.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(8, 2))
-        ttk.Checkbutton(opts_row, text="Use chat completion / template",
+        ttk.Checkbutton(opts_row, text=tr("Use chat completion / template"),
                         variable=use_chat_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Checkbutton(opts_row, text="mmap", variable=mmap_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Checkbutton(opts_row, text="mlock", variable=mlock_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(opts_row, text=tr("mmap"), variable=mmap_var).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(opts_row, text=tr("mlock"), variable=mlock_var).pack(side=tk.LEFT)
 
         ttk.Label(outer,
-                  text="Note: GGUF is inference-only here. Training/fine-tuning uses AuraLite .pt models.",
+                  text=tr("Note: GGUF is inference-only here. Training/fine-tuning uses AuraLite .pt models."),
                   style="Sub.TLabel", foreground="#a60").grid(
             row=7, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
 
@@ -249,7 +253,7 @@ class ModelTabMixin:
                     "use_mlock": bool(mlock_var.get()),
                 }
             except ValueError:
-                messagebox.showerror("GGUF options", "n_ctx, GPU layers, threads and batch must be integers.", parent=dlg)
+                messagebox.showerror(tr("GGUF options"), tr("n_ctx, GPU layers, threads and batch must be integers."), parent=dlg)
                 return
             dlg.destroy()
 
@@ -259,8 +263,8 @@ class ModelTabMixin:
 
         btns = ttk.Frame(outer)
         btns.grid(row=8, column=0, columnspan=3, sticky=tk.E, pady=(12, 0))
-        ttk.Button(btns, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="Load GGUF", command=on_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text=tr("Cancel"), command=on_cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text=tr("Load GGUF"), command=on_ok).pack(side=tk.RIGHT, padx=4)
 
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
         dlg.update_idletasks()
@@ -274,12 +278,12 @@ class ModelTabMixin:
     def load_model(self, path=None):
         # 2.25: `path` from File -> Recent models; else the file dialog
         path = path or filedialog.askopenfilename(
-            title="Load Model",
+            title=tr("Load Model"),
             filetypes=[
-                ("Supported models", "*.pt *.gguf"),
-                ("AuraLite / PyTorch", "*.pt"),
-                ("GGUF / llama.cpp", "*.gguf"),
-                ("All files", "*.*"),
+                (tr("Supported models"), "*.pt *.gguf"),
+                (tr("AuraLite / PyTorch"), "*.pt"),
+                (tr("GGUF / llama.cpp"), "*.gguf"),
+                (tr("All files"), "*.*"),
             ],
         )
         if not path:
@@ -289,7 +293,7 @@ class ModelTabMixin:
                 opts = self._ask_gguf_options(path)
                 if opts is None:
                     return
-                self.status_label.config(text=f"Status: Loading GGUF… ({os.path.basename(path)})")
+                self.status_label.config(text=tr("Status: Loading GGUF… ({name})", name=os.path.basename(path)))
                 self.root.update_idletasks()
                 self.engine.load_gguf_model(path, **opts)
             else:
@@ -298,15 +302,15 @@ class ModelTabMixin:
             self.gen_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.DISABLED if self.engine.is_gguf_model() else tk.NORMAL)
             n = self.engine.model.count_parameters()
-            self.param_label.config(text=f"Parameters: {n:,}" if n else "Parameters: —")
+            self.param_label.config(text=tr("Parameters: {n:,}", n=n) if n else tr("Parameters: —"))
             self.model_file_label.config(
-                text=f"Loaded: {os.path.basename(path)}", foreground="black")
+                text=tr("Loaded: {name}", name=os.path.basename(path)), foreground="black")
             if self.engine.is_gguf_model():
                 self.status_label.config(
-                    text=f"Status: GGUF model loaded ✅  ({os.path.basename(path)})")
+                    text=tr("Status: GGUF model loaded ✅  ({name})", name=os.path.basename(path)))
             else:
                 self.status_label.config(
-                    text=f"Status: Model loaded ✅  ({os.path.basename(path)})")
+                    text=tr("Status: Model loaded ✅  ({name})", name=os.path.basename(path)))
             if gui_common.HAS_QUANTIZATION:
                 self._update_quant_buttons()
             # Fill GUI fields from stored params
@@ -329,9 +333,9 @@ class ModelTabMixin:
         except GGUFNotAvailableError as e:
             # The engine's message already carries the prebuilt-wheel command
             # (a bare `pip install llama-cpp-python` compiles llama.cpp).
-            messagebox.showerror("GGUF support is not installed", str(e))
+            messagebox.showerror(tr("GGUF support is not installed"), str(e))
         except Exception as e:
-            self.report_error(e, "loading the model", title="Load Error")
+            self.report_error(e, tr("loading the model"), title=tr("Load Error"))
 
 
     # ---- 2.18.1: Hugging Face models in the native engine -------------------
@@ -339,22 +343,25 @@ class ModelTabMixin:
         """Import the model named above (or a folder) as a native AuraLite model."""
         name = str(self.hf_model_var.get() or "").strip()
         if not name:
-            messagebox.showinfo("No model", "Enter a Hugging Face model name (ORG/NAME) or "
-                                            "choose a downloaded folder first.")
+            messagebox.showinfo(tr("No model"), tr("Enter a Hugging Face model name (ORG/NAME) or "
+                                            "choose a downloaded folder first."))
             return
         source = name if (os.path.isdir(name) or name.lower().startswith("hf:")) else f"hf:{name}"
         quantize = "nf4" if self.hf_4bit_var.get() else None
         self.hf_native_btn.config(state=tk.DISABLED)
-        self.status_label.config(text=f"Status: Importing {name} into the AuraLite engine… ⏳")
+        self.status_label.config(text=tr("Status: Importing {name} into the AuraLite engine… ⏳", name=name))
 
         def progress(info):
             if info.get("stage") == "download":
                 total = info.get("all_total") or info.get("total") or 0
                 done = info.get("all_bytes") or info.get("bytes") or 0
-                text = (f"Status: Downloading {info.get('file')}: {done / 1e6:,.0f}"
-                        + (f" / {total / 1e6:,.0f} MB" if total else " MB"))
+                text = (tr("Status: Downloading {file}: {done:,.0f} / {total:,.0f} MB",
+                           file=info.get("file"), done=done / 1e6, total=total / 1e6) if total
+                        else tr("Status: Downloading {file}: {done:,.0f} MB",
+                                file=info.get("file"), done=done / 1e6))
             else:
-                text = f"Status: Converting the weights {info.get('done')}/{info.get('total')}…"
+                text = tr("Status: Converting the weights {done}/{total}…",
+                          done=info.get("done"), total=info.get("total"))
             self.root.after(0, lambda t=text: self.status_label.config(text=t))
 
         def run():
@@ -364,9 +371,9 @@ class ModelTabMixin:
                 self.root.after(0, self._hf_native_imported, name, info)
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, f"importing {name}", title="Import Error"))
+                    exc, tr("importing {name}", name=name), title=tr("Import Error")))
                 self.root.after(0, lambda: self.status_label.config(
-                    text="Status: Import failed ✗"))
+                    text=tr("Status: Import failed ✗")))
             finally:
                 self.root.after(0, lambda: self.hf_native_btn.config(state=tk.NORMAL))
 
@@ -377,11 +384,11 @@ class ModelTabMixin:
         self.is_trained = True
         self.gen_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
-        self.param_label.config(text=f"Parameters: {int(info.get('params', 0)):,}")
-        self.model_file_label.config(text=f"Imported: {name} (native engine)",
+        self.param_label.config(text=tr("Parameters: {n:,}", n=int(info.get('params', 0))))
+        self.model_file_label.config(text=tr("Imported: {name} (native engine)", name=name),
                                      foreground="black")
-        self.status_label.config(text=f"Status: Imported ✅ {describe_import(info)} — Training "
-                                      f"tab: «Continue training» + LoRA rank fine-tunes it")
+        self.status_label.config(text=tr("Status: Imported ✅ {what} — Training "
+                                      "tab: «Continue training» + LoRA rank fine-tunes it", what=describe_import(info)))
         if hasattr(self, "continue_var"):
             self.continue_var.set(True)
         if hasattr(self, "lora_var") and str(self.lora_var.get()).strip() in ("", "0"):
@@ -394,17 +401,17 @@ class ModelTabMixin:
             self._lib_after_import = ""
             self._goto_tab(then)
             if hasattr(self, "lib_task_label"):
-                self.lib_task_label.config(text=f"{name} is in memory.")
+                self.lib_task_label.config(text=tr("{name} is in memory.", name=name))
 
     def _browse_local_hf_model(self):
         """Open folder dialog to select an already downloaded HF model directory."""
         folder = filedialog.askdirectory(
-            title="Choose the folder with the downloaded Hugging Face model (must contain config.json)"
+            title=tr("Choose the folder with the downloaded Hugging Face model (must contain config.json)")
         )
         if folder:
             self.hf_model_var.set(folder)
             self.hf_local_only_var.set(True)   # automatically enable offline mode
-            self.status_label.config(text=f"Status: Selected local model: {os.path.basename(folder)}")
+            self.status_label.config(text=tr("Status: Selected local model: {name}", name=os.path.basename(folder)))
 
 
     def _confirm_trust_remote_code(self, name: str) -> bool:
@@ -412,16 +419,16 @@ class ModelTabMixin:
         if not self.hf_trust_remote_var.get():
             return True
         return bool(messagebox.askyesno(
-            "Trust remote code?",
-            f"'{name}' will be loaded with trust_remote_code=True.\n\n"
+            tr("Trust remote code?"),
+            tr("'{name}' will be loaded with trust_remote_code=True.\n\n"
             "Python code shipped in that repository will run on this computer "
-            "with your permissions. Continue only if you trust its author."))
+            "with your permissions. Continue only if you trust its author.", name=name)))
 
 
     def _load_hf_model(self):
         model_name = self.hf_model_var.get().strip()
         if not model_name:
-            messagebox.showwarning("No model", "Please enter a Hugging Face model name or select a local folder")
+            messagebox.showwarning(tr("No model"), tr("Please enter a Hugging Face model name or select a local folder"))
             return
 
         load_4bit = self.hf_4bit_var.get()
@@ -430,7 +437,7 @@ class ModelTabMixin:
         local_only = self.hf_local_only_var.get()
 
         if load_4bit and load_8bit:
-            messagebox.showwarning("Invalid options", "Choose either 4-bit or 8-bit loading, not both.")
+            messagebox.showwarning(tr("Invalid options"), tr("Choose either 4-bit or 8-bit loading, not both."))
             return
 
         try:
@@ -443,7 +450,7 @@ class ModelTabMixin:
         trust_remote = bool(self.hf_trust_remote_var.get())
 
         self.hf_load_btn.config(state=tk.DISABLED)
-        self.status_label.config(text=f"Status: Loading HF model {model_name}…")
+        self.status_label.config(text=tr("Status: Loading HF model {model_name}…", model_name=model_name))
         self.root.update_idletasks()
 
         def run():
@@ -469,9 +476,9 @@ class ModelTabMixin:
                     self.hf_push_btn.config(state=tk.NORMAL)
 
                     n = self.engine.model.count_parameters()
-                    self.param_label.config(text=f"Parameters: {n:,}")
+                    self.param_label.config(text=tr("Parameters: {n:,}", n=n))
                     self.model_file_label.config(text=f"HF: {model_name}", foreground="black")
-                    self.status_label.config(text=f"Status: HF model loaded ✅ ({model_name})")
+                    self.status_label.config(text=tr("Status: HF model loaded ✅ ({model_name})", model_name=model_name))
                     self._refresh_model_info()
 
                     # Disable native training / saving buttons for HF models
@@ -484,12 +491,12 @@ class ModelTabMixin:
             except HFNotAvailableError as e:
                 err = str(e)
                 self.root.after(0, lambda err=err: messagebox.showerror(
-                    "HF support missing",
-                    f"{err}\n\nRun: pip install \"auralite-ai[hf]\""
+                    tr("HF support missing"),
+                    tr("{error}\n\nRun: pip install \"auralite-ai[hf]\"", error=err)
                 ))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "loading the model", title="HF Load Error"))
+                    exc, tr("loading the model"), title=tr("HF Load Error")))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -498,7 +505,7 @@ class ModelTabMixin:
 
     def _apply_lora_to_hf(self):
         if not self.engine.is_hf_model():
-            messagebox.showwarning("No HF model", "Load a Hugging Face model first.")
+            messagebox.showwarning(tr("No HF model"), tr("Load a Hugging Face model first."))
             return
 
         try:
@@ -510,10 +517,10 @@ class ModelTabMixin:
             self.engine.apply_lora_to_hf(rank=rank)
             self.hf_save_lora_btn.config(state=tk.NORMAL)
             self.hf_finetune_btn.config(state=tk.NORMAL)
-            self.status_label.config(text=f"Status: LoRA (rank {rank}) applied ✅")
+            self.status_label.config(text=tr("Status: LoRA (rank {rank}) applied ✅", rank=rank))
             self._refresh_model_info()
         except Exception as e:
-            self.report_error(e, "adding LoRA", title="LoRA Error")
+            self.report_error(e, tr("adding LoRA"), title=tr("LoRA Error"))
 
 
     def _save_hf_lora(self):
@@ -523,51 +530,51 @@ class ModelTabMixin:
         # before v2.6.5, so the button silently did nothing): ask for a folder
         # and allow a new one, since LoRA adapters are written to a fresh dir.
         path = filedialog.askdirectory(
-            title="Choose folder to save LoRA adapter", mustexist=False)
+            title=tr("Choose folder to save LoRA adapter"), mustexist=False)
         if not path:
             return
         try:
             self.engine.save_hf_lora(path)
-            messagebox.showinfo("Saved", f"LoRA adapter saved to:\n{path}")
-            self.status_label.config(text="Status: LoRA adapter saved ✅")
+            messagebox.showinfo(tr("Saved"), tr("LoRA adapter saved to:\n{path}", path=path))
+            self.status_label.config(text=tr("Status: LoRA adapter saved ✅"))
         except Exception as e:
-            self.report_error(e, "saving the LoRA adapters", title="Save LoRA Error")
+            self.report_error(e, tr("saving the LoRA adapters"), title=tr("Save LoRA Error"))
 
 
     def _load_hf_lora(self):
         if not self.engine.is_hf_model():
-            messagebox.showwarning("No base model", "Load the base HF model first, then load adapter.")
+            messagebox.showwarning(tr("No base model"), tr("Load the base HF model first, then load adapter."))
             return
-        path = filedialog.askdirectory(title="Select folder with saved LoRA adapter")
+        path = filedialog.askdirectory(title=tr("Select folder with saved LoRA adapter"))
         if not path:
             return
         try:
             self.engine.load_hf_lora(path)
             self.hf_save_lora_btn.config(state=tk.NORMAL)
             self.hf_finetune_btn.config(state=tk.NORMAL)
-            self.status_label.config(text="Status: LoRA adapter loaded ✅")
+            self.status_label.config(text=tr("Status: LoRA adapter loaded ✅"))
             self._refresh_model_info()
         except Exception as e:
-            self.report_error(e, "loading the LoRA adapters", title="Load LoRA Error")
+            self.report_error(e, tr("loading the LoRA adapters"), title=tr("Load LoRA Error"))
 
 
     def _push_hf_to_hub(self):
         if not self.engine.is_hf_model():
-            messagebox.showwarning("No HF model", "Load a Hugging Face model first.")
+            messagebox.showwarning(tr("No HF model"), tr("Load a Hugging Face model first."))
             return
 
         repo_id = tk.simpledialog.askstring(
-            "Push to Hub",
-            "Enter repository ID (e.g. username/model-name):",
+            tr("Push to Hub"),
+            tr("Enter repository ID (e.g. username/model-name):"),
             parent=self.root
         )
         if not repo_id:
             return
 
-        private = messagebox.askyesno("Private?", "Make repository private?", parent=self.root)
+        private = messagebox.askyesno(tr("Private?"), tr("Make repository private?"), parent=self.root)
 
         self.hf_push_btn.config(state=tk.DISABLED)
-        self.status_label.config(text=f"Status: Pushing to {repo_id}...")
+        self.status_label.config(text=tr("Status: Pushing to {repo_id}...", repo_id=repo_id))
 
         def run():
             try:
@@ -577,14 +584,14 @@ class ModelTabMixin:
                     private=private
                 )
                 self.root.after(0, lambda: messagebox.showinfo(
-                    "Success", f"Model successfully pushed to:\nhttps://huggingface.co/{repo_id}"
+                    tr("Success"), tr("Model successfully pushed to:\nhttps://huggingface.co/{repo_id}", repo_id=repo_id)
                 ))
                 self.root.after(0, lambda: self.status_label.config(
-                    text=f"Status: Pushed to {repo_id} ✅"
+                    text=tr("Status: Pushed to {repo_id} ✅", repo_id=repo_id)
                 ))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the upload to the Hub", title="Push Error"))
+                    exc, tr("the upload to the Hub"), title=tr("Push Error")))
             finally:
                 self.root.after(0, lambda: self.hf_push_btn.config(state=tk.NORMAL))
 
@@ -593,8 +600,8 @@ class ModelTabMixin:
 
     def _load_hf_from_hub(self):
         repo_id = tk.simpledialog.askstring(
-            "Load from Hub",
-            "Enter repository ID or model name:",
+            tr("Load from Hub"),
+            tr("Enter repository ID or model name:"),
             parent=self.root
         )
         if not repo_id:
@@ -605,7 +612,7 @@ class ModelTabMixin:
         apply_lora = self.hf_apply_lora_var.get()
 
         if load_4bit and load_8bit:
-            messagebox.showwarning("Invalid options", "Choose either 4-bit or 8-bit loading, not both.")
+            messagebox.showwarning(tr("Invalid options"), tr("Choose either 4-bit or 8-bit loading, not both."))
             return
 
         try:
@@ -617,7 +624,7 @@ class ModelTabMixin:
             return
         trust_remote = bool(self.hf_trust_remote_var.get())
 
-        self.status_label.config(text=f"Status: Loading {repo_id} from Hub...")
+        self.status_label.config(text=tr("Status: Loading {repo_id} from Hub...", repo_id=repo_id))
         self.hf_load_btn.config(state=tk.DISABLED)
 
         def run():
@@ -643,9 +650,9 @@ class ModelTabMixin:
                     self.hf_push_btn.config(state=tk.NORMAL)
 
                     n = self.engine.model.count_parameters()
-                    self.param_label.config(text=f"Parameters: {n:,}")
+                    self.param_label.config(text=tr("Parameters: {n:,}", n=n))
                     self.model_file_label.config(text=f"HF: {repo_id}", foreground="black")
-                    self.status_label.config(text=f"Status: Loaded from Hub ✅ ({repo_id})")
+                    self.status_label.config(text=tr("Status: Loaded from Hub ✅ ({repo_id})", repo_id=repo_id))
                     self._refresh_model_info()
                     self.train_btn.config(state=tk.DISABLED)
                     if gui_common.HAS_QUANTIZATION:
@@ -655,7 +662,7 @@ class ModelTabMixin:
 
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "loading from the Hub", title="HF Hub Load Error"))
+                    exc, tr("loading from the Hub"), title=tr("HF Hub Load Error")))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -664,14 +671,14 @@ class ModelTabMixin:
 
     def _finetune_hf_from_gui(self):
         if not self.engine.is_hf_model():
-            messagebox.showwarning("No HF model", "Load a Hugging Face model first (preferably in 4-bit).")
+            messagebox.showwarning(tr("No HF model"), tr("Load a Hugging Face model first (preferably in 4-bit)."))
             return
 
         # Ask for training text
         if self.selected_file_path:
             use_training = messagebox.askyesno(
-                "Training data",
-                "Use the currently selected .txt file for fine-tuning?"
+                tr("Training data"),
+                tr("Use the currently selected .txt file for fine-tuning?")
             )
             if use_training:
                 try:
@@ -679,7 +686,7 @@ class ModelTabMixin:
                         text = f.read()
                     texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
                 except Exception as e:
-                    self.report_error(e, "reading the file", title="File Error")
+                    self.report_error(e, tr("reading the file"), title=tr("File Error"))
                     return
             else:
                 texts = None
@@ -688,40 +695,41 @@ class ModelTabMixin:
 
         if not texts:
             # Ask user to select a file or use a small example
-            path = filedialog.askopenfilename(title="Select .txt file for fine-tuning",
-                                              filetypes=[("Text", "*.txt"), ("All", "*.*")])
+            path = filedialog.askopenfilename(title=tr("Select .txt file for fine-tuning"),
+                                              filetypes=[(tr("Text"), "*.txt"), (tr("All"), "*.*")])
             if not path:
-                messagebox.showinfo("Info", "Fine-tuning cancelled.")
+                messagebox.showinfo(tr("Info"), tr("Fine-tuning cancelled."))
                 return
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     text = f.read()
                 texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
             except Exception as e:
-                self.report_error(e, "reading the file", title="File Error")
+                self.report_error(e, tr("reading the file"), title=tr("File Error"))
                 return
 
         if not texts:
-            messagebox.showwarning("No data", "Not enough text for fine-tuning.")
+            messagebox.showwarning(tr("No data"), tr("Not enough text for fine-tuning."))
             return
 
         # v2.6.6: the adapter goes where the user says. It used to land in a
         # hard-coded "hf_lora_finetuned" relative to the current directory —
         # for a frozen .exe that is its install folder (often read-only).
         out_dir = filedialog.askdirectory(
-            title="Choose a folder for the fine-tuned LoRA adapter", mustexist=False)
+            title=tr("Choose a folder for the fine-tuned LoRA adapter"), mustexist=False)
         if not out_dir:
-            messagebox.showinfo("Info", "Fine-tuning cancelled.")
+            messagebox.showinfo(tr("Info"), tr("Fine-tuning cancelled."))
             return
 
         self._hf_stop_event = threading.Event()
         stop_event = self._hf_stop_event
         self.hf_finetune_btn.config(state=tk.DISABLED)
         self.hf_stop_ft_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="Status: Fine-tuning with LoRA/QLoRA… starting")
+        self.status_label.config(text=tr("Status: Fine-tuning with LoRA/QLoRA… starting"))
 
         def on_progress(epoch, total, loss, _val_loss=None):
-            text = f"Status: Fine-tuning… epoch {epoch}/{total}, loss {loss:.4f}"
+            text = tr("Status: Fine-tuning… epoch {epoch}/{total}, loss {loss:.4f}", epoch=epoch,
+                      total=total, loss=loss)
             self.root.after(0, lambda: self.status_label.config(text=text))
 
         def run():
@@ -738,18 +746,20 @@ class ModelTabMixin:
                     stop_event=stop_event,
                 )
                 stopped = stop_event.is_set()
-                title = "Fine-tuning stopped" if stopped else "Fine-tuning complete"
-                note = " (stopped early)" if stopped else ""
+                title = tr("Fine-tuning stopped") if stopped else tr("Fine-tuning complete")
+                note = " " + tr("(stopped early)") if stopped else ""
                 self.root.after(0, lambda: messagebox.showinfo(
                     title,
-                    f"LoRA adapter saved to:\n{saved}{note}\n\n"
-                    "You can now load it with 'Load LoRA Adapter'."
+                    tr("LoRA adapter saved to:\n{saved}{note}\n\n"
+                    "You can now load it with 'Load LoRA Adapter'.", saved=saved, note=note)
                 ))
                 self.root.after(0, lambda: self.status_label.config(
-                    text=f"Status: Fine-tuning {'stopped' if stopped else 'complete'} ✅ Adapter in {saved}"))
+                    text=(tr("Status: Fine-tuning stopped ✅ Adapter in {saved}", saved=saved) if stopped
+                          else tr("Status: Fine-tuning complete ✅ Adapter in {saved}",
+                                  saved=saved))))
             except Exception as e:
                 self.root.after(0, lambda exc=e: self.report_error(
-                    exc, "the fine-tuning", title="Fine-tune Error"))
+                    exc, tr("the fine-tuning"), title=tr("Fine-tune Error")))
             finally:
                 self.root.after(0, lambda: self.hf_finetune_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.hf_stop_ft_btn.config(state=tk.DISABLED))
@@ -761,12 +771,12 @@ class ModelTabMixin:
         """Ask the running fine-tune to stop after the current step."""
         self._hf_stop_event.set()
         self.hf_stop_ft_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Status: Stopping fine-tune after the current step…")
+        self.status_label.config(text=tr("Status: Stopping fine-tune after the current step…"))
 
     # ---- 2.16: LoRA adapters of a native model ---------------------------
     def _native_lora_ready(self, title: str) -> bool:
         if self.engine.model is None or self.engine.is_gguf_model() or self.engine.is_hf_model():
-            messagebox.showinfo(title, "Load or train a native AuraLite model (.pt) first.")
+            messagebox.showinfo(title, tr("Load or train a native AuraLite model (.pt) first."))
             return False
         return True
 
@@ -787,78 +797,78 @@ class ModelTabMixin:
 
     def merge_lora_adapters(self):
         """Fold the LoRA adapters into the weights (a plain model again)."""
-        if not self._native_lora_ready("Merge LoRA"):
+        if not self._native_lora_ready(tr("Merge LoRA")):
             return
         if not self.engine.has_lora():
-            messagebox.showinfo("Merge LoRA", "The model in memory has no LoRA adapters (train "
-                                              "with a LoRA rank, or load an adapter).")
+            messagebox.showinfo(tr("Merge LoRA"), tr("The model in memory has no LoRA adapters (train "
+                                              "with a LoRA rank, or load an adapter)."))
             return
         # 2.26: a 4-bit base becomes float32 when merged - ask first, as the Studio does
         from auralite.studio.modelinfo import merge_question
         question = merge_question(self.engine)
-        if question and not messagebox.askyesno("Merge into full precision?", question):
+        if question and not messagebox.askyesno(tr("Merge into full precision?"), question):
             return
         try:
             merged = self.engine.merge_lora()
         except Exception as e:  # noqa: BLE001 - shown to the user
-            self.report_error(e, "merging the adapters", title="Merge LoRA")
+            self.report_error(e, tr("merging the adapters"), title=tr("Merge LoRA"))
             return
         self._refresh_after_lora()
-        messagebox.showinfo("LoRA merged", f"{merged} weight matrices now hold the adapters; "
-                                           f"the model has no adapters left and runs at full "
-                                           f"speed. Save it with «Save Model».")
+        messagebox.showinfo(tr("LoRA merged"), tr("{merged} weight matrices now hold the adapters; "
+                                           "the model has no adapters left and runs at full "
+                                           "speed. Save it with «Save Model».", merged=merged))
 
     def save_lora_adapter(self):
         """Write the adapters and the rows of new tokens alone."""
-        if not self._native_lora_ready("Save LoRA adapter"):
+        if not self._native_lora_ready(tr("Save LoRA adapter")):
             return
         if not self.engine.has_lora():
-            messagebox.showinfo("Save LoRA adapter", "The model in memory has no LoRA adapters.")
+            messagebox.showinfo(tr("Save LoRA adapter"), tr("The model in memory has no LoRA adapters."))
             return
-        path = filedialog.asksaveasfilename(title="Save LoRA adapter", defaultextension=".pt",
-                                            filetypes=[("LoRA adapter", "*.pt"),
-                                                       ("All files", "*.*")])
+        path = filedialog.asksaveasfilename(title=tr("Save LoRA adapter"), defaultextension=".pt",
+                                            filetypes=[(tr("LoRA adapter"), "*.pt"),
+                                                       (tr("All files"), "*.*")])
         if not path:
             return
         try:
             info = self.engine.save_adapter(path)
         except Exception as e:  # noqa: BLE001 - shown to the user
-            self.report_error(e, "saving the adapters", title="Save LoRA adapter")
+            self.report_error(e, tr("saving the adapters"), title=tr("Save LoRA adapter"))
             return
-        messagebox.showinfo("LoRA adapter saved",
-                            f"{os.path.basename(path)}: {info['bytes'] / 1e6:.2f} MB, "
-                            f"{info['adapters']} adapters, {info['new_rows']} new token rows.\n"
-                            f"Load the base model and «Load LoRA adapter…» to use it again.")
+        messagebox.showinfo(tr("LoRA adapter saved"),
+                            tr("{name}: {value:.2f} MB, "
+                            "{adapters} adapters, {new_rows} new token rows.\n"
+                            "Load the base model and «Load LoRA adapter…» to use it again.", name=os.path.basename(path), value=info['bytes'] / 1e6, adapters=info['adapters'], new_rows=info['new_rows']))
 
     def load_lora_adapter(self):
         """Put an adapter file on the base model in memory."""
-        if not self._native_lora_ready("Load LoRA adapter"):
+        if not self._native_lora_ready(tr("Load LoRA adapter")):
             return
-        path = filedialog.askopenfilename(title="Load LoRA adapter",
-                                          filetypes=[("LoRA adapter", "*.pt"),
-                                                     ("All files", "*.*")])
+        path = filedialog.askopenfilename(title=tr("Load LoRA adapter"),
+                                          filetypes=[(tr("LoRA adapter"), "*.pt"),
+                                                     (tr("All files"), "*.*")])
         if not path:
             return
         try:
             info = self.engine.load_adapter(path)
         except ValueError as e:
             if "another base model" not in str(e):
-                self.report_error(e, "loading the adapters", title="Load LoRA adapter")
+                self.report_error(e, tr("loading the adapters"), title=tr("Load LoRA adapter"))
                 return
             if not messagebox.askyesno(
-                    "Another base model",
-                    f"{e}\n\nPut the adapter on the model in memory anyway?"):
+                    tr("Another base model"),
+                    tr("{error}\n\nPut the adapter on the model in memory anyway?", error=e)):
                 return
             try:
                 info = self.engine.load_adapter(path, check_base=False)
             except Exception as err:  # noqa: BLE001 - shown to the user
-                self.report_error(err, "loading the adapters", title="Load LoRA adapter")
+                self.report_error(err, tr("loading the adapters"), title=tr("Load LoRA adapter"))
                 return
         except Exception as e:  # noqa: BLE001 - shown to the user
-            self.report_error(e, "loading the adapters", title="Load LoRA adapter")
+            self.report_error(e, tr("loading the adapters"), title=tr("Load LoRA adapter"))
             return
         self._refresh_after_lora()
-        messagebox.showinfo("LoRA adapter loaded",
-                            f"{info['adapters']} adapters and {info['new_rows']} new tokens "
-                            f"from {os.path.basename(path)}. «Merge LoRA» folds them into the "
-                            f"weights.")
+        messagebox.showinfo(tr("LoRA adapter loaded"),
+                            tr("{adapters} adapters and {new_rows} new tokens "
+                            "from {name}. «Merge LoRA» folds them into the "
+                            "weights.", adapters=info['adapters'], new_rows=info['new_rows'], name=os.path.basename(path)))

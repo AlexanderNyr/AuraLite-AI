@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .i18n import N_, tr
+
 __all__ = ["CATALOG", "BaseModel", "find_model"]
 
 
@@ -67,7 +69,12 @@ class BaseModel:
     @property
     def display_name(self) -> str:
         """The name in the Studio's lists: ``"Qwen2.5 0.5B Instruct (older)"`` (2.23)."""
-        return f"{self.name} (older)" if self.older else self.name
+        return tr("{name} (older)", name=self.name) if self.older else self.name
+
+    @property
+    def note_text(self) -> str:
+        """2.28: the note in the interface's language, part by part (``"; "`` parts them)."""
+        return "; ".join(tr(part) for part in self.note.split("; ")) if self.note else ""
 
     def _counts(self) -> dict[str, int]:
         from auralite.engine.sizing import count_parameters
@@ -99,12 +106,19 @@ class BaseModel:
         return f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.0f}M"
 
 
-_QWEN_NOTE = "strong in many languages, Russian included"
-_LLAMA_NOTE = "accept Meta's license on huggingface.co first, then set HF_TOKEN"
+_QWEN_NOTE = N_("strong in many languages, Russian included")
+_LLAMA_NOTE = N_("accept Meta's license on huggingface.co first, then set HF_TOKEN")
 #: 2.23: Qwen3.5 (March 2026) - three linear-attention layers to one of full attention
 _QWEN35_LAYERS = ("linear_attention", "linear_attention", "linear_attention", "full_attention")
-_QWEN35_NOTE = (_QWEN_NOTE + "; 2026's small Qwen: linear attention keeps the memory of a long "
-                "context small; its vision part is not imported")
+#: 2.28: the other parts of the notes ("; " parts them), translated where they are shown
+NOTE_PARTS = (N_("thinks aloud (<think>) unless told not to"),
+              N_("research license: no commercial use"),
+              N_("tiny and quick: the way to learn the steps, and fits 4 GB PCs"),
+              N_("English"), N_("small and quick"), N_("English and European languages"),
+              N_("GGUF: export --format hf, then llama.cpp's converter"))
+_QWEN35_NOTE = (_QWEN_NOTE + "; " + N_("2026's small Qwen: linear attention keeps the memory "
+                                       "of a long context small") + "; "
+                + N_("its vision part is not imported"))
 
 
 def _qwen35(repo: str, name: str, d_model: int, n_layers: int, n_heads: int, n_kv: int,

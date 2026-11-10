@@ -331,6 +331,15 @@ def _start(argv: list[str]) -> int:
         return 1
 
 
+def restart_command(argv: list[str] | None = None) -> list[str]:
+    """2.28: the command that starts the Studio again as it was started (a new language)."""
+    args = [arg for arg in (sys.argv[1:] if argv is None else argv)
+            if arg not in (CHILD, SELF_TEST)]
+    if getattr(sys, "frozen", False):              # a packaged app: the executable itself
+        return [sys.executable, *args]
+    return [sys.executable, "-m", "auralite.studio", *args]
+
+
 def _child_command(argv: list[str]) -> list[str]:
     if getattr(sys, "frozen", False):              # a packaged app: the executable itself
         return [sys.executable, CHILD, *argv]
@@ -411,6 +420,10 @@ def _self_test(say: Any) -> int:
         say(f"  Installed: {package}")
         if stale:
             say(f"  ! {stale}")
+        from auralite.i18n import LANGUAGES, catalogue     # 2.28: the catalogues are there
+        say("  Languages: " + ", ".join(
+            [LANGUAGES["en"]] + [f"{code} {len(catalogue(code)):,} strings"
+                                 for code in LANGUAGES if code != "en"]))
         runtime = prepare_runtime()
         if sys.platform == "win32":
             copies = ", ".join(f"{c.origin} {c.text}" for c in runtime_copies()) or "none found"

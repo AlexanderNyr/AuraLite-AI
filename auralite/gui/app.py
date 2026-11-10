@@ -4,6 +4,7 @@ The GUI class is assembled from tab mixins (see `gui/tabs/`); the historical
 entry point `python gui_app.py` re-exports `AIApp`/`main` from here.
 """
 import multiprocessing
+import subprocess
 
 from .tabs.start import StartTabMixin
 from .tabs.training import TrainTabMixin
@@ -24,8 +25,10 @@ from . import common as gui_common
 from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
-from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (CHAT_TEMPLATES, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, sys, threading, tk, ttk)
+from .i18n import (LANGUAGES, available_languages, language_name, resolve_language,
+                   set_language, tr)
+from .common import (CHAT_TEMPLATES, AuraLiteEngine, ConsoleRedirector, ImageGenEngine,
+                     messagebox, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -46,6 +49,14 @@ def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
     return f"{win_w}x{win_h}"
 
 
+def _tab_padding_for(excess: int, tabs: int, padding: int = 14, least: int = 4) -> int:
+    """2.28: the room on each side of a tab title that takes ``excess`` pixels out of a row
+    of ``tabs`` titles - never under ``least``."""
+    if excess <= 0 or tabs <= 0:
+        return padding
+    return max(least, padding - -(-excess // (2 * tabs)))
+
+
 class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, GenerationTabMixin,
             ModelTabMixin, QuantizationTabMixin, EvaluationTabMixin, ExportTabMixin,
             LibraryTabMixin, ConsoleTabMixin, ChatTabMixin, ResultViewMixin, MenuMixin,
@@ -56,18 +67,22 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
     #: session snapshot (`gui/session.py` stores the active tab by name).
     _TAB_NAMES = ("start", "train", "finetune", "image", "gen", "chat", "model", "quant",
                   "eval", "export", "library", "console")  # 2.26: Start, Fine-tune; 2.27: Library
+    #: 2.28: the room on each side of a tab title (closer on a screen too narrow for the row)
+    _tab_padding = 14
 
     def __init__(self, root):
         self.root = root
 
         # ---- persisted settings (v2.6.5) --------------------------------
         self.gui_config = load_config()
-        self.language = set_language(self.gui_config.language)
+        self.language = set_language(self.gui_config.language
+                                     if self.gui_config.language_chosen else None)
         self.last_prompt = ""
         self._tab_names = list(self._TAB_NAMES)
 
         from auralite import __version__     # 2.14.1: the one version source
-        self.root.title(f"AuraLite AI v{__version__} — Modern Transformer Edition")
+        self.root.title(tr("AuraLite AI v{version} — Modern Transformer Edition",
+                           version=__version__))
         # Default 800x600, clamped to the physical screen so the window (and its
         # content) never exceeds what the monitor can show. The scrollable tabs
         # handle the rest, so nothing is clipped on 1280x720 / 1280x800 / 1280x1024.
@@ -86,6 +101,8 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         # WxH string and fits the current screen.
         saved_geometry = _sanitize_geometry(self.gui_config.geometry, avail_w, avail_h)
         self.root.geometry(saved_geometry or f"{win_w}x{win_h}")
+        self._window_size = tuple(int(n) for n in (saved_geometry or f"{win_w}x{win_h}")
+                                  .split("x"))
         self.root.minsize(min(560, win_w), min(420, win_h))
         self.root.configure(bg="#f5f6f7")
 
@@ -129,20 +146,20 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         if self.engine.device.type == "cuda":
             dev = "GPU: CUDA 🟢"
         else:
-            dev = f"CPU: {self.engine.num_threads} threads"
+            dev = tr("CPU: {n} threads", n=self.engine.num_threads)
         info_row = ttk.Frame(main_frame)
         info_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
-        ttk.Label(info_row, text="🌟 AuraLite AI — Modern Edition",
+        ttk.Label(info_row, text=tr("🌟 AuraLite AI — Modern Edition"),
                   style="Sub.TLabel").pack(side=tk.LEFT, padx=8)
-        self.device_label = ttk.Label(info_row, text=f"Hardware: {dev}",
+        self.device_label = ttk.Label(info_row, text=tr("Hardware: {device}", device=dev),
                                       style="Sub.TLabel")
         self.device_label.pack(side=tk.LEFT, padx=8)
-        self.param_label = ttk.Label(info_row, text="Parameters: —",
+        self.param_label = ttk.Label(info_row, text=tr("Parameters: —"),
                                      style="Sub.TLabel")
         self.param_label.pack(side=tk.LEFT, padx=8)
         self._build_footer_tools(info_row)      # 2.25: RAM and the speed test, as the Studio
         # Dark theme toggle (moved down together with the rest of the header).
-        theme_btn = ttk.Checkbutton(info_row, text="🌙 Dark", variable=self.dark_mode,
+        theme_btn = ttk.Checkbutton(info_row, text=tr("🌙 Dark"), variable=self.dark_mode,
                                     command=self._toggle_dark_mode)
         theme_btn.pack(side=tk.RIGHT, padx=8)
 
@@ -185,21 +202,24 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         if self.dark_mode.get():
             self._apply_theme(light=False)
 
-        # Language selector (v2.6.5): tabs are re-labelled in place, the choice
-        # is remembered in gui_config.json. Shown only when the catalogue has
+        # Language selector (v2.6.5; 2.28: also View -> Language): the choice is remembered
+        # in gui_config.json and spoken from the next start. Shown only when the catalogue has
         # more than one language.
         try:
-            self.language_var = tk.StringVar(value=language_name(self.language))
+            names = [tr("Automatic"), *[language_name(code) for code in available_languages()]]
+            current = (language_name(self.gui_config.language)
+                       if self.gui_config.language_chosen and self.gui_config.language
+                       else names[0])
+            self.language_var = tk.StringVar(value=current)
             if len(available_languages()) < 2:
                 raise LookupError("single-language catalogue")
-            lang_menu = ttk.OptionMenu(info_row, self.language_var,
-                                       language_name(self.language),
-                                       *[language_name(code) for code in available_languages()],
+            lang_menu = ttk.OptionMenu(info_row, self.language_var, current, *names,
                                        command=self._on_language_change)
             lang_menu.pack(side=tk.RIGHT, padx=8)
             ttk.Label(info_row, text=tr("btn.language"), style="Sub.TLabel").pack(side=tk.RIGHT)
         except Exception as exc:      # one language, or an exotic Tk build
             gui_common.logger.debug("language selector not shown: %s", exc)
+        self._fit_window_to_tabs()
 
         # Hook stdout/stderr into the console tab. Do it AFTER the widget
         # exists. Keep references so we can restore them on shutdown.
@@ -313,7 +333,8 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         style.configure("TLabelframe", background=bg)
         style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), background=bg, foreground=fg)
         style.configure("TNotebook", background=bg)
-        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 6))
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
+                        padding=(self._tab_padding, 6))
         style.configure("TButton", font=("Segoe UI", 10))
         style.configure("TEntry", fieldbackground=entry_bg, foreground=fg)
         style.configure("TCombobox", fieldbackground=entry_bg, foreground=fg)
@@ -348,18 +369,77 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         if self._active_tab_name == "library":  # 2.27: what is on the disk now
             self._lib_refresh()
 
-    # ---- language / session (v2.6.5) ---------------------------------
-    def _on_language_change(self, display_name):
-        """Switch the UI language and re-label the notebook tabs in place."""
-        code = next((c for c, name in LANGUAGES.items() if name == display_name), "en")
-        self.language = set_language(code)
-        self.gui_config = self.gui_config.update(language=self.language)
-        for name, widget in getattr(self, "_tab_widgets", {}).items():
+    def _fit_window_to_tabs(self) -> None:
+        """2.28: a window at least as wide as the row of tab titles, when the screen has
+        room - Russian titles are longer than the English ones the 800 x 600 default was
+        made for. On a narrower screen the titles first move closer together, so that ttk
+        squeezes (and clips) them less, or not at all."""
+        try:
+            self.root.update_idletasks()
+            need = int(self.notebook.winfo_reqwidth()) + 32       # the frame's padding
+            screen = int(self.root.winfo_screenwidth())
+            width, height = self._window_size
+        except Exception:             # a test double, or no window yet
+            return
+        room = screen - 72
+        padding = _tab_padding_for(need - room, len(self._TAB_NAMES), self._tab_padding)
+        if padding < self._tab_padding:
+            self._tab_padding = padding
+            ttk.Style().configure("TNotebook.Tab", padding=(padding, 6))
             try:
-                self.notebook.tab(widget, text=tr(f"tab.{name}"))
-            except Exception:      # tab already gone / mocked notebook
+                self.root.update_idletasks()
+                need = int(self.notebook.winfo_reqwidth()) + 32
+            except Exception:         # pragma: no cover - a window closing
+                return
+        wanted = min(need, room)
+        if wanted > width > 0:
+            self.root.geometry(f"{wanted}x{height}")
+            self._window_size = (wanted, height)
+
+    # ---- language / session (v2.6.5) ---------------------------------
+    def _on_language_change(self, choice):
+        """2.28: a language picked (a code, its name, or "" / "Automatic" for the computer's):
+        saved, and spoken from the next start - the whole window then. Offers to restart
+        now; the window keeps its language until then."""
+        code = choice if choice in LANGUAGES else next(
+            (c for c, name in LANGUAGES.items() if name == choice), "")
+        self.gui_config = self.gui_config.update(language=code, language_chosen=True)
+        try:
+            self.gui_config.save()
+        except Exception as exc:      # pragma: no cover - read-only home
+            gui_common.logger.warning("could not save GUI config: %s", exc)
+        for var, value in ((getattr(self, "language_var", None),
+                            language_name(code) if code else tr("Automatic")),
+                           (getattr(self, "language_choice", None), code)):
+            try:
+                if var is not None and var.get() != value:
+                    var.set(value)
+            except Exception:         # a test double
                 pass
-        self._save_session(quiet=True)
+        if resolve_language(code or None) == self.language:
+            return
+        busy = self._busy_with()                               # type: ignore[attr-defined]
+        if busy:
+            messagebox.showinfo(tr("Language"),
+                                tr("The new language is used from the next start (AuraLite is "
+                                   "busy with {busy} now).", busy=busy))
+            return
+        if messagebox.askyesno(tr("Language"),
+                               tr("The classic interface speaks the new language after a "
+                                  "restart. The model in memory is not kept - save it first.")
+                               + "\n\n" + tr("Restart now?")):
+            self.restart()
+
+    def restart(self) -> bool:
+        """Start the classic interface again and close this window (2.28: a new language)."""
+        try:
+            subprocess.Popen([sys.executable, "-m", "auralite.gui"], close_fds=True,
+                             start_new_session=sys.platform != "win32")
+        except OSError as err:
+            self.report_error(err, tr("starting the classic interface"))  # type: ignore[attr-defined]
+            return False
+        self._on_close()
+        return True
 
     def _restore_session(self):
         """Apply the last session snapshot, if the user left one behind."""

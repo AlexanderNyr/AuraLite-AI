@@ -25,17 +25,20 @@ from auralite.studio.settingsfile import read_settings, write_settings
 
 from .. import common as gui_common
 from ..common import filedialog, messagebox, threading, tk, ttk
+from ..i18n import N_, tr
 
 #: How often the bar may move (seconds): the engine reports more often than Tk can draw.
 _PROGRESS_EVERY = 0.12
 
 
 def _label_of(pairs: tuple, key: str) -> str:
-    return dict(pairs).get(key, "")
+    """2.28: the label the list shows, in the interface's language."""
+    return tr(dict(pairs).get(key, ""))
 
 
 def _key_of(pairs: tuple, label: str, default: str = "") -> str:
-    return next((k for k, text in pairs if text == label), default)
+    """The key of a shown label (2.28: translated or English)."""
+    return next((k for k, text in pairs if label in (text, tr(text))), default)
 
 
 class FineTuneTabMixin:
@@ -61,14 +64,14 @@ class FineTuneTabMixin:
         self.ft_stop_event = threading.Event()
         self.ft_finish_event = threading.Event()
 
-        ttk.Label(tab, text="Fine-tune a model", style="Header.TLabel").pack(anchor=tk.W)
+        ttk.Label(tab, text=tr("Fine-tune a model"), style="Header.TLabel").pack(anchor=tk.W)
         ttk.Label(tab, wraplength=760, justify=tk.LEFT,
-                  text="A ready model learns to answer your way from your dialogs - or your "
+                  text=tr("A ready model learns to answer your way from your dialogs - or your "
                        "style and knowledge from texts. Only small adapters train (LoRA), so a "
-                       "PC is enough.").pack(anchor=tk.W, pady=(2, 8))
+                       "PC is enough.")).pack(anchor=tk.W, pady=(2, 8))
 
         # ---- 1. base model
-        base = ttk.LabelFrame(tab, text="  1. Base model  ", padding="8")
+        base = ttk.LabelFrame(tab, text=tr("  1. Base model  "), padding="8")
         base.pack(fill=tk.X, pady=(0, 8))
         self.ft_source_var = tk.StringVar(value="catalog")
         self.ft_source_buttons: dict = {}
@@ -80,7 +83,7 @@ class FineTuneTabMixin:
         for key in SOURCES:
             row = ttk.Frame(base)
             row.pack(fill=tk.X, pady=1)
-            button = ttk.Radiobutton(row, text=SOURCE_LABELS[key], value=key, width=28,
+            button = ttk.Radiobutton(row, text=tr(SOURCE_LABELS[key]), value=key, width=28,
                                      variable=self.ft_source_var,
                                      command=lambda k=key: self._ft_choose_base(k))
             button.pack(side=tk.LEFT)
@@ -94,16 +97,16 @@ class FineTuneTabMixin:
                 entry = ttk.Entry(row, textvariable=self.ft_hub_var)
                 entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 entry.bind("<KeyRelease>", lambda _e: self._ft_choose_base("hub"))
-                ttk.Button(row, text="Folder…", command=self._ft_pick_hub_folder).pack(
+                ttk.Button(row, text=tr("Folder…"), command=self._ft_pick_hub_folder).pack(
                     side=tk.LEFT, padx=4)
             elif key == "file":
                 entry = ttk.Entry(row, textvariable=self.ft_file_var)
                 entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 entry.bind("<KeyRelease>", lambda _e: self._ft_choose_base("file"))
-                ttk.Button(row, text="File…", command=self._ft_pick_file).pack(side=tk.LEFT,
+                ttk.Button(row, text=tr("File…"), command=self._ft_pick_file).pack(side=tk.LEFT,
                                                                                 padx=4)
             else:
-                self.ft_memory_label = ttk.Label(row, text="none - choose one above",
+                self.ft_memory_label = ttk.Label(row, text=tr("none - choose one above"),
                                                  style="Sub.TLabel")
                 self.ft_memory_label.pack(side=tk.LEFT)
         self.ft_base_info = ttk.Label(base, text="", wraplength=740, justify=tk.LEFT,
@@ -112,7 +115,7 @@ class FineTuneTabMixin:
         self._ft_fill_catalog()
 
         # ---- 2. data
-        data = ttk.LabelFrame(tab, text="  2. Your data  ", padding="8")
+        data = ttk.LabelFrame(tab, text=tr("  2. Your data  "), padding="8")
         data.pack(fill=tk.X, pady=(0, 8))
         row = ttk.Frame(data)
         row.pack(fill=tk.X)
@@ -121,25 +124,25 @@ class FineTuneTabMixin:
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         entry.bind("<Return>", lambda _e: self._ft_inspect())
         entry.bind("<FocusOut>", lambda _e: self._ft_inspect_if_changed())
-        ttk.Button(row, text="File…", command=self._ft_pick_data).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="Folder…", command=self._ft_pick_data_folder).pack(side=tk.LEFT)
-        self.ft_data_report = ttk.Label(data, text="No data chosen yet.", wraplength=740,
+        ttk.Button(row, text=tr("File…"), command=self._ft_pick_data).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text=tr("Folder…"), command=self._ft_pick_data_folder).pack(side=tk.LEFT)
+        self.ft_data_report = ttk.Label(data, text=tr("No data chosen yet."), wraplength=740,
                                         justify=tk.LEFT)
         self.ft_data_report.pack(anchor=tk.W, pady=(4, 0))
         ttk.Label(data, wraplength=740, justify=tk.LEFT, style="Sub.TLabel",
-                  text='Dialogs: a .jsonl file, one {"messages": [{"role": "user", ...}, '
+                  text=tr('Dialogs: a .jsonl file, one {"messages": [{"role": "user", ...}, '
                        '{"role": "assistant", ...}]} per line (ShareGPT, Alpaca and '
                        'prompt/completion records work too). Preference pairs: prompt, chosen, '
                        'rejected. No dialogs yet? The Train tab\'s "Dialogs from a teacher '
-                       'model" writes them.').pack(anchor=tk.W, pady=(2, 0))
+                       'model" writes them.')).pack(anchor=tk.W, pady=(2, 0))
         self._ft_inspected_paths: list[str] = []
 
         # ---- 3. how to train
-        how = ttk.LabelFrame(tab, text="  3. How to train  ", padding="8")
+        how = ttk.LabelFrame(tab, text=tr("  3. How to train  "), padding="8")
         how.pack(fill=tk.X, pady=(0, 8))
         self.ft_method_var = tk.StringVar(value="qlora")
         for key, label in METHODS:
-            ttk.Radiobutton(how, text=label, value=key, variable=self.ft_method_var,
+            ttk.Radiobutton(how, text=tr(label), value=key, variable=self.ft_method_var,
                             command=self._ft_method_picked).pack(anchor=tk.W)
         self.ft_vars: dict = {
             "lora_rank": tk.StringVar(value="16"), "epochs": tk.StringVar(value="2"),
@@ -161,86 +164,87 @@ class FineTuneTabMixin:
         self.ft_entries: dict = {}
 
         def field(parent: Any, label: str, key: str, width: int = 8, note: str = "") -> None:
-            ttk.Label(parent, text=label).pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Label(parent, text=tr(label)).pack(side=tk.LEFT, padx=(0, 2))
             entry = ttk.Entry(parent, textvariable=self.ft_vars[key], width=width)
             entry.pack(side=tk.LEFT, padx=(0, 10))
             self.ft_entries[key] = entry
             if note:
-                ttk.Label(parent, text=note, style="Sub.TLabel").pack(side=tk.LEFT,
+                ttk.Label(parent, text=tr(note), style="Sub.TLabel").pack(side=tk.LEFT,
                                                                       padx=(0, 10))
 
         row = ttk.Frame(how)
         row.pack(fill=tk.X, pady=(6, 2))
-        field(row, "LoRA rank:", "lora_rank", 5)
-        ttk.Checkbutton(row, text="8-bit AdamW (a quarter of the optimizer's memory)",
+        field(row, N_("LoRA rank:"), "lora_rank", 5)
+        ttk.Checkbutton(row, text=tr("8-bit AdamW (a quarter of the optimizer's memory)"),
                         variable=self.ft_adam8_var, command=self._ft_tuned).pack(side=tk.LEFT)
         row = ttk.Frame(how)
         row.pack(fill=tk.X, pady=2)
-        field(row, "Passes over the data:", "epochs", 5)
-        field(row, "Window (tokens):", "seq_length", 7)
-        field(row, "Time limit (min, 0 = none):", "time_limit_min", 6)
+        field(row, N_("Passes over the data:"), "epochs", 5)
+        field(row, N_("Window (tokens):"), "seq_length", 7)
+        field(row, N_("Time limit (min, 0 = none):"), "time_limit_min", 6)
         row = ttk.Frame(how)
         row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Chat template:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(row, text=tr("Chat template:")).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Combobox(row, textvariable=self.ft_template_var, state="readonly", width=18,
-                     values=[label for _k, label in TEMPLATES]).pack(side=tk.LEFT)
+                     values=[tr(label) for _k, label in TEMPLATES]).pack(side=tk.LEFT)
         self.ft_objective_frame = ttk.Frame(how)
-        ttk.Label(self.ft_objective_frame, text="Preference pairs:").pack(side=tk.LEFT,
+        ttk.Label(self.ft_objective_frame, text=tr("Preference pairs:")).pack(side=tk.LEFT,
                                                                           padx=(0, 2))
         ttk.Combobox(self.ft_objective_frame, textvariable=self.ft_objective_var,
                      state="readonly", width=24,
-                     values=[label for _k, label in OBJECTIVES]).pack(side=tk.LEFT, padx=(0, 10))
-        field(self.ft_objective_frame, "beta:", "beta", 6)
-        field(self.ft_objective_frame, "passes (0 = auto):", "pref_epochs", 5)
+                     values=[tr(label) for _k, label in OBJECTIVES]).pack(side=tk.LEFT,
+                                                                          padx=(0, 10))
+        field(self.ft_objective_frame, N_("beta:"), "beta", 6)
+        field(self.ft_objective_frame, N_("passes (0 = auto):"), "pref_epochs", 5)
         self._ft_objective_shown = False
         self.ft_estimate_label = ttk.Label(how, text="", style="Sub.TLabel", wraplength=740,
                                            justify=tk.LEFT)
         self.ft_estimate_label.pack(anchor=tk.W, pady=(4, 0))
         self.ft_how_frame = how
 
-        advanced = ttk.LabelFrame(tab, text="  Advanced settings  ", padding="8")
+        advanced = ttk.LabelFrame(tab, text=tr("  Advanced settings  "), padding="8")
         advanced.pack(fill=tk.X, pady=(0, 8))
         row = ttk.Frame(advanced)
         row.pack(fill=tk.X, pady=2)
-        field(row, "LoRA learning rate:", "lora_lr", 8)
-        ttk.Label(row, text="LoRA trains:").pack(side=tk.LEFT, padx=(0, 2))
+        field(row, N_("LoRA learning rate:"), "lora_lr", 8)
+        ttk.Label(row, text=tr("LoRA trains:")).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Combobox(row, textvariable=self.ft_targets_var, state="readonly", width=28,
-                     values=[label for _k, label in LORA_TARGETS]).pack(side=tk.LEFT)
+                     values=[tr(label) for _k, label in LORA_TARGETS]).pack(side=tk.LEFT)
         row = ttk.Frame(advanced)
         row.pack(fill=tk.X, pady=2)
-        field(row, "Learning rate (every weight):", "lr", 8)
-        field(row, "Windows per step (batch):", "batch_size", 5)
+        field(row, N_("Learning rate (every weight):"), "lr", 8)
+        field(row, N_("Windows per step (batch):"), "batch_size", 5)
         row = ttk.Frame(advanced)
         row.pack(fill=tk.X, pady=2)
-        field(row, "Prompt weight:", "prompt_weight", 6,
-              "0 = only the replies, auto = 0.1 (0 with LoRA)")
-        ttk.Checkbutton(row, text="Whole dialogs per window",
+        field(row, N_("Prompt weight:"), "prompt_weight", 6,
+              N_("0 = only the replies, auto = 0.1 (0 with LoRA)"))
+        ttk.Checkbutton(row, text=tr("Whole dialogs per window"),
                         variable=self.ft_pack_var).pack(side=tk.LEFT)
         row = ttk.Frame(advanced)
         row.pack(fill=tk.X, pady=2)
-        field(row, "Held out for validation:", "val_split", 6)
-        field(row, "Steps at most (0 = no limit):", "max_steps", 8)
-        ttk.Checkbutton(row, text="Fit the memory automatically (memory plan)",
+        field(row, N_("Held out for validation:"), "val_split", 6)
+        field(row, N_("Steps at most (0 = no limit):"), "max_steps", 8)
+        ttk.Checkbutton(row, text=tr("Fit the memory automatically (memory plan)"),
                         variable=self.ft_memory_plan_var).pack(side=tk.LEFT)
 
         # ---- the run
-        run = ttk.LabelFrame(tab, text="  ▶  Fine-tuning  ", padding="8")
+        run = ttk.LabelFrame(tab, text=tr("  ▶  Fine-tuning  "), padding="8")
         run.pack(fill=tk.X, pady=(0, 8))
         row = ttk.Frame(run)
         row.pack(fill=tk.X)
-        self.ft_start_btn = ttk.Button(row, text="▶ Start fine-tuning",
+        self.ft_start_btn = ttk.Button(row, text=tr("▶ Start fine-tuning"),
                                        command=self.start_finetune)
         self.ft_start_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.ft_finish_btn = ttk.Button(row, text="⏹ Finish", state=tk.DISABLED,
+        self.ft_finish_btn = ttk.Button(row, text=tr("⏹ Finish"), state=tk.DISABLED,
                                         command=self.finish_finetune)
         self.ft_finish_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.ft_stop_btn = ttk.Button(row, text="🛑 Stop", state=tk.DISABLED,
+        self.ft_stop_btn = ttk.Button(row, text=tr("🛑 Stop"), state=tk.DISABLED,
                                       command=self.stop_finetune)
         self.ft_stop_btn.pack(side=tk.LEFT)
         self.ft_progress_var = tk.DoubleVar(value=0.0)
         ttk.Progressbar(run, variable=self.ft_progress_var, maximum=100.0).pack(fill=tk.X,
                                                                               pady=(6, 2))
-        self.ft_status = ttk.Label(run, text="Ready.", wraplength=740, justify=tk.LEFT)
+        self.ft_status = ttk.Label(run, text=tr("Ready."), wraplength=740, justify=tk.LEFT)
         self.ft_status.pack(anchor=tk.W)
         self.ft_detail = ttk.Label(run, text="", style="Sub.TLabel", wraplength=740,
                                    justify=tk.LEFT)
@@ -250,23 +254,23 @@ class FineTuneTabMixin:
         after.pack(fill=tk.X, pady=(0, 4))
         self.ft_after_buttons: dict = {}
         for key, text, command in (
-                ("save", "💾 Save the model…", lambda: self.save_model()),   # type: ignore[attr-defined]
-                ("chat", "💬 Chat with it", lambda: self._goto_tab("chat")),  # type: ignore[attr-defined]
-                ("export", "📦 Export…", lambda: self._goto_tab("export")),  # type: ignore[attr-defined]
-                ("merge", "🔗 Merge the adapters",
+                ("save", N_("💾 Save the model…"), lambda: self.save_model()),   # type: ignore[attr-defined]
+                ("chat", N_("💬 Chat with it"), lambda: self._goto_tab("chat")),  # type: ignore[attr-defined]
+                ("export", N_("📦 Export…"), lambda: self._goto_tab("export")),  # type: ignore[attr-defined]
+                ("merge", N_("🔗 Merge the adapters"),
                  lambda: self.merge_lora_adapters()),                       # type: ignore[attr-defined]
-                ("save_adapter", "💾 Save the adapters…",
+                ("save_adapter", N_("💾 Save the adapters…"),
                  lambda: self.save_lora_adapter()),                         # type: ignore[attr-defined]
-                ("load_adapter", "📂 Load adapters…",
+                ("load_adapter", N_("📂 Load adapters…"),
                  lambda: self._ft_load_adapters())):
-            button = ttk.Button(after, text=text, command=command)
+            button = ttk.Button(after, text=tr(text), command=command)
             button.pack(side=tk.LEFT, padx=(0, 4))
             self.ft_after_buttons[key] = button
         files = ttk.Frame(tab)
         files.pack(fill=tk.X)
-        ttk.Button(files, text="Load settings…", command=self.ft_load_settings).pack(
+        ttk.Button(files, text=tr("Load settings…"), command=self.ft_load_settings).pack(
             side=tk.RIGHT)
-        ttk.Button(files, text="Save settings…", command=self.ft_save_settings).pack(
+        ttk.Button(files, text=tr("Save settings…"), command=self.ft_save_settings).pack(
             side=tk.RIGHT, padx=4)
 
         self._ft_method_picked(chosen=False)
@@ -348,15 +352,15 @@ class FineTuneTabMixin:
             self._ft_choose_base("memory")
 
     def _ft_pick_hub_folder(self) -> None:
-        path = filedialog.askdirectory(title="Choose a downloaded Hugging Face model folder")
+        path = filedialog.askdirectory(title=tr("Choose a downloaded Hugging Face model folder"))
         if path:
             self.ft_hub_var.set(path)
             self._ft_choose_base("hub")
 
     def _ft_pick_file(self) -> None:
-        path = filedialog.askopenfilename(title="Choose an AuraLite model",
-                                          filetypes=[("AuraLite models", "*.pt"),
-                                                     ("All files", "*.*")])
+        path = filedialog.askopenfilename(title=tr("Choose an AuraLite model"),
+                                          filetypes=[(tr("AuraLite models"), "*.pt"),
+                                                     (tr("All files"), "*.*")])
         if path:
             self.ft_file_var.set(path)
             self._ft_choose_base("file")
@@ -395,14 +399,14 @@ class FineTuneTabMixin:
     # ---- the data --------------------------------------------------------------------
     def _ft_pick_data(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose the training data",
-            filetypes=[("Data", "*.jsonl *.json *.txt *.md *.parquet *.zst *.gz"),
-                       ("All files", "*.*")])
+            title=tr("Choose the training data"),
+            filetypes=[(tr("Data"), "*.jsonl *.json *.txt *.md *.parquet *.zst *.gz"),
+                       (tr("All files"), "*.*")])
         if path:
             self.ft_set_data(path)
 
     def _ft_pick_data_folder(self) -> None:
-        path = filedialog.askdirectory(title="Choose a folder of training data")
+        path = filedialog.askdirectory(title=tr("Choose a folder of training data"))
         if path:
             self.ft_set_data(path)
 
@@ -424,10 +428,10 @@ class FineTuneTabMixin:
         self._ft_inspected_paths = list(paths)
         if not paths:
             self.ft_report = None
-            self.ft_data_report.config(text="No data chosen yet.")
+            self.ft_data_report.config(text=tr("No data chosen yet."))
             self._ft_data_changed()
             return
-        self.ft_data_report.config(text="Reading the data…")
+        self.ft_data_report.config(text=tr("Reading the data…"))
 
         def work() -> None:
             from auralite.studio.datacheck import DataReport, inspect_data
@@ -563,32 +567,32 @@ class FineTuneTabMixin:
         try:
             settings = self.ft_settings()
         except SettingsError as err:
-            messagebox.showerror("Save settings", str(err))
+            messagebox.showerror(tr("Save settings"), str(err))
             return
-        path = filedialog.asksaveasfilename(title="Save the settings", defaultextension=".json",
+        path = filedialog.asksaveasfilename(title=tr("Save the settings"), defaultextension=".json",
                                             initialfile="finetune-settings.json",
-                                            filetypes=[("Settings", "*.json")])
+                                            filetypes=[(tr("Settings"), "*.json")])
         if not path:
             return
         try:
             write_settings(path, "finetune", settings.to_dict(), self.ft_data_paths(),
                            base=self.ft_base_spec() if self.ft_source() != "memory" else "")
         except OSError as err:
-            self.report_error(err, "saving the settings", title="Save settings")  # type: ignore[attr-defined]
+            self.report_error(err, tr("saving the settings"), title=tr("Save settings"))  # type: ignore[attr-defined]
             return
-        self.ft_status.config(text=f"Settings saved to {os.path.basename(path)}.")
+        self.ft_status.config(text=tr("Settings saved to {name}.", name=os.path.basename(path)))
 
     def ft_load_settings(self) -> None:
         """The form from a settings file (the Studio's too), with its base and data."""
-        path = filedialog.askopenfilename(title="Load settings",
-                                          filetypes=[("Settings", "*.json"),
-                                                     ("All files", "*.*")])
+        path = filedialog.askopenfilename(title=tr("Load settings"),
+                                          filetypes=[(tr("Settings"), "*.json"),
+                                                     (tr("All files"), "*.*")])
         if not path:
             return
         try:
             doc = read_settings(path, "finetune")
         except (OSError, ValueError) as err:
-            messagebox.showerror("Load settings", str(err))
+            messagebox.showerror(tr("Load settings"), str(err))
             return
         self.ft_apply_settings(FineTuneSettings.from_dict(doc.get("settings") or {}))
         if doc.get("base"):
@@ -596,7 +600,7 @@ class FineTuneTabMixin:
         paths = [p for p in doc.get("data") or [] if isinstance(p, str)]
         if paths and os.path.exists(paths[0]):
             self.ft_set_data(paths[0])
-        self.ft_status.config(text=f"Settings loaded from {os.path.basename(path)}.")
+        self.ft_status.config(text=tr("Settings loaded from {name}.", name=os.path.basename(path)))
 
     # ---- from the Library and the wizard (2.27) ------------------------------------------
     def ft_apply_run(self, run: Any, base: str | None = None) -> None:
@@ -660,10 +664,11 @@ class FineTuneTabMixin:
                 count = int(engine.model.count_parameters())
             except Exception:
                 count = 0
-            self.ft_memory_label.config(text=f"a native model, {count:,} parameters"
-                                        + (" with LoRA adapters" if has_lora else ""))
+            self.ft_memory_label.config(
+                text=tr("a native model, {count:,} parameters with LoRA adapters", count=count)
+                if has_lora else tr("a native model, {count:,} parameters", count=count))
         else:
-            self.ft_memory_label.config(text="none - choose one above")
+            self.ft_memory_label.config(text=tr("none - choose one above"))
         states = {"save": native, "chat": has_model, "export": native, "merge": has_lora,
                   "save_adapter": has_lora, "load_adapter": native}
         for key, on in states.items():
@@ -680,34 +685,34 @@ class FineTuneTabMixin:
         report = self.ft_report
         if report is None or not report.for_finetune:
             problem = (report.problems[0] if report is not None and report.problems else
-                       "choose dialogs, preference pairs or a text to fine-tune on"
+                       tr("choose dialogs, preference pairs or a text to fine-tune on")
                        if report is None or report.ok else
-                       f"{report.kind_label} trains a new model (the Train tab)")
-            messagebox.showerror("Fine-tune", f"Cannot start: {problem}.")
+                       tr("{kind} trains a new model (the Train tab)", kind=report.kind_label))
+            messagebox.showerror(tr("Fine-tune"), tr("Cannot start: {problem}.", problem=problem))
             return False
         try:
             settings = self.ft_settings()
             params = finetune_params(settings, report.kind)
         except SettingsError as err:
-            messagebox.showerror("Fine-tune", f"Cannot start: {err}.")
+            messagebox.showerror(tr("Fine-tune"), tr("Cannot start: {error}.", error=err))
             return False
         source, spec = self.ft_source(), self.ft_base_spec()
         engine = self.engine
         if source == "memory" and engine.model is None:
-            messagebox.showerror("Fine-tune", "There is no model in memory: choose a base model.")
+            messagebox.showerror(tr("Fine-tune"), tr("There is no model in memory: choose a base model."))
             return False
         if source != "memory" and not spec:
-            messagebox.showerror("Fine-tune", "Choose the base model: a name, a folder or a file.")
+            messagebox.showerror(tr("Fine-tune"), tr("Choose the base model: a name, a folder or a file."))
             return False
         if source == "file" and not os.path.isfile(spec):
-            messagebox.showerror("Fine-tune", f"Not found: {spec}")
+            messagebox.showerror(tr("Fine-tune"), tr("Not found: {spec}", spec=spec))
             return False
         busy = self._busy_with()                               # type: ignore[attr-defined]
         if busy:
-            messagebox.showinfo("One run at a time", f"Wait until {busy} ends, or stop it.")
+            messagebox.showinfo(tr("One run at a time"), tr("Wait until {busy} ends, or stop it.", busy=busy))
             return False
         if source != "memory" and engine.model is not None and not messagebox.askyesno(
-                "Fine-tune", "The base model replaces the one in memory.\n\nStart?"):
+                tr("Fine-tune"), tr("The base model replaces the one in memory.\n\nStart?")):
             return False
         record = {"base": runner.base_record(source, spec),
                   "settings": settings.to_dict(), "source": "gui",
@@ -715,7 +720,7 @@ class FineTuneTabMixin:
                   "data": {"paths": list(report.paths), "kind": report.kind,
                            "records": report.records, "tokens": report.tokens,
                            "bytes": report.bytes}}
-        self._ft_begin("Starting…")
+        self._ft_begin(tr("Starting…"))
         holder: dict[str, Any] = {}
         started = time.time()
 
@@ -756,7 +761,7 @@ class FineTuneTabMixin:
         self.ft_detail.config(text="")
         self.ft_start_btn.config(state=tk.DISABLED)
         self.ft_finish_btn.config(state=tk.NORMAL)
-        self.ft_stop_btn.config(state=tk.NORMAL, text="🛑 Stop")
+        self.ft_stop_btn.config(state=tk.NORMAL, text=tr("🛑 Stop"))
         for button in self.ft_after_buttons.values():
             button.config(state=tk.DISABLED)
 
@@ -795,11 +800,13 @@ class FineTuneTabMixin:
         stage = info.get("stage")
         if stage == "download":
             done, total = int(info.get("all_bytes") or 0), int(info.get("all_total") or 0)
-            self._ft_show_stage(f"Downloading {info.get('file', '')}: {done / 1e6:,.0f} of "
-                                f"{total / 1e6:,.0f} MB", 100.0 * done / total if total else None)
+            self._ft_show_stage(tr("Downloading {file}: {done:,.0f} of {total:,.0f} MB",
+                                   file=info.get("file", ""), done=done / 1e6,
+                                   total=total / 1e6), 100.0 * done / total if total else None)
         elif stage == "convert":
             done, total = int(info.get("done") or 0), int(info.get("total") or 0)
-            self._ft_show_stage(f"Converting the weights: {done}/{total}",
+            self._ft_show_stage(tr("Converting the weights: {done}/{total}", done=done,
+                                   total=total),
                                 100.0 * done / total if total else None)
 
     def _ft_end(self, text: str, summary: Any = None, stopped: bool = False) -> None:
@@ -810,16 +817,16 @@ class FineTuneTabMixin:
         self.ft_detail.config(text="")
         self.ft_start_btn.config(state=tk.NORMAL)
         self.ft_finish_btn.config(state=tk.DISABLED)
-        self.ft_stop_btn.config(state=tk.DISABLED, text="🛑 Stop")
+        self.ft_stop_btn.config(state=tk.DISABLED, text=tr("🛑 Stop"))
         self._ft_thread = None
         self._ft_model_changed()
 
     def finish_finetune(self) -> None:
         """Finish: a short learning-rate cooldown, then the run ends with what it learned."""
         self.ft_finish_event.set()
-        self.ft_status.config(text="Finishing - cooling down the learning rate…")
+        self.ft_status.config(text=tr("Finishing - cooling down the learning rate…"))
 
     def stop_finetune(self) -> None:
         """Stop at the next step (the weights learned so far are kept)."""
         self.ft_stop_event.set()
-        self.ft_status.config(text="Stopping at the next step…")
+        self.ft_status.config(text=tr("Stopping at the next step…"))

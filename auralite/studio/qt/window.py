@@ -9,7 +9,7 @@ import sys
 from typing import Any
 
 from PySide6.QtCore import QByteArray, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QMainWindow, QMenu,
                                QScrollArea, QTabWidget, QWidget)
 
@@ -33,14 +33,15 @@ from .tab_quantize import QuantizeTab
 from .tab_start import StartTab
 from .tab_train import TrainTab
 from .theme import apply_theme, icon_pixmap
+from ..i18n import LANGUAGES, N_, language, resolve_language, set_language, tr
 
 log = logging.getLogger("auralite.studio")
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md"
-TAB_TITLES = (("start", "Start"), ("train", "Train"), ("finetune", "Fine-tune"),
-              ("chat", "Chat"), ("generate", "Generate"), ("images", "Images"),
-              ("model", "Model"), ("quantize", "Quantize"), ("evaluate", "Evaluate"),
-              ("export", "Export"), ("library", "Library"), ("log", "Log"))
+TAB_TITLES = (("start", N_("Start")), ("train", N_("Train")), ("finetune", N_("Fine-tune")),
+              ("chat", N_("Chat")), ("generate", N_("Generate")), ("images", N_("Images")),
+              ("model", N_("Model")), ("quantize", N_("Quantize")), ("evaluate", N_("Evaluate")),
+              ("export", N_("Export")), ("library", N_("Library")), ("log", N_("Log")))
 
 
 def studio_icon() -> QIcon:
@@ -112,13 +113,13 @@ class MainWindow(QMainWindow):
         for key, title in TAB_TITLES:
             page = self.pages[key]
             if key in ("chat", "generate", "library", "log"):
-                self.tabs.addTab(page, title)
+                self.tabs.addTab(page, tr(title))
                 continue
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             scroll.setWidget(page)
-            self.tabs.addTab(scroll, title)
+            self.tabs.addTab(scroll, tr(title))
         self._build_menu()
         self.device_label = QLabel("")
         self.model_status = QLabel("")
@@ -147,6 +148,7 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(QByteArray.fromHex(self.settings.geometry.encode()))
             except Exception:
                 pass
+        self._fit_to_tabs()                              # 2.28: a saved size included
         if self.settings.last_tab in self.pages:         # 2.24: where the last session was
             self.goto(self.settings.last_tab)
         self._update_status()
@@ -165,39 +167,88 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
-        file_menu = bar.addMenu("&File")
-        self._action(file_menu, "Open a model…", self.open_model_dialog, "Ctrl+O")
-        self.save_action = self._action(file_menu, "Save the model as…", self.save_model_dialog,
+        file_menu = bar.addMenu(tr("&File"))
+        self._action(file_menu, tr("Open a model…"), self.open_model_dialog, "Ctrl+O")
+        self.save_action = self._action(file_menu, tr("Save the model as…"), self.save_model_dialog,
                                         "Ctrl+S")
-        self.recent_menu = file_menu.addMenu("Recent models")
+        self.recent_menu = file_menu.addMenu(tr("Recent models"))
         self.recent_menu.aboutToShow.connect(self._fill_recent)
         file_menu.addSeparator()
-        self._action(file_menu, "Quit", self.close, "Ctrl+Q")
-        view = bar.addMenu("&View")
-        self.dark_action = self._action(view, "Dark theme", self.toggle_dark)
+        self._action(file_menu, tr("Quit"), self.close, "Ctrl+Q")
+        view = bar.addMenu(tr("&View"))
+        self.dark_action = self._action(view, tr("Dark theme"), self.toggle_dark)
         self.dark_action.setCheckable(True)
         self.dark_action.setChecked(self.settings.dark)
-        tools = bar.addMenu("&Tools")
-        self._action(tools, "Setup wizard…", lambda: self.open_wizard("finetune"), "Ctrl+N")
-        self._action(tools, "Speed test", self.run_speed_test)
+        # 2.28: the interface's language - saved, and spoken from the next start
+        self.language_menu = view.addMenu(tr("Language"))
+        self.language_group = QActionGroup(self)
+        self.language_group.setExclusive(True)
+        self.language_actions: dict[str, QAction] = {}
+        for code, name in (("", tr("Automatic (the computer's language)")), *LANGUAGES.items()):
+            action = QAction(name, self)
+            action.setCheckable(True)
+            action.setChecked(code == (self.settings.language or ""))
+            action.triggered.connect(lambda _checked=False, c=code: self.choose_language(c))
+            self.language_group.addAction(action)
+            self.language_menu.addAction(action)
+            self.language_actions[code] = action
+        tools = bar.addMenu(tr("&Tools"))
+        self._action(tools, tr("Setup wizard…"), lambda: self.open_wizard("finetune"), "Ctrl+N")
+        self._action(tools, tr("Speed test"), self.run_speed_test)
         # 2.22: auralite bench in the window
-        self.bench_action = self._action(tools, "Benchmark…", self.run_benchmark)
-        self._action(tools, "Library: runs, models, datasets", lambda: self.goto("library"),
+        self.bench_action = self._action(tools, tr("Benchmark…"), self.run_benchmark)
+        self._action(tools, tr("Library: runs, models, datasets"), lambda: self.goto("library"),
                      "Ctrl+L")
         tools.addSeparator()
         if not bundle.packaged():             # 2.21: the app leaves the classic GUI out
-            self._action(tools, "Classic interface (tkinter)", self.open_classic)
-        self._action(tools, "Open the AuraLite folder", lambda: self._open(str(auralite_home())))
-        self._action(tools, "Open the log folder", lambda: self._open(str(log_dir())))
-        help_menu = bar.addMenu("&Help")
-        self._action(help_menu, "Guide", lambda: QDesktopServices.openUrl(QUrl(GUIDE_URL)), "F1")
-        self._action(help_menu, "Check for updates…", self.check_updates)
-        self._action(help_menu, "About AuraLite Studio", self.about)
+            self._action(tools, tr("Classic interface (tkinter)"), self.open_classic)
+        self._action(tools, tr("Open the AuraLite folder"), lambda: self._open(str(auralite_home())))
+        self._action(tools, tr("Open the log folder"), lambda: self._open(str(log_dir())))
+        help_menu = bar.addMenu(tr("&Help"))
+        self._action(help_menu, tr("Guide"), lambda: QDesktopServices.openUrl(QUrl(GUIDE_URL)), "F1")
+        self._action(help_menu, tr("Check for updates…"), self.check_updates)
+        self._action(help_menu, tr("About AuraLite Studio"), self.about)
+
+    def choose_language(self, code: str) -> None:
+        """View -> Language (2.28): the choice is saved and the Studio speaks it from the next
+        start - now, after a restart, if the user wants."""
+        code = code if code in LANGUAGES else ""
+        if code == (self.settings.language or ""):
+            return
+        self.settings.language = code
+        save_settings(self.settings)
+        action = self.language_actions.get(code)
+        if action is not None:
+            action.setChecked(True)
+        if resolve_language(code or None) == language():
+            return
+        if confirm(self, tr("Language"),
+                   tr("AuraLite Studio speaks the new language after a restart.") + "\n\n"
+                   + tr("Restart now?")):
+            self.restart()
+
+    def restart(self) -> bool:
+        """Close the window - asking what closing asks - and start the Studio again."""
+        from ..app import restart_command
+        if not self.close():
+            return False
+        options: dict[str, Any] = ({"creationflags": getattr(subprocess, "DETACHED_PROCESS", 0)
+                                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+                                   if sys.platform == "win32" else {"start_new_session": True})
+        try:
+            subprocess.Popen(restart_command(), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             close_fds=True, **options)
+        except OSError as exc:
+            logging.getLogger("auralite.studio").warning("could not start the Studio again: %s",
+                                                         exc)
+            return False
+        return True
 
     def _fill_recent(self) -> None:
         self.recent_menu.clear()
         if not self.settings.recent_models:
-            action = self.recent_menu.addAction("(none yet)")
+            action = self.recent_menu.addAction(tr("(none yet)"))
             action.setEnabled(False)
         for path in self.settings.recent_models:
             action = self.recent_menu.addAction(path)
@@ -242,7 +293,7 @@ class MainWindow(QMainWindow):
         if self.hardware is None:
             return
         device = self.hardware.accelerator if self.hardware.accelerator != "cpu" else "cpu"
-        self.statusBar().showMessage("Speed test…")
+        self.statusBar().showMessage(tr("Speed test…"))
 
         def work(_job: Job) -> float:
             return measure_gflops(device)
@@ -256,7 +307,7 @@ class MainWindow(QMainWindow):
         self.settings.gflops = float(gflops)
         self.settings.gflops_threads = self.hardware.train_threads
         save_settings(self.settings)
-        self.statusBar().showMessage(f"Speed test: {gflops:,.0f} GFLOP/s", 6000)
+        self.statusBar().showMessage(tr("Speed test: {gflops:,.0f} GFLOP/s", gflops=gflops), 6000)
         self.hardware_changed.emit(self.hardware)
 
     def run_benchmark(self) -> None:
@@ -270,14 +321,14 @@ class MainWindow(QMainWindow):
         from .bench_dialog import choose_benchmark, describe
         if self.bench_job is not None:
             self.bench_job.stop_event.set()
-            self.statusBar().showMessage("Stopping the benchmark…")
+            self.statusBar().showMessage(tr("Stopping the benchmark…"))
             return
         sizes = list(bench.SIZES)
         choice = choose_benchmark(self, self.bench_choice)
         if choice is None:
             return
         self.bench_choice = choice
-        if not self.begin("benchmark"):
+        if not self.begin(N_("benchmark")):
             return
         log.info("[AuraLite] bench: %s", describe(choice))
 
@@ -292,17 +343,17 @@ class MainWindow(QMainWindow):
         job.finished.connect(self._benchmarked)
         job.failed.connect(self._bench_failed)
         self.bench_job = job
-        self.bench_action.setText("Stop the benchmark")
+        self.bench_action.setText(tr("Stop the benchmark"))
         job.start()
 
     def _bench_progress(self, line: Any) -> None:
         text = str(line).strip()
-        self.statusBar().showMessage(f"Benchmark: {text}")
+        self.statusBar().showMessage(tr("Benchmark: {line}", line=text))
         log.info("[AuraLite] bench: %s", text)
 
     def _bench_over(self) -> None:
         self.bench_job = None
-        self.bench_action.setText("Benchmark…")
+        self.bench_action.setText(tr("Benchmark…"))
         self.statusBar().clearMessage()
         self.end()
 
@@ -310,15 +361,15 @@ class MainWindow(QMainWindow):
         from auralite import bench
         report, (md, _js) = result
         self._bench_over()
-        inform(self, "Benchmark", "\n".join(bench.summary_lines(report))
-               + f"\n\nThe report, a table for an article or a README: {md}")
+        inform(self, tr("Benchmark"), "\n".join(bench.summary_lines(report)) + "\n\n"
+               + tr("The report, a table for an article or a README: {path}", path=md))
 
     def _bench_failed(self, exc: BaseException) -> None:
         self._bench_over()
         if isinstance(exc, InterruptedError):
-            self.statusBar().showMessage("The benchmark was stopped", 6000)
+            self.statusBar().showMessage(tr("The benchmark was stopped"), 6000)
             return
-        self.report_error(exc, "benchmark")
+        self.report_error(exc, tr("benchmark"))
 
     def _run_background(self, name: str, fn: Any, done: Any) -> Job:
         job = Job(name, fn, self)
@@ -334,6 +385,29 @@ class MainWindow(QMainWindow):
             self._jobs.remove(job)
 
     # ---- shared state ------------------------------------------------------------
+    def _fit_to_tabs(self) -> None:
+        """2.28: a window at least as wide as its row of tabs when the screen has room - the
+        Russian titles are longer than the English ones 1080 was chosen for, and a tab behind
+        the scroll arrows is easy to miss. A maximized window stays as it is."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        try:
+            bar = self.tabs.tabBar()
+            bar.ensurePolished()                     # the theme's padding before it is shown
+            need = int(bar.sizeHint().width()) + 16
+            screen = self.screen()
+            area = screen.availableGeometry() if screen is not None else None
+        except Exception:                            # pragma: no cover - an exotic platform
+            return
+        if area is None:
+            return
+        wanted = min(need, area.width() - 40)
+        if wanted <= self.width():
+            return
+        self.resize(wanted, self.height())
+        if self.x() + wanted > area.right():         # a place saved further right
+            self.move(max(area.left(), area.right() - wanted), self.y())
+
     def goto(self, name: str) -> None:
         index = [key for key, _ in TAB_TITLES].index(name)
         self.tabs.setCurrentIndex(index)
@@ -346,8 +420,9 @@ class MainWindow(QMainWindow):
         """Claim the engine for `name` (training, an export, a reply); False when busy."""
         if self.busy:
             if not quiet:
-                inform(self, "AuraLite is busy", f"AuraLite is busy with {self.busy}: wait "
-                                                 f"until it ends, or stop it first.")
+                inform(self, tr("AuraLite is busy"),
+                       tr("AuraLite is busy with {busy}: wait until it ends, or stop it first.",
+                          busy=tr(self.busy)))
             return False
         self.busy = name
         self.save_action.setEnabled(False)
@@ -365,52 +440,54 @@ class MainWindow(QMainWindow):
     def confirm_replace_model(self, text: str) -> bool:
         if self.engine.model is None or not self.model_dirty:
             return True
-        return confirm(self, "Replace the model in memory?",
-                       f"{text}\n\nThe model in memory has changes that are not saved. "
-                       f"Continue without saving them?")
+        return confirm(self, tr("Replace the model in memory?"),
+                       text + "\n\n" + tr("The model in memory has changes that are not saved. "
+                                           "Continue without saving them?"))
 
     def model_description(self) -> str:
         engine = self.engine
         model = engine.model
         if model is None:
-            return "no model"
+            return tr("no model")
         if engine.is_gguf_model():
-            return f"GGUF model {os.path.basename(engine.gguf_path or '')} (chat only)"
+            return tr("GGUF model {name} (chat only)",
+                      name=os.path.basename(engine.gguf_path or ""))
         if engine.is_hf_model():
-            peft = " with LoRA adapters" if getattr(engine.hf_proxy, "is_peft", False) else ""
-            return f"transformers model {engine.hf_path or ''}{peft}"
+            if getattr(engine.hf_proxy, "is_peft", False):
+                return tr("transformers model {path} with LoRA adapters", path=engine.hf_path or "")
+            return tr("transformers model {path}", path=engine.hf_path or "")
         native = getattr(model, "module", model)
         parts = []
         used = getattr(engine, "params_used", {}) or {}
         source = self.model_origin or str(used.get("imported_from") or "").removeprefix("hf:")
-        parts.append(source or (os.path.basename(self.model_path) if self.model_path
-                                else "trained here"))
+        parts.append(origin_text(source) if source else (
+            os.path.basename(self.model_path) if self.model_path else tr("trained here")))
         try:
-            parts.append(f"{_count(native.count_parameters())} parameters")
+            parts.append(tr("{count} parameters", count=_count(native.count_parameters())))
         except Exception:
             pass
         try:
             from auralite.engine.nf4 import nf4_layers
             if nf4_layers(native):
-                parts.append("4-bit base")
+                parts.append(tr("4-bit base"))
         except Exception:
             pass
         try:
             if engine.has_lora():
-                parts.append(f"LoRA adapters (rank {native.lora_rank})"
-                             if getattr(native, "lora_rank", 0) else "LoRA adapters")
+                parts.append(tr("LoRA adapters (rank {rank})", rank=native.lora_rank)
+                             if getattr(native, "lora_rank", 0) else tr("LoRA adapters"))
         except Exception:
             pass
         if self.model_dirty:
-            parts.append("not saved")
+            parts.append(tr("not saved"))
         return " · ".join(parts)
 
     def _update_status(self) -> None:
         hw = self.hardware
         if hw is not None:
             self.device_label.setText(f"GPU: {hw.gpu}" if hw.accelerator != "cpu"
-                                      else f"CPU · {hw.train_threads} threads")
-        self.model_status.setText(f"Model: {self.model_description()}")
+                                      else tr("CPU · {threads} threads", threads=hw.train_threads))
+        self.model_status.setText(tr("Model: {model}", model=self.model_description()))
 
     def _hardware_status(self, _hw: Any) -> None:
         self._update_status()
@@ -419,13 +496,14 @@ class MainWindow(QMainWindow):
     def _update_memory(self) -> None:
         used = process_memory()
         total = self.hardware.memory_total if self.hardware is not None else 0
-        self.memory_label.setText(f"RAM: {format_gb(used)}" + (f" of {format_gb(total)}"
-                                                               if total else ""))
+        self.memory_label.setText(tr("RAM: {used} of {total}", used=format_gb(used),
+                                     total=format_gb(total)) if total else
+                                  tr("RAM: {used}", used=format_gb(used)))
 
     # ---- models --------------------------------------------------------------------
     def open_model_dialog(self) -> None:
-        path = ask_open(self, "Open a model", "AuraLite models (*.pt);;GGUF (*.gguf);;"
-                                              "All files (*)", self.settings.last_model_dir)
+        path = ask_open(self, tr("Open a model"), tr("AuraLite models (*.pt);;GGUF (*.gguf);;"
+                                              "All files (*)"), self.settings.last_model_dir)
         if path:
             self.open_model(path)
 
@@ -433,14 +511,14 @@ class MainWindow(QMainWindow):
         """Load a model file; `origin` names it in the status bar (2.20: a run of
         the library), `then` is the tab to open once it is loaded."""
         if not os.path.exists(path):
-            show_error(self, FileNotFoundError(f"not found: {path}"))
+            show_error(self, FileNotFoundError(tr("not found: {path}", path=path)))
             return
-        if not self.confirm_replace_model("Opening a model replaces the one in memory."):
+        if not self.confirm_replace_model(tr("Opening a model replaces the one in memory.")):
             return
-        if not self.begin("opening a model"):
+        if not self.begin(N_("opening a model")):
             return
         engine = self.engine
-        self.statusBar().showMessage(f"Opening {os.path.basename(path)}…")
+        self.statusBar().showMessage(tr("Opening {name}…", name=os.path.basename(path)))
         gguf = path.lower().endswith(".gguf")
         options = self.model_tab.gguf_options() if gguf else {}   # 2.25: llama.cpp's settings
 
@@ -461,19 +539,19 @@ class MainWindow(QMainWindow):
         if origin:
             self.model_origin = origin
         self.end(model_dirty=False)
-        self.statusBar().showMessage(f"Opened {origin or path}", 6000)
+        self.statusBar().showMessage(tr("Opened {name}", name=origin or path), 6000)
         if then:
             self.goto(then)
 
     def import_model(self, spec: str, then: str = "") -> None:
         """Import a Hugging Face model into memory (2.20: a download of the library,
         which needs no network the second time)."""
-        if not self.confirm_replace_model("Importing a model replaces the one in memory."):
+        if not self.confirm_replace_model(tr("Importing a model replaces the one in memory.")):
             return
-        if not self.begin("importing a model"):
+        if not self.begin(N_("importing a model")):
             return
         engine = self.engine
-        self.statusBar().showMessage(f"Importing {spec}…")
+        self.statusBar().showMessage(tr("Importing {spec}…", spec=spec))
         def work(_job: Job) -> Any:
             engine.unload_model()
             return engine.import_hf_model(spec)
@@ -486,7 +564,7 @@ class MainWindow(QMainWindow):
 
     def _open_failed(self, exc: BaseException) -> None:
         self.end(model_dirty=None)
-        self.report_error(exc, "opening the model")
+        self.report_error(exc, tr("opening the model"))
 
     def model_loaded(self, spec: str) -> None:
         text = str(spec)
@@ -512,12 +590,12 @@ class MainWindow(QMainWindow):
         """After a run: a new model, the model trained further (2.24), or the base
         fine-tuned."""
         if how == "new":
-            self.model_origin = "new model"
+            self.model_origin = N_("new model")
         elif how == "more":
             if self.model_origin and not self.model_origin.endswith("(trained further)"):
-                self.model_origin += " (trained further)"
+                self.model_origin += " " + N_("(trained further)")
         elif self.model_origin and not self.model_origin.endswith("(fine-tuned)"):
-            self.model_origin += " (fine-tuned)"
+            self.model_origin += " " + N_("(fine-tuned)")
         self.model_path = ""
 
     def model_saved(self, path: str) -> None:
@@ -550,12 +628,12 @@ class MainWindow(QMainWindow):
             return
         start = self.model_path or os.path.join(self.settings.last_model_dir or
                                                 os.path.expanduser("~"), "my-model.pt")
-        path = ask_save(self, "Save the model as", "AuraLite models (*.pt)", start)
+        path = ask_save(self, tr("Save the model as"), tr("AuraLite models (*.pt)"), start)
         if not path:
             return
         if not path.endswith(".pt"):
             path += ".pt"
-        if not self.begin("saving the model"):
+        if not self.begin(N_("saving the model")):
             return
         engine = self.engine
         job = Job("save-model", lambda _job: engine.save_model(path), self)
@@ -567,17 +645,18 @@ class MainWindow(QMainWindow):
     def _saved(self, path: str) -> None:
         self.model_saved(path)
         self.end(model_dirty=False)
-        self.statusBar().showMessage(f"Saved {path}", 6000)
+        self.statusBar().showMessage(tr("Saved {path}", path=path), 6000)
 
     def _save_failed(self, exc: BaseException) -> None:
         self.end(model_dirty=None)
-        self.report_error(exc, "saving the model")
+        self.report_error(exc, tr("saving the model"))
 
     # ---- wizard, errors, help ------------------------------------------------------
     def open_wizard(self, goal: str = "finetune") -> None:
         from .wizard import SetupWizard
         if self.busy:
-            inform(self, "AuraLite is busy", f"AuraLite is busy with {self.busy}.")
+            inform(self, tr("AuraLite is busy"),
+                   tr("AuraLite is busy with {busy}.", busy=tr(self.busy)))
             return
         wizard = SetupWizard(self, goal)
         try:
@@ -624,13 +703,13 @@ class MainWindow(QMainWindow):
             subprocess.Popen([sys.executable, "-m", "auralite.gui"],
                              close_fds=True, start_new_session=sys.platform != "win32")
         except OSError as err:
-            self.report_error(err, "starting the classic interface")
+            self.report_error(err, tr("starting the classic interface"))
 
     def check_updates(self) -> None:
         from ..updates import check_for_update
-        self.statusBar().showMessage("Checking for updates…")
+        self.statusBar().showMessage(tr("Checking for updates…"))
         self._run_background("update-check", lambda _job: check_for_update(self.version),
-                             lambda info: inform(self, "Updates", info.message()))
+                             lambda info: inform(self, tr("Updates"), info.message()))
 
     def about(self) -> None:
         import torch
@@ -639,14 +718,16 @@ class MainWindow(QMainWindow):
             qt = PySide6.__version__
         except Exception:
             qt = "?"
-        app = f"\nThis is {bundle.describe()}\n" if bundle.packaged() else ""
-        inform(self, "About AuraLite Studio",
+        app = ("\n" + tr("This is {app}", app=bundle.describe()) + "\n") if bundle.packaged() \
+            else ""
+        inform(self, tr("About AuraLite Studio"),
                f"AuraLite Studio {self.version}\n\n"
-               f"Train, fine-tune and run language models on your own computer.\n\n"
-               f"Python {platform.python_version()} · PyTorch {torch.__version__} · "
-               f"Qt (PySide6) {qt}\nLicense: Apache-2.0\n"
-               f"https://github.com/AlexanderNyr/AuraLite-AI\n{app}\n"
-               f"Models: {auralite_home()}\nLogs: {log_dir()}")
+               + tr("Train, fine-tune and run language models on your own computer.") + "\n\n"
+               + f"Python {platform.python_version()} · PyTorch {torch.__version__} · "
+               f"Qt (PySide6) {qt}\n" + tr("License: {license}", license="Apache-2.0") + "\n"
+               "https://github.com/AlexanderNyr/AuraLite-AI\n" + app + "\n"
+               + tr("Models: {path}", path=auralite_home()) + "\n"
+               + tr("Logs: {path}", path=log_dir()))
 
     # ---- closing ---------------------------------------------------------------------
     def running_jobs(self) -> list[Job]:
@@ -661,19 +742,20 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt's name
         running = self.running_jobs()
-        if running and not confirm(self, "Quit AuraLite Studio?",
-                                   f"AuraLite is busy with {self.busy or 'work'}. Stop it and "
-                                   f"quit? (A model being trained is not saved.)"):
+        if running and not confirm(self, tr("Quit AuraLite Studio?"),
+                                   tr("AuraLite is busy with {busy}. Stop it and quit? (A model "
+                                      "being trained is not saved.)",
+                                      busy=tr(self.busy or N_("work")))):
             event.ignore()
             return
         if not running and self.engine.model is not None and self.model_dirty and \
-                not confirm(self, "Quit AuraLite Studio?",
-                            "The model in memory is not saved. Quit anyway?"):
+                not confirm(self, tr("Quit AuraLite Studio?"),
+                            tr("The model in memory is not saved. Quit anyway?")):
             event.ignore()
             return
         if not running and self.images_tab.unsaved and self.images_tab.has_model() and \
-                not confirm(self, "Quit AuraLite Studio?",
-                            "The image generator in memory is not saved. Quit anyway?"):
+                not confirm(self, tr("Quit AuraLite Studio?"),
+                            tr("The image generator in memory is not saved. Quit anyway?")):
             event.ignore()
             return
         for job in running:
@@ -689,6 +771,15 @@ class MainWindow(QMainWindow):
         self.memory_timer.stop()
         self.log_tab.detach()
         event.accept()
+
+
+def origin_text(origin: str) -> str:
+    """2.28: where the model came from, in the interface's language. It is kept in English:
+    run records and the library note it."""
+    text = tr(origin) if origin == "new model" else origin
+    for suffix in ("(trained further)", "(fine-tuned)"):
+        text = text.replace(suffix, tr(suffix))
+    return text
 
 
 def _count(n: int) -> str:
@@ -719,7 +810,10 @@ def run(argv: list[str] | None = None) -> int:
     app.setApplicationName("AuraLite Studio")
     app.setOrganizationName("AuraLite")
     setup_logging("studio")
-    window = MainWindow()
+    settings = load_settings()
+    set_language(settings.language or None)        # 2.28: before a word is shown
+    install_qt_translations(app)
+    window = MainWindow(settings=settings)
     install_excepthooks(window.error_raised.emit)
     window.show()
     log = logging.getLogger("auralite.studio")
@@ -731,6 +825,28 @@ def run(argv: list[str] | None = None) -> int:
         log.info("%s=%s: closing the window in %s s", SMOKE_ENV, seconds, seconds)
         QTimer.singleShot(int(seconds * 1000), lambda: _smoke_close(window))
     return int(app.exec())
+
+
+def install_qt_translations(app: QApplication) -> Any:
+    """2.28: Qt's own words - the buttons of its dialogs (Yes, No, Cancel) - in the
+    interface's language, when Qt brings them. Returns the translator (None: English)."""
+    code = language()
+    if code == "en":
+        return None
+    from PySide6.QtCore import QLibraryInfo, QTranslator
+    folders = [QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)]
+    try:
+        import PySide6
+        base = os.path.dirname(PySide6.__file__ or "")
+        folders += [os.path.join(base, "Qt", "translations"), os.path.join(base, "translations")]
+    except Exception:                         # pragma: no cover - PySide6 is there
+        pass
+    translator = QTranslator(app)
+    for folder in folders:
+        if folder and translator.load(f"qtbase_{code}", folder):
+            app.installTranslator(translator)
+            return translator
+    return None
 
 
 #: 2.21: close the window this many seconds after it opened (a smoke test of a build).

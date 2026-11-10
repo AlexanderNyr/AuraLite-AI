@@ -3,6 +3,7 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from ..common import (filedialog, messagebox, os, tk)
+from ..i18n import tr
 
 class ResultViewMixin:
     def _display_result(self, text):
@@ -18,7 +19,7 @@ class ResultViewMixin:
     def _copy_result(self):
         text = self._get_result_text()
         if not text.strip():
-            self.status_label.config(text="Status: Output is empty — nothing to copy.")
+            self.status_label.config(text=tr("Status: Output is empty — nothing to copy."))
             return
         try:
             self.root.clipboard_clear()
@@ -26,9 +27,9 @@ class ResultViewMixin:
             self.root.update()  # ensure clipboard persists after focus change
             n = len(text)
             self.status_label.config(
-                text=f"Status: Copied {n:,} characters to clipboard ✅")
+                text=tr("Status: Copied {n:,} characters to clipboard ✅", n=n))
         except tk.TclError as e:
-            self.report_error(e, "copying", title="Copy Error")
+            self.report_error(e, tr("copying"), title=tr("Copy Error"))
 
 
     def _copy_selection_result(self):
@@ -42,7 +43,7 @@ class ResultViewMixin:
         self.root.clipboard_append(sel)
         self.root.update()
         self.status_label.config(
-            text=f"Status: Copied selection ({len(sel):,} chars) ✅")
+            text=tr("Status: Copied selection ({n:,} chars) ✅", n=len(sel)))
 
 
     def _clear_result(self):
@@ -52,13 +53,13 @@ class ResultViewMixin:
     def _save_result(self):
         text = self._get_result_text()
         if not text.strip():
-            messagebox.showinfo("Empty", "Nothing to save — output is empty.")
+            messagebox.showinfo(tr("Empty"), tr("Nothing to save — output is empty."))
             return
         path = filedialog.asksaveasfilename(
-            title="Save generated text",
+            title=tr("Save generated text"),
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("Markdown", "*.md"),
-                       ("All files", "*.*")],
+            filetypes=[(tr("Text files"), "*.txt"), (tr("Markdown"), "*.md"),
+                       (tr("All files"), "*.*")],
         )
         if not path:
             return
@@ -66,21 +67,21 @@ class ResultViewMixin:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
             self.status_label.config(
-                text=f"Status: Saved output ✅ ({os.path.basename(path)})")
+                text=tr("Status: Saved output ✅ ({name})", name=os.path.basename(path)))
         except Exception as e:
-            self.report_error(e, "saving", title="Save Error")
+            self.report_error(e, tr("saving"), title=tr("Save Error"))
 
 
     def _append_result(self):
         text = self._get_result_text()
         if not text.strip():
-            messagebox.showinfo("Empty", "Nothing to append — output is empty.")
+            messagebox.showinfo(tr("Empty"), tr("Nothing to append — output is empty."))
             return
         path = filedialog.asksaveasfilename(
-            title="Append generated text to file (existing file will be appended)",
+            title=tr("Append generated text to file (existing file will be appended)"),
             defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("Markdown", "*.md"),
-                       ("All files", "*.*")],
+            filetypes=[(tr("Text files"), "*.txt"), (tr("Markdown"), "*.md"),
+                       (tr("All files"), "*.*")],
         )
         if not path:
             return
@@ -91,9 +92,9 @@ class ResultViewMixin:
                     f.write(sep)
                 f.write(text)
             self.status_label.config(
-                text=f"Status: Appended output ✅ ({os.path.basename(path)})")
+                text=tr("Status: Appended output ✅ ({name})", name=os.path.basename(path)))
         except Exception as e:
-            self.report_error(e, "appending to the file", title="Append Error")
+            self.report_error(e, tr("appending to the file"), title=tr("Append Error"))
 
 
     def _show_result_menu(self, event):

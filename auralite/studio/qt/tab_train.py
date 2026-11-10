@@ -22,7 +22,7 @@ from ..advisor import (PresetFit, Recommendation, preset_label, recommend_pretra
                        size_text, small_text_note)
 from ..datacheck import DataReport
 from ..hardware import format_gb
-from ..i18n import tr
+from ..i18n import N_, number, tr
 from ..library import remember_dataset
 from ..progress import ended_by_itself, format_duration, stage_percent, stage_text, summary_text
 from ..recipes import CUSTOM, SettingsError, TrainSettings, custom_params, pretrain_params
@@ -33,11 +33,12 @@ from .widgets import DataPicker, RunPanel
 if TYPE_CHECKING:
     from .window import MainWindow
 
-_OPTIMIZERS = [("The recipe's (Muon)", ""), ("AdamW", "adamw"), ("8-bit AdamW (less memory)",
-                                                                   "adamw8bit")]
-_SCHEDULES = [("The recipe's (warm-up, stable, decay)", ""), ("Warm-up, stable, decay (WSD)",
-                                                              "wsd"), ("Cosine", "cosine")]
-_ROPE = [("None (recommended)", ""), ("Linear", "linear"), ("NTK", "ntk"), ("YaRN", "yarn")]
+_OPTIMIZERS = [(N_("The recipe's (Muon)"), ""), ("AdamW", "adamw"),
+               (N_("8-bit AdamW (less memory)"), "adamw8bit")]
+_SCHEDULES = [(N_("The recipe's (warm-up, stable, decay)"), ""),
+              (N_("Warm-up, stable, decay (WSD)"), "wsd"), (N_("Cosine"), "cosine")]
+_ROPE = [(N_("None (recommended)"), ""), (N_("Linear"), "linear"), ("NTK", "ntk"),
+         ("YaRN", "yarn")]
 #: tokenizer kinds "Save the model's tokenizer" writes (as the classic interface)
 _SAVEABLE_TOKENIZERS = ("bpe", "char", "hf_bpe")
 
@@ -411,8 +412,8 @@ class TrainTab(QWidget):
             fits = "" if fit.fits else tr(" - does not fit the memory")
             # 2.21.2: the real size and shape; the preset's name ("25m") is the tooltip
             self.size.setItemText(i, f"{preset_label(fit)}{mark}{fits}")
-            self.size.setItemData(i, f"the {fit.preset} preset: auralite train --preset "
-                                     f"{fit.preset}", Qt.ItemDataRole.ToolTipRole)
+            self.size.setItemData(i, tr("the {preset} preset: auralite train --preset {preset}",
+                                        preset=fit.preset), Qt.ItemDataRole.ToolTipRole)
         self._size_changed()
 
     def _current_fit(self) -> PresetFit | None:
@@ -668,13 +669,13 @@ class TrainTab(QWidget):
         the classic interface's files too - its *Save Config* files of 2.26 and before
         included (`studio/trainform.py`)."""
         from ..trainform import read_train_settings
-        path = ask_open(self, "Load settings", "Settings (*.json);;All files (*)")
+        path = ask_open(self, tr("Load settings"), tr("Settings (*.json);;All files (*)"))
         if not path:
             return
         try:
             doc = read_train_settings(path)
         except (OSError, ValueError) as err:
-            show_error(self, err, "reading the settings")
+            show_error(self, err, tr("reading the settings"))
             return
         self.apply_settings(TrainSettings.from_dict(doc["settings"]))
         paths = [p for p in doc["data"] if isinstance(p, str)]
@@ -696,7 +697,7 @@ class TrainTab(QWidget):
         try:
             tokenizer, info = read_tokenizer_file(path)
         except Exception as err:
-            show_error(self, err, "reading the tokenizer")
+            show_error(self, err, tr("reading the tokenizer"))
             return False
         self.tokenizer_vocab = int(getattr(tokenizer, "vocab_size", 0) or 0)
         self.tokenizer_path.setText(path)
@@ -715,7 +716,7 @@ class TrainTab(QWidget):
         try:
             engine.save_tokenizer(path)
         except Exception as err:
-            show_error(self, err, "saving the tokenizer")
+            show_error(self, err, tr("saving the tokenizer"))
             return
         self.panel.status.setText(tr("Tokenizer saved: {path}", path=path))
 
@@ -745,7 +746,7 @@ class TrainTab(QWidget):
                                      f"{stem}_{kind}{size}_tokenizer.json"))
         if not path:
             return
-        if not self.studio.begin("training the tokenizer"):
+        if not self.studio.begin(N_("training the tokenizer")):
             return
         engine = self.studio.engine
         paths = list(report.paths)
@@ -786,7 +787,7 @@ class TrainTab(QWidget):
         vocab = int(self.vocab.value())
         val = min(max(float(self.val_split.value()), 0.0), 0.5)
         source = report.paths[0]
-        if not self.studio.begin("preparing the dataset"):
+        if not self.studio.begin(N_("preparing the dataset")):
             return
         # the app tokenizes in this process (frozen programs start no worker processes)
         workers = 1 if getattr(sys, "frozen", False) else None
@@ -852,8 +853,8 @@ class TrainTab(QWidget):
         self.panel.end(tr("It failed - see the message."))
         self.studio.end(model_dirty=None)
         self._model_changed()
-        self.studio.report_error(exc, "training the tokenizer" if task == "tokenizer"
-                                 else "preparing the dataset")
+        self.studio.report_error(exc, tr("training the tokenizer") if task == "tokenizer"
+                                 else tr("preparing the dataset"))
 
     def suggest_epochs(self) -> None:
         """2.24: passes for about 20 tokens of text per parameter (the classic interface's
@@ -872,7 +873,7 @@ class TrainTab(QWidget):
         self.epochs.setValue(int(epochs))
         self.suggest_hint.setText(tr("{params} parameters, about {tokens} tokens of text: "
                                      "{epochs} passes", params=size_text(fit.params),
-                                     tokens=f"{tokens:,}", epochs=epochs))
+                                     tokens=number(tokens), epochs=epochs))
         self.suggest_hint.setVisible(True)
 
     # ---- helping another computer (2.24) -------------------------------------
@@ -887,7 +888,7 @@ class TrainTab(QWidget):
             show_error(self, _settings_error(tr("type the address of the main computer (like "
                                                 "192.168.1.10 or 192.168.1.10:29500)")))
             return
-        if not self.studio.begin("helping another computer's training"):
+        if not self.studio.begin(N_("helping another computer's training")):
             return
 
         def work(job: Job) -> Any:
@@ -917,7 +918,7 @@ class TrainTab(QWidget):
         self.worker_status.setText(tr("The connection failed - see the message."))
         self.studio.end(model_dirty=None)
         self._model_changed()
-        self.studio.report_error(exc, "helping another computer's training")
+        self.studio.report_error(exc, tr("helping another computer's training"))
 
     # ---- running -----------------------------------------------------------
     def start(self) -> None:
@@ -946,7 +947,7 @@ class TrainTab(QWidget):
         elif not self.studio.confirm_replace_model(tr("A new model replaces the one in "
                                                       "memory.")):
             return
-        if not self.studio.begin("training"):
+        if not self.studio.begin(N_("training")):
             return
         paths = list(report.paths)
         # trained further: "Train the model in memory on more.txt" (its file, if any, kept)
@@ -983,7 +984,7 @@ class TrainTab(QWidget):
         if not self.studio.confirm_replace_model(tr("Continuing the run loads it in place of "
                                                     "the model in memory.")):
             return
-        if not self.studio.begin("training"):
+        if not self.studio.begin(N_("training")):
             return
         engine = self.studio.engine
         self.studio.goto("train")
@@ -1053,7 +1054,7 @@ class TrainTab(QWidget):
         self.studio.end(model_dirty=self.studio.engine.model is not None)
         self._model_changed()
         self.studio.runs_changed.emit()
-        self.studio.report_error(exc, "training")
+        self.studio.report_error(exc, tr("training"))
 
     def finish(self) -> None:
         if self.job is not None:

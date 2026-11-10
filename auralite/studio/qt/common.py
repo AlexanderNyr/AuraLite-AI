@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QFileDialog, QFrame, QHBoxLayou
 from ..errors import FriendlyError, explain_error
 from ..logs import log_dir
 from ..settingsfile import SETTINGS_FORMAT, read_settings, write_settings  # noqa: F401
+from ..i18n import tr
 
 log = logging.getLogger("auralite.studio")
 
@@ -135,10 +136,11 @@ def show_error(parent: QWidget | None, error: BaseException | FriendlyError,
     box.setWindowTitle(friendly.title)
     box.setText(f"<b>{_html(friendly.title)}</b><br><br>{_html(friendly.message)}")
     if friendly.hints:
-        box.setInformativeText("What to try:\n" + "\n".join(f"• {h}" for h in friendly.hints))
+        box.setInformativeText(tr("What to try:") + "\n"
+                               + "\n".join(f"• {h}" for h in friendly.hints))
     if friendly.details:
         box.setDetailedText(friendly.details)
-    logs = box.addButton("Open the log folder", QMessageBox.ButtonRole.HelpRole)
+    logs = box.addButton(tr("Open the log folder"), QMessageBox.ButtonRole.HelpRole)
     box.addButton(QMessageBox.StandardButton.Ok)
     box.exec()
     if box.clickedButton() is logs:
@@ -207,14 +209,15 @@ def package_note(module: str) -> str:
         pass
     from auralite import bundle
     hints = bundle.missing_part(module, bundle.EXTRAS.get(module, ""))
-    return f"Needs the package «{module}»: " + (hints[0] if hints else f"pip install {module}")
+    return tr("Needs the package «{module}»: ", module=module) + (
+        hints[0] if hints else f"pip install {module}")
 
 
 def save_settings_file(parent: QWidget | None, tab: str, settings: dict[str, Any],
                        data: list[str] | None = None, **extra: Any) -> str:
     """Write a tab's settings (and its data's paths) to a JSON file the user picks (2.24:
     the classic interface's Save Config); returns the path, or "" when cancelled."""
-    path = ask_save(parent, "Save the settings", "Settings (*.json)", f"{tab}-settings.json")
+    path = ask_save(parent, tr("Save the settings"), tr("Settings (*.json)"), f"{tab}-settings.json")
     if not path:
         return ""
     return write_settings(path, tab, settings, data, **extra)
@@ -223,7 +226,7 @@ def save_settings_file(parent: QWidget | None, tab: str, settings: dict[str, Any
 def load_settings_file(parent: QWidget | None, tab: str) -> dict[str, Any] | None:
     """Read a settings file of `tab` the user picks (None when cancelled). Raises
     ValueError for a file that is not one, OSError when it cannot be read."""
-    path = ask_open(parent, "Load settings", "Settings (*.json);;All files (*)")
+    path = ask_open(parent, tr("Load settings"), tr("Settings (*.json);;All files (*)"))
     if not path:
         return None
     return read_settings(path, tab)

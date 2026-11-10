@@ -10,7 +10,40 @@ from __future__ import annotations
 
 from typing import Any
 
+from .i18n import N_, language, number, tr
+
 __all__ = ["merge_question", "model_info_lines"]
+
+#: 2.28: the words of the description, translated where it is shown; the names of the
+#: model's dimensions (d_model, n_heads, …) stay as they are.
+LABELS = (N_("Backend"), N_("File"), N_("Parameters"), N_("Vocab size"), N_("Tokenizer"),
+          N_("threads"), N_("GPU layers"), N_("Batch"), N_("Chat completion"),
+          N_("Chat format"), N_("Training"), N_("Model"), N_("Trainable"), N_("device"),
+          N_("Quantized"), N_("LoRA config"), N_("Trainable (LoRA)"), N_("Chat template"),
+          N_("gen. window"), N_("last val loss"), N_("last val BPB"))
+VALUES = (N_("Yes"), N_("No"), N_("Yes ✅"), N_("not supported for .gguf (inference-only)"),
+          N_("use the HF / LoRA fine-tuning tools in the Model tab"), N_("full context"),
+          N_("auto/default"), N_("No model in memory."), N_("GGUF metadata:"),
+          N_("Last training params:"))
+_WIDTH = 16
+
+
+def _localize(lines: list[str]) -> list[str]:
+    """The lines with their labels and words in the interface's language, the values lined
+    up again behind the longest label."""
+    if language() == "en":
+        return lines
+    rows: list[tuple[str, str] | str] = []
+    for line in lines:
+        if len(line) > _WIDTH + 1 and line[_WIDTH:_WIDTH + 2] == ": " and line[:1] != " ":
+            label, value = line[:_WIDTH].rstrip(), line[_WIDTH + 2:]
+            value = value.replace(" (trained length)", " " + tr("(trained length)"))
+            value = value.replace("bits/byte", tr("bits/byte"))
+            rows.append((tr(label), tr(value)))
+        else:
+            rows.append(tr(line) if line and line[:1] != " " else line)
+    width = max([len(r[0]) for r in rows if isinstance(r, tuple)] + [_WIDTH - 1])
+    return [f"{r[0]:<{width}} : {r[1]}" if isinstance(r, tuple) else r for r in rows]
 
 
 def model_info_lines(engine: Any) -> list[str]:
@@ -24,7 +57,7 @@ def model_info_lines(engine: Any) -> list[str]:
         n_params = m.count_parameters() if hasattr(m, "count_parameters") else 0
         lines.append("Backend         : GGUF / llama.cpp")
         lines.append(f"File            : {getattr(m, 'path', '—')}")
-        lines.append(f"Parameters      : {n_params:,}" if n_params else "Parameters      : —")
+        lines.append(f"Parameters      : {number(n_params)}" if n_params else "Parameters      : —")
         lines.append(f"Vocab size      : {engine.vocab_size or '—'}")
         lines.append(f"Tokenizer       : {tok.kind if tok else 'gguf'}")
         lines.append(f"max_seq_len     : {getattr(m, 'max_seq_len', '—')}")
@@ -48,8 +81,8 @@ def model_info_lines(engine: Any) -> list[str]:
         info = engine.hf_proxy.get_info() if engine.hf_proxy else {}
         lines.append("Backend         : Hugging Face / transformers")
         lines.append(f"Model           : {info.get('model', engine.hf_path or '—')}")
-        lines.append(f"Parameters      : {m.count_parameters():,}")
-        lines.append(f"Trainable       : {m.count_trainable_parameters():,}")
+        lines.append(f"Parameters      : {number(m.count_parameters())}")
+        lines.append(f"Trainable       : {number(m.count_trainable_parameters())}")
         lines.append(f"Vocab size      : {engine.vocab_size or '—'}")
         lines.append(f"Tokenizer       : {type(tok).__name__ if tok else '—'}")
         lines.append(f"max_seq_len     : "
@@ -62,9 +95,9 @@ def model_info_lines(engine: Any) -> list[str]:
         lines.append("Training        : use the HF / LoRA fine-tuning tools in the Model tab")
     else:
         tok = engine.tokenizer
-        lines.append(f"Parameters      : {m.count_parameters():,}")
+        lines.append(f"Parameters      : {number(m.count_parameters())}")
         if hasattr(m, "lora_rank") and m.lora_rank > 0:
-            lines.append(f"Trainable (LoRA): {m.count_trainable_parameters():,} "
+            lines.append(f"Trainable (LoRA): {number(m.count_trainable_parameters())} "
                          f"(rank {m.lora_rank})")
         lines.append(f"Vocab size      : {engine.vocab_size}")
         lines.append(f"Tokenizer       : {tok.kind if tok else '—'}")
@@ -97,7 +130,7 @@ def model_info_lines(engine: Any) -> list[str]:
             lines.append("Last training params:")
             for k, v in engine.params_used.items():
                 lines.append(f"  {k} = {v}")
-    return lines
+    return _localize(lines)
 
 
 def merge_question(engine: Any) -> str:
@@ -117,6 +150,6 @@ def merge_question(engine: Any) -> str:
     if not quantized:
         return ""
     need = int(native.count_parameters()) * 4
-    return (f"The base is stored in 4 bits. Merged, every weight is a float32 one: about "
-            f"{format_gb(need)} of memory and a bigger file, but fast replies. Save the "
-            f"adapters first to keep the small version.\n\nMerge now?")
+    return tr("The base is stored in 4 bits. Merged, every weight is a float32 one: about "
+              "{size} of memory and a bigger file, but fast replies. Save the adapters first to "
+              "keep the small version.", size=format_gb(need)) + "\n\n" + tr("Merge now?")

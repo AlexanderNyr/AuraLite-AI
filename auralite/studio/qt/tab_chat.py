@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGr
                                QWidget)
 
 from .. import agentmode, insights
-from ..i18n import tr
+from ..i18n import N_, number, tr
 from ..recipes import SettingsError
 from .common import (Collapsible, Job, ask_save, confirm, heading, hint, inform, primary,
                      show_error)
@@ -73,51 +73,51 @@ class ChatTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         top = QHBoxLayout()
-        top.addWidget(heading("Chat"))
+        top.addWidget(heading(tr("Chat")))
         self.model_label = hint("")
         top.addWidget(self.model_label, 1)
-        self.open_button = QPushButton("Open a model…")
+        self.open_button = QPushButton(tr("Open a model…"))
         top.addWidget(self.open_button)
         layout.addLayout(top)
-        self.slow_hint = hint("This model's weights are in 4 bits, which makes every reply "
+        self.slow_hint = hint(tr("This model's weights are in 4 bits, which makes every reply "
                               "slow: merge the adapters and export to GGUF (Export tab) for fast "
-                              "chat in llama.cpp, Ollama or LM Studio.")
+                              "chat in llama.cpp, Ollama or LM Studio."))
         self.slow_hint.setVisible(False)
         layout.addWidget(self.slow_hint)
         # 2.21.3: a model trained on plain text continues text (text_mode, TEXT_MODE)
-        self.text_hint = hint("This model learned plain text, not dialogs: it continues what "
+        self.text_hint = hint(tr("This model learned plain text, not dialogs: it continues what "
                               "you write instead of answering - type the start of a text. To "
-                              "chat, train or fine-tune a model on dialogs (.jsonl).")
+                              "chat, train or fine-tune a model on dialogs (.jsonl)."))
         self.text_hint.setVisible(False)
         layout.addWidget(self.text_hint)
 
         settings = QHBoxLayout()
         self.system = QLineEdit()
-        self.system.setPlaceholderText("System prompt (optional): who the assistant is, how it "
-                                       "answers")
+        self.system.setPlaceholderText(tr("System prompt (optional): who the assistant is, how it "
+                                       "answers"))
         settings.addWidget(self.system, 3)
-        settings.addWidget(QLabel("Temperature:"))
+        settings.addWidget(QLabel(tr("Temperature:")))
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.1)
         self.temperature.setValue(0.7)
         settings.addWidget(self.temperature)
-        settings.addWidget(QLabel("Max tokens:"))
+        settings.addWidget(QLabel(tr("Max tokens:")))
         self.max_tokens = QSpinBox()
         self.max_tokens.setRange(8, 8192)
         self.max_tokens.setValue(256)
         settings.addWidget(self.max_tokens)
-        settings.addWidget(QLabel("Template:"))
+        settings.addWidget(QLabel(tr("Template:")))
         self.template = QComboBox()
-        self.template.addItem("auto", "")
-        self.template.addItem("continue the text", TEXT_MODE)
+        self.template.addItem(tr("auto"), "")
+        self.template.addItem(tr("continue the text"), TEXT_MODE)
         from auralite.engine import CHAT_TEMPLATES
         for name in CHAT_TEMPLATES:
             self.template.addItem(name, name)
-        self.template.setToolTip("How messages reach the model: auto - its own chat template, "
+        self.template.setToolTip(tr("How messages reach the model: auto - its own chat template, "
                                  "or text it continues for a model trained on plain text; "
                                  "continue the text - the message is the start of a text the "
-                                 "model writes on; or a chat template by name")
+                                 "model writes on; or a chat template by name"))
         settings.addWidget(self.template)
         layout.addLayout(settings)
 
@@ -141,16 +141,16 @@ class ChatTab(QWidget):
         chat_layout.addWidget(self.view, 1)
 
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Write a message - Enter sends, Shift+Enter starts a new "
-                                      "line")
+        self.input.setPlaceholderText(tr("Write a message - Enter sends, Shift+Enter starts a new "
+                                      "line"))
         self.input.setMaximumHeight(90)
         self.input.installEventFilter(_EnterSends(self))
         chat_layout.addWidget(self.input)
         buttons = QHBoxLayout()
-        self.send_button = primary(QPushButton("Send"))
-        self.stop_button = QPushButton("Stop")
-        self.new_button = QPushButton("New chat")
-        self.save_button = QPushButton("Save the chat…")
+        self.send_button = primary(QPushButton(tr("Send")))
+        self.stop_button = QPushButton(tr("Stop"))
+        self.new_button = QPushButton(tr("New chat"))
+        self.save_button = QPushButton(tr("Save the chat…"))
         for button in (self.send_button, self.stop_button, self.new_button, self.save_button):
             buttons.addWidget(button)
         self.speed = hint("")
@@ -220,7 +220,7 @@ class ChatTab(QWidget):
         tools = QGridLayout()
         self.tool_boxes: dict[str, QCheckBox] = {}
         for i, row in enumerate(agentmode.tool_rows()):
-            box = QCheckBox(f"{row.name} - {row.description}")
+            box = QCheckBox(f"{row.name} - {tr(row.description)}")
             box.setChecked(row.available)
             box.setEnabled(row.available)
             if row.note:
@@ -301,7 +301,7 @@ class ChatTab(QWidget):
     def _model_changed(self) -> None:
         engine = self.studio.engine
         self.model_label.setText(self.studio.model_description() if engine.model is not None
-                                 else "no model yet: train, fine-tune or open one")
+                                 else tr("no model yet: train, fine-tune or open one"))
         quantized = False
         model = engine.model
         if model is not None:
@@ -336,8 +336,8 @@ class ChatTab(QWidget):
         self.text_hint.setVisible(text and self.studio.engine.model is not None)
         self.system.setEnabled(not text)
         self.input.setPlaceholderText(
-            "Write the start of a text - the model continues it; Enter sends" if text else
-            "Write a message - Enter sends, Shift+Enter starts a new line")
+            tr("Write the start of a text - the model continues it; Enter sends") if text else
+            tr("Write a message - Enter sends, Shift+Enter starts a new line"))
         if not self.messages and self.job is None:
             self.render()
 
@@ -367,7 +367,7 @@ class ChatTab(QWidget):
             except ValueError as err:
                 show_error(self, SettingsError(str(err)))
                 return
-        if not self.studio.begin("chat", quiet=True):
+        if not self.studio.begin(N_("chat"), quiet=True):
             if agent is not None:
                 agent.cleanup()
             return
@@ -492,7 +492,7 @@ class ChatTab(QWidget):
             self._dirty = False
             self.render()
             seconds = max(1e-6, time.time() - self._started)
-            self.speed.setText(f"{self._pieces / seconds:.1f} pieces/s")
+            self.speed.setText(tr("{value:.1f} pieces/s", value=self._pieces / seconds))
 
     def _done(self, _result: Any) -> None:
         self.timer.stop()
@@ -512,7 +512,7 @@ class ChatTab(QWidget):
         self.studio.end(model_dirty=None)
         self.render()
         seconds = time.time() - self._started
-        self.speed.setText(f"{self._pieces} pieces in {seconds:.1f} s")
+        self.speed.setText(tr("{pieces} pieces in {seconds:.1f} s", pieces=self._pieces, seconds=seconds))
         self._update_buttons()
 
     def _failed(self, exc: BaseException) -> None:
@@ -527,7 +527,7 @@ class ChatTab(QWidget):
         self.studio.end(model_dirty=None)
         self.render()
         self._update_buttons()
-        self.studio.report_error(exc, "the reply")
+        self.studio.report_error(exc, tr("the reply"))
 
     def stop(self) -> None:
         if self.job is not None:
@@ -561,7 +561,7 @@ class ChatTab(QWidget):
         top = insights.top_tokens(pairs, TOP_TOKENS)
         self.insight_view.show_bars(top, tr("The most frequent tokens of the last reply"))
         self.insight_status.setText(tr("{unique} different tokens in {chars} characters",
-                                       unique=f"{len(pairs):,}", chars=f"{len(text):,}"))
+                                       unique=number(len(pairs)), chars=number(len(text))))
         self.insights_section.set_expanded(True)
 
     def show_attention(self) -> None:
@@ -590,7 +590,7 @@ class ChatTab(QWidget):
         self.insights_section.set_expanded(True)
 
     def save_chat(self) -> None:
-        path = ask_save(self, "Save the chat", "Dialog (*.jsonl);;Text (*.txt)", "chat.jsonl")
+        path = ask_save(self, tr("Save the chat"), tr("Dialog (*.jsonl);;Text (*.txt)"), "chat.jsonl")
         if not path:
             return
         try:
@@ -603,7 +603,7 @@ class ChatTab(QWidget):
                                 if self.system.text().strip() else []) + self.messages
                     f.write(json.dumps({"messages": messages}, ensure_ascii=False) + "\n")
         except OSError as err:
-            show_error(self, err, "saving the chat")
+            show_error(self, err, tr("saving the chat"))
 
     # ---- view ----------------------------------------------------------------
     def render(self) -> None:
@@ -615,17 +615,17 @@ class ChatTab(QWidget):
             else "#323944"
         parts = [f"<div style='color:{text_color}'>"]
         if not self.messages and not self.job:
-            parts.append("<p style='color:gray'>Type the start of a text: the model writes on "
-                         "from it.</p>" if self.text_mode() else
-                         "<p style='color:gray'>Ask something to see how the model answers. "
-                         "Fine-tuned models answer in the style of their dialogs.</p>")
+            parts.append("<p style='color:gray'>" + (
+                tr("Type the start of a text: the model writes on from it.") if self.text_mode()
+                else tr("Ask something to see how the model answers. Fine-tuned models answer "
+                        "in the style of their dialogs.")) + "</p>")
         shown = list(self.messages)
         if self.job is not None:
             shown.append({"role": "assistant", "content": self.reply + " ▌"})
         for m in shown:
             mine = m["role"] == "user"
             body = html.escape(m["content"]).replace("\n", "<br>")
-            who = "You" if mine else "Model"
+            who = tr("You") if mine else tr("Model")
             parts.append(
                 f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
                 f"<td align='{'right' if mine else 'left'}'>"

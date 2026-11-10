@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auralite-ai"
-version = "2.27.0"
+version = "2.28.0"
 description = "Train, fine-tune and run language models on your own PC: native engine, QLoRA, GGUF and Hugging Face export, a desktop app (AuraLite Studio) and an OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -125,8 +125,9 @@ include = ["auralite", "auralite.*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-# PEP 561 marker for the whole package (was model_engine/py.typed until 2.6).
-auralite = ["py.typed"]
+# PEP 561 marker for the whole package (was model_engine/py.typed until 2.6); 2.28: the
+# interfaces' catalogues (auralite/locale/ru.json).
+auralite = ["py.typed", "locale/*.json"]
 
 [tool.ruff]
 line-length = 100

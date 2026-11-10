@@ -31,6 +31,7 @@ from ..libraryview import EVAL_DIALOGS, EVAL_TOKENS, REFRESH_MS
 from .common import Job, confirm, heading, hint, inform, open_path, primary, show_error
 from .theme import ACCENT
 from .widgets import CurveChart
+from ..i18n import N_, tr, trn
 
 if TYPE_CHECKING:
     from .window import MainWindow
@@ -42,7 +43,7 @@ STATUS_COLORS = dict(view.STATUS_COLORS, running=ACCENT)
 
 def _table(headers: list[str]) -> QTableWidget:
     table = QTableWidget(0, len(headers))
-    table.setHorizontalHeaderLabels(headers)
+    table.setHorizontalHeaderLabels([tr(h) for h in headers])
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.verticalHeader().setVisible(False)
@@ -80,10 +81,10 @@ class CompareDialog(QDialog):
 
     def __init__(self, runs: list[runlib.Run], parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle(f"Compare {len(runs)} runs")
+        self.setWindowTitle(tr("Compare {n_runs} runs", n_runs=len(runs)))
         self.comparison = runlib.compare_runs(runs)
         layout = QVBoxLayout(self)
-        self.chart = CurveChart(empty_text="These runs have no curves")
+        self.chart = CurveChart(empty_text=N_("These runs have no curves"))
         self.chart.set_series(self.comparison["series"])
         layout.addWidget(self.chart, 1)
         rows = self.comparison["rows"]
@@ -95,9 +96,9 @@ class CompareDialog(QDialog):
             for c, value in enumerate(values):
                 self.table.setItem(r, c, _item(value, bold=differs))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(hint(view.COMPARE_HINT))
+        layout.addWidget(hint(tr(view.COMPARE_HINT)))
         layout.addWidget(self.table, 2)
-        close = QPushButton("Close")
+        close = QPushButton(tr("Close"))
         close.clicked.connect(self.close)
         line = QHBoxLayout()
         line.addStretch(1)
@@ -119,19 +120,19 @@ class LibraryTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 14, 18, 10)
         top = QHBoxLayout()
-        top.addWidget(heading("Library"))
+        top.addWidget(heading(tr("Library")))
         top.addStretch(1)
         self.disk_label = QLabel("")
         self.disk_label.setObjectName("hint")
         top.addWidget(self.disk_label)
-        refresh = QPushButton("Refresh")
+        refresh = QPushButton(tr("Refresh"))
         refresh.clicked.connect(self.refresh)
         top.addWidget(refresh)
         layout.addLayout(top)
         self.pages = QTabWidget()
-        self.pages.addTab(self._build_runs(), "Runs")
-        self.pages.addTab(self._build_models(), "Models")
-        self.pages.addTab(self._build_datasets(), "Datasets")
+        self.pages.addTab(self._build_runs(), tr("Runs"))
+        self.pages.addTab(self._build_models(), tr("Models"))
+        self.pages.addTab(self._build_datasets(), tr("Datasets"))
         layout.addWidget(self.pages, 1)
         self.timer = QTimer(self)
         self.timer.setInterval(REFRESH_MS)
@@ -145,14 +146,14 @@ class LibraryTab(QWidget):
         layout.setContentsMargins(0, 8, 0, 0)
         tools = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText(view.SEARCH_PLACEHOLDER)
+        self.search.setPlaceholderText(tr(view.SEARCH_PLACEHOLDER))
         self.search.textChanged.connect(lambda _t: self.fill_runs())
         tools.addWidget(self.search, 1)
-        self.compare_button = QPushButton("Compare")
-        self.compare_button.setToolTip(view.COMPARE_TIP)
+        self.compare_button = QPushButton(tr("Compare"))
+        self.compare_button.setToolTip(tr(view.COMPARE_TIP))
         self.compare_button.clicked.connect(self.compare_selected)
         tools.addWidget(self.compare_button)
-        folder = QPushButton("Runs folder")
+        folder = QPushButton(tr("Runs folder"))
         folder.clicked.connect(lambda: open_path(str(runlib.runs_root())))
         tools.addWidget(folder)
         layout.addLayout(tools)
@@ -160,7 +161,7 @@ class LibraryTab(QWidget):
         self.runs_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.runs_table.itemSelectionChanged.connect(self._run_selected)
         self.runs_table.itemDoubleClicked.connect(lambda _i: self.open_result())
-        self.empty_runs = hint(view.EMPTY_RUNS)
+        self.empty_runs = hint(tr(view.EMPTY_RUNS))
         splitter = QSplitter(Qt.Orientation.Vertical)
         top = QWidget()
         top_layout = QVBoxLayout(top)
@@ -180,22 +181,22 @@ class LibraryTab(QWidget):
         layout.setContentsMargins(0, 6, 0, 0)
         name_line = QHBoxLayout()
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("The run's name")
+        self.name_edit.setPlaceholderText(tr("The run's name"))
         name_line.addWidget(self.name_edit, 1)
-        self.save_button = QPushButton("Save the name and notes")
+        self.save_button = QPushButton(tr("Save the name and notes"))
         self.save_button.clicked.connect(self.save_notes)
         name_line.addWidget(self.save_button)
         layout.addLayout(name_line)
         body = QHBoxLayout()
         left = QVBoxLayout()
-        self.facts = QLabel("Select a run.")
+        self.facts = QLabel(tr("Select a run."))
         self.facts.setWordWrap(True)
         self.facts.setTextFormat(Qt.TextFormat.RichText)
         self.facts.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.facts.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         left.addWidget(self.facts, 1)
         self.notes = QPlainTextEdit()
-        self.notes.setPlaceholderText("Notes: what you tried, what you saw")
+        self.notes.setPlaceholderText(tr("Notes: what you tried, what you saw"))
         self.notes.setMaximumHeight(70)
         left.addWidget(self.notes)
         body.addLayout(left, 1)
@@ -203,27 +204,27 @@ class LibraryTab(QWidget):
         body.addWidget(self.chart, 1)
         layout.addLayout(body, 1)
         buttons = QHBoxLayout()
-        self.continue_button = primary(QPushButton("Continue"))
-        self.continue_button.setToolTip(view.CONTINUE_TIP)
+        self.continue_button = primary(QPushButton(tr("Continue")))
+        self.continue_button.setToolTip(tr(view.CONTINUE_TIP))
         self.continue_button.clicked.connect(self.continue_selected)
-        self.open_button = QPushButton("Open the result")
+        self.open_button = QPushButton(tr("Open the result"))
         self.open_button.clicked.connect(self.open_result)
-        self.evaluate_button = QPushButton("Evaluate")
-        self.evaluate_button.setToolTip(view.EVALUATE_TIP)
+        self.evaluate_button = QPushButton(tr("Evaluate"))
+        self.evaluate_button.setToolTip(tr(view.EVALUATE_TIP, n=EVAL_DIALOGS))
         self.evaluate_button.clicked.connect(self.evaluate_selected)
-        self.more_button = QPushButton("Train more")
-        self.more_button.setToolTip(view.MORE_TIP)
+        self.more_button = QPushButton(tr("Train more"))
+        self.more_button.setToolTip(tr(view.MORE_TIP))
         self.more_button.clicked.connect(self.train_more)
-        self.repeat_button = QPushButton("Repeat")
-        self.repeat_button.setToolTip(view.REPEAT_TIP)
+        self.repeat_button = QPushButton(tr("Repeat"))
+        self.repeat_button.setToolTip(tr(view.REPEAT_TIP))
         self.repeat_button.clicked.connect(self.repeat)
-        self.files_button = QPushButton("Show files")
+        self.files_button = QPushButton(tr("Show files"))
         self.files_button.clicked.connect(self.show_files)
-        self.delete_button = QPushButton("Delete")
+        self.delete_button = QPushButton(tr("Delete"))
         menu = QMenu(self.delete_button)
-        menu.addAction("Delete its model files (keep the record and curve)",
+        menu.addAction(tr("Delete its model files (keep the record and curve)"),
                        lambda: self.delete_selected(files_only=True))
-        menu.addAction("Delete the run", lambda: self.delete_selected(files_only=False))
+        menu.addAction(tr("Delete the run"), lambda: self.delete_selected(files_only=False))
         self.delete_button.setMenu(menu)
         for button in (self.continue_button, self.open_button, self.evaluate_button,
                        self.more_button, self.repeat_button, self.files_button,
@@ -235,7 +236,7 @@ class LibraryTab(QWidget):
         self.task_label = QLabel("")
         self.task_label.setObjectName("hint")
         task.addWidget(self.task_label, 1)
-        self.task_stop = QPushButton("Stop")
+        self.task_stop = QPushButton(tr("Stop"))
         self.task_stop.clicked.connect(self.stop_task)
         self.task_stop.setVisible(False)
         task.addWidget(self.task_stop)
@@ -281,7 +282,7 @@ class LibraryTab(QWidget):
         for row, run in enumerate(shown):
             name, status, kind, best, seconds, started = view.run_row(run)
             table.setItem(row, 0, _item(name, run.id))
-            table.setItem(row, 1, _item(status, color=STATUS_COLORS.get(status, "")))
+            table.setItem(row, 1, _item(status, color=STATUS_COLORS.get(run.status, "")))
             table.setItem(row, 2, _item(kind))
             table.setItem(row, 3, _item(best, right=True))
             table.setItem(row, 4, _item(seconds, right=True))
@@ -327,7 +328,7 @@ class LibraryTab(QWidget):
             self._shown_id = ""
             self.name_edit.setText("")
             self.notes.setPlainText("")
-            self.facts.setText("Select a run." if self.runs else "")
+            self.facts.setText(tr("Select a run.") if self.runs else "")
             self.chart.set_series([])
         else:
             if run.id != self._shown_id:
@@ -371,7 +372,7 @@ class LibraryTab(QWidget):
         """Continue `run` in its tab (Train or Fine-tune), where its progress shows."""
         ok, why = run.continue_state()
         if not ok:
-            inform(self, "This run cannot continue", f"{run.name} cannot continue: {why}.")
+            inform(self, tr("This run cannot continue"), tr("{name} cannot continue: {why}.", name=run.name, why=why))
             return
         self._tab_of(run).continue_run(run)
 
@@ -410,18 +411,18 @@ class LibraryTab(QWidget):
         run = self.current_run()
         if run is None or run.status == "running":
             return
-        if not confirm(self, "Delete", view.delete_run_question(run, files_only)):
+        if not confirm(self, tr("Delete"), view.delete_run_question(run, files_only)):
             return
         try:
             runlib.delete_run(run, files_only=files_only)
         except (OSError, ValueError) as err:
-            show_error(self, err, "deleting the run")
+            show_error(self, err, tr("deleting the run"))
         self.refresh()
 
     def compare_selected(self) -> None:
         runs = self.selected_runs()
         if len(runs) < 2:
-            inform(self, "Compare runs", view.SELECT_TWO)
+            inform(self, tr("Compare runs"), tr(view.SELECT_TWO))
             return
         if self.compare_dialog is not None:
             self.compare_dialog.close()
@@ -435,24 +436,25 @@ class LibraryTab(QWidget):
         if run is None or run.result_path is None:
             return
         if str(run.data.get("kind")) not in ("dialogs", "preferences"):
-            inform(self, "Evaluate", view.EVAL_TEXT_ONLY)
+            inform(self, tr("Evaluate"), tr(view.EVAL_TEXT_ONLY))
             return
-        if not self.studio.confirm_replace_model("The evaluation loads the run's result in "
-                                                 "place of the model in memory."):
+        if not self.studio.confirm_replace_model(tr("The evaluation loads the run's result in "
+                                                    "place of the model in memory.")):
             return
-        if not self.studio.begin("an evaluation"):
+        if not self.studio.begin(N_("an evaluation")):
             return
         engine = self.studio.engine
         path = run.result_path
 
         def work(job: Job) -> Any:
-            job.progress.emit(("stage", f"Loading {run.name}…"))
+            job.progress.emit(("stage", tr("Loading {name}…", name=run.name)))
             engine.unload_model()
             engine.load_model(str(path))
             job.progress.emit(("loaded", str(path)))
             dialogs = runlib.held_out_dialogs(run)
             total = min(EVAL_DIALOGS, len(dialogs))
-            job.progress.emit(("stage", f"Replying to {total} held-out dialogs…"))
+            job.progress.emit(("stage", trn("Replying to {n} held-out dialog…",
+                                            "Replying to {n} held-out dialogs…", total)))
             started = time.time()
             result = engine.evaluate_chat(
                 dialogs, limit=EVAL_DIALOGS, max_new_tokens=EVAL_TOKENS,
@@ -465,7 +467,7 @@ class LibraryTab(QWidget):
         self.job.progress.connect(self._eval_progress)
         self.job.finished.connect(lambda result, r=run: self._evaluated(r, result))
         self.job.failed.connect(self._eval_failed)
-        self.task_label.setText("Evaluating…")
+        self.task_label.setText(tr("Evaluating…"))
         self.task_stop.setVisible(True)
         self._update_run_buttons()
         self.job.start()
@@ -476,7 +478,7 @@ class LibraryTab(QWidget):
         elif event[0] == "loaded":
             self.studio.model_loaded(str(event[1]))
         elif event[0] == "eval":
-            self.task_label.setText(f"Evaluating: {event[1]} of {event[2]} dialogs")
+            self.task_label.setText(tr("Evaluating: {event} of {event2} dialogs", event=event[1], event2=event[2]))
 
     def _evaluated(self, run: runlib.Run, result: dict) -> None:
         self.job = None
@@ -491,40 +493,40 @@ class LibraryTab(QWidget):
     def _eval_failed(self, exc: BaseException) -> None:
         self.job = None
         self.task_stop.setVisible(False)
-        self.task_label.setText("The evaluation failed - see the message.")
+        self.task_label.setText(tr("The evaluation failed - see the message."))
         self.studio.end(model_dirty=None)
         self._update_run_buttons()
-        self.studio.report_error(exc, "the evaluation")
+        self.studio.report_error(exc, tr("the evaluation"))
 
     def stop_task(self) -> None:
         if self.job is not None:
             self.job.stop_event.set()
-            self.task_label.setText("Stopping after this reply…")
+            self.task_label.setText(tr("Stopping after this reply…"))
 
     # ==== models ====================================================================
     def _build_models(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(hint(view.MODELS_HINT))
+        layout.addWidget(hint(tr(view.MODELS_HINT)))
         self.models_table = _table(list(view.MODEL_COLUMNS))
         self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.models_table.itemSelectionChanged.connect(self._update_model_buttons)
         self.models_table.itemDoubleClicked.connect(lambda _i: self.chat_with_model())
         layout.addWidget(self.models_table, 1)
         buttons = QHBoxLayout()
-        self.chat_model_button = primary(QPushButton("Chat with it"))
+        self.chat_model_button = primary(QPushButton(tr("Chat with it")))
         self.chat_model_button.clicked.connect(self.chat_with_model)
-        self.finetune_model_button = QPushButton("Fine-tune it")
+        self.finetune_model_button = QPushButton(tr("Fine-tune it"))
         self.finetune_model_button.clicked.connect(self.finetune_model)
-        self.export_model_button = QPushButton("Export it")
+        self.export_model_button = QPushButton(tr("Export it"))
         self.export_model_button.clicked.connect(self.export_model)
-        self.show_model_button = QPushButton("Show in folder")
+        self.show_model_button = QPushButton(tr("Show in folder"))
         self.show_model_button.clicked.connect(
             lambda: self._show(self.selected_model()))
-        self.forget_model_button = QPushButton("Remove from the list")
+        self.forget_model_button = QPushButton(tr("Remove from the list"))
         self.forget_model_button.clicked.connect(lambda: self._forget(self.selected_model()))
-        self.delete_model_button = QPushButton("Delete…")
+        self.delete_model_button = QPushButton(tr("Delete…"))
         self.delete_model_button.clicked.connect(lambda: self._delete(self.selected_model()))
         for button in (self.chat_model_button, self.finetune_model_button,
                        self.export_model_button, self.show_model_button,
@@ -623,12 +625,12 @@ class LibraryTab(QWidget):
     def _delete(self, item: library.LibraryItem | None) -> None:
         if item is None or not item.exists:
             return
-        if not confirm(self, "Delete", view.delete_item_question(item)):
+        if not confirm(self, tr("Delete"), view.delete_item_question(item)):
             return
         try:
             library.delete_item(item)
         except (OSError, ValueError) as err:
-            show_error(self, err, "deleting it")
+            show_error(self, err, tr("deleting it"))
         self.refresh()
 
     # ==== datasets ==================================================================
@@ -636,21 +638,21 @@ class LibraryTab(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(hint(view.DATASETS_HINT))
+        layout.addWidget(hint(tr(view.DATASETS_HINT)))
         self.data_table = _table(list(view.DATA_COLUMNS))
         self.data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.data_table.itemSelectionChanged.connect(self._update_data_buttons)
         layout.addWidget(self.data_table, 1)
         buttons = QHBoxLayout()
-        self.finetune_data_button = primary(QPushButton("Fine-tune on it"))
+        self.finetune_data_button = primary(QPushButton(tr("Fine-tune on it")))
         self.finetune_data_button.clicked.connect(lambda: self.use_data("finetune"))
-        self.train_data_button = QPushButton("Train on it")
+        self.train_data_button = QPushButton(tr("Train on it"))
         self.train_data_button.clicked.connect(lambda: self.use_data("train"))
-        self.show_data_button = QPushButton("Show in folder")
+        self.show_data_button = QPushButton(tr("Show in folder"))
         self.show_data_button.clicked.connect(lambda: self._show(self.selected_dataset()))
-        self.forget_data_button = QPushButton("Remove from the list")
+        self.forget_data_button = QPushButton(tr("Remove from the list"))
         self.forget_data_button.clicked.connect(lambda: self._forget(self.selected_dataset()))
-        self.delete_data_button = QPushButton("Delete…")
+        self.delete_data_button = QPushButton(tr("Delete…"))
         self.delete_data_button.clicked.connect(lambda: self._delete(self.selected_dataset()))
         for button in (self.finetune_data_button, self.train_data_button, self.show_data_button,
                        self.forget_data_button, self.delete_data_button):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from .i18n import tr
 
 __all__ = ["SETTINGS_FORMAT", "read_settings", "write_settings"]
 
@@ -33,8 +34,8 @@ def read_settings(path: str, tab: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
     if not isinstance(doc, dict) or doc.get("format") != SETTINGS_FORMAT:
-        raise ValueError(f"{os.path.basename(path)} is not a settings file of AuraLite Studio")
+        raise ValueError(tr("{name} is not a settings file of AuraLite Studio", name=os.path.basename(path)))
     if doc.get("tab") != tab:
-        raise ValueError(f"{os.path.basename(path)} holds settings of the {doc.get('tab')} "
-                         f"tab, not of the {tab} tab")
+        raise ValueError(tr("{name} holds settings of the {value} "
+                         "tab, not of the {tab} tab", name=os.path.basename(path), value=doc.get('tab'), tab=tab))
     return doc

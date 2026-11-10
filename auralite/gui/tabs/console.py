@@ -3,6 +3,7 @@
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
 from ..common import (filedialog, messagebox, tk, ttk)
+from ..i18n import tr
 
 class ConsoleTabMixin:
     def _build_console_tab(self):
@@ -12,18 +13,18 @@ class ConsoleTabMixin:
         toolbar = ttk.Frame(tab)
         toolbar.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(toolbar, text="🖥️ Live stdout / stderr from the engine",
+        ttk.Label(toolbar, text=tr("🖥️ Live stdout / stderr from the engine"),
                   style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(toolbar, text="🗑 Clear",
+        ttk.Button(toolbar, text=tr("🗑 Clear"),
                    command=self._clear_console).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(toolbar, text="📋 Copy All",
+        ttk.Button(toolbar, text=tr("📋 Copy All"),
                    command=self._copy_console).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(toolbar, text="💾 Save to file…",
+        ttk.Button(toolbar, text=tr("💾 Save to file…"),
                    command=self._save_console).pack(side=tk.RIGHT, padx=2)
 
         # Output area with scrollbar
-        out_frame = ttk.LabelFrame(tab, text="  📜  Output  ", padding="4")
+        out_frame = ttk.LabelFrame(tab, text=tr("  📜  Output  "), padding="4")
         out_frame.pack(fill=tk.BOTH, expand=True)
 
         ysb = ttk.Scrollbar(out_frame, orient=tk.VERTICAL)
@@ -54,14 +55,14 @@ class ConsoleTabMixin:
         # Legend strip
         legend = ttk.Frame(tab)
         legend.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(legend, text="Legend:", style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
+        ttk.Label(legend, text=tr("Legend:"), style="Sub.TLabel").pack(side=tk.LEFT, padx=4)
         for txt, color in [
             ("[AuraLite]", "#c586c0"),
             ("epoch",      "#4ec9b0"),
             ("INFO",       "#9cdcfe"),
             ("WARNING",    "#dcdcaa"),
             ("ERROR",      "#f48771"),
-            ("✅ done",     "#6a9955"),
+            (tr("✅ done"), "#6a9955"),
         ]:
             tk.Label(legend, text=txt, fg=color, bg="#f5f6f7",
                      font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=6)
@@ -78,24 +79,24 @@ class ConsoleTabMixin:
             text = self.console_text.get("1.0", tk.END)
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
-            self.status_label.config(text="Status: Console copied to clipboard ✅")
+            self.status_label.config(text=tr("Status: Console copied to clipboard ✅"))
         except tk.TclError:
             pass
 
 
     def _save_console(self):
         path = filedialog.asksaveasfilename(
-            title="Save console log",
+            title=tr("Save console log"),
             defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"),
-                       ("All files", "*.*")],
+            filetypes=[(tr("Log files"), "*.log"), (tr("Text files"), "*.txt"),
+                       (tr("All files"), "*.*")],
         )
         if not path:
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.console_text.get("1.0", tk.END))
-            messagebox.showinfo("Saved", f"Console log saved to:\n{path}")
+            messagebox.showinfo(tr("Saved"), tr("Console log saved to:\n{path}", path=path))
         except Exception as e:
-            self.report_error(e, "saving the console", title="Save Error")
+            self.report_error(e, tr("saving the console"), title=tr("Save Error"))
 

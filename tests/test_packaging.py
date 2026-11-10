@@ -282,6 +282,7 @@ def test_wheel_contains_every_module(built_wheel):
     missing = sorted(_package_modules() - names)
     assert not missing, f"not in the wheel: {missing}"
     assert "auralite/py.typed" in names
+    assert "auralite/locale/ru.json" in names   # 2.28: the interfaces' Russian catalogue
     assert "auralite/_compat.py" in names       # the alias machinery itself ships
 
 

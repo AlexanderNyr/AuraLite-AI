@@ -1,26 +1,28 @@
-"""gui/i18n.py — the string catalogue of the AuraLite GUI.
+"""gui/i18n.py — the words of the classic interface (2.28: in Russian too).
 
-A *dictionary*, not a framework: one catalogue per language, a module-level
-"current language" that the GUI sets from `GuiConfig`/``$AURALITE_GUI_LANG``,
-and a fallback chain ``requested language → English → the key itself`` so a
-missing string can never crash a tab. The GUI shows a language selector only
-when more than one catalogue is present.
+The catalogue is the one the Studio speaks through, ``auralite/locale/<code>.json``
+(`auralite.i18n`), keyed by the English text: ``tr("Open a model…")``. A few strings
+keep the names they had since 2.6.5 - ``tab.*`` for notebook titles (the suffix is the
+`AIApp._TAB_NAMES` entry: ``tab.train``, ``tab.gen``, …), ``btn.*`` for buttons and
+labels, ``msg.*`` for status lines - and ``tr`` takes those names too: `MESSAGES` holds
+their English, which the catalogue translates. A missing string can never crash a tab:
+it stays English, and so does a translation that fails to format.
 
-Keys are grouped by area: ``tab.*`` for notebook titles (the suffix is the
-`AIApp._TAB_NAMES` entry: ``tab.train``, ``tab.gen``, ``tab.quant``, …), ``btn.*`` for buttons
-and labels, ``msg.*`` for the few status strings the app produces itself.
+The language is chosen when the interface starts (`GuiConfig.language`, else
+``$AURALITE_GUI_LANG`` or ``$AURALITE_LANG``, else the computer's) and changes with the
+next start: the selector beside the device line and View -> Language save the choice.
 """
 from __future__ import annotations
 
 import os
 
-__all__ = ["LANGUAGES", "MESSAGES", "available_languages", "get_language",
-           "language_name", "set_language", "tr"]
+from auralite import i18n as _shared
+from auralite.i18n import LANGUAGES, N_, trn
+
+__all__ = ["LANGUAGES", "MESSAGES", "N_", "available_languages", "get_language",
+           "language_name", "resolve_language", "set_language", "tr", "trn"]
 
 DEFAULT_LANGUAGE = "en"
-
-#: language code → human-readable name (shown in the GUI selector)
-LANGUAGES = {"en": "English"}
 
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
@@ -61,41 +63,41 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
 }
 
-_current = os.environ.get("AURALITE_GUI_LANG", DEFAULT_LANGUAGE)
-if _current not in MESSAGES:
-    _current = DEFAULT_LANGUAGE
-
 
 def available_languages() -> tuple[str, ...]:
-    """Codes the GUI offers in its language selector."""
-    return tuple(LANGUAGES)
+    """Codes the GUI offers in its language selector: English and every language whose
+    catalogue is there."""
+    return tuple(code for code in LANGUAGES
+                 if code == DEFAULT_LANGUAGE or _shared.catalogue(code))
 
 
 def language_name(code: str | None = None) -> str:
-    code = code or _current
-    return LANGUAGES.get(code, code)
+    return _shared.language_name(code)
 
 
 def get_language() -> str:
-    return _current
+    return _shared.language()
 
 
-def set_language(code: str) -> str:
-    """Switch the active language; unknown codes fall back to English."""
-    global _current
-    _current = code if code in MESSAGES else DEFAULT_LANGUAGE
-    return _current
+def resolve_language(code: str | None = None) -> str:
+    """The language `set_language(code)` would choose (2.28)."""
+    return _shared.resolve_language(code or os.environ.get("AURALITE_GUI_LANG") or None)
+
+
+def set_language(code: str | None = None) -> str:
+    """Speak `code` (else ``$AURALITE_GUI_LANG``/``$AURALITE_LANG``, else the computer's
+    language); unknown codes fall back to English. Returns the language chosen."""
+    return _shared.set_language(code or os.environ.get("AURALITE_GUI_LANG") or None)
 
 
 def tr(key: str, lang: str | None = None, **kwargs) -> str:
-    """Translate ``key`` (optionally ``{placeholder}``-formatted with kwargs)."""
-    catalogue = MESSAGES.get(lang or _current) or MESSAGES[DEFAULT_LANGUAGE]
-    text = catalogue.get(key)
-    if text is None:
-        text = MESSAGES[DEFAULT_LANGUAGE].get(key, key)
-    if kwargs:
-        try:
-            return text.format(**kwargs)
-        except (KeyError, IndexError):
-            return text
-    return text
+    """`key` - an English text, or one of `MESSAGES`' names - in the interface's language
+    (or `lang`'s), ``{placeholder}``-formatted with `kwargs`."""
+    english = MESSAGES[DEFAULT_LANGUAGE].get(key, key)
+    code = lang or _shared.language()
+    if code not in LANGUAGES:
+        code = DEFAULT_LANGUAGE
+    try:
+        return _shared.translate(code, english, **kwargs)
+    except (KeyError, IndexError, ValueError):
+        return _shared.translate(code, english)

@@ -49,6 +49,11 @@ for dist in ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "shiboken6",
         pass
 
 
+# 2.28: the interfaces' catalogues (Russian): data files of the package, which PyInstaller
+# does not take by itself; the self-test names them, smoke_app.py checks that.
+datas.append((str(Path(bundle.__file__).resolve().parent / "locale"), "auralite/locale"))
+
+
 def license_copy(dest):
     """A license file inside a *.dist-info folder: the app has them all in its licenses
     folder already, and PyTorch's go deeper than a path Windows can unzip."""

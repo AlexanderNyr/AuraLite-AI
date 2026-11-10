@@ -18,6 +18,7 @@ import webbrowser
 from typing import Any
 
 from .common import messagebox, tk, ttk
+from .i18n import available_languages, language_name, tr
 
 GUIDE_URL = "https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/classic.md"
 #: How often the footer's memory figure is refreshed (milliseconds).
@@ -57,42 +58,55 @@ class MenuMixin:
         bar = tk.Menu(self.root)
         self.menubar = bar
         file_menu = tk.Menu(bar, tearoff=0)
-        file_menu.add_command(label="Open a model…", accelerator="Ctrl+O",
+        file_menu.add_command(label=tr("Open a model…"), accelerator="Ctrl+O",
                               command=lambda: self.load_model())         # type: ignore[attr-defined]
-        file_menu.add_command(label="Save the model as…", accelerator="Ctrl+S",
+        file_menu.add_command(label=tr("Save the model as…"), accelerator="Ctrl+S",
                               command=lambda: self.save_model())         # type: ignore[attr-defined]
         self.recent_menu = tk.Menu(file_menu, tearoff=0,
                                    postcommand=self._fill_recent_menu)
-        file_menu.add_cascade(label="Recent models", menu=self.recent_menu)
+        file_menu.add_cascade(label=tr("Recent models"), menu=self.recent_menu)
         file_menu.add_separator()
-        file_menu.add_command(label="Quit", accelerator="Ctrl+Q",
+        file_menu.add_command(label=tr("Quit"), accelerator="Ctrl+Q",
                               command=lambda: self._on_close())          # type: ignore[attr-defined]
-        bar.add_cascade(label="File", menu=file_menu)
+        bar.add_cascade(label=tr("File"), menu=file_menu)
         view = tk.Menu(bar, tearoff=0)
-        view.add_checkbutton(label="Dark theme", variable=self.dark_mode,
+        view.add_checkbutton(label=tr("Dark theme"), variable=self.dark_mode,
                              command=lambda: self._toggle_dark_mode())   # type: ignore[attr-defined]
-        bar.add_cascade(label="View", menu=view)
+        # 2.28: the interface's language, as the Studio's View -> Language
+        config = self.gui_config                                         # type: ignore[attr-defined]
+        self.language_choice = tk.StringVar(
+            value=config.language if config.language_chosen else "")
+        languages = tk.Menu(view, tearoff=0)
+        languages.add_radiobutton(label=tr("Automatic (the computer's language)"), value="",
+                                  variable=self.language_choice,
+                                  command=lambda: self._on_language_change(""))  # type: ignore[attr-defined]
+        for code in available_languages():
+            languages.add_radiobutton(
+                label=language_name(code), value=code, variable=self.language_choice,
+                command=lambda c=code: self._on_language_change(c))  # type: ignore[attr-defined]
+        view.add_cascade(label=tr("Language"), menu=languages)
+        bar.add_cascade(label=tr("View"), menu=view)
         tools = tk.Menu(bar, tearoff=0)
         self.tools_menu = tools
-        tools.add_command(label="Benchmark…", command=self._benchmark_clicked)  # entry 0
-        tools.add_command(label="Speed test", command=self._run_speed_test)
+        tools.add_command(label=tr("Benchmark…"), command=self._benchmark_clicked)  # entry 0
+        tools.add_command(label=tr("Speed test"), command=self._run_speed_test)
         tools.add_separator()
         # 2.27: the Studio's wizard and Library, and the log
-        tools.add_command(label="Setup wizard…", accelerator="Ctrl+N",
+        tools.add_command(label=tr("Setup wizard…"), accelerator="Ctrl+N",
                           command=lambda: self.open_wizard())             # type: ignore[attr-defined]
-        tools.add_command(label="Library: runs, models, datasets", accelerator="Ctrl+L",
+        tools.add_command(label=tr("Library: runs, models, datasets"), accelerator="Ctrl+L",
                           command=lambda: self._goto_tab("library"))      # type: ignore[attr-defined]
         tools.add_separator()
-        tools.add_command(label="Open the AuraLite folder", command=self._open_home)
-        tools.add_command(label="Open the log folder", command=self._open_logs)
-        tools.add_command(label="AuraLite Studio (Qt)", command=self._open_studio)
-        bar.add_cascade(label="Tools", menu=tools)
+        tools.add_command(label=tr("Open the AuraLite folder"), command=self._open_home)
+        tools.add_command(label=tr("Open the log folder"), command=self._open_logs)
+        tools.add_command(label=tr("AuraLite Studio (Qt)"), command=self._open_studio)
+        bar.add_cascade(label=tr("Tools"), menu=tools)
         help_menu = tk.Menu(bar, tearoff=0)
-        help_menu.add_command(label="Guide", accelerator="F1",
+        help_menu.add_command(label=tr("Guide"), accelerator="F1",
                               command=lambda: webbrowser.open(GUIDE_URL))
-        help_menu.add_command(label="Check for updates…", command=self._check_updates)
-        help_menu.add_command(label="About AuraLite", command=self._show_about)
-        bar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label=tr("Check for updates…"), command=self._check_updates)
+        help_menu.add_command(label=tr("About AuraLite"), command=self._show_about)
+        bar.add_cascade(label=tr("Help"), menu=help_menu)
         self.root.configure(menu=bar)
         for key, action in (("<Control-o>", lambda _e: self.load_model()),  # type: ignore[attr-defined]
                             ("<Control-s>", lambda _e: self.save_model()),  # type: ignore[attr-defined]
@@ -107,7 +121,8 @@ class MenuMixin:
 
     def _build_footer_tools(self, info_row: Any) -> None:
         """The footer's memory figure and the last speed test."""
-        self.memory_label = ttk.Label(info_row, text="RAM: —", style="Sub.TLabel")
+        self.memory_label = ttk.Label(info_row, text=tr("RAM: {used}", used="—"),
+                                      style="Sub.TLabel")
         self.memory_label.pack(side=tk.LEFT, padx=8)
         self.speed_label = ttk.Label(info_row, text=self._speed_text(), style="Sub.TLabel")
         self.speed_label.pack(side=tk.LEFT, padx=8)
@@ -118,7 +133,7 @@ class MenuMixin:
     def _speed_text(self) -> str:
         """The last speed test, for the footer ("" before the first)."""
         speed = float(getattr(self.gui_config, "gflops", 0.0) or 0.0)
-        return f"Speed: {speed:,.0f} GFLOP/s" if speed else ""
+        return tr("Speed: {speed:,.0f} GFLOP/s", speed=speed) if speed else ""
 
     # ---- recent models -------------------------------------------------------------------
     def _remember_model(self, path: str) -> None:
@@ -136,13 +151,13 @@ class MenuMixin:
         menu.delete(0, tk.END)
         recent = [p for p in getattr(self.gui_config, "recent_models", []) if isinstance(p, str)]
         if not recent:
-            menu.add_command(label="(none yet)", state=tk.DISABLED)
+            menu.add_command(label=tr("(none yet)"), state=tk.DISABLED)
         for path in recent:
             menu.add_command(label=path, command=lambda p=path: self._open_recent(p))
 
     def _open_recent(self, path: str) -> None:
         if not os.path.exists(path):
-            messagebox.showwarning("Recent models", f"The file is gone:\n{path}")
+            messagebox.showwarning(tr("Recent models"), tr("The file is gone:\n{path}", path=path))
             self.gui_config = self.gui_config.update(
                 recent_models=[p for p in self.gui_config.recent_models if p != path])
             return
@@ -154,7 +169,7 @@ class MenuMixin:
         used = process_memory()
         label = getattr(self, "memory_label", None)
         if label is not None:
-            label.config(text=f"RAM: {format_gb(used)}" if used else "RAM: —")
+            label.config(text=tr("RAM: {used}", used=format_gb(used) if used else "—"))
 
     def _tick_memory(self) -> None:
         # A test's root runs after() at once: the flag makes that one update, not a loop.
@@ -210,20 +225,20 @@ class MenuMixin:
         import importlib.util
         if importlib.util.find_spec("PySide6") is None:
             messagebox.showinfo("AuraLite Studio",
-                                "AuraLite Studio needs Qt 6:\n"
-                                "pip install \"auralite-ai[studio]\"\nthen start it again.")
+                                tr("AuraLite Studio needs Qt 6:\n"
+                                "pip install \"auralite-ai[studio]\"\nthen start it again."))
             return
         try:
             subprocess.Popen([sys.executable, "-m", "auralite.studio"], close_fds=True,
                              start_new_session=sys.platform != "win32")
         except OSError as err:
-            self.report_error(err, "starting AuraLite Studio", title="AuraLite Studio")
+            self.report_error(err, tr("starting AuraLite Studio"), title="AuraLite Studio")
 
     def _run_speed_test(self) -> None:
         """Tools -> Speed test: the GFLOP/s that every time estimate builds on."""
         device = "cuda" if getattr(getattr(self.engine, "device", None), "type", "") == "cuda" \
             else "cpu"
-        self.speed_label.config(text="Speed test…")
+        self.speed_label.config(text=tr("Speed test…"))
 
         def run() -> None:
             from auralite.studio.hardware import measure_gflops
@@ -251,7 +266,7 @@ class MenuMixin:
 
     def _speed_failed(self, error: Any) -> None:
         self.speed_label.config(text=self._speed_text())
-        self.report_error(error, "the speed test", title="Speed test")    # 2.27
+        self.report_error(error, tr("the speed test"), title=tr("Speed test"))    # 2.27
 
     # ---- the benchmark -------------------------------------------------------------------
     def _benchmark_clicked(self) -> None:
@@ -259,7 +274,7 @@ class MenuMixin:
         stop = getattr(self, "_bench_stop", None)
         if stop is not None:
             stop.set()
-            self.speed_label.config(text="Stopping the benchmark…")
+            self.speed_label.config(text=tr("Stopping the benchmark…"))
             return
         choice = self._ask_benchmark()
         if choice is not None:
@@ -273,30 +288,30 @@ class MenuMixin:
         from auralite.studio.catalog import CATALOG, find_model
         start = start or getattr(self, "bench_choice", None) or default_choice()
         dlg = tk.Toplevel(self.root)
-        dlg.title("Benchmark")
+        dlg.title(tr("Benchmark"))
         dlg.transient(self.root)
         dlg.resizable(False, False)
         outer = ttk.Frame(dlg, padding="12")
         outer.pack(fill=tk.BOTH, expand=True)
         sizes = list(bench.SIZES)
         ttk.Label(outer, wraplength=520, justify=tk.LEFT,
-                  text=f"Measures how fast this computer trains and writes: three sizes of a "
-                       f"new model ({', '.join(sizes)}), offline. Close other programs: they "
-                       f"slow it down. The report (Markdown and JSON) goes to "
-                       f"{bench.default_folder()}.").pack(anchor=tk.W)
+                  text=tr("Measures how fast this computer trains and writes: three sizes of a "
+                       "new model ({join}), offline. Close other programs: they "
+                       "slow it down. The report (Markdown and JSON) goes to "
+                       "{default_folder}.", join=', '.join(sizes), default_folder=bench.default_folder())).pack(anchor=tk.W)
         row = ttk.Frame(outer)
         row.pack(fill=tk.X, pady=(8, 4))
-        ttk.Label(row, text="Training for each size (seconds):").pack(side=tk.LEFT)
+        ttk.Label(row, text=tr("Training for each size (seconds):")).pack(side=tk.LEFT)
         seconds_var = tk.StringVar(value=str(int(round(start.seconds))))
         ttk.Spinbox(row, from_=15, to=600, increment=15, width=6,
                     textvariable=seconds_var).pack(side=tk.LEFT, padx=6)
         finetune_var = tk.BooleanVar(value=bool(start.finetune))
-        ttk.Checkbutton(outer, text="Also measure fine-tuning a model (LoRA / QLoRA)",
+        ttk.Checkbutton(outer, text=tr("Also measure fine-tuning a model (LoRA / QLoRA)"),
                         variable=finetune_var).pack(anchor=tk.W, pady=(6, 2))
-        group = ttk.LabelFrame(outer, text="The model to fine-tune", padding="8")
+        group = ttk.LabelFrame(outer, text=tr("The model to fine-tune"), padding="8")
         group.pack(fill=tk.X)
-        labels = [f"{m.display_name} - {m.size_label}, {m.download_gb:.1f} GB to download"
-                  for m in CATALOG]
+        labels = [tr("{name} - {size}, {gb:.1f} GB to download", name=m.display_name,
+                     size=m.size_label, gb=m.download_gb) for m in CATALOG]
         specs = [m.spec for m in CATALOG]
         spec = start.finetune or ""
         model = find_model(spec) if spec.lower().startswith("hf:") else None
@@ -307,12 +322,12 @@ class MenuMixin:
                                    if shown is not None and shown.spec in specs
                                    else (labels[0] if labels else ""))
         path_var = tk.StringVar(value=spec if start.finetune and model is None else "")
-        ttk.Radiobutton(group, text="From the catalog (downloaded once into ~/.auralite/hf):",
+        ttk.Radiobutton(group, text=tr("From the catalog (downloaded once into ~/.auralite/hf):"),
                         variable=where_var, value="catalog").pack(anchor=tk.W)
         ttk.Combobox(group, textvariable=catalog_var, values=labels, state="readonly",
                      width=60).pack(anchor=tk.W, padx=18)
-        ttk.Radiobutton(group, text="Already downloaded - a Hugging Face model folder or an "
-                                    "AuraLite checkpoint:",
+        ttk.Radiobutton(group, text=tr("Already downloaded - a Hugging Face model folder or an "
+                                    "AuraLite checkpoint:"),
                         variable=where_var, value="disk").pack(anchor=tk.W, pady=(6, 0))
         line = ttk.Frame(group)
         line.pack(fill=tk.X, padx=18)
@@ -321,8 +336,8 @@ class MenuMixin:
 
         def pick_folder() -> None:
             from .common import filedialog
-            path = filedialog.askdirectory(title="The downloaded model's folder "
-                                                 "(with config.json)", parent=dlg)
+            path = filedialog.askdirectory(title=tr("The downloaded model's folder "
+                                                 "(with config.json)"), parent=dlg)
             if path:
                 path_var.set(path)
                 where_var.set("disk")
@@ -330,17 +345,17 @@ class MenuMixin:
         def pick_file() -> None:
             from .common import filedialog
             path = filedialog.askopenfilename(
-                title="An AuraLite checkpoint to fine-tune", parent=dlg,
-                filetypes=[("AuraLite checkpoints", "*.pt *.safetensors"), ("All files", "*.*")])
+                title=tr("An AuraLite checkpoint to fine-tune"), parent=dlg,
+                filetypes=[(tr("AuraLite checkpoints"), "*.pt *.safetensors"), (tr("All files"), "*.*")])
             if path:
                 path_var.set(path)
                 where_var.set("disk")
 
-        ttk.Button(line, text="Folder…", command=pick_folder).pack(side=tk.LEFT, padx=4)
-        ttk.Button(line, text="File…", command=pick_file).pack(side=tk.LEFT)
+        ttk.Button(line, text=tr("Folder…"), command=pick_folder).pack(side=tk.LEFT, padx=4)
+        ttk.Button(line, text=tr("File…"), command=pick_file).pack(side=tk.LEFT)
         method_row = ttk.Frame(group)
         method_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(method_row, text="Method:").pack(side=tk.LEFT)
+        ttk.Label(method_row, text=tr("Method:")).pack(side=tk.LEFT)
         method_labels = [label for _key, label in METHODS]
         method_var = tk.StringVar(value=next((label for key, label in METHODS
                                               if key == start.method), method_labels[0]))
@@ -376,8 +391,8 @@ class MenuMixin:
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Start", command=start_clicked).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(buttons, text=tr("Cancel"), command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(buttons, text=tr("Start"), command=start_clicked).pack(side=tk.RIGHT, padx=4)
         self._bench_dialog = {"read": read, "start": start_clicked, "problem": problem,
                               "result": result,
                               "vars": {"seconds": seconds_var, "finetune": finetune_var,
@@ -398,7 +413,7 @@ class MenuMixin:
         self.bench_choice = choice
         stop = threading.Event()
         self._bench_stop = stop
-        self._set_bench_label("Stop the benchmark")
+        self._set_bench_label(tr("Stop the benchmark"))
         print(f"[AuraLite] bench: {describe(choice)}")
 
         def progress(line: str) -> None:
@@ -432,14 +447,14 @@ class MenuMixin:
 
     def _bench_over(self, text: str, error: Any = "") -> None:
         self._bench_stop = None
-        self._set_bench_label("Benchmark…")
+        self._set_bench_label(tr("Benchmark…"))
         self.speed_label.config(text=self._speed_text())
         if isinstance(error, BaseException):          # 2.27: explained, and in the log
-            self.report_error(error, "the benchmark", title="Benchmark")
+            self.report_error(error, tr("the benchmark"), title=tr("Benchmark"))
         elif error:
-            messagebox.showerror("Benchmark", error)
+            messagebox.showerror(tr("Benchmark"), error)
         elif text:
-            messagebox.showinfo("Benchmark", text)
+            messagebox.showinfo(tr("Benchmark"), text)
         self.last_bench_text = text or str(error)
 
     # ---- help ---------------------------------------------------------------------------------
@@ -449,7 +464,7 @@ class MenuMixin:
 
         def run() -> None:
             info = check_for_update(__version__)
-            self.root.after(0, lambda: messagebox.showinfo("Updates", info.message()))
+            self.root.after(0, lambda: messagebox.showinfo(tr("Updates"), info.message()))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -459,11 +474,13 @@ class MenuMixin:
         from auralite import __version__
         from auralite.studio.hardware import auralite_home
         from auralite.studio.logs import log_dir
-        return (f"AuraLite {__version__} - the classic interface (tkinter {tk.TkVersion})\n\n"
-                f"Train, fine-tune and run language models on your own computer.\n\n"
-                f"Python {platform.python_version()} · PyTorch {torch.__version__}\n"
-                f"License: Apache-2.0\nhttps://github.com/AlexanderNyr/AuraLite-AI\n\n"
-                f"Models and settings: {auralite_home()}\nLogs: {log_dir()}")
+        return (tr("AuraLite {version} - the classic interface (tkinter {tk})",
+                   version=__version__, tk=tk.TkVersion) + "\n\n"
+                + tr("Train, fine-tune and run language models on your own computer.") + "\n\n"
+                + f"Python {platform.python_version()} · PyTorch {torch.__version__}\n"
+                + tr("License: Apache-2.0") + "\nhttps://github.com/AlexanderNyr/AuraLite-AI\n\n"
+                + tr("Models and settings: {path}", path=auralite_home()) + "\n"
+                + tr("Logs: {path}", path=log_dir()))
 
     def _show_about(self) -> None:
-        messagebox.showinfo("About AuraLite", self.about_text())
+        messagebox.showinfo(tr("About AuraLite"), self.about_text())

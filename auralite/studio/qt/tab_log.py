@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLay
 
 from ..logs import log_dir
 from .common import ask_save, heading, hint, open_path, show_error
+from ..i18n import tr, trc
 
 if TYPE_CHECKING:
     from .window import MainWindow
@@ -99,27 +100,27 @@ class LogTab(QWidget):
         self.studio = window
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
-        layout.addWidget(heading("Log"))
-        layout.addWidget(hint(f"Everything AuraLite reports, as it happens. The log file keeps "
-                              f"it (with the details of every error): {log_dir()}"))
+        layout.addWidget(heading(tr("Log")))
+        layout.addWidget(hint(tr("Everything AuraLite reports, as it happens. The log file keeps "
+                              "it (with the details of every error): {log_dir}", log_dir=log_dir())))
         self.view = QPlainTextEdit()
         self.view.setReadOnly(True)
         self.view.setMaximumBlockCount(5000)
         self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(self.view, 1)
         buttons = QHBoxLayout()
-        self.open_button = QPushButton("Open the log folder")
-        self.copy_button = QPushButton("Copy all")
-        self.save_button = QPushButton("Save to a file…")
-        self.clear_button = QPushButton("Clear")
+        self.open_button = QPushButton(tr("Open the log folder"))
+        self.copy_button = QPushButton(tr("Copy all"))
+        self.save_button = QPushButton(tr("Save to a file…"))
+        self.clear_button = QPushButton(tr("Clear"))
         for button in (self.open_button, self.copy_button, self.save_button,
                        self.clear_button):
             buttons.addWidget(button)
         buttons.addStretch(1)
         legend = " · ".join(f"<span style='color:{COLOURS[k]}'>{name}</span>"
-                            for k, name in (("error", "errors"), ("warn", "warnings"),
-                                            ("epoch", "epochs"), ("ok", "done"),
-                                            ("info", "notes")))
+                            for k, name in (("error", tr("errors")), ("warn", tr("warnings")),
+                                            ("epoch", trc("log", "epochs")),
+                                            ("ok", tr("done")), ("info", tr("notes"))))
         self.legend = hint("")
         self.legend.setTextFormat(Qt.TextFormat.RichText)
         self.legend.setText(legend)
@@ -161,7 +162,7 @@ class LogTab(QWidget):
 
     def save(self) -> None:
         """2.24: the lines shown here to a text file (the classic Console's Save)."""
-        path = ask_save(self, "Save the log", "Text (*.txt *.log);;All files (*)",
+        path = ask_save(self, tr("Save the log"), tr("Text (*.txt *.log);;All files (*)"),
                         "auralite-log.txt")
         if not path:
             return
@@ -169,4 +170,4 @@ class LogTab(QWidget):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.view.toPlainText() + "\n")
         except OSError as err:
-            show_error(self, err, "saving the log")
+            show_error(self, err, tr("saving the log"))

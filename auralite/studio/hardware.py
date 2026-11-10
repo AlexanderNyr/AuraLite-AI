@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from auralite.i18n import tr
+
 __all__ = ["Hardware", "auralite_home", "detect_hardware", "format_gb", "measure_gflops",
            "process_memory"]
 
@@ -35,7 +37,7 @@ def format_gb(n: float | None) -> str:
     """``"7.8 GB"`` (one decimal), ``"?"`` when unknown."""
     if n is None:
         return "?"
-    return f"{n / _GB:.1f} GB"
+    return tr("{n:.1f} GB", n=n / _GB)
 
 
 @dataclass
@@ -68,26 +70,31 @@ class Hardware:
 
     def summary_lines(self) -> list[str]:
         """The computer in a few lines (the Studio's Start page, ``auralite doctor``)."""
-        cpu = self.cpu or "unknown processor"
-        lines = [f"Processor: {cpu} - {self.cores} cores / {self.threads} threads"
+        cpu = self.cpu or tr("unknown processor")
+        lines = [tr("Processor: {cpu} - {cores} cores / {threads} threads", cpu=cpu,
+                    cores=self.cores, threads=self.threads)
                  + (f", {self.simd}" if self.simd else "")]
-        memory = f"Memory: {format_gb(self.memory_total)}"
+        memory = tr("Memory: {size}", size=format_gb(self.memory_total))
         if self.memory_available:
-            memory += f" ({format_gb(self.memory_available)} free now)"
+            memory += " " + tr("({size} free now)", size=format_gb(self.memory_available))
         lines.append(memory)
         if self.gpu:
             vram = f", {format_gb(self.gpu_memory)}" if self.gpu_memory else ""
-            lines.append(f"GPU: {self.gpu}{vram} - training runs on it ({self.accelerator})")
+            lines.append(tr("GPU: {gpu} - training runs on it ({device})",
+                            gpu=self.gpu + vram, device=self.accelerator))
         else:
-            lines.append("GPU: none that PyTorch can train on - training runs on the processor")
+            lines.append(tr("GPU: none that PyTorch can train on - training runs on the "
+                            "processor"))
         if self.disk_free:
-            lines.append(f"Disk: {format_gb(self.disk_free)} free for models ({auralite_home()})")
+            lines.append(tr("Disk: {size} free for models ({folder})",
+                            size=format_gb(self.disk_free), folder=auralite_home()))
         if self.gflops:
-            lines.append(f"Speed test: {self.gflops:,.0f} GFLOP/s "
-                         f"({'GPU' if self.accelerator != 'cpu' else f'{self.train_threads} threads'})")
+            lines.append(tr("Speed test: {gflops:,.0f} GFLOP/s ({what})", gflops=self.gflops,
+                            what="GPU" if self.accelerator != "cpu" else
+                            tr("{n} threads", n=self.train_threads)))
         if self.system:
-            lines.append(f"System: {self.system}")
-        return lines + [f"Note: {note}" for note in self.notes]
+            lines.append(tr("System: {system}", system=self.system))
+        return lines + [tr("Note: {note}", note=note) for note in self.notes]
 
 
 # ----------------------------------------------------------------------
@@ -316,8 +323,9 @@ def _accelerator(notes: list[str]) -> tuple[str, str, int]:
             props = torch.cuda.get_device_properties(0)
             if _cuda_arch_supported(torch, int(props.major), int(props.minor)):
                 return "cuda", str(props.name), int(props.total_memory)
-            notes.append(f"{props.name} (compute capability {props.major}.{props.minor}) is too "
-                         f"old for this PyTorch build: training runs on the processor")
+            notes.append(tr("{gpu} (compute capability {major}.{minor}) is too old for this "
+                            "PyTorch build: training runs on the processor", gpu=props.name,
+                            major=props.major, minor=props.minor))
             return "cpu", "", 0
     except Exception:
         pass
@@ -370,14 +378,15 @@ def detect_hardware(*, gflops: float | None = None) -> Hardware:
     if hw.cores > hw.threads:
         hw.cores = hw.threads
     if simd in ("SSE4.2", "basic") and accelerator == "cpu":
-        hw.notes.append("no AVX: training works, but several times slower than on a CPU with AVX2")
+        hw.notes.append(tr("no AVX: training works, but several times slower than on a CPU "
+                           "with AVX2"))
     if v2 is False:
         from auralite import bundle
-        hw.notes.append("no SSE4.2 / POPCNT: the app's Qt 6.9 runs here (Qt 6.10+ would not)"
-                        if bundle.packaged() else
-                        "no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9.3 here "
-                        "(Qt 6.10+ needs an x86-64-v2 processor; pip install "
-                        "\"PySide6-Essentials<6.10\"); the classic GUI works")
+        hw.notes.append(tr("no SSE4.2 / POPCNT: the app's Qt 6.9 runs here (Qt 6.10+ would "
+                           "not)") if bundle.packaged() else
+                        tr("no SSE4.2 / POPCNT: AuraLite Studio needs PySide6 6.9.3 here "
+                           "(Qt 6.10+ needs an x86-64-v2 processor; pip install "
+                           "\"PySide6-Essentials<6.10\"); the classic GUI works"))
     return hw
 
 

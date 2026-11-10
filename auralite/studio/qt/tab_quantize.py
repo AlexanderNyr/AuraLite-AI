@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
                                QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
                                QWidget)
 
-from ..i18n import tr
+from ..i18n import N_, number, tr
 from ..quantize import (BITS, CALIBRATED, FP8_NOTE, METHODS, QuantSettings, bits_for, bits_note,
                         calibration_text, describe_method, read_calibration_file, runnable,
                         uses)
@@ -261,7 +261,7 @@ class QuantizeTab(QWidget):
         self.calibration = text
         if text:
             self.calib_label.setText(tr("{source}: {n} characters", source=source,
-                                        n=f"{len(text):,}"))
+                                        n=number(len(text))))
         else:
             self.calib_label.setText(tr("None yet. Static, QAT, GPTQ and AWQ need it; the "
                                         "benchmark and the comparison measure on it."))
@@ -275,7 +275,7 @@ class QuantizeTab(QWidget):
         try:
             text = read_calibration_file(path)
         except OSError as err:
-            show_error(self, err, "reading the calibration text")
+            show_error(self, err, tr("reading the calibration text"))
             return
         if not text.strip():
             show_error(self, SettingsError(tr("{name} holds no text",
@@ -301,7 +301,7 @@ class QuantizeTab(QWidget):
         try:
             text = calibration_text(paths)
         except (OSError, ValueError) as err:
-            show_error(self, err, "reading the training data")
+            show_error(self, err, tr("reading the training data"))
             return
         if not text.strip():
             show_error(self, SettingsError(tr("the training data holds no text")))
@@ -468,7 +468,7 @@ class QuantizeTab(QWidget):
                                      engine.device, seq_length=seq,
                                      progress_callback=self._progress(job))
 
-        self._start("benchmark", "a benchmark", work, self._benchmarked,
+        self._start("benchmark", N_("a benchmark"), work, self._benchmarked,
                     tr("Measuring the original and the quantized model…"))
 
     def _benchmarked(self, result: Any) -> None:
@@ -505,7 +505,7 @@ class QuantizeTab(QWidget):
                                             seq_length=seq, progress_callback=progress)
             return results, format_comparison_table(results)
 
-        self._start("compare", "comparing the methods", work, self._compared,
+        self._start("compare", N_("comparing the methods"), work, self._compared,
                     tr("Comparing every method…"))
 
     def _compared(self, outcome: Any) -> None:
@@ -556,7 +556,7 @@ class QuantizeTab(QWidget):
                                               params_used=engine.params_used,
                                               result=self.result)
         except Exception as err:
-            self.studio.report_error(err, "saving the quantized model")
+            self.studio.report_error(err, tr("saving the quantized model"))
             return
         self.status.setText(tr("Saved: {path} - the quantized weights for PyTorch "
                                "(torch.load); AuraLite opens .pt checkpoints and GGUF files",

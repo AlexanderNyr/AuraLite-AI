@@ -603,6 +603,10 @@ def test_packaging_targets_exist_on_disk():
     assert find["namespaces"] is False
     root = pathlib.Path(REPO_ROOT) / "auralite"
     for init_dir in [p for p in root.rglob("*") if p.is_dir() and p.name != "__pycache__"]:
+        if not any(init_dir.rglob("*.py")):     # 2.28: data only (locale/), package-data
+            assert f"{init_dir.relative_to(root).as_posix()}/*.json" in \
+                cfg["package-data"]["auralite"], f"{init_dir}'s files would not be packaged"
+            continue
         assert (init_dir / "__init__.py").exists(), f"{init_dir} would not be packaged"
 
 

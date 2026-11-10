@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass, fields
 from typing import Any
+from .i18n import tr
 
 __all__ = ["CUSTOM", "FineTuneSettings", "SettingsError", "TrainSettings", "custom_params",
            "finetune_params", "pretrain_params"]
@@ -141,22 +142,22 @@ def finetune_params(settings: FineTuneSettings, data_kind: str) -> dict[str, Any
     s = settings
     method = str(s.method).lower()
     if method not in ("qlora", "lora", "full"):
-        raise SettingsError(f"unknown method {s.method!r}: qlora, lora or full")
+        raise SettingsError(tr("unknown method {method!r}: qlora, lora or full", method=s.method))
     if data_kind not in FINETUNE_DATA:
-        raise SettingsError("fine-tuning trains on dialogs (.jsonl), preference pairs or plain "
+        raise SettingsError(tr("fine-tuning trains on dialogs (.jsonl), preference pairs or plain "
                             "text; a prepared dataset or big data trains a new model "
-                            "(the Train tab)")
+                            "(the Train tab)"))
     if method != "full" and int(s.lora_rank) < 1:
-        raise SettingsError("LoRA needs a rank of 1 or more (16 is a good start)")
+        raise SettingsError(tr("LoRA needs a rank of 1 or more (16 is a good start)"))
     if s.optimizer not in ("adamw8bit", "adamw"):
-        raise SettingsError(f"unknown optimizer {s.optimizer!r}: adamw8bit or adamw")
+        raise SettingsError(tr("unknown optimizer {optimizer!r}: adamw8bit or adamw", optimizer=s.optimizer))
     objective = str(s.objective or "auto").lower()
     if objective not in ("auto", "sft", "dpo", "simpo"):
-        raise SettingsError(f"unknown objective {s.objective!r}: auto, sft, dpo or simpo")
+        raise SettingsError(tr("unknown objective {objective!r}: auto, sft, dpo or simpo", objective=s.objective))
     if objective in ("dpo", "simpo") and data_kind != "preferences":
-        raise SettingsError(f"{objective.upper()} learns from preference pairs (a prompt with "
-                            f"a chosen and a rejected reply): choose such a file, or the "
-                            f"objective SFT")
+        raise SettingsError(tr("{upper} learns from preference pairs (a prompt with "
+                            "a chosen and a rejected reply): choose such a file, or the "
+                            "objective SFT", upper=objective.upper()))
     params: dict[str, Any] = {
         "continue_training": True, "epochs": int(s.epochs), "seq_length": int(s.seq_length),
         "batch_size": int(s.batch_size), "val_split": float(s.val_split),
@@ -175,7 +176,7 @@ def finetune_params(settings: FineTuneSettings, data_kind: str) -> dict[str, Any
         params["lora_rank"] = int(s.lora_rank)
         targets = str(s.lora_targets or "all").strip().lower()
         if targets not in LORA_TARGETS:
-            raise SettingsError(f"LoRA trains all, attn or ffn layers, not {s.lora_targets!r}")
+            raise SettingsError(tr("LoRA trains all, attn or ffn layers, not {lora_targets!r}", lora_targets=s.lora_targets))
         params["lora_targets"] = targets
         if s.lora_lr:
             params["lora_lr"] = float(s.lora_lr)
@@ -205,16 +206,16 @@ def custom_params(settings: TrainSettings) -> dict[str, Any]:
                                     "n_heads": int(s.n_heads), "d_ff": int(s.d_ff)}
     sizes = [int(v or 0) for v in shape.values()]
     if min(sizes) < 1:
-        raise SettingsError("the width, the layers, the heads and the feed-forward width are "
-                            "whole numbers above 0")
+        raise SettingsError(tr("the width, the layers, the heads and the feed-forward width are "
+                            "whole numbers above 0"))
     width, heads = int(s.d_model), int(s.n_heads)
     if width % heads:
-        raise SettingsError(f"the width ({width}) divides into the heads ({heads}): each head "
-                            f"gets an equal part")
+        raise SettingsError(tr("the width ({width}) divides into the heads ({heads}): each head "
+                            "gets an equal part", width=width, heads=heads))
     kv = int(s.n_kv_heads)
     if kv < 0 or (kv and heads % kv):
-        raise SettingsError(f"the heads ({heads}) divide into the key/value heads ({kv}): 0 "
-                            f"gives every head its own")
+        raise SettingsError(tr("the heads ({heads}) divide into the key/value heads ({kv}): 0 "
+                            "gives every head its own", heads=heads, kv=kv))
     shape["n_kv_heads"] = kv or None
     return dict(shape)
 
@@ -226,13 +227,13 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
 
     s = settings
     if data_kind not in PRETRAIN_DATA:
-        raise SettingsError("a new model trains on text, big data, a prepared dataset or "
-                            "dialogs; preference pairs polish a chat model (the Fine-tune tab)")
+        raise SettingsError(tr("a new model trains on text, big data, a prepared dataset or "
+                            "dialogs; preference pairs polish a chat model (the Fine-tune tab)"))
     if s.preset != CUSTOM and s.preset not in MODEL_PRESETS:
-        raise SettingsError(f"unknown model size {s.preset!r}: {', '.join(MODEL_PRESETS)}, "
-                            f"{CUSTOM}")
+        raise SettingsError(tr("unknown model size {preset!r}: {join}, "
+                            "{CUSTOM}", preset=s.preset, join=', '.join(MODEL_PRESETS), CUSTOM=CUSTOM))
     if s.tokenizer not in ("bpe", "char", "file"):
-        raise SettingsError("the tokenizer is bpe, char or a file")
+        raise SettingsError(tr("the tokenizer is bpe, char or a file"))
     params: dict[str, Any] = custom_params(s) if s.preset == CUSTOM else preset_params(s.preset)
     params.update({"seq_length": int(s.seq_length), "batch_size": int(s.batch_size),
                    "epochs": int(s.epochs), "tokenizer": s.tokenizer,
@@ -246,17 +247,17 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
     if s.tokenizer == "file":            # 2.24: a tokenizer of one's own (tokenizer_io)
         path = str(s.tokenizer_path or "").strip()
         if not path:
-            raise SettingsError("«Own file» trains with a tokenizer file: choose one, or "
-                                "train one with «Train the tokenizer only»")
+            raise SettingsError(tr("«Own file» trains with a tokenizer file: choose one, or "
+                                "train one with «Train the tokenizer only»"))
         if not os.path.exists(path):
-            raise SettingsError(f"the tokenizer file is missing: {path}")
+            raise SettingsError(tr("the tokenizer file is missing: {path}", path=path))
         params.update(tokenizer="bpe", tokenizer_path=path)
     # 2.24: the classic interface's settings, written only when they differ from the recipe's
     if s.use_alibi:
         params["use_alibi"] = True
     if s.rope_scaling:
         if s.rope_scaling not in ROPE_SCALINGS:
-            raise SettingsError(f"RoPE scaling is {', '.join(ROPE_SCALINGS)} or none")
+            raise SettingsError(tr("RoPE scaling is {join} or none", join=', '.join(ROPE_SCALINGS)))
         params["rope_scaling"] = {"type": s.rope_scaling, "factor": float(s.rope_factor)}
     if not s.use_qk_norm:
         params["use_qk_norm"] = False
@@ -270,7 +271,7 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
         params["accumulation_steps"] = int(s.accumulation_steps)
     if s.lr_schedule:
         if s.lr_schedule not in LR_SCHEDULES:
-            raise SettingsError(f"the learning-rate schedule is {' or '.join(LR_SCHEDULES)}")
+            raise SettingsError(tr("the learning-rate schedule is {join}", join=' or '.join(LR_SCHEDULES)))
         params["lr_schedule"] = s.lr_schedule
     if s.muon_lr:
         params["muon_lr"] = float(s.muon_lr)
@@ -280,8 +281,8 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
         params["use_ddp"] = True
     if int(s.cluster_workers) > 0:
         if data_kind == "dialogs":
-            raise SettingsError("dialogs train on this computer only: set the other computers "
-                                "to 0")
+            raise SettingsError(tr("dialogs train on this computer only: set the other computers "
+                                "to 0"))
         params["cluster_workers"] = int(s.cluster_workers)
         params["cluster_port"] = int(s.cluster_port)
     if data_kind == "dialogs":

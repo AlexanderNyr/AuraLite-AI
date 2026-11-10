@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLin
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..evaluate import COMMON_TASKS, chat_eval_rows, lm_eval_lines, parse_tasks
-from ..i18n import tr
+from ..i18n import N_, tr
 from ..recipes import SettingsError
 from .common import Job, ask_open, ask_save, compact_spins, heading, hint, package_note, \
     primary, show_error
@@ -208,9 +208,9 @@ class EvaluateTab(QWidget):
             if not path:
                 return
         if not os.path.exists(path):
-            show_error(self, FileNotFoundError(f"not found: {path}"))
+            show_error(self, FileNotFoundError(tr("not found: {path}", path=path)))
             return
-        if not self.studio.begin("an evaluation"):
+        if not self.studio.begin(N_("an evaluation")):
             return
         limit = int(self.limit.value()) or None
         tokens = int(self.reply_tokens.value())
@@ -257,7 +257,7 @@ class EvaluateTab(QWidget):
         self.chat_status.setText(tr("Failed - see the message."))
         self.studio.end(model_dirty=None)
         self._update_buttons()
-        self.studio.report_error(exc, "the evaluation")
+        self.studio.report_error(exc, tr("the evaluation"))
 
     def stop(self) -> None:
         if self.job is not None:
@@ -278,7 +278,7 @@ class EvaluateTab(QWidget):
         if not tasks:
             show_error(self, SettingsError(tr("name at least one task (like arc_easy)")))
             return
-        if not self.studio.begin("the benchmarks"):
+        if not self.studio.begin(N_("the benchmarks")):
             return
         fewshot, batch = int(self.fewshot.value()), int(self.batch.value())
         limit = int(self.bench_limit.value()) or None
@@ -309,7 +309,7 @@ class EvaluateTab(QWidget):
         self.bench_status.setText(tr("Failed - see the message."))
         self.studio.end(model_dirty=None)
         self._update_buttons()
-        self.studio.report_error(exc, "the benchmarks")
+        self.studio.report_error(exc, tr("the benchmarks"))
 
     # ---- results -----------------------------------------------------------------------------
     def save(self, which: str) -> None:
@@ -324,7 +324,7 @@ class EvaluateTab(QWidget):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
         except OSError as err:
-            show_error(self, err, "saving the results")
+            show_error(self, err, tr("saving the results"))
             return
         status = self.chat_status if which == "chat" else self.bench_status
         status.setText(tr("Saved: {path}", path=path))

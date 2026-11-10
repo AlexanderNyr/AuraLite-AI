@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from auralite.i18n import N_
 
 
 # ======================================================================
@@ -69,30 +70,30 @@ METHOD_SUPPORTED_BITS: dict[QuantMethod, list[BitWidth]] = {
 
 # Human-readable descriptions
 METHOD_DESCRIPTIONS: dict[QuantMethod, str] = {
-    QuantMethod.DYNAMIC: (
+    QuantMethod.DYNAMIC: N_(
         "Dynamic Quantization (INT8): Weights quantized to INT8 at save time, "
         "activations quantized dynamically at inference. No calibration needed. "
         "Fast, minimal quality loss, CPU-only."),
-    QuantMethod.STATIC: (
+    QuantMethod.STATIC: N_(
         "Static Quantization (INT8): Both weights and activations quantized to INT8. "
         "Requires calibration data to determine activation ranges. "
         "Best INT8 speed on CPU."),
-    QuantMethod.QAT: (
+    QuantMethod.QAT: N_(
         "Quantization-Aware Training: Fake-quantize ops inserted during training "
         "so the model learns to compensate for quantization noise. "
         "Highest quality INT8 but needs retraining."),
-    QuantMethod.GPTQ: (
+    QuantMethod.GPTQ: N_(
         "GPTQ-style Weight Quantization: Layer-by-layer weight compression using "
         "Hessian-based optimal rounding. Supports INT2/3/4/8. "
         "Best weight compression with minimal quality loss. GPU-friendly."),
-    QuantMethod.AWQ: (
+    QuantMethod.AWQ: N_(
         "AWQ-style Activation-Aware Weights: Identifies salient weight channels "
         "(based on activation magnitudes) and protects them during quantization. "
         "Better quality than naive round-to-nearest at INT4."),
-    QuantMethod.HQQ: (
+    QuantMethod.HQQ: N_(
         "HQQ (Half-Quadratic Quantization): calibration-free low-bit weight "
         "quantization with iterative scale refinement. Good INT4 fallback when GPTQ calibration is unavailable."),
-    QuantMethod.HALF: (
+    QuantMethod.HALF: N_(
         "Half / FP8 Precision: Convert model to FP16, BF16, or native FP8 on modern GPUs. "
         "BF16 preferred for training stability; FP8 requires PyTorch float8 support."),
 }

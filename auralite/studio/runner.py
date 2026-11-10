@@ -18,6 +18,7 @@ import os
 from typing import Any, Callable
 
 from auralite import runs
+from .i18n import N_, tr
 
 __all__ = ["base_record", "continue_run", "finetune", "machine_record", "train_recorded"]
 
@@ -42,7 +43,7 @@ def train_recorded(engine: Any, recorder: Any, data: Any, params: dict,
         recorder.fail(exc)
         raise
     if not (isinstance(summary, dict) and summary.get("stopped_during")):
-        emit("stage", "Saving the run in the library…", None)
+        emit("stage", tr("Saving the run in the library…"), None)
     recorder.save_and_finish(summary, engine)
     return summary
 
@@ -64,7 +65,7 @@ def base_record(source: str, spec: str, memory_path: str = "",
                 memory_label: str = "") -> dict[str, str]:
     """The ``base`` of a fine-tune's record: what it started from."""
     if source == "memory":
-        return {"spec": memory_path, "label": memory_label or "the model in memory"}
+        return {"spec": memory_path, "label": memory_label or tr("the model in memory")}
     return {"spec": spec, "label": runs.base_label(spec)}
 
 
@@ -83,18 +84,18 @@ def finetune(engine: Any, *, source: str, spec: str, settings: Any, params: dict
         engine.unload_model()             # one model in memory, not two
         emit("unloaded")
     if source in ("catalog", "hub"):
-        emit("stage", f"Getting {spec}…", 0.0)
+        emit("stage", tr("Getting {spec}…", spec=spec), 0.0)
         engine.import_hf_model(spec, quantize="nf4" if settings.method == "qlora" else None,
                                progress_callback=lambda info: emit("import", dict(info)),
                                stop_event=stop_event)
         emit("loaded", spec)
     elif source == "file":
-        emit("stage", f"Loading {os.path.basename(spec)}…", None)
+        emit("stage", tr("Loading {name}…", name=os.path.basename(spec)), None)
         engine.load_model(spec)
         emit("loaded", spec)
     if stop_event is not None and stop_event.is_set():
-        return {"stopped_during": "loading the base model"}
-    emit("stage", "Reading the data…", None)
+        return {"stopped_during": N_("loading the base model")}
+    emit("stage", tr("Reading the data…"), None)
     data = load_training_data(paths)
     as_dialogs = isinstance(data, PreferenceSet) and settings.objective == "sft"
     if as_dialogs:
@@ -119,12 +120,12 @@ def continue_run(engine: Any, run: Any, progress_callback: Callable[..., Any] | 
     continue) comes before the model in memory is touched."""
     emit = on_event or _quiet
     path = runs.continue_point(run)
-    emit("stage", f"Loading {run.name}…", None)
+    emit("stage", tr("Loading {name}…", name=run.name), None)
     engine.unload_model()
     emit("unloaded")
     engine.load_model(str(path))
     emit("continued", run.name)
-    emit("stage", "Reading the data…", None)
+    emit("stage", tr("Reading the data…"), None)
     data = runs.load_run_data(run)
     recorder = runs.RunRecorder.resume(run)
     emit("recorder", recorder)

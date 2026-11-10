@@ -20,6 +20,7 @@ from auralite.studio.startinfo import fit_lines, interrupted_text
 
 from .. import common as gui_common
 from ..common import messagebox, threading, tk, ttk
+from ..i18n import N_, tr
 
 
 class StartTabMixin:
@@ -34,77 +35,77 @@ class StartTabMixin:
         tab = self.tab_start                                   # type: ignore[attr-defined]
         self.hardware = None
         self.start_interrupted_run = None
-        ttk.Label(tab, text="Welcome to AuraLite", style="Header.TLabel").pack(anchor=tk.W)
+        ttk.Label(tab, text=tr("Welcome to AuraLite"), style="Header.TLabel").pack(anchor=tk.W)
         self.start_intro = ttk.Label(
             tab, wraplength=760, justify=tk.LEFT,
-            text="Train language models on your own computer: make a ready model answer your "
+            text=tr("Train language models on your own computer: make a ready model answer your "
                  "way (fine-tuning), or grow a new one from your texts. Nothing leaves this "
-                 "computer.")
+                 "computer."))
         self.start_intro.pack(anchor=tk.W, pady=(2, 8))
 
         # a run that was interrupted continues from here (shown when there is one)
-        self.start_interrupted_frame = ttk.LabelFrame(tab, text="  ⏸  An interrupted run  ",
+        self.start_interrupted_frame = ttk.LabelFrame(tab, text=tr("  ⏸  An interrupted run  "),
                                                       padding="8")
         self.start_interrupted_label = ttk.Label(self.start_interrupted_frame, text="",
                                                  wraplength=740, justify=tk.LEFT)
         self.start_interrupted_label.pack(anchor=tk.W)
         row = ttk.Frame(self.start_interrupted_frame)
         row.pack(anchor=tk.W, pady=(6, 0))
-        self.start_continue_btn = ttk.Button(row, text="▶ Continue it",
+        self.start_continue_btn = ttk.Button(row, text=tr("▶ Continue it"),
                                              command=self._start_continue_interrupted)
         self.start_continue_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.start_show_btn = ttk.Button(row, text="Show in the library",   # 2.27
+        self.start_show_btn = ttk.Button(row, text=tr("Show in the library"),   # 2.27
                                          command=self._start_show_interrupted)
         self.start_show_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.start_dismiss_btn = ttk.Button(row, text="Dismiss",
+        self.start_dismiss_btn = ttk.Button(row, text=tr("Dismiss"),
                                             command=self._start_dismiss_interrupted)
         self.start_dismiss_btn.pack(side=tk.LEFT)
         self._start_interrupted_shown = False
 
-        actions = ttk.LabelFrame(tab, text="  What do you want to do?  ", padding="8")
+        actions = ttk.LabelFrame(tab, text=tr("  What do you want to do?  "), padding="8")
         actions.pack(fill=tk.X, pady=(0, 8))
         self.start_actions_frame = actions
         for title, text, command in (
-                ("🎯 Fine-tune a ready model  (recommended)",
-                 "Qwen, Llama, Mistral or SmolLM2 learns from your dialogs or texts",
+                (N_("🎯 Fine-tune a ready model  (recommended)"),
+                 N_("Qwen, Llama, Mistral or SmolLM2 learns from your dialogs or texts"),
                  lambda: self._goto_tab("finetune")),
-                ("🧠 Train a new model from scratch",
-                 "A small model of your own, from your texts: architecture and tokenizer "
-                 "included", lambda: self._goto_tab("train")),
-                ("📂 Open a model…",
-                 "An AuraLite checkpoint (.pt) or a GGUF file to chat with, train further or "
-                 "export", lambda: self.load_model()),               # type: ignore[attr-defined]
-                ("🧭 Set up a run step by step…",                    # 2.27: the wizard
-                 "The goal, your data, the model that fits this computer - then the tab opens "
-                 "filled in", lambda: self.open_wizard()),           # type: ignore[attr-defined]
-                ("📚 Library",                                       # 2.27
-                 "Every run with its curve, the models and the datasets on the disk",
+                (N_("🧠 Train a new model from scratch"),
+                 N_("A small model of your own, from your texts: architecture and tokenizer "
+                    "included"), lambda: self._goto_tab("train")),
+                (N_("📂 Open a model…"),
+                 N_("An AuraLite checkpoint (.pt) or a GGUF file to chat with, train further or "
+                    "export"), lambda: self.load_model()),               # type: ignore[attr-defined]
+                (N_("🧭 Set up a run step by step…"),                    # 2.27: the wizard
+                 N_("The goal, your data, the model that fits this computer - then the tab "
+                    "opens filled in"), lambda: self.open_wizard()),           # type: ignore[attr-defined]
+                (N_("📚 Library"),                                       # 2.27
+                 N_("Every run with its curve, the models and the datasets on the disk"),
                  lambda: self._goto_tab("library"))):
             line = ttk.Frame(actions)
             line.pack(fill=tk.X, pady=2)
-            ttk.Button(line, text=title, width=42, command=command).pack(side=tk.LEFT)
-            ttk.Label(line, text=text, style="Sub.TLabel").pack(side=tk.LEFT, padx=8)
+            ttk.Button(line, text=tr(title), width=42, command=command).pack(side=tk.LEFT)
+            ttk.Label(line, text=tr(text), style="Sub.TLabel").pack(side=tk.LEFT, padx=8)
 
-        computer = ttk.LabelFrame(tab, text="  💻  This computer  ", padding="8")
+        computer = ttk.LabelFrame(tab, text=tr("  💻  This computer  "), padding="8")
         computer.pack(fill=tk.X, pady=(0, 8))
-        self.start_hardware_label = ttk.Label(computer, text="Looking at this computer…",
+        self.start_hardware_label = ttk.Label(computer, text=tr("Looking at this computer…"),
                                               justify=tk.LEFT, wraplength=740)
         self.start_hardware_label.pack(anchor=tk.W)
-        self.start_speed_btn = ttk.Button(computer, text="Run the speed test (1 s)",
+        self.start_speed_btn = ttk.Button(computer, text=tr("Run the speed test (1 s)"),
                                           command=self._run_speed_test)  # type: ignore[attr-defined]
         self.start_speed_btn.pack(anchor=tk.W, pady=4)
-        ttk.Label(computer, text="What fits", style="TLabelframe.Label").pack(anchor=tk.W,
+        ttk.Label(computer, text=tr("What fits"), style="TLabelframe.Label").pack(anchor=tk.W,
                                                                             pady=(4, 0))
         self.start_fit_label = ttk.Label(computer, text="…", justify=tk.LEFT, wraplength=740)
         self.start_fit_label.pack(anchor=tk.W)
 
-        recent = ttk.LabelFrame(tab, text="  🕘  Recent models  ", padding="8")
+        recent = ttk.LabelFrame(tab, text=tr("  🕘  Recent models  "), padding="8")
         recent.pack(fill=tk.BOTH, expand=True)
         self.start_recent = ttk.Treeview(recent, show="tree", height=5, selectmode="browse")
         self.start_recent.pack(fill=tk.X)
         self.start_recent.bind("<Double-1>", self._start_recent_clicked)
         self.start_recent_paths: list[str] = []
-        ttk.Label(recent, text="Double-click to open.", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(recent, text=tr("Double-click to open."), style="Sub.TLabel").pack(anchor=tk.W)
 
         self._start_refresh_recent()
         self._start_refresh_interrupted()
@@ -143,12 +144,12 @@ class StartTabMixin:
     def _start_show_hardware(self, hw: Any) -> None:
         self.hardware = hw
         if hw is None:
-            self.start_hardware_label.config(text="Could not look at this computer.")
+            self.start_hardware_label.config(text=tr("Could not look at this computer."))
             self.start_fit_label.config(text="")
         else:
             self.start_hardware_label.config(text="\n".join(hw.summary_lines()))
-            self.start_speed_btn.config(text="Run the speed test again" if hw.gflops
-                                        else "Run the speed test (1 s)")
+            self.start_speed_btn.config(text=tr("Run the speed test again") if hw.gflops
+                                        else tr("Run the speed test (1 s)"))
             self.start_fit_label.config(text="\n".join(fit_lines(hw)))
         update = getattr(self, "_ft_update_estimates", None)
         if callable(update):
@@ -173,7 +174,7 @@ class StartTabMixin:
                                    if isinstance(p, str)]
         if not self.start_recent_paths:
             tree.insert("", tk.END, iid="none",
-                        text="No models yet - the ones you train, open or save appear here.")
+                        text=tr("No models yet - the ones you train, open or save appear here."))
         for i, path in enumerate(self.start_recent_paths):
             gone = "" if os.path.exists(path) else "   (gone)"
             tree.insert("", tk.END, iid=str(i),
@@ -231,12 +232,12 @@ class StartTabMixin:
         """What trains now ("" when nothing does): one run at a time."""
         thread = getattr(self, "_ft_thread", None)
         if thread is not None and thread.is_alive():
-            return "a fine-tune"
+            return tr("a fine-tune")
         if getattr(self, "_train_phase", ""):
-            return "a training run"
+            return tr("a training run")
         thread = getattr(self, "_lib_eval_thread", None)    # 2.27: the Library's evaluation
         if thread is not None and thread.is_alive():
-            return "an evaluation"
+            return tr("an evaluation")
         return ""
 
     def _model_in_memory_changed(self, label: str = "") -> None:
@@ -256,8 +257,8 @@ class StartTabMixin:
             count = int(model.count_parameters()) if has else 0
         except Exception:
             count = 0
-        self.param_label.config(text=f"Parameters: {count:,}" if count  # type: ignore[attr-defined]
-                                else "Parameters: —")
+        self.param_label.config(text=tr("Parameters: {count:,}", count=count) if count  # type: ignore[attr-defined]
+                                else tr("Parameters: —"))
         if label:
             self.model_file_label.config(text=label, foreground="black")  # type: ignore[attr-defined]
         if gui_common.HAS_QUANTIZATION and hasattr(self, "_update_quant_buttons"):
@@ -280,15 +281,15 @@ class StartTabMixin:
         Fine-tune tab (`studio/runner.continue_run`, as the Studio). True when it started."""
         ok, why = run.continue_state()
         if not ok:
-            messagebox.showinfo("This run cannot continue", f"{run.name} cannot continue: {why}.")
+            messagebox.showinfo(tr("This run cannot continue"), tr("{name} cannot continue: {why}.", name=run.name, why=why))
             return False
         busy = self._busy_with()
         if busy:
-            messagebox.showinfo("One run at a time", f"Wait until {busy} ends, or stop it.")
+            messagebox.showinfo(tr("One run at a time"), tr("Wait until {busy} ends, or stop it.", busy=busy))
             return False
         if self.engine.model is not None and not messagebox.askyesno(
-                "Continue the run", "Continuing the run loads it in place of the model in "
-                                    "memory.\n\nContinue?"):
+                tr("Continue the run"), tr("Continuing the run loads it in place of the model in "
+                                    "memory.\n\nContinue?")):
             return False
         kind = "train" if run.kind == "train" else "finetune"
         if kind == "train":
@@ -298,7 +299,7 @@ class StartTabMixin:
                                       self.stop_event, self.finish_event)  # type: ignore[attr-defined]
         else:
             self._goto_tab("finetune")
-            self._ft_begin(f"Continuing {run.name}…")          # type: ignore[attr-defined]
+            self._ft_begin(tr("Continuing {name}…", name=run.name))          # type: ignore[attr-defined]
             progress, stop, finish = (self._ft_progress,       # type: ignore[attr-defined]
                                       self.ft_stop_event, self.ft_finish_event)  # type: ignore[attr-defined]
         holder: dict[str, Any] = {}
@@ -331,17 +332,17 @@ class StartTabMixin:
         if event == "stage":
             text = str(payload[0])
             if kind == "train":
-                self.status_label.config(text=f"Status: {text}")  # type: ignore[attr-defined]
+                self.status_label.config(text=tr("Status: {text}", text=text))  # type: ignore[attr-defined]
             else:
                 self._ft_show_stage(text, payload[1] if len(payload) > 1 else None)  # type: ignore[attr-defined]
         elif event == "import" and kind == "finetune":
             self._ft_show_import(payload[0])                   # type: ignore[attr-defined]
         elif event == "unloaded":
-            self._model_in_memory_changed("No model loaded")
+            self._model_in_memory_changed(tr("No model loaded"))
         elif event in ("loaded", "continued"):
             spec = str(payload[0])
             label = spec[3:] if spec.lower().startswith("hf:") else os.path.basename(spec) or spec
-            self._model_in_memory_changed(f"Loaded: {label}")
+            self._model_in_memory_changed(tr("Loaded: {name}", name=label))
             if os.path.isfile(spec) and spec.endswith(".pt"):
                 remember = getattr(self, "_remember_model", None)
                 if callable(remember):
@@ -353,11 +354,11 @@ class StartTabMixin:
         run = recorder.run if recorder is not None else None
         note = saved_note(run)                     # 2.27: the Studio's words, shared
         text += note
-        label = f"Run: {run.name}" if note and run is not None else ""
+        label = tr("Run: {name}", name=run.name) if note and run is not None else ""
         print(f"[AuraLite] {text}")
         if kind == "train":
             self._reset_train_buttons()                        # type: ignore[attr-defined]
-            self.status_label.config(text=f"Status: {text}")   # type: ignore[attr-defined]
+            self.status_label.config(text=tr("Status: {text}", text=text))   # type: ignore[attr-defined]
         else:
             self._ft_end(text, summary, stopped)               # type: ignore[attr-defined]
         self._model_in_memory_changed(label)
@@ -367,15 +368,15 @@ class StartTabMixin:
     def _run_failed(self, kind: str, exc: BaseException) -> None:
         if kind == "train":
             self._reset_train_buttons()                        # type: ignore[attr-defined]
-            self.status_label.config(text="Status: The run failed - see the message.")  # type: ignore[attr-defined]
+            self.status_label.config(text=tr("Status: The run failed - see the message."))  # type: ignore[attr-defined]
         else:
-            self._ft_end("The fine-tuning failed - see the message.")  # type: ignore[attr-defined]
+            self._ft_end(tr("The fine-tuning failed - see the message."))  # type: ignore[attr-defined]
         self._model_in_memory_changed()
         self._start_refresh_interrupted()
         self._runs_changed()
         # 2.27: what went wrong, and what to try (the Studio's explanation)
-        self.report_error(exc, "training" if kind == "train" else "the fine-tuning",  # type: ignore[attr-defined]
-                          title="The run failed")
+        self.report_error(exc, tr("training") if kind == "train" else tr("the fine-tuning"),  # type: ignore[attr-defined]
+                          title=tr("The run failed"))
 
     def _runs_changed(self) -> None:
         """A run started or ended: the Library follows (2.27)."""

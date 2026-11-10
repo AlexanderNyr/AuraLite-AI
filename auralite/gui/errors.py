@@ -16,6 +16,7 @@ from auralite.studio.errors import FriendlyError, explain_error
 from auralite.studio.logs import install_excepthooks, log_dir, setup_logging
 
 from .common import messagebox, tk, ttk
+from .i18n import tr
 
 __all__ = ["APP_NAME", "DIALOGS", "ErrorDialog", "attach_logging", "show_error"]
 
@@ -67,7 +68,7 @@ class ErrorDialog:
         ttk.Label(outer, text=friendly.message, wraplength=520,
                   justify=tk.LEFT).pack(anchor=tk.W, pady=(6, 0))
         if friendly.hints:
-            ttk.Label(outer, text="What to try:", font=("Segoe UI", 10, "bold")).pack(
+            ttk.Label(outer, text=tr("What to try:"), font=("Segoe UI", 10, "bold")).pack(
                 anchor=tk.W, pady=(10, 0))
             for hint in friendly.hints:
                 ttk.Label(outer, text=f"•  {hint}", wraplength=500,
@@ -83,11 +84,11 @@ class ErrorDialog:
         buttons.pack(fill=tk.X, pady=(12, 0))
         self.ok_button = ttk.Button(buttons, text="OK", command=self.close)
         self.ok_button.pack(side=tk.RIGHT)
-        self.details_button = ttk.Button(buttons, text="Details ▸", command=self.toggle_details)
+        self.details_button = ttk.Button(buttons, text=tr("Details ▸"), command=self.toggle_details)
         self.details_button.pack(side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Copy the details", command=self.copy_details).pack(
+        ttk.Button(buttons, text=tr("Copy the details"), command=self.copy_details).pack(
             side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Open the log folder", command=self.open_logs).pack(
+        ttk.Button(buttons, text=tr("Open the log folder"), command=self.open_logs).pack(
             side=tk.LEFT)
         win.bind("<Escape>", lambda _e: self.close())
         win.bind("<Return>", lambda _e: self.close())
@@ -98,10 +99,10 @@ class ErrorDialog:
     def toggle_details(self) -> None:
         if self._details_shown:
             self.details.pack_forget()
-            self.details_button.config(text="Details ▸")
+            self.details_button.config(text=tr("Details ▸"))
         else:
             self.details.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-            self.details_button.config(text="Details ▾")
+            self.details_button.config(text=tr("Details ▾"))
         self._details_shown = not self._details_shown
 
     def copy_details(self) -> None:
