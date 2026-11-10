@@ -1091,9 +1091,9 @@ def test_the_library_lists_models_and_datasets(tmp_path, monkeypatch):
     assert not models["gone.pt"].exists and models["gone.pt"].detail == "not found any more"
     data = {d.name: d for d in library.list_datasets()}
     assert set(data) == {"chats.jsonl", "notes.txt", "fineweb-1", "wiki-2"}
-    assert data["chats.jsonl"].detail == "Dialogs, 1 dialogs, about 12 tokens"
+    assert data["chats.jsonl"].detail == "Dialogs, 1 dialog, about 12 tokens"   # 2.27
     assert len(data["chats.jsonl"].extra["runs"]) == 2 and data["chats.jsonl"].remembered
-    assert data["notes.txt"].detail == "Text, 1 documents"
+    assert data["notes.txt"].detail == "Text, 1 document"
     assert data["fineweb-1"].kind == "shards" and data["fineweb-1"].owned
     assert data["fineweb-1"].detail == "1,000 tokens, BPE, 512 tokens"
     assert "not finished" in data["wiki-2"].detail

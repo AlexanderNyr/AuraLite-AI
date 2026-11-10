@@ -27,7 +27,7 @@ from ..library import remember_dataset
 from ..progress import ended_by_itself, format_duration, stage_percent, stage_text, summary_text
 from ..recipes import CUSTOM, SettingsError, TrainSettings, custom_params, pretrain_params
 from .common import (Collapsible, Job, ask_dir, ask_open, ask_save, compact_spins, heading,
-                     hint, load_settings_file, run_training, save_settings_file, show_error)
+                     hint, run_training, save_settings_file, show_error)
 from .widgets import DataPicker, RunPanel
 
 if TYPE_CHECKING:
@@ -664,16 +664,20 @@ class TrainTab(QWidget):
         save_settings_file(self, "train", settings.to_dict(), self.data.paths())
 
     def load_settings(self) -> None:
-        """2.24: the form from a settings file, and its data when the file is there."""
+        """2.24: the form from a settings file, and its data when the file is there. 2.27:
+        the classic interface's files too - its *Save Config* files of 2.26 and before
+        included (`studio/trainform.py`)."""
+        from ..trainform import read_train_settings
+        path = ask_open(self, "Load settings", "Settings (*.json);;All files (*)")
+        if not path:
+            return
         try:
-            doc = load_settings_file(self, "train")
+            doc = read_train_settings(path)
         except (OSError, ValueError) as err:
             show_error(self, err, "reading the settings")
             return
-        if doc is None:
-            return
-        self.apply_settings(TrainSettings.from_dict(doc.get("settings") or {}))
-        paths = [p for p in doc.get("data") or [] if isinstance(p, str)]
+        self.apply_settings(TrainSettings.from_dict(doc["settings"]))
+        paths = [p for p in doc["data"] if isinstance(p, str)]
         if paths and os.path.exists(paths[0]):
             self.data.set_path(paths[0])
 

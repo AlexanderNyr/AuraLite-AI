@@ -1,3 +1,60 @@
+# 📦 v2.27.0 — The classic interface gets the Library, the setup wizard, recorded Train runs and explained errors
+
+The third step of bringing the Studio's features to the classic interface (tkinter): with it
+the classic interface has all of them — the Russian interface comes next, for both. The two
+run the same code for what is new here (`auralite/studio/libraryview.py`, `wizardplan.py`,
+`trainform.py`: no toolkit inside), so they list the same runs in the same words and read
+each other's settings files. [docs/classic.md](docs/classic.md) has the table of what is
+where.
+
+- **The Library tab** (classic): every run of the two interfaces and of `auralite train`,
+  newest first, with a search; the selected run's facts, its curve (the training loss, the
+  validation dots) and notes with a name. *Continue* goes on exactly where a stopped,
+  failed or interrupted run stood; *Open the result* loads it into the chat; *Evaluate*
+  has a chat model answer up to 30 of the dialogs its run held out (how often it stops by
+  itself, how often it is exact), with *Stop*; *Train more* fine-tunes the result on;
+  *Repeat* fills the run's tab with its settings and data; *Compare* draws two runs or
+  more and marks what differs; *Delete…* removes the model files only or the whole run.
+  The *Models* page (downloads, run results, saved and opened models, adapters, exports:
+  chat, fine-tune, export, show, remove from the list, delete) and the *Datasets* page
+  (fine-tune or train on it, show, remove, delete) show the room they take. A running run's
+  row follows it every 3 seconds; the Start tab's interrupted run has *Show in the library*.
+- **The setup wizard** (classic): *Tools → Setup wizard…* (Ctrl+N) or the Start tab's *Set
+  up a run step by step…* — the goal, this computer (with the speed test), the data with
+  its report, the model that fits (the advisor's table, the recommended one starred; a
+  Hugging Face name or folder; a model of one's own to continue), the plan. *Finish* fills
+  the Train or Fine-tune tab and, when asked, starts the run.
+- **The Train tab's runs are recorded** in the library as the Studio's are: the curve,
+  the settings, the data and this computer, a checkpoint every 10 minutes in the run's
+  folder (an epoch autosave goes there too), the model at the end — a crash or a power
+  cut costs at most ten minutes, and the run continues from the Library or the Start tab.
+  New models, the model in memory trained further, LoRA and QLoRA on it, and preference
+  pairs (recorded without checkpoints: they are short and start anew). The status says
+  "Saved in the library: it can continue from there". `AURALITE_NO_RUNS=1` keeps the tab's
+  runs out of the library, as it does for `auralite train`.
+- **The Train tab's settings files are the Studio's**: *Save settings…* writes the Studio's
+  format with the keys of 2.26 and before beside it (the Studio and older versions read
+  it), *Load settings…* reads the Studio's files, this tab's and those of 2.26 and before,
+  and selects their data. A size of the Studio's (25m, 45m, …) gives its shape.
+- **Errors explained, and a log file** (classic): what went wrong in plain words and what
+  to try — out of memory, a missing package and the extra that brings it, a file not
+  found, no connection, no permission, a full disk — with *Open the log folder*, *Copy the
+  details* and the details one click away, for every error a tab shows (it showed the
+  exception's text). The details go to `~/.auralite/logs/classic.log` (2 MB, three old
+  ones kept) with every uncaught error of a button, a key or a worker thread; *Tools → Open
+  the log folder*, and *About* names the folder.
+- **The Studio** loads the classic Train tab's settings files, those of 2.26 and before
+  included; *Train more* of a new model's run no longer sets the fine-tune's passes to
+  that run's 100 (its settings stay out: only a fine-tune's are applied). Its Library and
+  wizard take their rows, texts and plan from the shared modules.
+- **`auralite train --params`** (and `plan`, `image-train`): a missing file, a file that is
+  not JSON or does not hold an object is said in one line (exit 2) instead of a traceback,
+  and the JSON itself works too: `--params '{"epochs": 3}'`.
+- **Smaller:** a run that trained the model in memory further says so ("Method: more"
+  before); "1 document", not "1 documents"; a tiny model reads "36K", not "0.0M"; the
+  explanation of an unknown error points to *Tools → Open the log folder* (it said Help).
+- Next: the Russian interface, in the Studio and in the classic interface.
+
 # 📦 v2.26.0 — The Studio makes images, runs the agent and shows the insights; the classic interface gets Start and Fine-tune
 
 Part 3, the last, of moving everything the classic interface (tkinter) does into AuraLite

@@ -1,11 +1,12 @@
 """The setup wizard: goal, this computer, the data, the model, the plan (2.19).
 
 It fills the Fine-tune or Train tab with settings that fit this computer and
-the data (:mod:`auralite.studio.advisor`) and can start the run.
+the data (:mod:`auralite.studio.advisor`) and can start the run. 2.27: the steps'
+texts, tables and plan are shared with the classic interface's wizard
+(:mod:`auralite.studio.wizardplan`).
 """
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt
@@ -13,24 +14,17 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QHBox
                                QLineEdit, QPushButton, QRadioButton, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWizard, QWizardPage)
 
-from ..advisor import Recommendation, recommend_finetune, recommend_pretrain
-from ..catalog import find_model
+from .. import wizardplan as steps
+from ..advisor import Recommendation
 from ..datacheck import DataReport
-from ..hardware import format_gb
-from ..progress import format_duration
+from ..wizardplan import GOALS
 from .common import ask_open, hint
 from .widgets import DataPicker
 
 if TYPE_CHECKING:
     from .window import MainWindow
 
-GOALS = (("finetune", "Fine-tune a ready model (recommended)",
-          "A pretrained model (Qwen, Llama, Mistral, SmolLM2) learns to answer your way from "
-          "your dialogs - or your style from texts. Works on an ordinary PC."),
-         ("pretrain", "Train a new model from scratch",
-          "A small model that knows only your texts. Needs a lot of text to write well."),
-         ("continue", "Continue training my model",
-          "A model you trained or imported before (.pt) learns from more data."))
+__all__ = ["GOALS", "SetupWizard"]
 
 
 class GoalPage(QWizardPage):
@@ -64,13 +58,13 @@ class ComputerPage(QWizardPage):
         super().__init__()
         self.wizard_ = wizard
         self.setTitle("This computer")
-        self.setSubTitle("What it can train decides the model and the settings.")
+        self.setSubTitle(steps.COMPUTER_SUBTITLE)
         layout = QVBoxLayout(self)
         self.summary = QLabel("Looking at this computer…")
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.summary)
-        self.speed_button = QPushButton("Run the speed test (1 s) - better time estimates")
+        self.speed_button = QPushButton(steps.SPEED_BUTTON)
         layout.addWidget(self.speed_button)
         layout.addStretch(1)
         self.speed_button.clicked.connect(wizard.studio.run_speed_test)
@@ -78,14 +72,9 @@ class ComputerPage(QWizardPage):
 
     def initializePage(self) -> None:  # noqa: N802 - Qt's name
         hw = self.wizard_.studio.hardware
-        if hw is None:
-            self.summary.setText("Looking at this computer…")
-            return
-        from ..advisor import memory_budget
-        self.summary.setText("\n".join(hw.summary_lines())
-                             + f"\n\nMemory a training run may use: "
-                               f"{format_gb(memory_budget(hw))}")
-        self.speed_button.setEnabled(not hw.gflops)
+        self.summary.setText(steps.computer_text(hw))
+        if hw is not None:
+            self.speed_button.setEnabled(not hw.gflops)
 
 
 class DataPage(QWizardPage):
@@ -104,29 +93,15 @@ class DataPage(QWizardPage):
     def initializePage(self) -> None:  # noqa: N802 - Qt's name
         goal = self.wizard_.goal_page.goal()
         self.picker.purpose = "pretrain" if goal == "pretrain" else "finetune"
-        if goal == "pretrain":
-            self.setSubTitle("Texts the new model learns from: a .txt file or a folder of them "
-                             "(UTF-8), big compressed files, or a dataset prepared before.")
-            self.explain.setText("More text writes better: a few MB teach style and common "
-                                 "words, hundreds of MB teach a language.")
-        else:
-            self.setSubTitle("Dialogs teach answers; preference pairs polish them; plain text "
-                             "teaches style and knowledge.")
-            self.explain.setText("Dialogs: a .jsonl file with one {\"messages\": [{\"role\": "
-                                 "\"user\", \"content\": ...}, {\"role\": \"assistant\", "
-                                 "\"content\": ...}]} per line. 200+ dialogs work, 1,000+ are "
-                                 "good.")
+        subtitle, explanation = steps.data_texts(goal)
+        self.setSubTitle(subtitle)
+        self.explain.setText(explanation)
 
     def report(self) -> DataReport | None:
         return self.picker.report
 
     def isComplete(self) -> bool:  # noqa: N802 - Qt's name
-        report = self.picker.report
-        if report is None or not report.ok:
-            return False
-        if self.wizard_.goal_page.goal() == "pretrain":
-            return report.kind in ("text", "big", "shards", "dialogs")
-        return report.kind in ("dialogs", "preferences", "text")
+        return steps.data_complete(self.wizard_.goal_page.goal(), self.picker.report)
 
 
 class ModelPage(QWizardPage):
@@ -142,13 +117,13 @@ class ModelPage(QWizardPage):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
-        self.other_label = QLabel("Or another Hugging Face model (hf:ORG/NAME) or a folder:")
+        self.other_label = QLabel(steps.OTHER_LABEL)
         self.other = QLineEdit()
         layout.addWidget(self.other_label)
         layout.addWidget(self.other)
         file_row = QHBoxLayout()
         self.file = QLineEdit()
-        self.file.setPlaceholderText("Your model: an AuraLite checkpoint (.pt)")
+        self.file.setPlaceholderText(steps.FILE_PLACEHOLDER)
         self.file_button = QPushButton("File…")
         file_row.addWidget(self.file, 1)
         file_row.addWidget(self.file_button)
@@ -176,58 +151,24 @@ class ModelPage(QWizardPage):
         self.other_label.setVisible(goal == "finetune")
         self.file.setVisible(continuing)
         self.file_button.setVisible(continuing)
-        if continuing:
-            self.setSubTitle("Choose the model to continue.")
-            self.note.setText("")
+        table = steps.model_table(goal, hw, report)
+        if table.subtitle:
+            self.setSubTitle(table.subtitle)
+        self.note.setText(table.note)
+        if table.recommendation is None:
             return
-        if hw is None:
-            self.note.setText("This computer is still being looked at: try again in a moment.")
-            return
-        if goal == "pretrain":
-            self.setSubTitle("The size that fits this computer and your text.")
-            self.recommendation = rec = recommend_pretrain(hw, report)
-            self.table.setColumnCount(5)
-            self.table.setHorizontalHeaderLabels(["Size", "Parameters", "Memory", "Fits",
-                                                  "One pass over the text"])
-            self.table.setRowCount(len(rec.presets))
-            chosen = 0
-            for i, fit in enumerate(rec.presets):
-                cells = [fit.preset, f"{fit.params / 1e6:,.0f}M", format_gb(fit.memory),
-                         "yes" if fit.fits else "no",
-                         format_duration(fit.epoch_hours * 3600)
-                         if fit.epoch_hours is not None else "—"]
-                self._fill(i, cells, recommended=fit is rec.preset)
-                if fit is rec.preset:
-                    chosen = i
-            self.table.selectRow(chosen)
-        else:
-            self.setSubTitle("Models that fit this computer, the recommended one selected. "
-                             "Bigger answers better but trains slower.")
-            self.recommendation = rec = recommend_finetune(hw, report)
-            self.table.setColumnCount(7)
-            self.table.setHorizontalHeaderLabels(["Model", "Size", "Method", "Memory", "Fits",
-                                                  "Time", "License"])
-            self.table.setRowCount(len(rec.options))
-            chosen = 0
-            for i, fit in enumerate(rec.options):
-                cells = [fit.model.display_name, fit.model.size_label, fit.method_label,
-                         format_gb(fit.memory),
-                         "yes" if fit.fits else ("tight" if fit.tight else "no"),
-                         format_duration(fit.hours * 3600) if fit.hours is not None else "—",
-                         fit.model.license + (" (gated)" if fit.model.gated else "")]
-                self._fill(i, cells, recommended=fit is rec.choice, usable=fit.usable)
-                if fit is rec.choice:
-                    chosen = i
-            self.table.selectRow(chosen)
+        self.recommendation = table.recommendation
+        self.table.setColumnCount(len(table.headers))
+        self.table.setHorizontalHeaderLabels(table.headers)
+        self.table.setRowCount(len(table.rows))
+        for row, (cells, _recommended, usable) in enumerate(table.rows):
+            self._fill(row, cells, usable=usable)
+        self.table.selectRow(table.chosen)
         self.table.resizeColumnsToContents()
-        self.note.setText("\n".join(f"Note: {w}" for w in rec.warnings)
-                          + ("" if rec.measured else
-                             "\nTimes are rough: the speed test on the previous page "
-                             "makes them better."))
 
-    def _fill(self, row: int, cells: list[str], recommended: bool, usable: bool = True) -> None:
+    def _fill(self, row: int, cells: list[str], usable: bool = True) -> None:
         for column, text in enumerate(cells):
-            item = QTableWidgetItem(text + (" ★" if recommended and column == 0 else ""))
+            item = QTableWidgetItem(text)
             if not usable:
                 item.setForeground(self.palette().color(self.palette().ColorRole.PlaceholderText))
             self.table.setItem(row, column, item)
@@ -237,38 +178,13 @@ class ModelPage(QWizardPage):
         return rows[0].row() if rows else -1
 
     def isComplete(self) -> bool:  # noqa: N802 - Qt's name
-        goal = self.wizard_.goal_page.goal()
-        if goal == "continue":
-            return os.path.isfile(self.file.text().strip())
-        if goal == "finetune" and self.other.text().strip():
-            return True
-        return self.selected_row() >= 0 and self.recommendation is not None
+        return steps.model_complete(self.wizard_.goal_page.goal(), self.selected_row(),
+                                   self.recommendation, self.other.text(), self.file.text())
 
     def choice(self) -> dict[str, Any]:
         """``{"base": spec, "settings": {...}}`` of the selection."""
-        goal = self.wizard_.goal_page.goal()
-        rec = self.recommendation
-        if goal == "continue":
-            return {"base": self.file.text().strip(),
-                    "settings": {"method": "lora", "lora_rank": 16, "optimizer": "adamw",
-                                 "epochs": 2}}
-        if goal == "pretrain" and rec is not None:
-            fit = rec.presets[max(0, self.selected_row())]
-            return {"base": "", "settings": dict(rec.settings, preset=fit.preset)}
-        other = self.other.text().strip()
-        settings = dict(rec.settings) if rec is not None else {}
-        if other:
-            known = find_model(other)
-            spec = known.spec if known is not None else (
-                other if os.path.exists(other) or other.lower().startswith("hf:")
-                else "hf:" + other)
-            return {"base": spec, "settings": dict(settings, base=spec)}
-        if rec is not None and self.selected_row() >= 0:
-            fit = rec.options[self.selected_row()]
-            settings.update(base=fit.model.spec, method=fit.method,
-                            optimizer="adamw8bit" if fit.method != "lora" else "adamw")
-            return {"base": fit.model.spec, "settings": settings}
-        return {"base": "", "settings": settings}
+        return steps.choose(self.wizard_.goal_page.goal(), self.recommendation,
+                           self.selected_row(), self.other.text(), self.file.text())
 
 
 class PlanPage(QWizardPage):
@@ -276,7 +192,7 @@ class PlanPage(QWizardPage):
         super().__init__()
         self.wizard_ = wizard
         self.setTitle("The plan")
-        self.setSubTitle("Check it, then Finish: the tab opens with these settings.")
+        self.setSubTitle(steps.PLAN_SUBTITLE)
         layout = QVBoxLayout(self)
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
@@ -293,23 +209,7 @@ class PlanPage(QWizardPage):
         goal = self.wizard_.goal_page.goal()
         choice = self.wizard_.model_page.choice()
         report = self.wizard_.data_page.report()
-        settings = choice["settings"]
-        lines = [f"Goal: {dict((k, t) for k, t, _ in GOALS)[goal]}"]
-        if goal == "pretrain":
-            lines.append(f"Model: a {settings.get('preset')} model from scratch")
-            lines.append(f"Time limit: {int(settings.get('time_limit_min', 0))} min (the run "
-                         f"finishes well when it is up)")
-        else:
-            method = {"qlora": "QLoRA (4-bit base + adapters)", "lora": "LoRA",
-                      "full": "every weight"}.get(str(settings.get("method")), "LoRA")
-            lines.append(f"Base model: {choice['base']}")
-            lines.append(f"Method: {method}, rank {settings.get('lora_rank', 16)}, "
-                         f"{'8-bit AdamW' if settings.get('optimizer') == 'adamw8bit' else 'AdamW'}")
-            lines.append(f"Passes over the data: {settings.get('epochs', 2)}, windows of "
-                         f"{settings.get('seq_length', 512)} tokens, memory plan on")
-        if report is not None:
-            lines += report.summary_lines()[:2]
-        self.summary.setText("\n".join(lines))
+        self.summary.setText("\n".join(steps.plan_lines(goal, choice, report)))
 
 
 class SetupWizard(QWizard):
@@ -332,10 +232,6 @@ class SetupWizard(QWizard):
             self.addPage(page)
 
     def accept(self) -> None:
-        choice = self.model_page.choice()
-        report = self.data_page.report()
-        self.plan = {"goal": self.goal_page.goal(), "base": choice["base"],
-                     "settings": choice["settings"],
-                     "data": report.paths[0] if report is not None and report.paths else "",
-                     "start": self.plan_page.start.isChecked()}
+        self.plan = steps.make_plan(self.goal_page.goal(), self.model_page.choice(),
+                                   self.data_page.report(), self.plan_page.start.isChecked())
         super().accept()

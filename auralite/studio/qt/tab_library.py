@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QHeaderV
 from auralite import runs as runlib
 
 from .. import library
+from .. import libraryview as view
+from ..libraryview import EVAL_DIALOGS, EVAL_TOKENS, REFRESH_MS
 from .common import Job, confirm, heading, hint, inform, open_path, primary, show_error
 from .theme import ACCENT
 from .widgets import CurveChart
@@ -33,14 +35,9 @@ from .widgets import CurveChart
 if TYPE_CHECKING:
     from .window import MainWindow
 
-STATUS_COLORS = {"finished": "#1e8e3e", "stopped": "#b06000", "interrupted": "#d93025",
-                 "failed": "#d93025", "running": ACCENT}
-#: The chat evaluation: at most this many held-out dialogs, replies of at
-#: most this many tokens (minutes, not hours, on an old computer).
-EVAL_DIALOGS = 30
-EVAL_TOKENS = 48
-#: How often the runs refresh while one of them trains (milliseconds).
-REFRESH_MS = 3000
+# 2.27: the rows, texts and button states are shared with the classic interface's Library
+# (auralite/studio/libraryview.py)
+STATUS_COLORS = dict(view.STATUS_COLORS, running=ACCENT)
 
 
 def _table(headers: list[str]) -> QTableWidget:
@@ -98,8 +95,7 @@ class CompareDialog(QDialog):
             for c, value in enumerate(values):
                 self.table.setItem(r, c, _item(value, bold=differs))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(hint("Bold: what differs. Lines: the training loss; dots: the "
-                              "validation loss."))
+        layout.addWidget(hint(view.COMPARE_HINT))
         layout.addWidget(self.table, 2)
         close = QPushButton("Close")
         close.clicked.connect(self.close)
@@ -149,25 +145,22 @@ class LibraryTab(QWidget):
         layout.setContentsMargins(0, 8, 0, 0)
         tools = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Find a run: a name, a model, data, a status")
+        self.search.setPlaceholderText(view.SEARCH_PLACEHOLDER)
         self.search.textChanged.connect(lambda _t: self.fill_runs())
         tools.addWidget(self.search, 1)
         self.compare_button = QPushButton("Compare")
-        self.compare_button.setToolTip("Select two runs or more (Ctrl+click), then compare "
-                                       "their curves and settings")
+        self.compare_button.setToolTip(view.COMPARE_TIP)
         self.compare_button.clicked.connect(self.compare_selected)
         tools.addWidget(self.compare_button)
         folder = QPushButton("Runs folder")
         folder.clicked.connect(lambda: open_path(str(runlib.runs_root())))
         tools.addWidget(folder)
         layout.addLayout(tools)
-        self.runs_table = _table(["Name", "Status", "Kind", "Best val. loss", "Time", "Started"])
+        self.runs_table = _table(list(view.RUN_COLUMNS))
         self.runs_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.runs_table.itemSelectionChanged.connect(self._run_selected)
         self.runs_table.itemDoubleClicked.connect(lambda _i: self.open_result())
-        self.empty_runs = hint("No runs yet. Every training run of the Train and Fine-tune tabs "
-                               "(and of `auralite train`) appears here with its curve; a stopped "
-                               "or interrupted one continues where it stood.")
+        self.empty_runs = hint(view.EMPTY_RUNS)
         splitter = QSplitter(Qt.Orientation.Vertical)
         top = QWidget()
         top_layout = QVBoxLayout(top)
@@ -211,21 +204,18 @@ class LibraryTab(QWidget):
         layout.addLayout(body, 1)
         buttons = QHBoxLayout()
         self.continue_button = primary(QPushButton("Continue"))
-        self.continue_button.setToolTip("Go on exactly where the run stood: the same data order, "
-                                        "learning-rate schedule and counters")
+        self.continue_button.setToolTip(view.CONTINUE_TIP)
         self.continue_button.clicked.connect(self.continue_selected)
         self.open_button = QPushButton("Open the result")
         self.open_button.clicked.connect(self.open_result)
         self.evaluate_button = QPushButton("Evaluate")
-        self.evaluate_button.setToolTip(f"A chat model answers up to {EVAL_DIALOGS} of the "
-                                        f"dialogs its run held out: how often it stops by "
-                                        f"itself, how often it answers exactly")
+        self.evaluate_button.setToolTip(view.EVALUATE_TIP)
         self.evaluate_button.clicked.connect(self.evaluate_selected)
         self.more_button = QPushButton("Train more")
-        self.more_button.setToolTip("Fine-tune the run's result further (a new run)")
+        self.more_button.setToolTip(view.MORE_TIP)
         self.more_button.clicked.connect(self.train_more)
         self.repeat_button = QPushButton("Repeat")
-        self.repeat_button.setToolTip("Open the run's tab with its settings, base and data")
+        self.repeat_button.setToolTip(view.REPEAT_TIP)
         self.repeat_button.clicked.connect(self.repeat)
         self.files_button = QPushButton("Show files")
         self.files_button.clicked.connect(self.show_files)
@@ -276,22 +266,10 @@ class LibraryTab(QWidget):
             self.fill_runs()
 
     def _update_disk(self) -> None:
-        d = library.disk_summary()
-        parts = [f"AuraLite's files: {library.format_size(d['total'])}"]
-        detail = [f"{label} {library.format_size(d[key])}" for key, label in
-                  (("runs", "runs"), ("downloads", "downloads"), ("datasets", "prepared data"))
-                  if d[key]]
-        if detail:
-            parts[0] += f" ({', '.join(detail)})"
-        if d.get("free") is not None:
-            parts.append(f"{library.format_size(d['free'])} free on the disk")
-        self.disk_label.setText(" · ".join(parts))
+        self.disk_label.setText(view.disk_line(library.disk_summary()))
 
     def _matches(self, run: runlib.Run, words: list[str]) -> bool:
-        text = " ".join([run.name, run.id, run.status, run.kind_label, run.method,
-                         str(run.base.get("label") or ""),
-                         runlib.data_label(run.data.get("paths") or []), run.notes]).lower()
-        return all(word in text for word in words)
+        return view.run_matches(run, words)
 
     def fill_runs(self) -> None:
         words = self.search.text().lower().split()
@@ -301,14 +279,13 @@ class LibraryTab(QWidget):
         table.blockSignals(True)
         table.setRowCount(len(shown))
         for row, run in enumerate(shown):
-            status = run.status
-            best = f"{run.best_val:.4f}" if run.best_val is not None else ""
-            table.setItem(row, 0, _item(run.name, run.id))
+            name, status, kind, best, seconds, started = view.run_row(run)
+            table.setItem(row, 0, _item(name, run.id))
             table.setItem(row, 1, _item(status, color=STATUS_COLORS.get(status, "")))
-            table.setItem(row, 2, _item(run.kind_label))
+            table.setItem(row, 2, _item(kind))
             table.setItem(row, 3, _item(best, right=True))
-            table.setItem(row, 4, _item(runlib._duration(run.seconds), right=True))
-            table.setItem(row, 5, _item(runlib.format_when(run.created)))
+            table.setItem(row, 4, _item(seconds, right=True))
+            table.setItem(row, 5, _item(started))
         table.clearSelection()
         for row, run in enumerate(shown):
             if run.id in selected:
@@ -368,22 +345,15 @@ class LibraryTab(QWidget):
     def _update_run_buttons(self) -> None:
         run = self.current_run()
         busy = bool(self.studio.busy) or self.job is not None
-        has = run is not None
-        self.continue_button.setEnabled(has and not busy and run.continue_state()[0])
-        self.open_button.setEnabled(has and not busy and run.result_path is not None)
-        self.evaluate_button.setEnabled(has and not busy and run.result_path is not None
-                                        and str(run.data.get("kind")) in ("dialogs",
-                                                                          "preferences"))
-        self.more_button.setEnabled(has and not busy and run.result_path is not None)
-        self.repeat_button.setEnabled(has and not busy)
+        can = view.run_actions(run, busy)
+        for key, button in (("continue", self.continue_button), ("open", self.open_button),
+                            ("evaluate", self.evaluate_button), ("more", self.more_button),
+                            ("repeat", self.repeat_button), ("delete", self.delete_button)):
+            button.setEnabled(can[key])
         for widget in (self.files_button, self.save_button, self.name_edit, self.notes):
-            widget.setEnabled(has)
-        self.delete_button.setEnabled(has and run.status != "running")
-        if has:
-            ok, why = run.continue_state()
-            self.continue_button.setToolTip(
-                "Go on exactly where the run stood: the same data order, learning-rate "
-                "schedule and counters" if ok else f"It cannot continue: {why}")
+            widget.setEnabled(can["files"])
+        if run is not None:
+            self.continue_button.setToolTip(view.continue_tip(run))
 
     # ---- run actions ---------------------------------------------------------------
     def save_notes(self) -> None:
@@ -395,7 +365,7 @@ class LibraryTab(QWidget):
         self.on_runs_changed()
 
     def _tab_of(self, run: runlib.Run) -> Any:
-        return self.studio.train_tab if run.kind == "train" else self.studio.finetune_tab
+        return self.studio.train_tab if view.tab_of(run) == "train" else self.studio.finetune_tab
 
     def continue_run(self, run: runlib.Run) -> None:
         """Continue `run` in its tab (Train or Fine-tune), where its progress shows."""
@@ -429,7 +399,7 @@ class LibraryTab(QWidget):
         if run is None:
             return
         self._tab_of(run).apply_run(run)
-        self.studio.goto("train" if run.kind == "train" else "finetune")
+        self.studio.goto(view.tab_of(run))
 
     def show_files(self) -> None:
         run = self.current_run()
@@ -440,17 +410,7 @@ class LibraryTab(QWidget):
         run = self.current_run()
         if run is None or run.status == "running":
             return
-        size = library.format_size(run.disk_bytes())
-        if files_only:
-            question = (f"Delete the model files of {run.name} ({size} with its record)? Its "
-                        f"record and curve stay; it cannot continue or be opened after this.")
-        else:
-            question = f"Delete the run {run.name} and its folder ({size})?"
-        outside = [str(path) for _label, path, _size in run.files() if run.folder not in
-                   path.parents]
-        if outside:
-            question += f"\n\nFiles outside its folder stay: {', '.join(outside)}"
-        if not confirm(self, "Delete", question):
+        if not confirm(self, "Delete", view.delete_run_question(run, files_only)):
             return
         try:
             runlib.delete_run(run, files_only=files_only)
@@ -461,7 +421,7 @@ class LibraryTab(QWidget):
     def compare_selected(self) -> None:
         runs = self.selected_runs()
         if len(runs) < 2:
-            inform(self, "Compare runs", "Select two runs or more (Ctrl+click) to compare them.")
+            inform(self, "Compare runs", view.SELECT_TWO)
             return
         if self.compare_dialog is not None:
             self.compare_dialog.close()
@@ -475,8 +435,7 @@ class LibraryTab(QWidget):
         if run is None or run.result_path is None:
             return
         if str(run.data.get("kind")) not in ("dialogs", "preferences"):
-            inform(self, "Evaluate", "The evaluation measures chat models on the dialogs their "
-                                     "run held out; this run trained on text.")
+            inform(self, "Evaluate", view.EVAL_TEXT_ONLY)
             return
         if not self.studio.confirm_replace_model("The evaluation loads the run's result in "
                                                  "place of the model in memory."):
@@ -526,12 +485,7 @@ class LibraryTab(QWidget):
         self.studio.end(model_dirty=False)
         summary = runlib.evaluation_summary(result)
         runlib.update_run(run, evaluation=summary)
-        stop = summary.get("stop_rate")
-        exact = summary.get("exact")
-        self.task_label.setText(
-            f"Evaluated on {summary.get('dialogs', 0)} held-out dialogs"
-            + (f": {stop:.0%} of the replies stop by themselves" if stop is not None else "")
-            + (f", {exact:.0%} are exact" if exact is not None else "") + ".")
+        self.task_label.setText(view.evaluation_line(summary))
         self.on_runs_changed()
 
     def _eval_failed(self, exc: BaseException) -> None:
@@ -552,10 +506,8 @@ class LibraryTab(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(hint("Downloaded models, the results of runs, and the models, adapters "
-                              "and exports saved here. Deleting a download or a run's files "
-                              "only frees room: a download comes back on the next use."))
-        self.models_table = _table(["Name", "Kind", "Size", "Changed", "About"])
+        layout.addWidget(hint(view.MODELS_HINT))
+        self.models_table = _table(list(view.MODEL_COLUMNS))
         self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.models_table.itemSelectionChanged.connect(self._update_model_buttons)
         self.models_table.itemDoubleClicked.connect(lambda _i: self.chat_with_model())
@@ -596,17 +548,9 @@ class LibraryTab(QWidget):
         table.setRowCount(len(items))
         for row, item in enumerate(items):
             table.setItem(row, 0, _item(item.name, row, color="" if item.exists else "#888888"))
-            for column, key in enumerate(columns, 1):
-                if key == "size":
-                    cell = _item(library.format_size(item.bytes) if item.exists else "",
-                                 right=True)
-                elif key == "changed":
-                    cell = _item(runlib.format_when(item.modified))
-                elif key == "runs":
-                    cell = _item(str(len(item.extra.get("runs") or [])) or "", right=True)
-                else:
-                    cell = _item(str(getattr(item, key)))
-                table.setItem(row, column, cell)
+            cells = view.item_cells(item, columns)
+            for column, (key, text) in enumerate(zip(columns, cells, strict=True), 1):
+                table.setItem(row, column, _item(text, right=key in ("size", "runs")))
         table.clearSelection()
         table.blockSignals(False)
 
@@ -630,25 +574,13 @@ class LibraryTab(QWidget):
         return False
 
     def _update_model_buttons(self) -> None:
-        item = self.selected_model()
-        buttons = (self.chat_model_button, self.finetune_model_button, self.export_model_button,
-                   self.show_model_button, self.forget_model_button, self.delete_model_button)
-        if item is None:
-            for button in buttons:
-                button.setEnabled(False)
-            return
-        ready = item.exists and not self.studio.busy
-        path = item.path.lower()
-        loadable = item.kind == "download" or path.endswith((".pt", ".gguf"))
-        self.chat_model_button.setEnabled(ready and loadable and item.kind != "adapter")
-        self.finetune_model_button.setEnabled(
-            ready and item.kind in ("download", "result", "saved", "opened")
-            and not path.endswith(".gguf"))
-        self.export_model_button.setEnabled(ready and path.endswith(".pt")
-                                            and item.kind != "adapter")
-        self.show_model_button.setEnabled(item.exists)
-        self.forget_model_button.setEnabled(item.kind in ("saved", "adapter", "export", "opened"))
-        self.delete_model_button.setEnabled(ready)
+        can = view.model_actions(self.selected_model(), bool(self.studio.busy))
+        for key, button in (("chat", self.chat_model_button),
+                            ("finetune", self.finetune_model_button),
+                            ("export", self.export_model_button), ("show", self.show_model_button),
+                            ("forget", self.forget_model_button),
+                            ("delete", self.delete_model_button)):
+            button.setEnabled(can[key])
 
     def chat_with_model(self) -> None:
         item = self.selected_model()
@@ -691,17 +623,7 @@ class LibraryTab(QWidget):
     def _delete(self, item: library.LibraryItem | None) -> None:
         if item is None or not item.exists:
             return
-        size = library.format_size(item.bytes)
-        if item.owned:
-            question = f"Delete {item.name} ({size})?"
-            if item.kind == "download":
-                question += " It is downloaded again when it is used next time."
-            elif item.kind == "result":
-                question += " The run's checkpoint goes too; its record and curve stay."
-        else:
-            question = (f"Delete {item.path} ({size}) from the disk? This is your file: it "
-                        f"cannot be brought back.")
-        if not confirm(self, "Delete", question):
+        if not confirm(self, "Delete", view.delete_item_question(item)):
             return
         try:
             library.delete_item(item)
@@ -714,9 +636,8 @@ class LibraryTab(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(hint("The data you checked or trained on, and the datasets `auralite "
-                              "data prepare` made (prepared once, reused by later runs)."))
-        self.data_table = _table(["Name", "Kind", "Size", "Changed", "Runs", "About"])
+        layout.addWidget(hint(view.DATASETS_HINT))
+        self.data_table = _table(list(view.DATA_COLUMNS))
         self.data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.data_table.itemSelectionChanged.connect(self._update_data_buttons)
         layout.addWidget(self.data_table, 1)
@@ -749,21 +670,12 @@ class LibraryTab(QWidget):
         return self._selected(self.data_table, self.datasets)
 
     def _update_data_buttons(self) -> None:
-        item = self.selected_dataset()
-        buttons = (self.finetune_data_button, self.train_data_button, self.show_data_button,
-                   self.forget_data_button, self.delete_data_button)
-        if item is None:
-            for button in buttons:
-                button.setEnabled(False)
-            return
-        usable = (item.exists or item.path.lower().startswith("hf:")) and not self.studio.busy
-        kind = str((item.extra.get("report") or {}).get("kind") or "")
-        self.finetune_data_button.setEnabled(usable and item.kind == "data"
-                                             and kind in ("", "dialogs", "preferences", "text"))
-        self.train_data_button.setEnabled(usable and kind != "preferences")
-        self.show_data_button.setEnabled(item.exists)
-        self.forget_data_button.setEnabled(item.remembered)
-        self.delete_data_button.setEnabled(item.exists and not self.studio.busy)
+        can = view.data_actions(self.selected_dataset(), bool(self.studio.busy))
+        for key, button in (("finetune", self.finetune_data_button),
+                            ("train", self.train_data_button), ("show", self.show_data_button),
+                            ("forget", self.forget_data_button),
+                            ("delete", self.delete_data_button)):
+            button.setEnabled(can[key])
 
     def use_data(self, tab_name: str) -> None:
         item = self.selected_dataset()

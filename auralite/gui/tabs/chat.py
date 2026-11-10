@@ -372,8 +372,8 @@ class ChatTabMixin:
                         self.root.after(0, lambda: self._append_chat_message("assistant", "[No response generated]"))
 
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Chat Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the reply", title="Chat Error"))
             finally:
                 self.root.after(0, lambda: (
                     self.chat_send_btn.config(state=tk.NORMAL),

@@ -35,6 +35,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tab.quant": " Quant ",
         "tab.eval": " Eval ",
         "tab.export": " Export ",
+        "tab.library": " Library ",          # 2.27
         "tab.console": " Console ",
         # buttons / labels
         "btn.language": "🌐 Language",

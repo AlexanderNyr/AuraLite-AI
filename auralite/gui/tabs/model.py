@@ -180,7 +180,7 @@ class ModelTabMixin:
             messagebox.showinfo("Saved",
                                 f"Model saved to:\n{path}")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving the model", title="Save Error")
 
 
     def _ask_gguf_options(self, path: str) -> dict | None:
@@ -331,7 +331,7 @@ class ModelTabMixin:
             # (a bare `pip install llama-cpp-python` compiles llama.cpp).
             messagebox.showerror("GGUF support is not installed", str(e))
         except Exception as e:
-            messagebox.showerror("Load Error", str(e))
+            self.report_error(e, "loading the model", title="Load Error")
 
 
     # ---- 2.18.1: Hugging Face models in the native engine -------------------
@@ -363,9 +363,8 @@ class ModelTabMixin:
                                                    progress_callback=progress)
                 self.root.after(0, self._hf_native_imported, name, info)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Import Error", f"Could not import {name}:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, f"importing {name}", title="Import Error"))
                 self.root.after(0, lambda: self.status_label.config(
                     text="Status: Import failed ✗"))
             finally:
@@ -390,6 +389,12 @@ class ModelTabMixin:
         if info.get("quantize") == "nf4" and hasattr(self, "qlora_var"):
             self.qlora_var.set(True)
         self._refresh_model_info()
+        then = getattr(self, "_lib_after_import", "")       # 2.27: the Library's "Chat with it"
+        if then:
+            self._lib_after_import = ""
+            self._goto_tab(then)
+            if hasattr(self, "lib_task_label"):
+                self.lib_task_label.config(text=f"{name} is in memory.")
 
     def _browse_local_hf_model(self):
         """Open folder dialog to select an already downloaded HF model directory."""
@@ -483,8 +488,8 @@ class ModelTabMixin:
                     f"{err}\n\nRun: pip install \"auralite-ai[hf]\""
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("HF Load Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "loading the model", title="HF Load Error"))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -508,7 +513,7 @@ class ModelTabMixin:
             self.status_label.config(text=f"Status: LoRA (rank {rank}) applied ✅")
             self._refresh_model_info()
         except Exception as e:
-            messagebox.showerror("LoRA Error", str(e))
+            self.report_error(e, "adding LoRA", title="LoRA Error")
 
 
     def _save_hf_lora(self):
@@ -526,7 +531,7 @@ class ModelTabMixin:
             messagebox.showinfo("Saved", f"LoRA adapter saved to:\n{path}")
             self.status_label.config(text="Status: LoRA adapter saved ✅")
         except Exception as e:
-            messagebox.showerror("Save LoRA Error", str(e))
+            self.report_error(e, "saving the LoRA adapters", title="Save LoRA Error")
 
 
     def _load_hf_lora(self):
@@ -543,7 +548,7 @@ class ModelTabMixin:
             self.status_label.config(text="Status: LoRA adapter loaded ✅")
             self._refresh_model_info()
         except Exception as e:
-            messagebox.showerror("Load LoRA Error", str(e))
+            self.report_error(e, "loading the LoRA adapters", title="Load LoRA Error")
 
 
     def _push_hf_to_hub(self):
@@ -578,8 +583,8 @@ class ModelTabMixin:
                     text=f"Status: Pushed to {repo_id} ✅"
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Push Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the upload to the Hub", title="Push Error"))
             finally:
                 self.root.after(0, lambda: self.hf_push_btn.config(state=tk.NORMAL))
 
@@ -649,8 +654,8 @@ class ModelTabMixin:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("HF Hub Load Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "loading from the Hub", title="HF Hub Load Error"))
             finally:
                 self.root.after(0, lambda: self.hf_load_btn.config(state=tk.NORMAL))
 
@@ -674,7 +679,7 @@ class ModelTabMixin:
                         text = f.read()
                     texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
                 except Exception as e:
-                    messagebox.showerror("File Error", str(e))
+                    self.report_error(e, "reading the file", title="File Error")
                     return
             else:
                 texts = None
@@ -693,7 +698,7 @@ class ModelTabMixin:
                     text = f.read()
                 texts = [t.strip() for t in text.split("\n\n") if len(t.strip()) > 30]
             except Exception as e:
-                messagebox.showerror("File Error", str(e))
+                self.report_error(e, "reading the file", title="File Error")
                 return
 
         if not texts:
@@ -743,8 +748,8 @@ class ModelTabMixin:
                 self.root.after(0, lambda: self.status_label.config(
                     text=f"Status: Fine-tuning {'stopped' if stopped else 'complete'} ✅ Adapter in {saved}"))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Fine-tune Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the fine-tuning", title="Fine-tune Error"))
             finally:
                 self.root.after(0, lambda: self.hf_finetune_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.hf_stop_ft_btn.config(state=tk.DISABLED))
@@ -796,7 +801,7 @@ class ModelTabMixin:
         try:
             merged = self.engine.merge_lora()
         except Exception as e:  # noqa: BLE001 - shown to the user
-            messagebox.showerror("Merge LoRA", str(e))
+            self.report_error(e, "merging the adapters", title="Merge LoRA")
             return
         self._refresh_after_lora()
         messagebox.showinfo("LoRA merged", f"{merged} weight matrices now hold the adapters; "
@@ -818,7 +823,7 @@ class ModelTabMixin:
         try:
             info = self.engine.save_adapter(path)
         except Exception as e:  # noqa: BLE001 - shown to the user
-            messagebox.showerror("Save LoRA adapter", str(e))
+            self.report_error(e, "saving the adapters", title="Save LoRA adapter")
             return
         messagebox.showinfo("LoRA adapter saved",
                             f"{os.path.basename(path)}: {info['bytes'] / 1e6:.2f} MB, "
@@ -838,7 +843,7 @@ class ModelTabMixin:
             info = self.engine.load_adapter(path)
         except ValueError as e:
             if "another base model" not in str(e):
-                messagebox.showerror("Load LoRA adapter", str(e))
+                self.report_error(e, "loading the adapters", title="Load LoRA adapter")
                 return
             if not messagebox.askyesno(
                     "Another base model",
@@ -847,10 +852,10 @@ class ModelTabMixin:
             try:
                 info = self.engine.load_adapter(path, check_base=False)
             except Exception as err:  # noqa: BLE001 - shown to the user
-                messagebox.showerror("Load LoRA adapter", str(err))
+                self.report_error(err, "loading the adapters", title="Load LoRA adapter")
                 return
         except Exception as e:  # noqa: BLE001 - shown to the user
-            messagebox.showerror("Load LoRA adapter", str(e))
+            self.report_error(e, "loading the adapters", title="Load LoRA adapter")
             return
         self._refresh_after_lora()
         messagebox.showinfo("LoRA adapter loaded",

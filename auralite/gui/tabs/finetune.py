@@ -574,7 +574,7 @@ class FineTuneTabMixin:
             write_settings(path, "finetune", settings.to_dict(), self.ft_data_paths(),
                            base=self.ft_base_spec() if self.ft_source() != "memory" else "")
         except OSError as err:
-            messagebox.showerror("Save settings", str(err))
+            self.report_error(err, "saving the settings", title="Save settings")  # type: ignore[attr-defined]
             return
         self.ft_status.config(text=f"Settings saved to {os.path.basename(path)}.")
 
@@ -597,6 +597,50 @@ class FineTuneTabMixin:
         if paths and os.path.exists(paths[0]):
             self.ft_set_data(paths[0])
         self.ft_status.config(text=f"Settings loaded from {os.path.basename(path)}.")
+
+    # ---- from the Library and the wizard (2.27) ------------------------------------------
+    def ft_apply_run(self, run: Any, base: str | None = None) -> None:
+        """Fill the form from a run of the Library: *Repeat* (its base) or *Train more*
+        (`base`: the run's result). A new model's settings are not a fine-tune's: they
+        stay out (its 100 passes would be a very long fine-tune)."""
+        from auralite.studio.libraryview import tab_of
+        if run.settings and tab_of(run) == "finetune":
+            self.ft_apply_settings(FineTuneSettings.from_dict(run.settings))
+        self.ft_set_base(str(run.base.get("spec") or "") if base is None else base)
+        paths = [str(p) for p in run.data.get("paths") or []]
+        if paths:
+            self.ft_set_data(paths[0])
+
+    def ft_apply_plan(self, plan: dict, report: Any = None) -> None:
+        """Fill the form from the wizard's plan: the base, the method, the passes, the
+        window, the rank, the batch, the optimizer and the data (with its report)."""
+        settings = dict(plan.get("settings") or {})
+        base = str(plan.get("base") or settings.get("base") or "")
+        if base:
+            self.ft_set_base(base)
+        self._ft_applying = True
+        try:
+            if settings.get("method") in dict(METHODS):
+                self.ft_method_var.set(str(settings["method"]))
+                self._ft_method_chosen = True
+            for key in ("epochs", "seq_length", "lora_rank", "batch_size"):
+                if settings.get(key):
+                    self.ft_vars[key].set(str(int(settings[key])))
+            if "optimizer" in settings:
+                self.ft_adam8_var.set(settings["optimizer"] == "adamw8bit")
+            self._ft_user_tuned = True            # the plan's numbers stay
+        finally:
+            self._ft_applying = False
+        self._ft_method_picked(chosen=False)
+        data = str(plan.get("data") or "")
+        if not data:
+            return
+        self.ft_data_var.set(data)
+        if report is not None and list(report.paths) == [data]:
+            self._ft_inspected_paths = [data]
+            self._ft_inspected(report)            # read by the wizard already
+        else:
+            self._ft_inspect()
 
     # ---- the model in memory ------------------------------------------------------------
     def _ft_model_changed(self) -> None:

@@ -14,16 +14,18 @@ from .tabs.model import ModelTabMixin
 from .tabs.quantization import QuantizationTabMixin
 from .tabs.evaluation import EvaluationTabMixin
 from .tabs.export import ExportTabMixin
+from .tabs.library import LibraryTabMixin
 from .tabs.console import ConsoleTabMixin
 from .tabs.chat import ChatTabMixin
 from .tabs.result_view import ResultViewMixin
 from .menu import MenuMixin
+from .wizard import WizardMixin
 from . import common as gui_common
 from . import session as gui_session
 from .async_ops import TkAsyncBridge
 from .config import load_config
 from .i18n import LANGUAGES, available_languages, language_name, set_language, tr
-from .common import (CHAT_TEMPLATES, DEFAULT_RECIPE, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, filedialog, json, messagebox, os, parse_dropout, read_tokenizer_file, sys, threading, tk, ttk)
+from .common import (CHAT_TEMPLATES, AuraLiteEngine, ConsoleRedirector, ImageGenEngine, sys, threading, tk, ttk)
 
 
 def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
@@ -46,13 +48,14 @@ def _sanitize_geometry(geometry: str, avail_w: int, avail_h: int) -> str:
 
 class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, GenerationTabMixin,
             ModelTabMixin, QuantizationTabMixin, EvaluationTabMixin, ExportTabMixin,
-            ConsoleTabMixin, ChatTabMixin, ResultViewMixin, MenuMixin):
+            LibraryTabMixin, ConsoleTabMixin, ChatTabMixin, ResultViewMixin, MenuMixin,
+            WizardMixin):
     """AuraLite desktop app: tabs live in `gui/tabs/*`, shared state here."""
 
     #: Notebook tab names, in build order — used for titles and for the
     #: session snapshot (`gui/session.py` stores the active tab by name).
     _TAB_NAMES = ("start", "train", "finetune", "image", "gen", "chat", "model", "quant",
-                  "eval", "export", "console")        # 2.26: Start and Fine-tune, as the Studio
+                  "eval", "export", "library", "console")  # 2.26: Start, Fine-tune; 2.27: Library
 
     def __init__(self, root):
         self.root = root
@@ -175,6 +178,7 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         self._build_quantization_tab()
         self._build_evaluation_tab()
         self._build_export_tab()
+        self._build_library_tab()               # 2.27: runs, models and datasets, as the Studio
         self._build_console_tab()
         self._build_start_tab()                 # 2.26: last - it shows what the others hold
         self._build_menu()                      # 2.25: File, View, Tools, Help (gui/menu.py)
@@ -218,6 +222,8 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
 
         # Restore original streams on window close.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 2.27: an error of a button or a key is explained (and logged), not only printed
+        self.root.report_callback_exception = self._tk_callback_error
 
 
     def _make_scrollable_tab(self):
@@ -338,7 +344,9 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
             index = self.notebook.index("current")
             self._active_tab_name = self._tab_names[int(index)]
         except Exception:                       # a test double, a closing window
-            pass
+            return
+        if self._active_tab_name == "library":  # 2.27: what is on the disk now
+            self._lib_refresh()
 
     # ---- language / session (v2.6.5) ---------------------------------
     def _on_language_change(self, display_name):
@@ -391,6 +399,7 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
             pass
         self._save_session()
         self._stop_memory_ticks()
+        self._stop_library_ticks()
         try:
             self.gui_config.save()
         except Exception as exc:      # pragma: no cover - read-only home
@@ -432,146 +441,8 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         if update_hint is not None and hasattr(self, "context_hint"):
             update_hint()
 
-
-    def save_config(self):
-        path = filedialog.asksaveasfilename(
-            title="Save Configuration",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            config = {
-                "lr": float(self.params["lr"].get()),
-                "epochs": int(self.params["epochs"].get()),
-                "d_model": int(self.params["d_model"].get()),
-                "d_ff": int(self.params["d_ff"].get()),
-                "n_heads": int(self.params["n_heads"].get()),
-                "n_layers": int(self.params["n_layers"].get()),
-                "seq_length": int(self.params["seq_length"].get()),
-                "batch_size": int(self.params["batch_size"].get()),
-                "dropout": parse_dropout(self.params["dropout"].get()),
-                "grad_clip": float(self.params["grad_clip"].get()),
-                # 2.14.1: "Own file" is saved as its path (train() reads it)
-                "tokenizer": "bpe" if self.tok_var.get() == "file" else self.tok_var.get(),
-                "tokenizer_path": (self.tokenizer_path_var.get()
-                                   if self.tok_var.get() == "file" else ""),
-                "bpe_vocab_size": int(self.bpe_vocab_var.get()),
-                "val_split": float(self.val_split_var.get()),
-                "early_stopping_patience": self.early_stop_param(),
-                "time_budget_s": 60.0 * float(str(self.time_limit_var.get() or 0)),
-                "use_compile": bool(self.compile_var.get()),
-                "continue_training": bool(self.continue_var.get()),
-                "autosave_every": int(self.autosave_var.get()),
-                "n_kv_heads": int(self.n_kv_heads_var.get()) or None,
-                "accumulation_steps": int(self.accum_var.get()) or 1,
-                "use_alibi": bool(self.alibi_var.get()),
-                "lora_rank": int(self.lora_var.get()) or 0,
-                **self.lora_params(),
-                # 2.16: dialogs
-                "prompt_loss_weight": self.prompt_weight_param(),
-                "dialog_packing": bool(self.dialog_pack_var.get()),
-                "use_gradient_checkpointing": bool(self.checkpoint_var.get()),
-                "use_ddp": bool(self.ddp_var.get()),
-                "rope_scaling": {
-                    "type": self.rope_type_var.get() if self.rope_type_var.get() != "none" else None,
-                    "factor": float(self.rope_factor_var.get()) if self.rope_type_var.get() != "none" else 1.0,
-                } if self.rope_type_var.get() != "none" else None,
-                "use_qk_norm": bool(self.qk_norm_var.get()),
-                "optimizer": self.opt_var.get(),
-                "muon_lr": float(self.muon_lr_var.get()),
-                "lr_schedule": self.sched_var.get(),
-                "tie_word_embeddings": bool(self.tie_var.get()),
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
-            self.status_label.config(
-                text=f"Status: Config saved ✅ ({os.path.basename(path)})")
-        except Exception as e:
-            messagebox.showerror("Save Config Error", str(e))
-
-
-    def load_config(self):
-        path = filedialog.askopenfilename(
-            title="Load Configuration",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            # Apply config to GUI
-            for key in ("lr", "epochs", "d_model", "d_ff", "n_heads",
-                        "n_layers", "seq_length", "batch_size", "dropout",
-                        "grad_clip"):
-                if key in config:
-                    self.params[key].set(str(config[key]))
-            if "tokenizer" in config:
-                self.tok_var.set(config["tokenizer"])
-            if config.get("tokenizer_path"):
-                path = str(config["tokenizer_path"])
-                try:
-                    self._use_tokenizer_file(path, read_tokenizer_file(path)[0])
-                except Exception as e:      # moved or damaged: keep the path, say so
-                    self.tokenizer_path_var.set(path)
-                    self.tok_var.set("file")
-                    self.tokenizer_label.config(text=f"Own tokenizer: {path} (cannot be read: "
-                                                     f"{e})")
-            if "bpe_vocab_size" in config:
-                self.bpe_vocab_var.set(str(config["bpe_vocab_size"]))
-            if "val_split" in config:
-                self.val_split_var.set(str(config["val_split"]))
-            if "early_stopping_patience" in config:
-                self.early_stop_var.set(str(config["early_stopping_patience"]))
-            if "time_budget_s" in config:
-                self.time_limit_var.set(f"{float(config['time_budget_s'] or 0) / 60.0:g}")
-            if "n_kv_heads" in config:
-                self.n_kv_heads_var.set(str(config["n_kv_heads"] or 0))
-            if "accumulation_steps" in config:
-                self.accum_var.set(str(config["accumulation_steps"]))
-            if "lora_rank" in config:
-                self.lora_var.set(str(config["lora_rank"]))
-            # 2.16
-            if "lora_targets" in config:
-                self.lora_targets_var.set(str(config["lora_targets"]))
-            self.lora_lr_var.set(str(config.get("lora_lr", "auto")))
-            if "prompt_loss_weight" in config:
-                self.prompt_weight_var.set(str(config["prompt_loss_weight"]))
-            if "dialog_packing" in config:
-                self.dialog_pack_var.set(bool(config["dialog_packing"]))
-            if "use_compile" in config:
-                self.compile_var.set(config["use_compile"])
-            if "use_alibi" in config:
-                self.alibi_var.set(config["use_alibi"])
-            if "use_gradient_checkpointing" in config:
-                self.checkpoint_var.set(bool(config["use_gradient_checkpointing"]))
-            if "use_ddp" in config:
-                self.ddp_var.set(bool(config["use_ddp"]))
-            if "rope_scaling" in config and config["rope_scaling"]:
-                self.rope_type_var.set(config["rope_scaling"].get("type", "none") or "none")
-                self.rope_factor_var.set(str(config["rope_scaling"].get("factor", 1.0)))
-            elif "rope_scaling" in config:
-                self.rope_type_var.set("none")
-                self.rope_factor_var.set("1.0")
-            if "use_qk_norm" in config:
-                self.qk_norm_var.set(bool(config["use_qk_norm"]))
-            if "optimizer" in config:
-                self.opt_var.set(config["optimizer"] if config["optimizer"] in ("muon", "adamw")
-                                 else DEFAULT_RECIPE["optimizer"])
-            if "muon_lr" in config:
-                self.muon_lr_var.set(str(config["muon_lr"]))
-            if "lr_schedule" in config:
-                self.sched_var.set(config["lr_schedule"] if config["lr_schedule"] in ("wsd", "cosine") else "wsd")
-            if "tie_word_embeddings" in config:
-                self.tie_var.set(bool(config["tie_word_embeddings"]))
-            self.status_label.config(
-                text=f"Status: Config loaded ✅ ({os.path.basename(path)})")
-            messagebox.showinfo("Config Loaded",
-                                f"Configuration loaded from:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Load Config Error", str(e))
+    # 2.27: the Train tab's settings files (save_config / load_config) live in its mixin
+    # (gui/tabs/training.py): the Studio's format, older files still load.
 
 
 def main():
@@ -579,6 +450,12 @@ def main():
     multiprocessing.freeze_support()
     root = tk.Tk()
     app = AIApp(root)
+    # 2.27: the log file (~/.auralite/logs/classic.log) and the errors of worker threads
+    from .errors import attach_logging
+    try:
+        attach_logging(app)
+    except OSError as exc:                      # a read-only home: no log file, the app runs
+        gui_common.logger.warning("no log file: %s", exc)
     # Bind batch mode checkbox
     app.batch_var.trace_add("write", app._toggle_batch_entry)
     root.mainloop()

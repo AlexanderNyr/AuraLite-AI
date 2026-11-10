@@ -186,10 +186,13 @@ def small_text_note(fit: PresetFit, data: DataReport | None) -> str:
 
 
 def size_text(params: float) -> str:
-    """A model's size as the Studio writes it: "0.8M", "7M", "85M", "1.2B" (2.21.3)."""
+    """A model's size as the Studio writes it: "0.8M", "7M", "85M", "1.2B" (2.21.3); 2.27:
+    "36K" below 0.1M (the classic Train tab's tiny models read "0.0M")."""
     millions = float(params) / 1e6
     if millions >= 1000:
         return f"{millions / 1000:,.1f}B"
+    if millions < 0.1:
+        return f"{float(params) / 1e3:,.0f}K"
     return f"{millions:,.1f}M" if millions < 1 else f"{millions:,.0f}M"
 
 

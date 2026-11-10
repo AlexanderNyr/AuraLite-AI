@@ -188,4 +188,4 @@ def explain_error(exc: BaseException, *, action: str = "") -> FriendlyError:
                     ["Use the model's own tokenizer.json, or let AuraLite train one"], "data")
     title = f"{action[:1].upper()}{action[1:]} failed" if action else "Something went wrong"
     return make(title, message,
-                ["The log has the details (Help → Open the log folder)"], "unknown")
+                ["The log has the details (Tools → Open the log folder)"], "unknown")

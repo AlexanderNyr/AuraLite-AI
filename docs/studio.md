@@ -151,7 +151,9 @@ The Train tab starts simple — a size that fits, the tokenizer, the window, a t
   another computer* with that address and *Join* — they train a part of every step
   until *Leave*.
 - **Settings files:** *Save settings…* / *Load settings…* keep the whole form and the
-  data's path in a `.json` file.
+  data's path in a `.json` file. 2.27: the classic interface's Train tab writes the same
+  files, and *Load settings…* reads its older ones too (*Save Config* of 2.26 and before:
+  their shape becomes a shape of your own).
 
 ## The Generate tab (2.24)
 
@@ -344,8 +346,10 @@ the computer, the models that fit and the `auralite train` command;
 ## The Library: runs, models, datasets (2.20)
 
 Every training run is kept: the runs of the Train and Fine-tune tabs, of the classic
-interface's Fine-tune tab (2.26), and of `auralite train` in a terminal. *Tools →
-Library* (Ctrl+L) opens them.
+interface's Fine-tune tab (2.26) and Train tab (2.27), and of `auralite train` in a
+terminal. *Tools → Library* (Ctrl+L) opens them. Since 2.27 the classic interface has the
+same Library ([docs/classic.md](classic.md#the-library-the-wizard-and-recorded-runs-227)):
+the two show the runs in the same words.
 
 **Runs.** Each run has its name (*Fine-tune SmolLM2-135M-Instruct on
 chats.jsonl* — rename it), its status, its curve (the training loss as a line,
@@ -355,7 +359,7 @@ your notes. The status says how it ended:
 
 | status | what happened | what you can do |
 |---|---|---|
-| finished | the run ended: its epochs, its step or time budget, early stopping | *Open the result*, *Evaluate*, *Train more* (a new run from its result), *Repeat* |
+| finished | the run ended: its epochs, its step or time budget, early stopping | *Open the result*, *Evaluate*, *Train more* (a new run from its result; 2.27: a new model's run leaves the fine-tune's passes as they are), *Repeat* |
 | stopped | you pressed *Stop now* (*Finish* ends a run well instead: it is then finished) | **Continue** — and the rest |
 | interrupted | the program or the computer stopped during the run: a crash, a power cut, the window closed | **Continue** from its last checkpoint |
 | failed | an error ended it (the message is kept) | **Continue** from its last checkpoint, once the cause is fixed |

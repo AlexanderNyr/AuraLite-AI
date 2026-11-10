@@ -144,8 +144,8 @@ class EvaluationTabMixin:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Evaluation Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the evaluation", title="Evaluation Error"))
             finally:
                 self.root.after(0, lambda: self.eval_run_btn.config(state=tk.NORMAL))
 
@@ -170,7 +170,7 @@ class EvaluationTabMixin:
                     f.write(text)
             messagebox.showinfo("Saved", f"Results saved to {path}")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving the results", title="Save Error")
 
     # ---- 2.16: a chat model on held-out dialogs (no lm-eval needed) -------
     def _build_chat_eval_frame(self, tab):
@@ -225,8 +225,8 @@ class EvaluationTabMixin:
                 self.last_chat_eval = result
                 self.root.after(0, lambda: self._show_chat_eval(result))
             except Exception as e:  # noqa: BLE001 - shown to the user
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Chat evaluation", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the chat evaluation", title="Chat evaluation"))
                 self.root.after(0, lambda: self.chat_eval_status.config(text="Status: failed"))
             finally:
                 self.root.after(0, lambda: self.chat_eval_btn.config(state=tk.NORMAL))

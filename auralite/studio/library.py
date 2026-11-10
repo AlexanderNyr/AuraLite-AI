@@ -273,7 +273,7 @@ def _report_detail(report: dict) -> str:
     parts = [{"dialogs": "Dialogs", "preferences": "Preference pairs", "text": "Text",
               "big": "Big text", "shards": "Prepared dataset"}.get(kind, kind or "Data")]
     if report.get("records") and kind in _COUNT_WORDS:
-        parts.append(f"{int(report['records']):,} {_COUNT_WORDS[kind]}")
+        parts.append(runlib.count_words(int(report["records"]), kind))   # 2.27: "1 dialog"
     if report.get("tokens"):
         parts.append(f"about {int(report['tokens']):,} tokens")
     return ", ".join(parts)

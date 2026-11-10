@@ -43,8 +43,8 @@ from typing import Any
 
 __all__ = ["CHECKPOINT_FILE", "CHECKPOINT_MINUTES", "METRICS_FILE", "MODEL_FILE", "NO_RUNS_ENV",
            "RUN_FILE", "Run", "RunRecorder", "base_label", "compare_runs", "continue_point",
-           "data_label", "delete_run", "describe_run", "evaluation_summary", "find_run",
-           "format_when", "held_out_dialogs",
+           "count_words", "data_label", "delete_run", "describe_run", "evaluation_summary",
+           "find_run", "format_when", "held_out_dialogs",
            "interrupted_runs", "list_runs", "load_run", "load_run_data", "machine_summary",
            "recording_enabled", "runs_root", "update_run"]
 
@@ -718,8 +718,15 @@ def _eval(run: Run, key: str) -> str:
 
 
 METHOD_LABELS = {"qlora": "QLoRA (a 4-bit base with LoRA adapters)", "lora": "LoRA adapters",
-                 "full": "every weight", "new": "a new model", "dpo": "DPO", "simpo": "SimPO"}
+                 "full": "every weight", "new": "a new model", "dpo": "DPO", "simpo": "SimPO",
+                 "more": "the model in memory, trained further"}      # 2.27: "more" read "more"
 _COUNT_WORDS = {"dialogs": "dialogs", "preferences": "pairs", "text": "documents"}
+_ONE_WORDS = {"dialogs": "dialog", "preferences": "pair", "text": "document"}
+
+
+def count_words(count: int, kind: str) -> str:
+    """``"1,200 dialogs"``, ``"1 document"`` (2.27: it read "1 documents")."""
+    return f"{count:,} {(_ONE_WORDS if count == 1 else _COUNT_WORDS)[kind]}"
 
 
 def _bytes(n: float) -> str:
@@ -769,7 +776,7 @@ def describe_run(run: Run) -> list[tuple[str, str]]:
         kind = str(data.get("kind") or "")
         extra = [kind] if kind else []
         if data.get("records") and kind in _COUNT_WORDS:
-            extra.append(f"{int(data['records']):,} {_COUNT_WORDS[kind]}")
+            extra.append(count_words(int(data["records"]), kind))
         lines.append(("Data", data_label(data["paths"]) + (f" ({', '.join(extra)})"
                                                           if extra else "")))
     p = run.params

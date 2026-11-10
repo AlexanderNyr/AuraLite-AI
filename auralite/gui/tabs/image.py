@@ -561,9 +561,8 @@ class ImageTabMixin:
                     self.image_is_trained = True
                     self.root.after(0, self._image_model_ready)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Image Train Error", f"Error during training:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "training the image generator", title="Image Train Error"))
             finally:
                 self.root.after(0, self._reset_image_buttons)
 
@@ -810,8 +809,8 @@ class ImageTabMixin:
                 self.root.after(0, lambda: self.img_status_label.config(
                     text=f"Status: generated {len(imgs)} image(s). ✅"))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Generate Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "generating the images", title="Generate Error"))
             finally:
                 self.root.after(0, lambda: self.img_gen_btn.config(state=tk.NORMAL))
 
@@ -852,8 +851,8 @@ class ImageTabMixin:
                        f"{_fmt_duration(float(result['seconds']))}")
                 self.root.after(0, lambda m=msg: self.img_status_label.config(text=m))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror("Quality Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "measuring the quality", title="Quality Error"))
             finally:
                 self.root.after(0, lambda: self.img_quality_btn.config(state=tk.NORMAL))
 
@@ -894,7 +893,7 @@ class ImageTabMixin:
             self.img_status_label.config(
                 text=f"Status: saved {len(self._last_generated_images)} image(s){extra} to {d}")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving", title="Save Error")
 
 
     def save_image_model(self):
@@ -909,7 +908,7 @@ class ImageTabMixin:
             self.image_engine.save_model(path)
             self.img_status_label.config(text=f"Status: model saved to {path}")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving", title="Save Error")
 
 
     def load_image_model(self):
@@ -938,4 +937,4 @@ class ImageTabMixin:
                 text=f"Status: loaded {cfg.get('img_size')}px {cfg.get('channels')}ch model "
                      f"({detail}{classes}).")
         except Exception as e:
-            messagebox.showerror("Load Error", str(e))
+            self.report_error(e, "loading the image generator", title="Load Error")

@@ -59,7 +59,9 @@ def _saved_model(tmp_path) -> str:
 
 def test_the_menu_bar_has_the_studios_menus(app):
     assert _labels(app.menubar, "add_cascade") == ["File", "View", "Tools", "Help"]
-    assert _labels(app.tools_menu) == ["Benchmark…", "Speed test", "Open the AuraLite folder",
+    assert _labels(app.tools_menu) == ["Benchmark…", "Speed test", "Setup wizard…",  # 2.27
+                                       "Library: runs, models, datasets",
+                                       "Open the AuraLite folder", "Open the log folder",
                                        "AuraLite Studio (Qt)"]
     loads = []
     app.load_model = lambda path=None: loads.append(path)
@@ -154,7 +156,9 @@ def test_memory_and_speed_in_the_footer(app, monkeypatch):
     errors = _messagebox().showerror
     errors.reset_mock()
     app._run_speed_test()
-    assert errors.call_args.args == ("Speed test", "no BLAS")
+    # 2.27: explained with what to try (a test's root has no window: the plain box)
+    title, text = errors.call_args.args
+    assert title == "Speed test" and text.startswith("The speed test failed\n\nno BLAS")
 
 
 def test_the_last_speed_test_shows_at_the_start(tmp_path, monkeypatch):
@@ -272,7 +276,9 @@ def test_the_benchmark_runs_reports_and_stops(app, tmp_path, monkeypatch):
     errors.reset_mock()
     app._run_benchmark(BenchChoice(seconds=15.0))
     wait_for(lambda: errors.called, timeout=30)
-    assert errors.call_args.args == ("Benchmark", "out of memory")
+    title, text = errors.call_args.args                         # 2.27: explained
+    assert title == "Benchmark" and text.startswith("Not enough memory")
+    assert "during the benchmark" in text and "What to try:" in text
 
 
 def test_updates_about_and_the_studio(app, monkeypatch, tmp_path):

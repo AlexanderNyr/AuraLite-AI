@@ -1,10 +1,10 @@
 """gui/tabs/start.py — the Start tab of the classic interface (2.26, as the Studio's).
 
 This computer and what fits it (the advisor), the ways in - fine-tune a ready model,
-train a new one, open one -, the recent models, and a run that was interrupted (a crash, a
-power cut), which continues from its checkpoint exactly where it stood: a new model's run
-on the Train tab, a fine-tune on the Fine-tune tab. The texts are the Studio's
-(`studio/startinfo.py`).
+train a new one, open one, the setup wizard (2.27) -, the recent models, and a run that was
+interrupted (a crash, a power cut), which continues from its checkpoint exactly where it
+stood: a new model's run on the Train tab, a fine-tune on the Fine-tune tab (2.27: or shown
+in the Library). The texts are the Studio's (`studio/startinfo.py`).
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Any
 
 from auralite import runs as runlib
 from auralite.studio import runner
+from auralite.studio.libraryview import saved_note
 from auralite.studio.progress import summary_text
 from auralite.studio.startinfo import fit_lines, interrupted_text
 
@@ -52,6 +53,9 @@ class StartTabMixin:
         self.start_continue_btn = ttk.Button(row, text="▶ Continue it",
                                              command=self._start_continue_interrupted)
         self.start_continue_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.start_show_btn = ttk.Button(row, text="Show in the library",   # 2.27
+                                         command=self._start_show_interrupted)
+        self.start_show_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.start_dismiss_btn = ttk.Button(row, text="Dismiss",
                                             command=self._start_dismiss_interrupted)
         self.start_dismiss_btn.pack(side=tk.LEFT)
@@ -69,7 +73,13 @@ class StartTabMixin:
                  "included", lambda: self._goto_tab("train")),
                 ("📂 Open a model…",
                  "An AuraLite checkpoint (.pt) or a GGUF file to chat with, train further or "
-                 "export", lambda: self.load_model())):              # type: ignore[attr-defined]
+                 "export", lambda: self.load_model()),               # type: ignore[attr-defined]
+                ("🧭 Set up a run step by step…",                    # 2.27: the wizard
+                 "The goal, your data, the model that fits this computer - then the tab opens "
+                 "filled in", lambda: self.open_wizard()),           # type: ignore[attr-defined]
+                ("📚 Library",                                       # 2.27
+                 "Every run with its curve, the models and the datasets on the disk",
+                 lambda: self._goto_tab("library"))):
             line = ttk.Frame(actions)
             line.pack(fill=tk.X, pady=2)
             ttk.Button(line, text=title, width=42, command=command).pack(side=tk.LEFT)
@@ -203,6 +213,14 @@ class StartTabMixin:
         if self.start_interrupted_run is not None:
             self.continue_recorded_run(self.start_interrupted_run)
 
+    def _start_show_interrupted(self) -> None:
+        """2.27: the interrupted run, selected in the Library."""
+        run = self.start_interrupted_run
+        self._goto_tab("library")
+        if run is not None and hasattr(self, "lib_runs_tree"):
+            self._lib_refresh()                                # type: ignore[attr-defined]
+            self.lib_select_run(run.id)                        # type: ignore[attr-defined]
+
     def _start_dismiss_interrupted(self) -> None:
         if self.start_interrupted_run is not None:
             runlib.update_run(self.start_interrupted_run, dismissed=True)
@@ -216,6 +234,9 @@ class StartTabMixin:
             return "a fine-tune"
         if getattr(self, "_train_phase", ""):
             return "a training run"
+        thread = getattr(self, "_lib_eval_thread", None)    # 2.27: the Library's evaluation
+        if thread is not None and thread.is_alive():
+            return "an evaluation"
         return ""
 
     def _model_in_memory_changed(self, label: str = "") -> None:
@@ -330,12 +351,9 @@ class StartTabMixin:
                   stopped: bool) -> None:
         text = summary_text(summary, seconds, stopped)
         run = recorder.run if recorder is not None else None
-        if run is not None and run.result_path is not None and not run.record.get("save_error"):
-            text += (". Saved in the library: it can continue from there."
-                     if run.continue_state()[0] else ". Saved in the library.")
-            label = f"Run: {run.name}"
-        else:
-            label = ""
+        note = saved_note(run)                     # 2.27: the Studio's words, shared
+        text += note
+        label = f"Run: {run.name}" if note and run is not None else ""
         print(f"[AuraLite] {text}")
         if kind == "train":
             self._reset_train_buttons()                        # type: ignore[attr-defined]
@@ -344,6 +362,7 @@ class StartTabMixin:
             self._ft_end(text, summary, stopped)               # type: ignore[attr-defined]
         self._model_in_memory_changed(label)
         self._start_refresh_interrupted()
+        self._runs_changed()
 
     def _run_failed(self, kind: str, exc: BaseException) -> None:
         if kind == "train":
@@ -353,4 +372,13 @@ class StartTabMixin:
             self._ft_end("The fine-tuning failed - see the message.")  # type: ignore[attr-defined]
         self._model_in_memory_changed()
         self._start_refresh_interrupted()
-        messagebox.showerror("The run failed", f"{type(exc).__name__}: {exc}")
+        self._runs_changed()
+        # 2.27: what went wrong, and what to try (the Studio's explanation)
+        self.report_error(exc, "training" if kind == "train" else "the fine-tuning",  # type: ignore[attr-defined]
+                          title="The run failed")
+
+    def _runs_changed(self) -> None:
+        """A run started or ended: the Library follows (2.27)."""
+        follow = getattr(self, "_lib_runs_changed", None)
+        if callable(follow):
+            follow()

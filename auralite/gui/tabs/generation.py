@@ -305,9 +305,8 @@ class GenerationTabMixin:
                                            min_p=min_p)
                 self.root.after(0, self._display_result, res)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "generating", title="Gen Error"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -376,9 +375,8 @@ class GenerationTabMixin:
                 self.root.after(0, self._display_result,
                                 "\n\n".join(parts))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "generating", title="Gen Error"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -424,9 +422,8 @@ class GenerationTabMixin:
                 self.root.after(0, lambda: self.result_text.insert(
                     tk.END, "\n\n✅ Generation complete."))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Gen Error", f"Error during generation:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "generating", title="Gen Error"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))
@@ -473,9 +470,8 @@ class GenerationTabMixin:
                 self.root.after(0, lambda: self.result_text.insert(
                     tk.END, f"\n✅ Batch generation complete ({len(prompts)} prompts)"))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Gen Error", f"Error during batch generation:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the batch generation", title="Gen Error"))
             finally:
                 self.root.after(0, lambda: self.gen_btn.config(
                     state=tk.NORMAL))

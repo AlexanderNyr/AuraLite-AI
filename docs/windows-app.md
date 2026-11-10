@@ -41,8 +41,8 @@ Each zip has a `.sha256` file next to it on the release page, and the release ha
 signed record of the CI run that built it:
 
 ```powershell
-Get-FileHash .\AuraLite-Studio-2.26.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
-gh attestation verify .\AuraLite-Studio-2.26.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
+Get-FileHash .\AuraLite-Studio-2.27.0-windows-x64.zip -Algorithm SHA256   # compare with the .sha256
+gh attestation verify .\AuraLite-Studio-2.27.0-windows-x64.zip -R AlexanderNyr/AuraLite-AI
 ```
 
 ## Where your things are
@@ -166,7 +166,7 @@ py -3.13 -m venv .venv-app
 pip install -r packaging\app\requirements.txt
 pip install --no-deps .
 python packaging\app\build_app.py --zip
-python packaging\app\smoke_app.py dist\AuraLite-Studio-2.26.0-windows-x64.zip
+python packaging\app\smoke_app.py dist\AuraLite-Studio-2.27.0-windows-x64.zip
 ```
 
 `build_app.py` refuses to build when the installed packages differ from the pins

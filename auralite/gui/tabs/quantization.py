@@ -266,7 +266,7 @@ class QuantizationTabMixin:
                 foreground="black")
             self._update_quant_buttons()
         except Exception as e:
-            messagebox.showerror("File Error", str(e))
+            self.report_error(e, "reading the file", title="File Error")
 
 
     def _use_training_file_for_calib(self):
@@ -288,7 +288,7 @@ class QuantizationTabMixin:
                     foreground="black")
                 self._update_quant_buttons()
             except Exception as e:
-                messagebox.showerror("File Error", str(e))
+                self.report_error(e, "reading the file", title="File Error")
         else:
             messagebox.showinfo("No File",
                                 "Select a training file first on the Training tab.")
@@ -358,7 +358,7 @@ class QuantizationTabMixin:
         try:
             config = self._build_quant_config()
         except (ValueError, KeyError) as e:
-            messagebox.showerror("Config Error", str(e))
+            self.report_error(e, "reading the settings", title="Config Error")
             return
 
         errors = config.validate()
@@ -422,9 +422,8 @@ class QuantizationTabMixin:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Quantization Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the quantization", title="Quantization Error"))
             finally:
                 self.root.after(0, lambda: (
                     self.q_quantize_btn.config(state=tk.NORMAL),
@@ -471,9 +470,8 @@ class QuantizationTabMixin:
 
                 self.root.after(0, update_ui)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Benchmark Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the benchmark", title="Benchmark Error"))
             finally:
                 self.root.after(0, lambda: (
                     self.q_benchmark_btn.config(state=tk.NORMAL),
@@ -516,9 +514,8 @@ class QuantizationTabMixin:
 
                 self.root.after(0, update_ui)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Compare Error", err))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "the comparison", title="Compare Error"))
             finally:
                 self.root.after(0, lambda: (
                     self.q_compare_btn.config(state=tk.NORMAL),
@@ -548,7 +545,7 @@ class QuantizationTabMixin:
             self.q_status_label.config(
                 text=f"Status: Saved ✅ ({os.path.basename(path)})")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving the model", title="Save Error")
 
 
     def _revert_model(self):

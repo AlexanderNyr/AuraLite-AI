@@ -47,6 +47,7 @@ class MockText:
 
     # widget protocol
     def pack(self, *a, **k): pass
+    def pack_forget(self, *a, **k): pass
     def grid(self, *a, **k): pass
     def place(self, *a, **k): pass
     def bind(self, *a, **k): pass

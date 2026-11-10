@@ -1,9 +1,11 @@
 """gui/menu.py - the classic interface's menu bar (2.25: from AuraLite Studio).
 
 File (open, save, recent models, quit), View (the dark theme, remembered), Tools (the
-benchmark, the speed test, the AuraLite folder, AuraLite Studio) and Help (the guide,
-updates, about). The footer shows the memory the app uses and the last speed test.
-The benchmark's choice is the Studio's (:mod:`auralite.studio.benchchoice`).
+benchmark, the speed test, 2.27: the setup wizard, the Library, the log folder; the
+AuraLite folder, AuraLite Studio) and Help (the guide, updates, about). The footer shows the
+memory the app uses and the last speed test. The benchmark's choice is the Studio's
+(:mod:`auralite.studio.benchchoice`). 2.27: errors are explained with what to try, and the
+log has their details (:mod:`auralite.gui.errors`).
 """
 from __future__ import annotations
 
@@ -72,10 +74,17 @@ class MenuMixin:
         bar.add_cascade(label="View", menu=view)
         tools = tk.Menu(bar, tearoff=0)
         self.tools_menu = tools
-        tools.add_command(label="Benchmark…", command=self._benchmark_clicked)
+        tools.add_command(label="Benchmark…", command=self._benchmark_clicked)  # entry 0
         tools.add_command(label="Speed test", command=self._run_speed_test)
         tools.add_separator()
+        # 2.27: the Studio's wizard and Library, and the log
+        tools.add_command(label="Setup wizard…", accelerator="Ctrl+N",
+                          command=lambda: self.open_wizard())             # type: ignore[attr-defined]
+        tools.add_command(label="Library: runs, models, datasets", accelerator="Ctrl+L",
+                          command=lambda: self._goto_tab("library"))      # type: ignore[attr-defined]
+        tools.add_separator()
         tools.add_command(label="Open the AuraLite folder", command=self._open_home)
+        tools.add_command(label="Open the log folder", command=self._open_logs)
         tools.add_command(label="AuraLite Studio (Qt)", command=self._open_studio)
         bar.add_cascade(label="Tools", menu=tools)
         help_menu = tk.Menu(bar, tearoff=0)
@@ -88,6 +97,8 @@ class MenuMixin:
         for key, action in (("<Control-o>", lambda _e: self.load_model()),  # type: ignore[attr-defined]
                             ("<Control-s>", lambda _e: self.save_model()),  # type: ignore[attr-defined]
                             ("<Control-q>", lambda _e: self._on_close()),   # type: ignore[attr-defined]
+                            ("<Control-n>", lambda _e: self.open_wizard()),  # type: ignore[attr-defined]
+                            ("<Control-l>", lambda _e: self._goto_tab("library")),  # type: ignore[attr-defined]
                             ("<F1>", lambda _e: webbrowser.open(GUIDE_URL))):
             try:
                 self.root.bind_all(key, action)
@@ -172,6 +183,29 @@ class MenuMixin:
         from auralite.studio.hardware import auralite_home
         open_folder(str(auralite_home()))
 
+    def _open_logs(self) -> None:
+        """2.27: Tools -> Open the log folder (``~/.auralite/logs``)."""
+        from auralite.studio.logs import log_dir
+        open_folder(str(log_dir()))
+
+    # ---- errors (2.27) ---------------------------------------------------------------------
+    def report_error(self, exc: Any, action: str = "", title: str = "",
+                     logged: bool = False) -> Any:
+        """Explain an error with what to try (the Studio's words), the log folder one click
+        away; its details go to the log file. Returns the explanation."""
+        from .errors import show_error
+        return show_error(self.root, exc, action, title, logged=logged)
+
+    def _tk_callback_error(self, kind: Any, value: Any, tb: Any) -> None:
+        """Tk's ``report_callback_exception``: an error of a button, a key or a timer -
+        written to the log, then explained (it used to go to the console only)."""
+        import logging
+        logging.getLogger("auralite.gui").error("uncaught error in the window",
+                                                exc_info=(kind, value, tb))
+        if isinstance(value, KeyboardInterrupt):
+            return
+        self.report_error(value, logged=True)
+
     def _open_studio(self) -> None:
         import importlib.util
         if importlib.util.find_spec("PySide6") is None:
@@ -183,7 +217,7 @@ class MenuMixin:
             subprocess.Popen([sys.executable, "-m", "auralite.studio"], close_fds=True,
                              start_new_session=sys.platform != "win32")
         except OSError as err:
-            messagebox.showerror("AuraLite Studio", f"Could not start it:\n{err}")
+            self.report_error(err, "starting AuraLite Studio", title="AuraLite Studio")
 
     def _run_speed_test(self) -> None:
         """Tools -> Speed test: the GFLOP/s that every time estimate builds on."""
@@ -196,8 +230,7 @@ class MenuMixin:
             try:
                 gflops = float(measure_gflops(device))
             except Exception as err:
-                message = str(err)
-                self.root.after(0, lambda: self._speed_failed(message))
+                self.root.after(0, lambda exc=err: self._speed_failed(exc))
                 return
             self.root.after(0, lambda: self._speed_measured(gflops))
 
@@ -216,9 +249,9 @@ class MenuMixin:
         if callable(measured):
             measured(gflops)
 
-    def _speed_failed(self, message: str) -> None:
+    def _speed_failed(self, error: Any) -> None:
         self.speed_label.config(text=self._speed_text())
-        messagebox.showerror("Speed test", message)
+        self.report_error(error, "the speed test", title="Speed test")    # 2.27
 
     # ---- the benchmark -------------------------------------------------------------------
     def _benchmark_clicked(self) -> None:
@@ -383,8 +416,7 @@ class MenuMixin:
                 self.root.after(0, lambda: self._bench_over("The benchmark was stopped."))
                 return
             except Exception as err:
-                message = str(err)
-                self.root.after(0, lambda: self._bench_over("", error=message))
+                self.root.after(0, lambda exc=err: self._bench_over("", error=exc))
                 return
             summary = "\n".join(bench.summary_lines(report))
             self.root.after(0, lambda: self._bench_over(
@@ -398,15 +430,17 @@ class MenuMixin:
         except (AttributeError, tk.TclError):
             pass
 
-    def _bench_over(self, text: str, error: str = "") -> None:
+    def _bench_over(self, text: str, error: Any = "") -> None:
         self._bench_stop = None
         self._set_bench_label("Benchmark…")
         self.speed_label.config(text=self._speed_text())
-        if error:
+        if isinstance(error, BaseException):          # 2.27: explained, and in the log
+            self.report_error(error, "the benchmark", title="Benchmark")
+        elif error:
             messagebox.showerror("Benchmark", error)
         elif text:
             messagebox.showinfo("Benchmark", text)
-        self.last_bench_text = text or error
+        self.last_bench_text = text or str(error)
 
     # ---- help ---------------------------------------------------------------------------------
     def _check_updates(self) -> None:
@@ -424,11 +458,12 @@ class MenuMixin:
 
         from auralite import __version__
         from auralite.studio.hardware import auralite_home
+        from auralite.studio.logs import log_dir
         return (f"AuraLite {__version__} - the classic interface (tkinter {tk.TkVersion})\n\n"
                 f"Train, fine-tune and run language models on your own computer.\n\n"
                 f"Python {platform.python_version()} · PyTorch {torch.__version__}\n"
                 f"License: Apache-2.0\nhttps://github.com/AlexanderNyr/AuraLite-AI\n\n"
-                f"Models and settings: {auralite_home()}")
+                f"Models and settings: {auralite_home()}\nLogs: {log_dir()}")
 
     def _show_about(self) -> None:
         messagebox.showinfo("About AuraLite", self.about_text())

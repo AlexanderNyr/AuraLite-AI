@@ -60,6 +60,9 @@ parametrisation for a megabyte of text on a CPU laptop:
 }
 ```
 
+Since 2.27 `--params` also takes the JSON itself, `--params '{"epochs": 20}'`, and a file
+that is missing or not JSON is said in one line.
+
 Notes that save time later:
 
 - **`tokenizer: "bpe"` pays off.** Character-level models need far more steps for

@@ -97,5 +97,5 @@ class ConsoleTabMixin:
                 f.write(self.console_text.get("1.0", tk.END))
             messagebox.showinfo("Saved", f"Console log saved to:\n{path}")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving the console", title="Save Error")
 

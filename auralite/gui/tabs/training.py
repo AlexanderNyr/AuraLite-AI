@@ -1,7 +1,18 @@
 """gui/tabs/training.py — TrainTabMixin for the AuraLite GUI (v2.6.5).
 
-Extracted verbatim from `gui_app.py`; behaviour is unchanged.
+Extracted from `gui_app.py`. 2.27: every run is recorded in the Library with a checkpoint
+every 10 minutes (as the Studio's Train tab), so it can continue after a stop, a crash or a
+power cut; the settings files are the Studio's (older ones still load), and *Repeat* in the
+Library fills the tab from a run (`studio/trainform.py`).
 """
+import json
+
+from auralite import runs as runlib
+from auralite.studio import libraryview, runner
+from auralite.studio.trainform import (FORM_DEFAULTS, form_from_params, form_from_settings,
+                                       read_train_settings, settings_from_form,
+                                       train_settings_doc)
+
 from .. import common as gui_common
 from ..common import (CONFIG_PRESETS, DEFAULT_RECIPE, cluster_lan_address, run_cluster_worker, Figure, FigureCanvasTkAgg, ParamValidationError, _fmt_duration, describe_tokenizer, estimate_n_params, filedialog, messagebox, os, parse_dropout, read_tokenizer_file, recommend_epochs, recommend_gen_length, threading, time, tk, ttk, validate_params)
 from ..common import SFT_TEMPLATES, DialogSet, data_kind, dialog_plain_text, load_training_data
@@ -348,12 +359,12 @@ class TrainTabMixin:
                                    state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=4)
 
-        # NEW: Save/Load config
-        self.save_cfg_btn = ttk.Button(top_row, text="💾 Save Config",
+        # Save/Load settings (2.27: the Studio's settings files; older ones load too)
+        self.save_cfg_btn = ttk.Button(top_row, text="💾 Save settings…",
                                        command=self.save_config)
         self.save_cfg_btn.pack(side=tk.LEFT, padx=4)
 
-        self.load_cfg_btn = ttk.Button(top_row, text="📂 Load Config",
+        self.load_cfg_btn = ttk.Button(top_row, text="📂 Load settings…",
                                        command=self.load_config)
         self.load_cfg_btn.pack(side=tk.LEFT, padx=4)
 
@@ -506,7 +517,7 @@ class TrainTabMixin:
         try:
             text_sample = self._selected_text()       # 2.15: files, folders, dialogs
         except Exception as e:
-            messagebox.showerror("File Error", f"Could not read file:\n{e}")
+            self.report_error(e, "reading the data", title="File Error")
             return
 
         n_chars = len(text_sample)
@@ -635,6 +646,170 @@ class TrainTabMixin:
             template = self.dialog_template_var.get() or "chatml"
             return "\n".join(dialog_plain_text(d, template) for d in data.dialogs)
         return data.text
+
+    # ---- the form as settings (2.27) --------------------------------------
+    def _train_form_vars(self) -> dict:
+        """The form's fields and their variables (as `studio/trainform.FORM_DEFAULTS` names
+        them)."""
+        return {**self.params,
+                "tokenizer": self.tok_var, "tokenizer_path": self.tokenizer_path_var,
+                "bpe_vocab_size": self.bpe_vocab_var, "val_split": self.val_split_var,
+                "early_stop": self.early_stop_var, "time_limit": self.time_limit_var,
+                "n_kv_heads": self.n_kv_heads_var, "accumulation": self.accum_var,
+                "alibi": self.alibi_var, "lora_rank": self.lora_var,
+                "lora_targets": self.lora_targets_var, "lora_lr": self.lora_lr_var,
+                "qlora": self.qlora_var, "adam8": self.adam8_var,
+                "checkpointing": self.checkpoint_var, "ddp": self.ddp_var,
+                "cluster_workers": self.cluster_workers_var,
+                "cluster_port": self.cluster_port_var, "rope_type": self.rope_type_var,
+                "rope_factor": self.rope_factor_var, "qk_norm": self.qk_norm_var,
+                "optimizer": self.opt_var, "muon_lr": self.muon_lr_var,
+                "lr_schedule": self.sched_var, "compile": self.compile_var,
+                "continue": self.continue_var, "tie": self.tie_var,
+                "autosave_every": self.autosave_var, "chat_template": self.dialog_template_var,
+                "pack_dialogs": self.dialog_pack_var, "prompt_weight": self.prompt_weight_var,
+                "pref_method": self.pref_method_var, "pref_beta": self.pref_beta_var,
+                "pref_lr": self.pref_lr_var, "pref_epochs": self.pref_epochs_var}
+
+    def train_form(self) -> dict:
+        """The Train tab's fields as text and checkboxes (a settings file's, a run's)."""
+        form = {}
+        for key, var in self._train_form_vars().items():
+            value = var.get()
+            form[key] = (bool(value) if isinstance(FORM_DEFAULTS.get(key), bool)
+                         else str(value if value is not None else ""))
+        return form
+
+    def apply_train_form(self, form: dict) -> None:
+        """Fill the Train tab from a form: a settings file, a run of the Library (Repeat),
+        the wizard. A tokenizer file that cannot be read keeps its path and says why."""
+        variables = self._train_form_vars()
+        for key, value in form.items():
+            var = variables.get(key)
+            if var is None or key in ("tokenizer", "tokenizer_path"):
+                continue
+            var.set(bool(value) if isinstance(FORM_DEFAULTS.get(key), bool) else str(value))
+        tokenizer = str(form.get("tokenizer") or "")
+        path = str(form.get("tokenizer_path") or "")
+        if tokenizer == "file" and path:
+            try:
+                self._use_tokenizer_file(path, read_tokenizer_file(path)[0])
+            except Exception as e:      # moved or damaged: keep the path, say so
+                self.tokenizer_path_var.set(path)
+                self.tok_var.set("file")
+                self.tokenizer_label.config(text=f"Own tokenizer: {path} (cannot be read: "
+                                                 f"{e})")
+        elif tokenizer:
+            self.tok_var.set(tokenizer)
+
+    def train_apply_run(self, run) -> None:
+        """Repeat a run of the Library: its settings (a run of `auralite train`: its
+        parameters) and its data."""
+        settings = run.settings
+        if settings and ("d_model" in settings or "preset" in settings):
+            form = form_from_settings(settings)
+        else:
+            form = form_from_params(run.params)
+        self.apply_train_form(form)
+        paths = [str(p) for p in run.data.get("paths") or []]
+        if paths and os.path.exists(paths[0]):
+            self._select_data(paths[0])
+
+    def save_config(self):
+        """The form and its data to a settings file: the Studio's format with the keys of
+        2.26 and before beside it - the Studio and older versions read it (2.27)."""
+        path = filedialog.asksaveasfilename(
+            title="Save the settings", defaultextension=".json",
+            initialfile="train-settings.json",
+            filetypes=[("Settings", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        data = [self.selected_file_path] if self.selected_file_path else []
+        try:
+            doc = train_settings_doc(self.train_form(), data)
+        except (TypeError, ValueError) as e:
+            messagebox.showerror("Save Config Error", f"A field is not a number: {e}")
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.report_error(e, "saving the settings", title="Save Config Error")
+            return
+        self.status_label.config(
+            text=f"Status: Settings saved ✅ ({os.path.basename(path)})")
+
+    def load_config(self):
+        """The form (and its data) from a settings file: the Studio's, this tab's, or one
+        of 2.26 and before."""
+        path = filedialog.askopenfilename(
+            title="Load settings",
+            filetypes=[("Settings", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            doc = read_train_settings(path)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Load Config Error", str(e))
+            return
+        self.apply_train_form(doc["form"])
+        paths = [p for p in doc["data"] if os.path.exists(p)]
+        if paths:
+            self._select_data(paths[0])
+        self.status_label.config(
+            text=f"Status: Settings loaded ✅ ({os.path.basename(path)})")
+
+    # ---- the run in the Library (2.27) ------------------------------------
+    def _train_size_text(self, params: dict) -> str:
+        """The size of the new model ("0.9M"), as a run's name says it."""
+        from auralite.studio.advisor import size_text
+        try:
+            vocab = 256 if params.get("tokenizer") == "char" else int(
+                params.get("bpe_vocab_size") or 512)
+            count = estimate_n_params(vocab, int(params["d_model"]), int(params["n_layers"]),
+                                      int(params["d_ff"]), int(params["n_heads"]),
+                                      params.get("n_kv_heads"))
+        except (KeyError, TypeError, ValueError):
+            return ""
+        return size_text(count)
+
+    def _train_record(self, params: dict, data) -> dict:
+        """What the Library keeps of a run of this tab: its kind, the form's settings, the
+        data, what it starts from and this computer."""
+        path = str(self.selected_file_path)
+        try:
+            settings = settings_from_form(self.train_form())
+        except (TypeError, ValueError):
+            settings = {}
+        more = bool(params.get("continue_training"))
+        if isinstance(data, PreferenceSet):
+            kind, method = "preference", str(params.get("method") or "dpo")
+        elif more and params.get("lora_rank"):
+            kind, method = "train", "qlora" if params.get("quantize_base") == "nf4" else "lora"
+        else:
+            kind, method = "train", "more" if more else "new"
+        base = ({"spec": "", "label": runlib.base_label("", "more")} if more else
+                {"spec": "", "label": runlib.base_label("", "train",
+                                                        self._train_size_text(params))})
+        info: dict = {"paths": [path], "kind": data_kind([path])}
+        if info["kind"] == "preferences" and isinstance(data, DialogSet):
+            info["options"] = {"as_dialogs": True}            # pairs trained as dialogs (sft)
+        try:
+            info["records"] = len(data)
+        except TypeError:
+            pass
+        return {"kind": kind, "method": method, "source": "gui", "params": params,
+                "settings": settings, "base": base, "data": info,
+                "hardware": runner.machine_record(self.engine, getattr(self, "hardware", None))}
+
+    def _train_run_over(self) -> None:
+        """A run of this tab ended: the Start tab's card and the Library follow."""
+        refresh = getattr(self, "_start_refresh_interrupted", None)
+        if callable(refresh):
+            refresh()
+        self._runs_changed()
 
 
     # ---- cluster (2.14) ----------------------------------------------
@@ -1086,7 +1261,7 @@ class TrainTabMixin:
             # 2.15: a file, a folder of documents, or dialogs (.jsonl)
             data = load_training_data([self.selected_file_path])
         except Exception as e:
-            messagebox.showerror("File Error", f"Could not read file:\n{e}")
+            self.report_error(e, "reading the data", title="File Error")
             return
         if isinstance(data, PreferenceSet):
             # 2.16: DPO or SimPO on the chat model in memory, with the row's own
@@ -1135,16 +1310,34 @@ class TrainTabMixin:
                     "number of other computers to 0.")
                 return
 
+        # 2.27: into the Library, with a checkpoint every 10 minutes (as the Studio)
+        record = self._train_record(params, data) if runlib.recording_enabled() else None
         self._begin_train_ui()
+        engine = self.engine
+
+        def on_event(event, *payload):
+            if event != "recorder":
+                self.root.after(0, self._run_event, "train", event, payload)
 
         def run():
+            recorder = None
             try:
-                summary = self.engine.train(
-                    data, params,
-                    progress_callback=self.update_progress,
-                    stop_event=self.stop_event,
-                    finish_event=self.finish_event,
-                )
+                if record is not None:
+                    recorder = runlib.RunRecorder(**record)
+                    self.root.after(0, self._runs_changed)
+                    run_params = (params if record["kind"] == "preference"   # short: anew
+                                  else recorder.checkpoint_params(params))
+                    summary = runner.train_recorded(
+                        engine, recorder, data, run_params, self.update_progress,
+                        stop_event=self.stop_event, finish_event=self.finish_event,
+                        on_event=on_event)
+                else:
+                    summary = engine.train(
+                        data, params,
+                        progress_callback=self.update_progress,
+                        stop_event=self.stop_event,
+                        finish_event=self.finish_event,
+                    )
                 summary = summary if isinstance(summary, dict) else {}
                 total_time = (time.time() - self.train_start_time
                               if self.train_start_time else 0.0)
@@ -1177,6 +1370,12 @@ class TrainTabMixin:
                 else:
                     msg = f"Status: Training complete! ✅  |  Total: {total_str}"
                     print(f"[AuraLite] Training finished in {total_str}.")
+                kept = recorder.run if recorder is not None else None
+                note = libraryview.saved_note(kept)
+                if note and kept is not None:
+                    msg += f"  |  {note.lstrip('. ')}"
+                    self.root.after(0, lambda n=kept.name: self.model_file_label.config(
+                        text=f"Run: {n}", foreground="black"))
                 self.root.after(0, lambda m=msg: self.status_label.config(text=m))
                 # Whether finished or stopped mid-way, the model holds
                 # learned weights — enable generation and saving.
@@ -1197,11 +1396,12 @@ class TrainTabMixin:
                 self.root.after(0, lambda err=err: messagebox.showerror(
                     "Validation Error", err))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Train Error", f"Error during training:\n{err}"))
+                # 2.27: what went wrong and what to try; the details go to the log
+                self.root.after(0, lambda exc=e: self.report_error(exc, "training",
+                                                                   title="Train Error"))
             finally:
                 self.root.after(0, self._reset_train_buttons)
+                self.root.after(0, self._train_run_over)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1301,7 +1501,7 @@ class TrainTabMixin:
             settings = self.distill_settings()
             prompts, _skipped = read_prompts(prompts_path)
         except (OSError, ValueError) as err:
-            messagebox.showerror("Generate dialogs", str(err))
+            self.report_error(err, "reading the prompts", title="Generate dialogs")
             return
         if not prompts:
             messagebox.showerror("Generate dialogs", f"No prompts in {prompts_path}.")
@@ -1348,8 +1548,8 @@ class TrainTabMixin:
                 if meta["files"]["dialogs"]["records"]:
                     self.root.after(0, lambda: self._select_data(out))
             except Exception as err:
-                message = str(err)
-                self.root.after(0, lambda m=message: messagebox.showerror("Generate dialogs", m))
+                self.root.after(0, lambda exc=err: self.report_error(
+                    exc, "writing the dialogs", title="Generate dialogs"))
                 self.root.after(0, lambda: self.distill_status.config(text="Failed"))
             finally:
                 self.root.after(0, lambda: self.distill_btn.config(state=tk.NORMAL))
@@ -1467,9 +1667,8 @@ class TrainTabMixin:
                     progress_callback=progress, stop_event=self.stop_event)
                 self.root.after(0, self._dataset_prepared, shards, time.time() - started)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Dataset Error", f"Could not prepare the dataset:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "preparing the dataset", title="Dataset Error"))
             finally:
                 self.root.after(0, self._reset_train_buttons)
 
@@ -1512,7 +1711,7 @@ class TrainTabMixin:
         try:
             tokenizer, info = read_tokenizer_file(path)
         except Exception as e:
-            messagebox.showerror("Tokenizer Error", f"Could not load the tokenizer:\n{e}")
+            self.report_error(e, "loading the tokenizer", title="Tokenizer Error")
             return
         self._use_tokenizer_file(path, tokenizer)
         self.status_label.config(
@@ -1536,7 +1735,7 @@ class TrainTabMixin:
         try:
             self.engine.save_tokenizer(path)
         except Exception as e:
-            messagebox.showerror("Tokenizer Error", f"Could not save the tokenizer:\n{e}")
+            self.report_error(e, "saving the tokenizer", title="Tokenizer Error")
             return
         self.status_label.config(text=f"Status: Tokenizer saved ✅ ({os.path.basename(path)}: "
                                       f"{describe_tokenizer(tokenizer)})")
@@ -1567,7 +1766,7 @@ class TrainTabMixin:
             data = load_training_data([self.selected_file_path])
             text = data if not isinstance(data, DialogSet) else self._selected_text()
         except Exception as e:
-            messagebox.showerror("File Error", f"Could not read file:\n{e}")
+            self.report_error(e, "reading the data", title="File Error")
             return
         self.stop_event.clear()
         self.finish_event.clear()
@@ -1595,9 +1794,8 @@ class TrainTabMixin:
                 self.root.after(0, self._tokenizer_trained, path, tokenizer, info,
                                 time.time() - started)
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: messagebox.showerror(
-                    "Tokenizer Error", f"Could not train the tokenizer:\n{err}"))
+                self.root.after(0, lambda exc=e: self.report_error(
+                    exc, "training the tokenizer", title="Tokenizer Error"))
             finally:
                 self.root.after(0, self._reset_train_buttons)
 

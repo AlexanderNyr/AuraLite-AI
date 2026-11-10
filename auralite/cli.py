@@ -104,6 +104,31 @@ def _parse_duration(value: str) -> float:
     return seconds
 
 
+def _read_params(value: str) -> dict:
+    """The settings of ``--params``: a JSON file, or (2.27) the JSON itself, like
+    ``'{"epochs": 3}'``. ValueError says what is wrong (it was a traceback before)."""
+    text = str(value).strip()
+    if text.startswith("{") and not os.path.exists(text):
+        source, label = text, "the JSON given"
+    else:
+        label = value
+        try:
+            with open(value, "r", encoding="utf-8") as f:
+                source = f.read()
+        except FileNotFoundError:
+            raise ValueError(f"--params: no such file: {value}") from None
+        except OSError as err:
+            raise ValueError(f"--params: {value} cannot be read: {err}") from None
+    try:
+        data = json.loads(source)
+    except ValueError as err:
+        raise ValueError(f"--params: {label} is not JSON: {err}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"--params: {label} holds a {type(data).__name__}, not settings - "
+                         f'write them as an object, like {{"epochs": 3}}')
+    return data
+
+
 def _graceful_sigint(finish_event: threading.Event, stop_event: threading.Event):
     """Ctrl+C: finish with a cooldown, again: stop now, a third time: interrupt.
 
@@ -409,8 +434,11 @@ def cmd_train(args: argparse.Namespace) -> int:
             return 2
     given: dict = {}
     if args.params:
-        with open(args.params, "r", encoding="utf-8") as f:
-            given = json.load(f)
+        try:
+            given = _read_params(args.params)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
         params.update(given)
     for flag, key in (("max_tokens", "max_tokens"), ("eval_every", "eval_every_steps"),
                       ("memory_plan", "memory_plan"), ("shards_dir", "shards_dir"),
@@ -813,8 +841,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"error: {err}", file=sys.stderr)
             return 2
     if args.params:
-        with open(args.params, "r", encoding="utf-8") as f:
-            given = json.load(f)
+        try:
+            given = _read_params(args.params)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
         model.update({k: v for k, v in given.items() if k in (
             "d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff", "seq_length", "batch_size",
             "accumulation_steps", "tie_word_embeddings", "optimizer", "amp_dtype", "lora_rank",
@@ -1369,8 +1400,10 @@ def _image_train_params(args: argparse.Namespace) -> tuple[dict, str | None]:
             return {}, f"unknown --preset {args.preset!r} (choose: {choices})"
         params.update(IMAGE_PRESETS[names[0]])
     if args.params:
-        with open(args.params, "r", encoding="utf-8") as f:
-            params.update(json.load(f))
+        try:
+            params.update(_read_params(args.params))
+        except ValueError as err:
+            return {}, str(err)
     if model_type:
         params["model_type"] = model_type
     for key in ("epochs", "batch_size", "seed", "val_split", "img_size"):
@@ -1961,7 +1994,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta", type=float, metavar="BETA",
                    help="DPO / SimPO: reward scale beta (default 0.1 for DPO, 2.0 for SimPO; "
                         "--params for lr, epochs, dpo_positive, simpo_gamma)")
-    p.add_argument("--params", help="JSON file with training params")
+    p.add_argument("--params", metavar="FILE",
+                   help="JSON file with training params (2.27: or the JSON itself, like "
+                        "'{\"epochs\": 3}')")
     p.add_argument("--model", default="model.pt", help="output checkpoint")
     p.add_argument("--mmap", action="store_true",
                    help="stream the corpus into a uint32 memmap (low RAM use; "
@@ -2049,7 +2084,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("plan", help="the memory a training run needs, and a batch that fits")
     p.add_argument("--preset", metavar="SIZE", help="a model size (see --list)")
-    p.add_argument("--params", metavar="FILE", help="JSON training params (model fields)")
+    p.add_argument("--params", metavar="FILE",
+                   help="JSON training params (model fields): a file or the JSON itself")
     p.add_argument("--list", action="store_true", help="list the model presets")
     p.add_argument("--vocab", type=int, default=32000, metavar="N",
                    help="vocabulary size (default 32000)")
@@ -2300,8 +2336,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "flow matching (rectified flow) or a GAN (R3GAN-style)")
     p.add_argument("--preset", help="tiny | small | medium | large | flow-tiny | flow-small | "
                                     "gan-tiny | gan-small (with --type: tiny = <type>-tiny)")
-    p.add_argument("--params", help="JSON file with image training params "
-                                    "(keys of ImageGenEngine.DEFAULTS)")
+    p.add_argument("--params", metavar="FILE",
+                   help="JSON file with image training params (keys of "
+                        "ImageGenEngine.DEFAULTS), or the JSON itself")
     p.add_argument("--model", default="image_model.pt",
                    help="output checkpoint (.pt or .safetensors)")
     p.add_argument("--epochs", type=int)

@@ -168,9 +168,8 @@ class ExportTabMixin:
                                      f"{info.get('bytes', 0) / 1e6:,.0f} MB){notes}"),
                     self.exp_status.config(text=f"Status: {label} exported ✓")))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda: (
-                    messagebox.showerror(f"{label} Export Error", err),
+                self.root.after(0, lambda exc=e: (
+                    self.report_error(exc, "the export", title=f"{label} Export Error"),
                     self.exp_status.config(text="Status: Export failed ✗")))
 
         threading.Thread(target=run, daemon=True).start()
@@ -201,9 +200,8 @@ class ExportTabMixin:
                     self.exp_status.config(text="Status: .pt2 export complete ✅")
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: (
-                    messagebox.showerror(".pt2 Export Error", err),
+                self.root.after(0, lambda exc=e: (
+                    self.report_error(exc, "the export", title=".pt2 Export Error"),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -234,9 +232,8 @@ class ExportTabMixin:
                     self.exp_status.config(text="Status: TorchScript export complete ✅")
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: (
-                    messagebox.showerror("Export Error", err),
+                self.root.after(0, lambda exc=e: (
+                    self.report_error(exc, "the export", title="Export Error"),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -269,9 +266,8 @@ class ExportTabMixin:
                     self.exp_status.config(text="Status: ONNX export complete ✅")
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: (
-                    messagebox.showerror("ONNX Export Error", err),
+                self.root.after(0, lambda exc=e: (
+                    self.report_error(exc, "the export", title="ONNX Export Error"),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 
@@ -297,9 +293,8 @@ class ExportTabMixin:
                     self.exp_status.config(text="Status: Export all complete ✅")
                 ))
             except Exception as e:
-                err = str(e)
-                self.root.after(0, lambda err=err: (
-                    messagebox.showerror("Export All Error", err),
+                self.root.after(0, lambda exc=e: (
+                    self.report_error(exc, "the export", title="Export All Error"),
                     self.exp_status.config(text="Status: Export failed ✗")
                 ))
 

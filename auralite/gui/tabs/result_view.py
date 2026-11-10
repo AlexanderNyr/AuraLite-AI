@@ -28,7 +28,7 @@ class ResultViewMixin:
             self.status_label.config(
                 text=f"Status: Copied {n:,} characters to clipboard ✅")
         except tk.TclError as e:
-            messagebox.showerror("Copy Error", str(e))
+            self.report_error(e, "copying", title="Copy Error")
 
 
     def _copy_selection_result(self):
@@ -68,7 +68,7 @@ class ResultViewMixin:
             self.status_label.config(
                 text=f"Status: Saved output ✅ ({os.path.basename(path)})")
         except Exception as e:
-            messagebox.showerror("Save Error", str(e))
+            self.report_error(e, "saving", title="Save Error")
 
 
     def _append_result(self):
@@ -93,7 +93,7 @@ class ResultViewMixin:
             self.status_label.config(
                 text=f"Status: Appended output ✅ ({os.path.basename(path)})")
         except Exception as e:
-            messagebox.showerror("Append Error", str(e))
+            self.report_error(e, "appending to the file", title="Append Error")
 
 
     def _show_result_menu(self, event):

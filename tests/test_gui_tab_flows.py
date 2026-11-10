@@ -228,7 +228,8 @@ class TestTrainingFlow:
         assert "Stopped early after epoch 7" in status and "restored" in status
         assert "1.2500 at epoch 4" in status
 
-    def test_autosave_path_is_derived_from_the_corpus(self, app, tmp_path, monkeypatch):
+    def test_autosave_goes_into_the_runs_folder(self, app, tmp_path, monkeypatch):
+        from auralite import runs as runlib
         corpus = write_corpus(tmp_path)
         tiny_train_params(app, corpus)
         app.autosave_var.set(3)
@@ -242,8 +243,17 @@ class TestTrainingFlow:
         monkeypatch.setattr(app.engine, "train", fake_train)
         app.start_training()
         assert seen["autosave_every"] == 3
-        assert seen["autosave_path"] == os.path.splitext(corpus)[0] + "_autosave.pt"
+        # 2.27: the run is in the library, its checkpoint every 10 minutes in its folder
+        run = runlib.find_run("last")
+        assert seen["autosave_path"] == str(run.folder / runlib.CHECKPOINT_FILE)
+        assert seen["autosave_every_minutes"] == pytest.approx(10.0)
         assert seen["progress_every_seconds"] == pytest.approx(0.5)
+        # without the library (AURALITE_NO_RUNS=1, as `auralite train`): beside the corpus
+        monkeypatch.setenv("AURALITE_NO_RUNS", "1")
+        seen.clear()
+        app.start_training()
+        assert seen["autosave_path"] == os.path.splitext(corpus)[0] + "_autosave.pt"
+        assert "autosave_every_minutes" not in seen
 
     def test_stop_training_finishes_first_and_stops_on_the_second_press(self, app):
         # 2.12: the first press ends the run with a learning-rate cooldown.
@@ -2082,13 +2092,14 @@ class TestImageTab:
         with dialog_double("filedialog.asksaveasfilename", str(target)):
             app.save_image_model()
         assert not target.exists()
+        # 2.27: explained - the extra that brings the package
         assert errors.call_args.args[0] == "Save Error"
-        assert "pip install safetensors" in errors.call_args.args[1]
+        assert 'pip install "auralite-ai[safetensors]"' in errors.call_args.args[1]
         errors.reset_mock()
         with dialog_double("filedialog.askopenfilename", str(target)):
             app.load_image_model()
         assert errors.call_args.args[0] == "Load Error"
-        assert "pip install safetensors" in errors.call_args.args[1]
+        assert 'pip install "auralite-ai[safetensors]"' in errors.call_args.args[1]
 
     def test_class_conditional_training_fills_the_class_picker(self, app, monkeypatch, tmp_path):
         from PIL import Image

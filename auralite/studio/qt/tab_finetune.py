@@ -559,8 +559,10 @@ class FineTuneTab(QWidget):
 
     def apply_run(self, run: runlib.Run, base: str | None = None) -> None:
         """Fill the form from a run of the library (2.20): Repeat (its base) or
-        Train more (`base`: the run's result)."""
-        if run.settings:
+        Train more (`base`: the run's result). 2.27: a new model's settings stay out -
+        its 100 passes (early stopping ends them) were a very long fine-tune."""
+        from ..libraryview import tab_of
+        if run.settings and tab_of(run) == "finetune":
             self.apply_settings(FineTuneSettings.from_dict(run.settings))
         self.set_base(str(run.base.get("spec") or "") if base is None else base)
         paths = run.data.get("paths") or []

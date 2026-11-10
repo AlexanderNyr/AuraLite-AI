@@ -36,7 +36,7 @@ TINY = {"tokenizer": "char", "d_model": 32, "d_ff": 64, "n_heads": 4, "n_kv_head
         "val_split": 0.0, "seed": 0, "optimizer": "adamw", "amp_dtype": "none",
         "progress_every_seconds": 100.0}
 TABS = ("start", "train", "finetune", "image", "gen", "chat", "model", "quant", "eval",
-        "export", "console")
+        "export", "library", "console")                         # 2.27: the Library
 
 
 def _hardware(memory_gb: float = 16, gflops: float = 200.0):
@@ -99,14 +99,14 @@ def _pairs_file(path, n: int = 30) -> str:
 
 
 # ----------------------------------------------------------------------
-#  The window: eleven tabs, the session keeps the one shown
+#  The window: its tabs (2.27: twelve), the session keeps the one shown
 # ----------------------------------------------------------------------
-def test_eleven_tabs_and_the_session_keeps_the_one_shown(app):
+def test_the_tabs_and_the_session_keeps_the_one_shown(app):
     from auralite.gui import session as gui_session
     assert tuple(app._tab_names) == TABS == tuple(app._TAB_NAMES)
     titles = [c.kwargs["text"].strip() for c in app.notebook.add.call_args_list]
     assert titles == ["Start", "Train", "Fine-tune", "Image", "Generate", "Chat", "Model",
-                      "Quant", "Eval", "Export", "Console"]
+                      "Quant", "Eval", "Export", "Library", "Console"]
     assert app._active_tab_name == "start"
     app.notebook.index.return_value = 2
     app._on_tab_changed()
@@ -436,7 +436,10 @@ def test_a_failed_finetune_says_why(app, tmp_path, monkeypatch):
     errors = _messagebox().showerror
     errors.reset_mock()
     assert app.start_finetune() is True
-    assert errors.call_args.args == ("The run failed", "RuntimeError: the base cannot be read")
+    title, text = errors.call_args.args                         # 2.27: explained
+    assert title == "The run failed"
+    assert text.startswith("The fine-tuning failed\n\nthe base cannot be read")
+    assert "Open the log folder" in text
     assert _text(app.ft_status) == "The fine-tuning failed - see the message."
     assert app._ft_thread is None
     assert app.ft_finish_btn.config.call_args.kwargs["state"] == "disabled"
