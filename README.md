@@ -3,7 +3,7 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.28.0-orange)
+![Version](https://img.shields.io/badge/version-2.28.1-orange)
 ![Coverage](https://img.shields.io/badge/coverage-88%25-green)
 
 [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [Windows app](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
@@ -29,7 +29,7 @@ Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/do
 
 ```bash
 pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
-# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.28.0'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.28.1'
 auralite doctor --data chats.jsonl   # what this computer can train, with the command to run it (2.19)
 auralite bench                       # how fast it trains and writes: a table in ~5 minutes (2.22)
 auralite bench --finetune D:\models\Qwen3.5-0.8B   # and a fine-tune of a model downloaded before (2.23)

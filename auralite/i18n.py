@@ -79,18 +79,21 @@ def catalogue(code: str) -> dict[str, Any]:
 def system_language() -> str:
     """The computer's language as a code of `LANGUAGES` (English when it is another)."""
     names = []
-    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):     # gettext's order
-        value = os.environ.get(var, "")
-        if value:
-            names.append(value.split(":")[0])
-            break
-    if not names and sys.platform == "win32":
+    if sys.platform == "win32":
+        # 2.28.1: Windows' display language first. $LANG on Windows comes from Git Bash,
+        # MSYS2 or Cygwin (en_US.UTF-8 by default) and said English to a Studio started there.
         try:
             import ctypes
             langid = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())  # type: ignore[attr-defined]
             names.append({0x19: "ru"}.get(langid & 0x3FF, "en"))
         except Exception:
             pass
+    if not names:
+        for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):     # gettext's order
+            value = os.environ.get(var, "")
+            if value:
+                names.append(value.split(":")[0])
+                break
     if not names:
         try:
             names.append(str(locale.getlocale()[0] or ""))

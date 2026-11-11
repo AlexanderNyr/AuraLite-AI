@@ -19,7 +19,7 @@ from ..hardware import Hardware, auralite_home, detect_hardware, format_gb, meas
 from ..library import remember_model
 from ..logs import install_excepthooks, log_dir, setup_logging
 from ..settings import StudioSettings, load_settings, save_settings
-from .common import Job, ask_open, ask_save, confirm, inform, show_error
+from .common import Job, ScrollPage, ask_open, ask_save, confirm, inform, show_error
 from .tab_chat import ChatTab
 from .tab_evaluate import EvaluateTab
 from .tab_export import ExportTab
@@ -84,7 +84,7 @@ class MainWindow(QMainWindow):
         self.version = __version__
         self.setWindowTitle(f"AuraLite Studio {__version__}")
         self.setWindowIcon(studio_icon())
-        self.resize(1080, 800)
+        self.resize(*self._initial_size())             # 2.28.1: within the screen
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -110,16 +110,11 @@ class MainWindow(QMainWindow):
                                           "evaluate": self.evaluate_tab,
                                           "export": self.export_tab, "library": self.library_tab,
                                           "log": self.log_tab}
+        # 2.28.1: every tab scrolls. Chat, Generate, Library and Log did not: Generate's
+        # 849 px made the window at least 929 px tall, taller than a 768 or 800 px screen, so
+        # the bottom of every tab - scrolled ones too - lay below the screen, out of reach.
         for key, title in TAB_TITLES:
-            page = self.pages[key]
-            if key in ("chat", "generate", "library", "log"):
-                self.tabs.addTab(page, tr(title))
-                continue
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            scroll.setWidget(page)
-            self.tabs.addTab(scroll, tr(title))
+            self.tabs.addTab(ScrollPage(self.pages[key]), tr(title))
         self._build_menu()
         self.device_label = QLabel("")
         self.model_status = QLabel("")
@@ -385,6 +380,25 @@ class MainWindow(QMainWindow):
             self._jobs.remove(job)
 
     # ---- shared state ------------------------------------------------------------
+    def _initial_size(self) -> tuple[int, int]:
+        """2.28.1: 1080 x 800, smaller on a screen that has less room - 800 px and the title
+        bar did not fit a 768 or 800 px screen."""
+        width, height = 1080, 800
+        try:
+            screen = self.screen()
+            area = screen.availableGeometry() if screen is not None else None
+        except Exception:                            # pragma: no cover - an exotic platform
+            area = None
+        if area is not None and area.width() > 0 and area.height() > 0:
+            width = min(width, area.width() - 40)
+            height = min(height, area.height() - 60)    # the title bar and a margin
+        return max(640, width), max(480, height)
+
+    def current_page(self) -> QWidget:
+        """2.28.1: the page of the tab shown (the tabs hold scroll areas)."""
+        area = self.tabs.currentWidget()
+        return area.widget() if isinstance(area, QScrollArea) else area
+
     def _fit_to_tabs(self) -> None:
         """2.28: a window at least as wide as its row of tabs when the screen has room - the
         Russian titles are longer than the English ones 1080 was chosen for, and a tab behind

@@ -714,7 +714,7 @@ def test_the_window_opens_where_it_was_left(tmp_path, monkeypatch, dialogs):
                         settings=StudioSettings(first_run_done=True, last_tab="generate"),
                         detect=False, capture_streams=False, save_on_close=True,
                         auto_speed_test=False)
-    assert window.tabs.currentWidget() is window.generate_tab
+    assert window.current_page() is window.generate_tab        # 2.28.1: tabs scroll
     window.goto("export")
     window.close()
     assert load_settings().last_tab == "export"

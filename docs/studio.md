@@ -93,6 +93,9 @@ works anywhere. AVX2 is not needed: training uses what the processor has.
 | **Library** (2.20) | every run with its curve, settings, results and files — continue a stopped or interrupted one, compare runs, evaluate a chat model; the models and datasets on the disk and the room they take |
 | **Log** | everything AuraLite reports while it works, errors, warnings and epochs in their own colours (2.24); copy it, save it to a file (2.24) — the log file keeps it too |
 
+Every tab scrolls when the window is smaller than its content (2.28.1), and the window
+opens within the screen, so the Studio works on a 1280 × 768 laptop screen as well.
+
 The **setup wizard** (*Tools → Setup wizard*, and the first time the Studio starts)
 asks what you want to do, looks at the computer, reads the data, shows the models
 that fit with their memory and time, and fills in the tab — it can start the run

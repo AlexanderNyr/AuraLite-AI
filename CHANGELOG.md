@@ -1,3 +1,21 @@
+# 📦 v2.28.1 — Every tab of the Studio scrolls, and the window fits a small screen
+
+- **Every tab scrolls.** Chat, Generate, Library and Log were not in scroll areas, and
+  Generate needs 849 px: the window could not be shorter than 929 px, taller than a 768 or
+  800 px screen. The bottom of every tab - the scrolled ones too - lay below the screen,
+  where no scroll bar could bring it up; a maximized window got the screen's height until
+  the next layout grew it again, so only restoring and maximizing it again helped. Now each
+  tab is a scroll area of its own (`ScrollPage`): the window's minimum height is about
+  150 px, and every tab scrolls to its end in a 1024 x 560 window - also after its sections
+  open and its reports grow (`tests/test_studio_v2281.py`).
+- **The window opens within the screen**: 1080 x 800 where there is room, smaller where
+  there is not (800 px and the title bar did not fit a 768 or 800 px screen). A size saved
+  by an earlier session that no longer fits is made to fit, as before.
+- **On Windows the display language comes first.** Both interfaces read Windows' display
+  language before `$LANG`, which Git Bash, MSYS2 and Cygwin set to `en_US.UTF-8`: started
+  from there, they spoke English on a Russian Windows. `AURALITE_LANG` still overrides it,
+  and other systems read `$LANG` as before.
+
 # 📦 v2.28.0 — AuraLite in Russian: both interfaces, one catalogue
 
 The Studio and the classic interface (tkinter) speak English and Russian. They follow the

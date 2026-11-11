@@ -18,8 +18,8 @@ from typing import Any
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QAbstractSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QMessageBox, QPushButton, QSizePolicy, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QMessageBox, QPushButton, QScrollArea, QSizePolicy, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from ..errors import FriendlyError, explain_error
 from ..logs import log_dir
@@ -293,6 +293,24 @@ def row(*widgets: QWidget | None, stretch: bool = True) -> QHBoxLayout:
     if stretch:
         layout.addStretch(1)
     return layout
+
+
+class ScrollPage(QScrollArea):
+    """2.28.1: a tab's page in a scroll area - the window may be smaller than the page.
+
+    The page fills the area when there is room (its stretchy parts - a chat, a table, a
+    text box - grow with the window) and scrolls when there is not, so no tab sets the
+    window's minimum height.
+    """
+
+    def __init__(self, page: QWidget, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setWidget(page)
+
+    def page(self) -> QWidget:
+        return self.widget()
 
 
 class Collapsible(QWidget):

@@ -173,6 +173,8 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         # clipped on small screens. self.tab_* stays the inner frame, so the
         # existing _build_*_tab() methods keep working unchanged.
         self._scroll_canvases = []  # keep refs so we can theme their background
+        self._scroll_syncs: list = []           # 2.28.1: each tab's _sync_scroll, in order
+        self._scroll_sizes: dict = {}
         self._tab_widgets: dict[str, object] = {}
         for _name in self._tab_names:
             container, canvas, inner = self._make_scrollable_tab()
@@ -220,6 +222,7 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         except Exception as exc:      # one language, or an exotic Tk build
             gui_common.logger.debug("language selector not shown: %s", exc)
         self._fit_window_to_tabs()
+        self._watch_tab_content()               # 2.28.1: content that grows, scrolls
 
         # Hook stdout/stderr into the console tab. Do it AFTER the widget
         # exists. Keep references so we can restore them on shutdown.
@@ -263,20 +266,16 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
 
         canvas.configure(yscrollcommand=vsb.set)
 
-        def _on_canvas_configure(event):
-            # Inner frame always matches the canvas width.
-            canvas.itemconfigure(inner_id, width=event.width)
-            # If content is shorter than the viewport, stretch inner to fill.
-            req_h = inner.winfo_reqheight()
-            if req_h < event.height:
-                canvas.itemconfigure(inner_id, height=event.height)
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _sync(_event=None):
+            self._sync_scroll(canvas, inner, inner_id)
 
-        def _on_inner_configure(_event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        canvas.bind("<Configure>", _on_canvas_configure)
-        inner.bind("<Configure>", _on_inner_configure)
+        # 2.28.1: one rule (_sync_scroll) for the canvas resized and the content changed.
+        # The inner frame used to get the canvas's height, fixed, whenever its content was
+        # shorter - and content that grew afterwards (a result shown, a section opened) lay
+        # below the scroll region, until the window was resized.
+        canvas.bind("<Configure>", _sync)
+        inner.bind("<Configure>", _sync)
+        self._scroll_syncs.append(_sync)
 
         def _on_mousewheel(event):
             if event.num == 4:            # Linux/Windows wheel up
@@ -293,6 +292,51 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         return container, canvas, inner
+
+    def _sync_scroll(self, canvas, inner, inner_id) -> None:
+        """2.28.1: a tab's inner frame as wide as its canvas and as tall as its content or
+        the canvas, whichever is more (its stretchy parts fill a tall window); the scroll
+        region the same - so the end of the content can always be scrolled to."""
+        try:
+            width = int(canvas.winfo_width())
+            height = max(int(inner.winfo_reqheight()), int(canvas.winfo_height()))
+        except Exception:                       # a test double, a window closing
+            return
+        if width <= 1 or self._scroll_sizes.get(str(canvas)) == (width, height):
+            return
+        self._scroll_sizes[str(canvas)] = (width, height)
+        canvas.itemconfigure(inner_id, width=width, height=height)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _sync_visible_tab(self) -> None:
+        try:
+            self._scroll_syncs[int(self.notebook.index("current"))]()
+        except Exception:                       # a test double, a window closing
+            pass
+
+    def _watch_tab_content(self) -> None:
+        """2.28.1: Tk tells nobody when a frame inside a canvas asks for more room - a result
+        shown, a section opened, a block added where no room was left - so the tab shown is
+        measured again every 0.4 s (a few winfo calls; nothing happens when it is the same)."""
+        if not isinstance(self.root, tk.Misc):  # a test double: no timer loop
+            return
+
+        def tick():
+            self._sync_visible_tab()
+            try:
+                self._scroll_timer = self.root.after(400, tick)
+            except Exception:                   # the window is closing
+                self._scroll_timer = None
+
+        tick()
+
+    def _stop_scroll_ticks(self) -> None:
+        timer, self._scroll_timer = getattr(self, "_scroll_timer", None), None
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:                   # already run, or the window gone
+                pass
 
 
     def _apply_theme(self, light: bool = True):
@@ -368,6 +412,7 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
             return
         if self._active_tab_name == "library":  # 2.27: what is on the disk now
             self._lib_refresh()
+        self._sync_visible_tab()                # 2.28.1
 
     def _fit_window_to_tabs(self) -> None:
         """2.28: a window at least as wide as the row of tab titles, when the screen has
@@ -480,6 +525,7 @@ class AIApp(StartTabMixin, TrainTabMixin, FineTuneTabMixin, ImageTabMixin, Gener
         self._save_session()
         self._stop_memory_ticks()
         self._stop_library_ticks()
+        self._stop_scroll_ticks()               # 2.28.1
         try:
             self.gui_config.save()
         except Exception as exc:      # pragma: no cover - read-only home
