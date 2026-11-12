@@ -256,6 +256,9 @@ def test_resolve_language_order(monkeypatch):
 
 
 def test_system_language_reads_lang(monkeypatch):
+    # 2.28.2: $LANG is what other systems read; on Windows the display language comes first
+    # (2.28.1) - and a Windows runner's is English
+    monkeypatch.setattr(sys, "platform", "linux")
     for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("LANG", "ru_RU.UTF-8")
