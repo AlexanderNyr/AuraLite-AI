@@ -3,12 +3,19 @@
 [![CI](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderNyr/AuraLite-AI/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Version](https://img.shields.io/badge/version-2.28.1-orange)
+![Version](https://img.shields.io/badge/version-2.28.2-orange)
 ![Coverage](https://img.shields.io/badge/coverage-88%25-green)
 
 [Quickstart](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quickstart.md) · [AuraLite Studio](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/studio.md) · [Windows app](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/windows-app.md) · [FAQ](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/faq.md) · [Quantization](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/quantization.md)
 
 **AuraLite AI** trains, fine-tunes and runs language models on your own computer — from a desktop app, **AuraLite Studio**, or the command line. Fine-tune Qwen3.5 (2026), Qwen2.5/3, Llama, Mistral or SmolLM2 on your dialogs with QLoRA, even on a 4-core CPU without a GPU; grow a small model of your own from your texts; chat with the result and export it to llama.cpp, Ollama, LM Studio or transformers, or serve it with an OpenAI-compatible API. Everything runs locally in plain **PyTorch**, and every part of the engine is readable code — the Transformer architecture behind models like GPT-4, from tokenizer to sampler, open to look into.
+
+**Measured on a PC from 2011** — a Core i5-2400 (4 cores, AVX, no AVX2), 16 GB of DDR3, Windows 10, and a GeForce GT 710 that PyTorch cannot use, so everything ran on the processor ([docs/benchmark.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/docs/benchmark.md#two-nights-on-a-core-i5-2400-228)):
+
+| Run | Time | Speed | Result |
+|---|---|---|---|
+| A 7M-parameter model from scratch on 5.3 MB of Russian folk tales | 5 h 38 min | 812 tokens/s | 1.06 bits/byte on held-out tales; writes new text in their style (0–5 % of its five-word runs occur in the tales) |
+| Qwen3.5-0.8B fine-tuned with LoRA on 321 dialogs about AuraLite | 1 h 44 min | 15 tokens/s | on 15 held-out questions the reference replies' loss fell from 3.46 to 0.09 nats/token; replies that end by themselves: 0 % → 100 % |
 
 **AuraLite Studio (2.19)** checks the computer and recommends a model and settings that fit it, reads your data before anything trains, runs training with a live chart, and explains errors with what to try. Fine-tuning and training from scratch have their own tabs; a wizard sets everything up:
 
@@ -29,7 +36,7 @@ Guide: [docs/studio.md](https://github.com/AlexanderNyr/AuraLite-AI/blob/main/do
 
 ```bash
 pip install "auralite-ai[serve]"     # Python 3.11–3.14, from PyPI (2.18.0 on); in a clone: pip install -e '.[serve]'
-# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.28.1'
+# or a tag straight from GitHub: pip install 'auralite-ai[serve] @ git+https://github.com/AlexanderNyr/AuraLite-AI@v2.28.2'
 auralite doctor --data chats.jsonl   # what this computer can train, with the command to run it (2.19)
 auralite bench                       # how fast it trains and writes: a table in ~5 minutes (2.22)
 auralite bench --finetune D:\models\Qwen3.5-0.8B   # and a fine-tune of a model downloaded before (2.23)

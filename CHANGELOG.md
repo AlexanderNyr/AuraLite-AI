@@ -1,3 +1,23 @@
+# 📦 v2.28.2 — What the first nights on an i5-2400 showed: the numbers on screen
+
+The first real runs of the article's showcase - a model trained from scratch overnight and a
+fine-tune of Qwen3.5-0.8B on a Core i5-2400 - trained as they should; a few numbers on screen
+did not. README and [docs/benchmark.md](docs/benchmark.md#two-nights-on-a-core-i5-2400-228)
+now have the runs themselves.
+
+- **The speed at the end of a run** counted the whole last epoch when *Finish*, a time limit
+  or `max_steps` ended it early (and a continued epoch as a whole one): the last line said
+  "1,803 tokens/s" for a run of 812. The engine's epoch-end event now counts the batches the
+  session ran (`tokens_per_sec`, `batches_per_sec`).
+- **The Library's chart counts optimizer steps**, as the run's facts do. The engine counts
+  batches, and a step that adds several up (accumulation, or the memory plan's split batch)
+  drew a fine-tune of 45 steps out to 180 (`Run.curve`).
+- **The charts' value axis stays at or above zero** for values that never go below it (a
+  fine-tune's loss had "-0.122" under its curve), and **the last label of the step axis**
+  ends at the chart's edge instead of losing its last digit ("2 02").
+- **The Generate tabs format the model's window** as a number of the interface's language:
+  "262 144" in Russian, "262,144" in English, not "262144" (both interfaces).
+
 # 📦 v2.28.1 — Every tab of the Studio scrolls, and the window fits a small screen
 
 - **Every tab scrolls.** Chat, Generate, Library and Log were not in scroll areas, and

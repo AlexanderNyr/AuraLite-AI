@@ -465,14 +465,21 @@ class Run:
         before it (the engine reports the mean of the epoch so far). A run
         continued from a checkpoint repeats the steps after it: the curve
         keeps the steps as the run went in the end.
+
+        2.28.2: the steps are optimizer steps, as the run's facts count them. The engine
+        counts batches; a step that adds several up (accumulation, or the memory plan's
+        split batch) drew 180 steps on the chart of a run of 45.
         """
         train: list[tuple[float, float]] = []
         val: list[tuple[float, float]] = []
         last: dict[str, Any] = {}
+        per_step = self.summary.get("accumulation_steps")
+        scale = 1.0 / int(per_step) if isinstance(per_step, int) and per_step > 1 else 1.0
         for point in self.metrics():
             step = point.get("s")
             if not isinstance(step, (int, float)):
                 continue
+            step = float(step) * scale
             if train and step < train[-1][0]:            # continued: drop what was redone
                 train = [p for p in train if p[0] < step]
                 val = [p for p in val if p[0] < step]

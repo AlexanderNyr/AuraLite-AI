@@ -2,6 +2,8 @@
 
 Extracted verbatim from `gui_app.py`; behaviour is unchanged.
 """
+from auralite.i18n import number          # 2.28.2: 262 144 in Russian, 262,144 in English
+
 from ..common import (build_web_context, messagebox, threading, tk, ttk)
 from ..i18n import tr
 
@@ -236,11 +238,11 @@ class GenerationTabMixin:
         trained = getattr(model, "max_seq_len", None)
         if self.full_context_var.get():
             text = (tr("whole history: past the trained length ({n} tokens) the output "
-                       "degrades", n=trained) if trained else
+                       "degrades", n=number(trained)) if trained else
                     tr("whole history: past the trained length the output degrades"))
         else:
-            text = (tr("each token sees the newest {n} tokens (the trained length)", n=trained)
-                    if trained else
+            text = (tr("each token sees the newest {n} tokens (the trained length)",
+                       n=number(trained)) if trained else
                     tr("each token sees as many tokens as the model was trained on"))
         self.context_hint.config(text=text)
 

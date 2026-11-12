@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFormLay
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..i18n import N_, tr
+from ..i18n import N_, number, tr
 from .common import Job, ask_save, compact_spins, heading, hint, primary, show_error
 
 if TYPE_CHECKING:
@@ -171,12 +171,12 @@ class GenerateTab(QWidget):
         trained = getattr(self.studio.engine.model, "max_seq_len", None)
         if self.full_context.isChecked():
             text = (tr("Every token sees the whole history: past the trained length ({n} "
-                       "tokens) the text gets worse.", n=trained) if trained else
+                       "tokens) the text gets worse.", n=number(trained)) if trained else
                     tr("Every token sees the whole history: past the trained length the "
                        "text gets worse."))
         else:
             text = (tr("Every token sees the newest {n} tokens (the trained length).",
-                       n=trained) if trained else
+                       n=number(trained)) if trained else                # 2.28.2: 262 144
                     tr("Every token sees as many tokens as the model was trained on."))
         self.context_hint.setText(text)
 

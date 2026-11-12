@@ -48,7 +48,7 @@ SPEC = HERE / "auralite_app.spec"
 REQUIREMENTS = HERE / "requirements.txt"
 #: The longest path inside the zip, its top folder included, that still unzips everywhere:
 #: Windows allows 260 characters, and a deep destination such as
-#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.28.1-windows-x64\ takes about 90.
+#: C:\Users\<a long name>\Downloads\AuraLite-Studio-2.28.2-windows-x64\ takes about 90.
 PATH_BUDGET = 160
 #: The distributions the app runs with (their dependencies follow); their licenses ship.
 RUNTIME_ROOTS = ("auralite-ai", "torch", "numpy", "PySide6-Essentials", "safetensors",

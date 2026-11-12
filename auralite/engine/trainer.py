@@ -2953,8 +2953,13 @@ class TrainerMixin:
                             else run_percent(epoch + 1)),
                         "epoch_percent": 100.0,
                         "lr": self.scheduler.get_lr() if self.scheduler else lr,
-                        "batches_per_sec": (n_loader_batches / epoch_dur) if epoch_dur > 0 else 0.0,
-                        "tokens_per_sec": ((n_loader_batches * tokens_per_batch) / epoch_dur) if epoch_dur > 0 else 0.0,
+                        # 2.28.2: the batches this session ran - an epoch that Finish, a time
+                        # limit or max_steps ended early (or a continued one) counted as whole
+                        # showed twice the speed or more ("1 803 tokens/s" for 812)
+                        "batches_per_sec": (max(0, seen_batches - first_batch) / epoch_dur
+                                            if epoch_dur > 0 else 0.0),
+                        "tokens_per_sec": (max(0, seen_batches - first_batch) * tokens_per_batch
+                                           / epoch_dur if epoch_dur > 0 else 0.0),
                         "elapsed": elapsed,
                         "eta_seconds": eta,
                         "is_epoch_end": True,

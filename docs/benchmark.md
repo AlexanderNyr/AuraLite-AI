@@ -21,6 +21,66 @@ model — one of the catalog (Qwen3.5 0.8B at the top) or one already on this co
 `.safetensors` files), *File…* for an AuraLite checkpoint (`.pt`, `.safetensors`). Start
 stays grey until the path is a model, and the next benchmark opens with the same settings.
 
+## Two nights on a Core i5-2400 (2.28)
+
+What the numbers below mean in practice, on the computer they were measured on: a Core i5-2400
+from 2011 (4 cores / 4 threads, AVX, no AVX2), 16 GB of DDR3, Windows 10, AuraLite Studio
+2.28.1 (the Windows app), a speed test of 74 GFLOP/s. Its GeForce GT 710 (Kepler, compute
+capability 3.5) is too old for PyTorch: everything ran on the processor.
+
+**A model from scratch.** 321 Russian folk tales from Wikisource, public domain, modern
+spelling (Afanasyev's *Russian Folk Tales*, Khudyakov's *Great Russian Tales*, Mamin-Sibiryak's
+*Alyonushka's Tales*, Odoevsky): 5.3 MB, 1.38 million tokens with a BPE of 512. The wizard
+chose the 25m preset (6.6M parameters) and said the text was small for it (about 9 MB would
+suit), with a time limit of 8 hours.
+
+| | |
+|---|---|
+| Time | 5 h 38 min (ended with *Finish*) |
+| Tokens trained | 16.5 million, about 13 passes over the tales |
+| Speed | 812 tokens/s on average (the wizard estimated 965; 889–970 within an epoch) |
+| Memory | 1.0–1.8 GB |
+| Best validation loss | 2.785 nats/token, 1.06 bits per byte of UTF-8 |
+| Training loss at the end | 1.93 |
+
+The validation loss stopped improving around the sixth pass while the training loss kept
+falling: with this much text the model learns it by heart, and an earlier run stopped after
+1 h 58 min reached 2.814 - more hours bought 1 %. What it writes reads like the tales in its
+phrases and vocabulary, not in its plots. Six texts of about 140 words, compared with the
+tales: the longest run of words they share is 4–8 (set phrases such as "in a certain kingdom,
+in a certain land"), 0–5 % of their five-word runs occur in the tales, and each has words of
+its own making.
+
+**A fine-tune.** Qwen3.5-0.8B with LoRA (rank 16, three passes, a window of 256 tokens) on 321
+dialogs about AuraLite itself: 103 topics from these docs, three phrasings of the question each,
+12 longer dialogs and a few off-topic questions it declines. The wizard recommended Qwen3.5 2B
+with QLoRA (about 6 hours); the 0.8B was taken because the 2B is another 4.6 GB to download.
+
+| | |
+|---|---|
+| Time | 1 h 44 min |
+| Tokens trained | 92,160, at 15 tokens/s |
+| Validation loss (the run's own held-out dialogs) | 0.264 |
+
+Then 15 questions held out on purpose - the same topics, asked in words the training data does
+not have - on the Evaluate tab (greedy, replies of up to 160 tokens):
+
+| | Qwen3.5-0.8B as published | fine-tuned |
+|---|---|---|
+| Replies that end by themselves | 0 % | 100 % |
+| Replies equal to the reference word for word | 0 % | 33 % |
+| Loss of the reference replies | 3.457 nats/token | 0.091 nats/token |
+| Tokens per reply | 160 (the limit) | 77.9 |
+
+Before, the model wrote general advice until the limit (Markdown lists, a file format AuraLite
+does not read, "LM Studio or similar engines such as Stable Diffusion"); after, it gives the
+docs' answers in a few sentences. Its mistakes are worth knowing too: facts stitched together
+("a 256-bit processor"), a wrong answer at temperature 0.7 in the chat to a question it answered
+nearly right greedily, and an off-topic question unlike the three in its data ("recommend a
+film") answered with an invented AuraLite feature. A dataset this small narrows a 0.8B model to
+its topic; more and more varied examples, a low temperature, or the 2B the wizard proposed are
+the cures.
+
 ## What it measures
 
 1. **The computer** — the processor, its cores and threads, AVX / AVX2 / AVX-512, the

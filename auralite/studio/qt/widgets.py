@@ -22,6 +22,26 @@ _VAL_COLOR = "#e67e22"
 SERIES_COLORS = (ACCENT, "#e67e22", "#1e8e3e", "#9334e6", "#d93025", "#00897b")
 
 
+def axis_range(values: list[float]) -> tuple[float, float]:
+    """2.28.2: the low and high ends of a chart's value axis: 5 % of room each way, but not
+    below zero for values that are never negative (a loss drew "-0.122" under its curve)."""
+    low, high = min(values), max(values)
+    if high - low < 1e-9:
+        low, high = low - 0.5, high + 0.5
+    pad = 0.05 * (high - low)
+    floor = 0.0 if min(values) >= 0 else float("-inf")
+    return max(floor, low - pad), high + pad
+
+
+def tick_label(x: float, top: float, right_edge: float) -> tuple[QRectF, Any]:
+    """2.28.2: where an x-axis label goes and how it is aligned: centred on its tick, or
+    ending at the widget's edge when centring would cross it (the chart's last label, "2 022",
+    lost its last digit)."""
+    if x + 40 <= right_edge:
+        return QRectF(x - 40, top, 80, 16), Qt.AlignmentFlag.AlignHCenter
+    return QRectF(right_edge - 80, top, 80, 16), Qt.AlignmentFlag.AlignRight
+
+
 class LossChart(QWidget):
     """Training (blue) and validation (orange) loss over the run's progress (0-100 %)."""
 
@@ -58,11 +78,7 @@ class LossChart(QWidget):
                              tr("The loss appears here while the model trains"))
             painter.end()
             return
-        low, high = min(values), max(values)
-        if high - low < 1e-9:
-            low, high = low - 0.5, high + 0.5
-        pad = 0.05 * (high - low)
-        low, high = low - pad, high + pad
+        low, high = axis_range(values)
 
         def point(x: float, y: float) -> QPointF:
             px = area.left() + area.width() * max(0.0, min(100.0, x)) / 100.0
@@ -152,12 +168,7 @@ class CurveChart(QWidget):
             painter.drawText(area, Qt.AlignmentFlag.AlignCenter, tr(self.empty_text))
             painter.end()
             return
-        low = min(y for _x, y in points)
-        high = max(y for _x, y in points)
-        if high - low < 1e-9:
-            low, high = low - 0.5, high + 0.5
-        pad = 0.05 * (high - low)
-        low, high = low - pad, high + pad
+        low, high = axis_range([y for _x, y in points])
         right = max(x for x, _y in points) or 1.0
 
         def point(x: float, y: float) -> QPointF:
@@ -176,8 +187,8 @@ class CurveChart(QWidget):
                              f"{y:.3g}")
         for x in (0.0, right / 2, right):
             p = point(x, low)
-            painter.drawText(QRectF(p.x() - 40, area.bottom() + 3, 80, 16),
-                             Qt.AlignmentFlag.AlignCenter, number(x, ",.0f"))
+            rect, align = tick_label(p.x(), area.bottom() + 3, self.width() - 2.0)
+            painter.drawText(rect, align | Qt.AlignmentFlag.AlignVCenter, number(x, ",.0f"))
         painter.drawText(QRectF(area.left(), area.bottom() + 3, area.width() / 2 - 44, 16),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          f"   {tr(self.x_label)}")
