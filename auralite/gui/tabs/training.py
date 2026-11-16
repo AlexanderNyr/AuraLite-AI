@@ -334,6 +334,55 @@ class TrainTabMixin:
         ttk.Entry(row2, textvariable=self.autosave_var,
                   width=5).pack(side=tk.LEFT, padx=4)
 
+        m5_frame = ttk.LabelFrame(tab, text=tr("  Optimizations & Stability  "),
+                                  padding="10")
+        m5_frame.pack(fill=tk.X, pady=(0, 8))
+
+        m5_row1 = ttk.Frame(m5_frame)
+        m5_row1.pack(fill=tk.X, pady=2)
+
+        self.depth_scaled_init_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(m5_row1, text=tr("Depth-scaled Init (residual 1/sqrt(2L))"),
+                        variable=self.depth_scaled_init_var).pack(side=tk.LEFT, padx=4)
+
+        self.truncated_init_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(m5_row1, text=tr("Truncated Normal Init ([-3σ, 3σ])"),
+                        variable=self.truncated_init_var).pack(side=tk.LEFT, padx=(12, 4))
+
+        ttk.Label(m5_row1, text=tr("Init Std:")).pack(side=tk.LEFT, padx=(8, 2))
+        self.init_std_var = tk.StringVar(value="0.02")
+        ttk.Entry(m5_row1, textvariable=self.init_std_var, width=6).pack(side=tk.LEFT, padx=2)
+
+        m5_row2 = ttk.Frame(m5_frame)
+        m5_row2.pack(fill=tk.X, pady=2)
+
+        self.use_layer_scale_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(m5_row2, text=tr("LayerScale (learnable branch scales)"),
+                        variable=self.use_layer_scale_var).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(m5_row2, text=tr("LayerScale Init:")).pack(side=tk.LEFT, padx=(8, 2))
+        self.layer_scale_init_var = tk.StringVar(value="1e-4")
+        ttk.Entry(m5_row2, textvariable=self.layer_scale_init_var, width=7).pack(side=tk.LEFT, padx=2)
+
+        self.fuse_projections_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(m5_row2, text=tr("Fused Projections (QKV + SwiGLU / _muon_splits)"),
+                        variable=self.fuse_projections_var).pack(side=tk.LEFT, padx=(16, 4))
+
+        m5_row3 = ttk.Frame(m5_frame)
+        m5_row3.pack(fill=tk.X, pady=2)
+
+        self.stochastic_round_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(m5_row3, text=tr("Stochastic Rounding (BF16 Muon)"),
+                        variable=self.stochastic_round_var).pack(side=tk.LEFT, padx=4)
+
+        self.async_bookkeeper_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(m5_row3, text=tr("Async Bookkeeper (non-blocking CUDA telemetry)"),
+                        variable=self.async_bookkeeper_var).pack(side=tk.LEFT, padx=(12, 4))
+
+        ttk.Label(m5_row3, text=tr("Lag Steps:")).pack(side=tk.LEFT, padx=(8, 2))
+        self.bookkeeper_lag_var = tk.StringVar(value="3")
+        ttk.Entry(m5_row3, textvariable=self.bookkeeper_lag_var, width=4).pack(side=tk.LEFT, padx=2)
+
         # ---- File + start/stop -----------------------------------------
         run_frame = ttk.LabelFrame(tab, text=tr("  🚀  Run  "), padding="10")
         run_frame.pack(fill=tk.X, pady=(0, 8))
@@ -673,7 +722,16 @@ class TrainTabMixin:
                 "autosave_every": self.autosave_var, "chat_template": self.dialog_template_var,
                 "pack_dialogs": self.dialog_pack_var, "prompt_weight": self.prompt_weight_var,
                 "pref_method": self.pref_method_var, "pref_beta": self.pref_beta_var,
-                "pref_lr": self.pref_lr_var, "pref_epochs": self.pref_epochs_var}
+                "pref_lr": self.pref_lr_var, "pref_epochs": self.pref_epochs_var,
+                "depth_scaled_init": self.depth_scaled_init_var,
+                "truncated_init": self.truncated_init_var,
+                "init_std": self.init_std_var,
+                "use_layer_scale": self.use_layer_scale_var,
+                "layer_scale_init": self.layer_scale_init_var,
+                "fuse_projections": self.fuse_projections_var,
+                "stochastic_round": self.stochastic_round_var,
+                "async_bookkeeper": self.async_bookkeeper_var,
+                "bookkeeper_lag": self.bookkeeper_lag_var}
 
     def train_form(self) -> dict:
         """The Train tab's fields as text and checkboxes (a settings file's, a run's)."""
@@ -1210,6 +1268,15 @@ class TrainTabMixin:
                 # 2.18: split the batch and recompute activations when the run
                 # would not fit the memory (instead of running out of it)
                 "memory_plan": "auto",
+                "depth_scaled_init": bool(self.depth_scaled_init_var.get()),
+                "truncated_init": bool(self.truncated_init_var.get()),
+                "init_std": float(self.init_std_var.get() or 0.02),
+                "use_layer_scale": bool(self.use_layer_scale_var.get()),
+                "layer_scale_init": float(self.layer_scale_init_var.get() or 1e-4),
+                "fuse_projections": bool(self.fuse_projections_var.get()),
+                "stochastic_round": bool(self.stochastic_round_var.get()),
+                "async_bookkeeper": bool(self.async_bookkeeper_var.get()),
+                "bookkeeper_lag": int(self.bookkeeper_lag_var.get() or 3),
             }
         except ValueError:
             messagebox.showerror(tr("Params Error"),

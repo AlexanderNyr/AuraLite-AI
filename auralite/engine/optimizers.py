@@ -12,6 +12,11 @@ import torch.nn as nn
 import torch.optim as optim
 import logging
 
+from auralite.kernels.stochastic_round import (
+    stochastic_round_to_dtype,
+    triton_stochastic_round,
+)
+
 logger = logging.getLogger("auralite")
 
 
@@ -35,8 +40,8 @@ def _newton_schulz_ortho(grad: torch.Tensor, ns_steps: int, eps: float) -> torch
 
     for _ in range(ns_steps):
         gram = X @ X.mT
-        B = b * gram + c * (gram @ gram)
-        X = a * X + B @ X
+        gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+        X = torch.addmm(X, gram_update, X, beta=a, alpha=1.0)
 
     if transpose:
         X = X.mT
@@ -68,12 +73,14 @@ class Muon(optim.Optimizer):
     def __init__(self, params, lr: float = 0.02, weight_decay: float = 0.0,
                  momentum: float = 0.95, nesterov: bool = True,
                  ns_steps: int = 5, eps: float = 1e-7,
-                 adjust_lr_fn: str = "match_rms_adamw"):
+                 adjust_lr_fn: str = "match_rms_adamw",
+                 stochastic_round: bool = True):
         if adjust_lr_fn not in ("original", "match_rms_adamw", "spectral_unclamped"):
             raise ValueError(f"Unknown adjust_lr_fn: {adjust_lr_fn!r}")
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
                         nesterov=nesterov, ns_steps=ns_steps, eps=eps,
-                        adjust_lr_fn=adjust_lr_fn)
+                        adjust_lr_fn=adjust_lr_fn,
+                        stochastic_round=stochastic_round)
         super().__init__(params, defaults)
         for group in self.param_groups:
             for p in group["params"]:
@@ -111,16 +118,38 @@ class Muon(optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(grad)
                 buf = state["momentum_buffer"]
 
-                # buf = buf * momentum + grad * (1 - momentum) in fp32
-                buf.lerp_(grad.to(torch.float32), 1.0 - momentum)
-                update = grad.to(torch.float32).lerp_(buf, momentum) if nesterov else buf
+                use_sr     = group.get("stochastic_round", True)
 
-                ortho = _newton_schulz_ortho(update, ns_steps, eps)
-                adjusted_lr = _muon_adjust_lr(lr, adjust_fn, p.shape)
+                # Обновляем буффер моментума в FP32 с стохастическим округлением
+                new_buf_fp32 = torch.lerp(buf.float(), grad.float(), 1.0 - momentum)
+                if use_sr:
+                    triton_stochastic_round(new_buf_fp32, buf.dtype, out=buf)
+                else:
+                    buf.copy_(new_buf_fp32.to(buf.dtype))
 
+                update = grad.float().lerp(buf.float(), momentum) if nesterov else buf.float()
+
+                p_fp32 = p.float()
                 if wd:
-                    p.mul_(1.0 - lr * wd)
-                p.add_(ortho.to(p.dtype), alpha=-adjusted_lr)
+                    p_fp32.mul_(1.0 - lr * wd)
+
+                splits = getattr(p, "_muon_splits", None)
+                if splits is not None:
+                    update_chunks = torch.split(update, splits, dim=0)
+                    p_chunks = torch.split(p_fp32, splits, dim=0)
+                    for u_chunk, p_chunk in zip(update_chunks, p_chunks):
+                        ortho_chunk = _newton_schulz_ortho(u_chunk, ns_steps, eps)
+                        chunk_lr = _muon_adjust_lr(lr, adjust_fn, u_chunk.shape)
+                        p_chunk.add_(ortho_chunk.float(), alpha=-chunk_lr)
+                else:
+                    ortho = _newton_schulz_ortho(update, ns_steps, eps)
+                    adjusted_lr = _muon_adjust_lr(lr, adjust_fn, p.shape)
+                    p_fp32.add_(ortho.float(), alpha=-adjusted_lr)
+
+                if use_sr:
+                    triton_stochastic_round(p_fp32, p.dtype, out=p)
+                else:
+                    p.copy_(p_fp32.to(p.dtype))
 
         return loss
 
@@ -217,4 +246,4 @@ class _ChainedOptimizers:
             opt.load_state_dict(sub)
 
 
-__all__ = ["Muon", "split_parameters_for_muon"]
+__all__ = ["Muon", "split_parameters_for_muon", "stochastic_round_to_dtype", "triton_stochastic_round"]
