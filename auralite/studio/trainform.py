@@ -45,7 +45,7 @@ FORM_DEFAULTS: dict[str, Any] = {
     "pref_method": "dpo", "pref_beta": "auto", "pref_lr": "auto", "pref_epochs": "auto",
     "depth_scaled_init": True, "truncated_init": True, "init_std": "0.02",
     "use_layer_scale": False, "layer_scale_init": "1e-4", "fuse_projections": False,
-    "stochastic_round": True, "async_bookkeeper": True, "bookkeeper_lag": "3",
+    "stochastic_round": True, "native_bf16": False, "async_bookkeeper": True, "bookkeeper_lag": "3",
 }
 #: The classic settings files' number fields (2.26 and before), as the form names them.
 _CONFIG_NUMBERS = ("lr", "epochs", "d_model", "d_ff", "n_heads", "n_layers", "seq_length",
@@ -119,6 +119,7 @@ def settings_from_form(form: dict[str, Any]) -> dict[str, Any]:
         layer_scale_init=float(_text(f["layer_scale_init"]) or 1e-4),
         fuse_projections=bool(f["fuse_projections"]),
         stochastic_round=bool(f["stochastic_round"]),
+        native_bf16=bool(f.get("native_bf16", False)) and bool(f.get("stochastic_round", True)),
         async_bookkeeper=bool(f["async_bookkeeper"]),
         bookkeeper_lag=int(_text(f["bookkeeper_lag"]) or 3))
     out = settings.to_dict()
@@ -179,6 +180,7 @@ def form_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "layer_scale_init": str(s.layer_scale_init),
         "fuse_projections": bool(s.fuse_projections),
         "stochastic_round": bool(s.stochastic_round),
+        "native_bf16": bool(s.native_bf16),
         "async_bookkeeper": bool(s.async_bookkeeper),
         "bookkeeper_lag": str(int(s.bookkeeper_lag)),
     })
@@ -243,6 +245,7 @@ def form_from_params(params: dict[str, Any]) -> dict[str, Any]:
                       ("use_layer_scale", "use_layer_scale"),
                       ("fuse_projections", "fuse_projections"),
                       ("stochastic_round", "stochastic_round"),
+                      ("native_bf16", "native_bf16"),
                       ("async_bookkeeper", "async_bookkeeper")):
         if key in p:
             form[name] = bool(p[key])
@@ -309,6 +312,7 @@ def form_from_config(config: dict[str, Any], base: dict[str, Any] | None = None
                       ("use_layer_scale", "use_layer_scale"),
                       ("fuse_projections", "fuse_projections"),
                       ("stochastic_round", "stochastic_round"),
+                      ("native_bf16", "native_bf16"),
                       ("async_bookkeeper", "async_bookkeeper")):
         if key in c:
             form[name] = bool(c[key])

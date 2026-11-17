@@ -175,6 +175,26 @@ def split_parameters_for_muon(model: nn.Module):
             adam_decay.append(param)
     return muon_params, adam_decay, adam_no_decay
 
+
+def setup_native_bf16_precision(model: nn.Module) -> tuple[int, int]:
+    """подготовка параметров для нативного обучения в BF16:
+    - 2D параметры трансформера остаются в bfloat16.
+    - Эмбеддинги, нормализации, LM голова, смещения, и layerscale остаются в float32.
+
+    """
+    muon_params, adam_decay, adam_no_decay = split_parameters_for_muon(model)
+    n_bf16 = 0
+    for p in muon_params:
+        p.data = p.data.to(torch.bfloat16)
+        n_bf16 += 1
+
+    n_fp32 = 0
+    for p in adam_decay + adam_no_decay:
+        p.data = p.data.to(torch.float32)
+        n_fp32 += 1
+
+    return n_bf16, n_fp32
+
 def _no_weight_decay(name: str, param: torch.Tensor) -> bool:
     """Norm gains, embeddings, biases and other <2-D tensors are not decayed."""
     return "norm" in name or "embedding" in name or param.ndim < 2
@@ -246,4 +266,4 @@ class _ChainedOptimizers:
             opt.load_state_dict(sub)
 
 
-__all__ = ["Muon", "split_parameters_for_muon", "stochastic_round_to_dtype", "triton_stochastic_round"]
+__all__ = ["Muon", "split_parameters_for_muon", "setup_native_bf16_precision", "stochastic_round_to_dtype", "triton_stochastic_round"]

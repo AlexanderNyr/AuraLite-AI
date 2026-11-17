@@ -5,6 +5,7 @@ every 10 minutes (as the Studio's Train tab), so it can continue after a stop, a
 power cut; the settings files are the Studio's (older ones still load), and *Repeat* in the
 Library fills the tab from a run (`studio/trainform.py`).
 """
+import contextlib
 import json
 
 from auralite import runs as runlib
@@ -372,8 +373,29 @@ class TrainTabMixin:
         m5_row3.pack(fill=tk.X, pady=2)
 
         self.stochastic_round_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(m5_row3, text=tr("Stochastic Rounding (BF16 Muon)"),
-                        variable=self.stochastic_round_var).pack(side=tk.LEFT, padx=4)
+        self.native_bf16_var = tk.BooleanVar(value=False)
+
+        def _on_stochastic_round_toggle(*_):
+            is_sr = bool(self.stochastic_round_var.get())
+            if hasattr(self, "native_bf16_cb"):
+                self.native_bf16_cb.config(state=tk.NORMAL if is_sr else tk.DISABLED)
+            if not is_sr:
+                self.native_bf16_var.set(False)
+
+        self._on_stochastic_round_toggle = _on_stochastic_round_toggle
+        self.stochastic_round_cb = ttk.Checkbutton(
+            m5_row3, text=tr("Stochastic Rounding (BF16 Muon)"),
+            variable=self.stochastic_round_var,
+            command=_on_stochastic_round_toggle)
+        self.stochastic_round_cb.pack(side=tk.LEFT, padx=4)
+
+        self.native_bf16_cb = ttk.Checkbutton(
+            m5_row3, text=tr("Native BF16"),
+            variable=self.native_bf16_var)
+        self.native_bf16_cb.pack(side=tk.LEFT, padx=(6, 4))
+        with contextlib.suppress(Exception):
+            self.stochastic_round_var.trace_add("write", _on_stochastic_round_toggle)
+        _on_stochastic_round_toggle()
 
         self.async_bookkeeper_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(m5_row3, text=tr("Async Bookkeeper (non-blocking CUDA telemetry)"),
@@ -730,6 +752,7 @@ class TrainTabMixin:
                 "layer_scale_init": self.layer_scale_init_var,
                 "fuse_projections": self.fuse_projections_var,
                 "stochastic_round": self.stochastic_round_var,
+                "native_bf16": self.native_bf16_var,
                 "async_bookkeeper": self.async_bookkeeper_var,
                 "bookkeeper_lag": self.bookkeeper_lag_var}
 
@@ -1275,6 +1298,7 @@ class TrainTabMixin:
                 "layer_scale_init": float(self.layer_scale_init_var.get() or 1e-4),
                 "fuse_projections": bool(self.fuse_projections_var.get()),
                 "stochastic_round": bool(self.stochastic_round_var.get()),
+                "native_bf16": bool(self.native_bf16_var.get()) and bool(self.stochastic_round_var.get()),
                 "async_bookkeeper": bool(self.async_bookkeeper_var.get()),
                 "bookkeeper_lag": int(self.bookkeeper_lag_var.get() or 3),
             }

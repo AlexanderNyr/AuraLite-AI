@@ -446,6 +446,9 @@ class TrainerMixin:
         """
         self.model.eval()
         total, count = 0.0, 0
+        use_amp = getattr(self, "_use_amp", False)
+        amp_device = getattr(self, "_amp_device", self.device.type if self.device.type in ("cuda", "cpu") else "cpu")
+        amp_t = getattr(self, "_amp_t", None)
         try:
             n_batches = len(loader) if hasattr(loader, "__len__") else 0
             if max_batches is not None and n_batches:
@@ -455,13 +458,14 @@ class TrainerMixin:
                     break
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
-                if chunked is not None:
-                    hidden = self.model(xb, return_hidden=True)
-                    loss = chunked(hidden.reshape(-1, hidden.size(-1)),
-                                   cast(Any, self.model).head.weight, yb.reshape(-1))
-                else:
-                    out = self.model(xb)
-                    loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
+                with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
+                    if chunked is not None:
+                        hidden = self.model(xb, return_hidden=True)
+                        loss = chunked(hidden.reshape(-1, hidden.size(-1)),
+                                       cast(Any, self.model).head.weight, yb.reshape(-1))
+                    else:
+                        out = self.model(xb)
+                        loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
                 # 2.15: dialogs learn only some targets; plain text learns all
                 learned = int((yb != IGNORE_INDEX).sum())
                 total += loss.item() * learned
@@ -1860,6 +1864,11 @@ class TrainerMixin:
         if params.get("fuse_projections", False) and hasattr(native_model, "fuse_projections"):
             native_model.fuse_projections()
             logger.info("[AuraLite] Fused linear projections: QKV attention and SwiGLU FFN with _muon_splits")
+        native_bf16 = bool(params.get("native_bf16", False))
+        if native_bf16:
+            from .optimizers import setup_native_bf16_precision
+            n_bf16, n_fp32 = setup_native_bf16_precision(native_model)
+            logger.info(f"[AuraLite] Native BF16 precision enabled: {n_bf16} Muon matrices in BF16, {n_fp32} AdamW params in FP32")
         if resuming and "use_gradient_checkpointing" in params \
                 and hasattr(native_model, "set_gradient_checkpointing"):
             # 2.18: also for a loaded model (it was a constructor argument only)
@@ -1923,6 +1932,9 @@ class TrainerMixin:
                 optimizer_name = "adamw"
             else:
                 stochastic_round = bool(params.get("stochastic_round", True))
+                if native_bf16 and not stochastic_round:
+                    logger.warning("[AuraLite] Native BF16 training requires stochastic rounding. Enabling stochastic_round.")
+                    stochastic_round = True
                 sub_optimizers = [
                     Muon(muon_params, lr=muon_lr, momentum=muon_momentum,
                          weight_decay=weight_decay, adjust_lr_fn=muon_adjust_lr,
@@ -2001,6 +2013,8 @@ class TrainerMixin:
         #   "bf16" — autocast bf16 on CUDA *and* CPU (bf16 needs no scaler);
         #            bf16 is far more forgiving than fp16 for training
         #   "none" — force full fp32 everywhere (debugging / determinism)
+        if native_bf16 and not params.get("amp_dtype"):
+            amp_dtype = "bf16"
         if amp_dtype == "none":
             use_amp = False
             amp_t = None
@@ -2012,7 +2026,10 @@ class TrainerMixin:
             amp_t = torch.float16
         amp_device = self.device.type if self.device.type in ("cuda", "cpu") else "cpu"
         self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=bool(use_amp and amp_t is torch.float16))
+            "cuda", enabled=bool(use_amp and amp_t is torch.float16 and not native_bf16))
+        self._use_amp = use_amp
+        self._amp_device = amp_device
+        self._amp_t = amp_t
         if use_amp:
             logger.info(f"[AuraLite] AMP: {amp_dtype} autocast on {amp_device}")
         if scaler_state_to_restore is not None:

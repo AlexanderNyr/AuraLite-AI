@@ -540,7 +540,10 @@ class Attention(nn.Module):
 
     def _proj(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """The projection `name` of `x`, plus its LoRA adapter's delta if it has one."""
-        out = getattr(self, name)(x)
+        proj = getattr(self, name)
+        if hasattr(proj, "weight") and x.dtype != proj.weight.dtype and not torch.is_autocast_enabled():
+            x = x.to(proj.weight.dtype)
+        out = proj(x)
         lora = self.lora
         if lora is not None and name in lora:
             out = out + lora[name](x)
@@ -566,6 +569,15 @@ class Attention(nn.Module):
         W_qkv.weight._muon_splits = (self.q_dim, self.kv_dim, self.kv_dim)
         self.W_qkv = W_qkv
         self.fused_qkv = True
+        self.W_q.weight.requires_grad_(False)
+        self.W_k.weight.requires_grad_(False)
+        self.W_v.weight.requires_grad_(False)
+        if self.W_q.bias is not None:
+            self.W_q.bias.requires_grad_(False)
+        if self.W_k.bias is not None:
+            self.W_k.bias.requires_grad_(False)
+        if self.W_v.bias is not None:
+            self.W_v.bias.requires_grad_(False)
 
     # ---- Forward -----------------------------------------------------
     def forward(self, x: torch.Tensor,
@@ -574,6 +586,8 @@ class Attention(nn.Module):
         B, T, _ = x.shape
 
         if self.fused_qkv and self.W_qkv is not None and self.lora is None:
+            if x.dtype != self.W_qkv.weight.dtype and not torch.is_autocast_enabled():
+                x = x.to(self.W_qkv.weight.dtype)
             qkv = self.W_qkv(x)
             q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
             q = q.view(B, T, self.n_heads,    self.head_dim)
@@ -735,10 +749,14 @@ class FeedForward(nn.Module):
         gate_up_proj.weight._muon_splits = (self.d_ff, self.d_ff)
         self.gate_up_proj = gate_up_proj
         self.fused = True
+        self.gate.weight.requires_grad_(False)
+        self.up.weight.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused and self.gate_up_proj is not None and self.lora is None:
             from auralite.kernels.swiglu import apply_swiglu
+            if x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
+                x = x.to(self.gate_up_proj.weight.dtype)
             return self.down(apply_swiglu(self.gate_up_proj(x)))
         if self.lora is None:
             return self.down(F.silu(self.gate(x)) * self.up(x))
@@ -993,6 +1011,8 @@ class PositionWiseFeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from auralite.kernels.swiglu import apply_swiglu
+        if hasattr(self.gate_up_proj, "weight") and x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
+            x = x.to(self.gate_up_proj.weight.dtype)
         gate_up = self.gate_up_proj(x)
         activated = apply_swiglu(gate_up)
         return self.down_proj(activated)
@@ -1021,6 +1041,8 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, q_in: torch.Tensor, k_in=None, v_in=None, mask=None, apply_rope: bool = True, cos=None, sin=None):
         batch_size, seq_len, _ = q_in.shape
+        if hasattr(self.W_qkv, "weight") and q_in.dtype != self.W_qkv.weight.dtype and not torch.is_autocast_enabled():
+            q_in = q_in.to(self.W_qkv.weight.dtype)
         qkv = self.W_qkv(q_in)
         q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 

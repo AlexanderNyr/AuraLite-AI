@@ -286,6 +286,11 @@ class TrainTab(QWidget):
         self.stochastic_round.setChecked(True)
         adv.addRow("", self.stochastic_round)
 
+        self.native_bf16 = QCheckBox(tr("Native BF16 training"))
+        self.native_bf16.setChecked(False)
+        self.stochastic_round.toggled.connect(self._sync_native_bf16_state)
+        adv.addRow("", self.native_bf16)
+
         self.async_bookkeeper = QCheckBox(tr("Async Bookkeeper (non-blocking CUDA telemetry)"))
         self.async_bookkeeper.setChecked(True)
         self.bookkeeper_lag = QSpinBox()
@@ -582,6 +587,11 @@ class TrainTab(QWidget):
                              n_layers=int(self.layers.value()), n_heads=int(self.heads.value()),
                              n_kv_heads=int(self.kv_heads.value()), d_ff=int(self.ffn.value()))
 
+    def _sync_native_bf16_state(self, checked: bool) -> None:
+        self.native_bf16.setEnabled(checked)
+        if not checked:
+            self.native_bf16.setChecked(False)
+
     def settings(self) -> TrainSettings:
         lr_text = self.lr.text().strip().lower()
         autosave = int(self.autosave.value())
@@ -621,6 +631,7 @@ class TrainTab(QWidget):
             layer_scale_init=float(self.layer_scale_init.text().strip() or 1e-4),
             fuse_projections=self.fuse_projections.isChecked(),
             stochastic_round=self.stochastic_round.isChecked(),
+            native_bf16=self.native_bf16.isChecked() and self.stochastic_round.isChecked(),
             async_bookkeeper=self.async_bookkeeper.isChecked(),
             bookkeeper_lag=int(self.bookkeeper_lag.value()))
 
@@ -687,6 +698,8 @@ class TrainTab(QWidget):
         self.layer_scale_init.setText(str(s.layer_scale_init))
         self.fuse_projections.setChecked(bool(s.fuse_projections))
         self.stochastic_round.setChecked(bool(s.stochastic_round))
+        self.native_bf16.setEnabled(bool(s.stochastic_round))
+        self.native_bf16.setChecked(bool(s.native_bf16 and s.stochastic_round))
         self.async_bookkeeper.setChecked(bool(s.async_bookkeeper))
         self.bookkeeper_lag.setValue(int(s.bookkeeper_lag))
         self._size_changed()

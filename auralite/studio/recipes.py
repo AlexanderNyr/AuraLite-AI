@@ -124,6 +124,7 @@ class TrainSettings:
     layer_scale_init: float = 1e-4
     fuse_projections: bool = False
     stochastic_round: bool = True
+    native_bf16: bool = False
     async_bookkeeper: bool = True
     bookkeeper_lag: int = 3
 
@@ -316,6 +317,7 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
     params["layer_scale_init"] = float(s.layer_scale_init)
     params["fuse_projections"] = bool(s.fuse_projections)
     params["stochastic_round"] = bool(s.stochastic_round)
+    params["native_bf16"] = bool(s.native_bf16)
     params["async_bookkeeper"] = bool(s.async_bookkeeper)
     params["bookkeeper_lag"] = int(s.bookkeeper_lag)
     if int(s.autosave_every) > 0:

@@ -458,6 +458,8 @@ class ModernTransformer(nn.Module):
         h = self.final_norm(h)
         if return_hidden:
             return h
+        if hasattr(self.head, "weight") and h.dtype != self.head.weight.dtype and not torch.is_autocast_enabled():
+            h = h.to(self.head.weight.dtype)
         return self.head(h)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
