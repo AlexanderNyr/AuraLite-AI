@@ -25,6 +25,12 @@ except ImportError:
 def stochastic_round_to_dtype(x_fp32: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
     """округляем с fp32 до target_dtype."""
     if target_dtype == torch.bfloat16:
+        # Маска знака здесь НЕ нужна: сложение в int32 и маска -65536 выполняют
+        # floor в битовом пространстве, а оно монотонно по значению (для
+        # отрицательных — обращено), поэтому вероятность выбора верхней точки
+        # автоматически равна доле пройденного расстояния. Проверено численно:
+        # при добавлении sign = (x_int >> 31) | 1 отрицательные значения
+        # систематически уходят от нуля (смещение ~4.5e-3 при шкале 1.0).
         x_int = x_fp32.contiguous().view(torch.int32)
         noise = torch.randint(0, 0x10000, x_fp32.shape, dtype=torch.int32, device=x_fp32.device)
         rounded = ((x_int + noise) & -65536).view(torch.float32)

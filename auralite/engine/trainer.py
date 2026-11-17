@@ -1754,8 +1754,10 @@ class TrainerMixin:
             self.hf_path = None
 
             use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
-            depth_scaled_init = params.get("depth_scaled_init", True)
-            truncated_init = params.get("truncated_init", True)
+            # False по умолчанию: смена инициализации молча меняет обучение
+            # всем, кто просто обновил версию. Включается явным параметром.
+            depth_scaled_init = params.get("depth_scaled_init", False)
+            truncated_init = params.get("truncated_init", False)
             init_std = params.get("init_std", 0.02)
             use_layer_scale = params.get("use_layer_scale", False)
             layer_scale_init = params.get("layer_scale_init", 1e-4)
