@@ -43,6 +43,9 @@ FORM_DEFAULTS: dict[str, Any] = {
     "compile": False, "continue": False, "tie": False, "autosave_every": "0",
     "chat_template": "chatml", "pack_dialogs": False, "prompt_weight": "auto",
     "pref_method": "dpo", "pref_beta": "auto", "pref_lr": "auto", "pref_epochs": "auto",
+    "depth_scaled_init": True, "truncated_init": True, "init_std": "0.02",
+    "use_layer_scale": False, "layer_scale_init": "1e-4", "fuse_projections": False,
+    "stochastic_round": True, "native_bf16": False, "async_bookkeeper": True, "bookkeeper_lag": "3",
 }
 #: The classic settings files' number fields (2.26 and before), as the form names them.
 _CONFIG_NUMBERS = ("lr", "epochs", "d_model", "d_ff", "n_heads", "n_layers", "seq_length",
@@ -108,7 +111,17 @@ def settings_from_form(form: dict[str, Any]) -> dict[str, Any]:
         cluster_port=int(_text(f["cluster_port"]) or 29500),
         tokenizer_path=_text(f["tokenizer_path"]) if tokenizer == "file" else "",
         continue_model=bool(f["continue"]), chat_template=_text(f["chat_template"]),
-        prompt_weight=_auto_float(f["prompt_weight"]), pack_dialogs=bool(f["pack_dialogs"]))
+        prompt_weight=_auto_float(f["prompt_weight"]), pack_dialogs=bool(f["pack_dialogs"]),
+        depth_scaled_init=bool(f["depth_scaled_init"]),
+        truncated_init=bool(f["truncated_init"]),
+        init_std=float(_text(f["init_std"]) or 0.02),
+        use_layer_scale=bool(f["use_layer_scale"]),
+        layer_scale_init=float(_text(f["layer_scale_init"]) or 1e-4),
+        fuse_projections=bool(f["fuse_projections"]),
+        stochastic_round=bool(f["stochastic_round"]),
+        native_bf16=bool(f.get("native_bf16", False)) and bool(f.get("stochastic_round", True)),
+        async_bookkeeper=bool(f["async_bookkeeper"]),
+        bookkeeper_lag=int(_text(f["bookkeeper_lag"]) or 3))
     out = settings.to_dict()
     out.update(lora_rank=int(_text(f["lora_rank"]) or 0),
                lora_targets=_text(f["lora_targets"]) or "all",
@@ -160,6 +173,16 @@ def form_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "tie": bool(s.tie_word_embeddings), "autosave_every": str(int(s.autosave_every)),
         "chat_template": s.chat_template or "chatml", "pack_dialogs": bool(s.pack_dialogs),
         "prompt_weight": _optional(None if s.prompt_weight is None else float(s.prompt_weight)),
+        "depth_scaled_init": bool(s.depth_scaled_init),
+        "truncated_init": bool(s.truncated_init),
+        "init_std": _number(float(s.init_std)),
+        "use_layer_scale": bool(s.use_layer_scale),
+        "layer_scale_init": str(s.layer_scale_init),
+        "fuse_projections": bool(s.fuse_projections),
+        "stochastic_round": bool(s.stochastic_round),
+        "native_bf16": bool(s.native_bf16),
+        "async_bookkeeper": bool(s.async_bookkeeper),
+        "bookkeeper_lag": str(int(s.bookkeeper_lag)),
     })
     if settings.get("lora_rank") is not None:
         form["lora_rank"] = str(int(settings["lora_rank"] or 0))
@@ -216,9 +239,22 @@ def form_from_params(params: dict[str, Any]) -> dict[str, Any]:
     for key, name in (("use_alibi", "alibi"), ("use_gradient_checkpointing", "checkpointing"),
                       ("use_ddp", "ddp"), ("use_qk_norm", "qk_norm"), ("use_compile", "compile"),
                       ("continue_training", "continue"), ("tie_word_embeddings", "tie"),
-                      ("dialog_packing", "pack_dialogs")):
+                      ("dialog_packing", "pack_dialogs"),
+                      ("depth_scaled_init", "depth_scaled_init"),
+                      ("truncated_init", "truncated_init"),
+                      ("use_layer_scale", "use_layer_scale"),
+                      ("fuse_projections", "fuse_projections"),
+                      ("stochastic_round", "stochastic_round"),
+                      ("native_bf16", "native_bf16"),
+                      ("async_bookkeeper", "async_bookkeeper")):
         if key in p:
             form[name] = bool(p[key])
+    if p.get("init_std") is not None:
+        form["init_std"] = _number(p["init_std"])
+    if p.get("layer_scale_init") is not None:
+        form["layer_scale_init"] = str(p["layer_scale_init"])
+    if p.get("bookkeeper_lag") is not None:
+        form["bookkeeper_lag"] = str(int(p["bookkeeper_lag"]))
     form["qlora"] = p.get("quantize_base") == "nf4"
     for key, name in (("cluster_workers", "cluster_workers"), ("cluster_port", "cluster_port"),
                       ("autosave_every", "autosave_every")):
@@ -270,9 +306,22 @@ def form_from_config(config: dict[str, Any], base: dict[str, Any] | None = None
     for key, name in (("dialog_packing", "pack_dialogs"), ("use_compile", "compile"),
                       ("use_alibi", "alibi"), ("use_gradient_checkpointing", "checkpointing"),
                       ("use_ddp", "ddp"), ("use_qk_norm", "qk_norm"),
-                      ("tie_word_embeddings", "tie"), ("continue_training", "continue")):
+                      ("tie_word_embeddings", "tie"), ("continue_training", "continue"),
+                      ("depth_scaled_init", "depth_scaled_init"),
+                      ("truncated_init", "truncated_init"),
+                      ("use_layer_scale", "use_layer_scale"),
+                      ("fuse_projections", "fuse_projections"),
+                      ("stochastic_round", "stochastic_round"),
+                      ("native_bf16", "native_bf16"),
+                      ("async_bookkeeper", "async_bookkeeper")):
         if key in c:
             form[name] = bool(c[key])
+    if "init_std" in c:
+        form["init_std"] = str(c["init_std"])
+    if "layer_scale_init" in c:
+        form["layer_scale_init"] = str(c["layer_scale_init"])
+    if "bookkeeper_lag" in c:
+        form["bookkeeper_lag"] = str(c["bookkeeper_lag"])
     if "rope_scaling" in c:
         rope = c["rope_scaling"]
         if rope and isinstance(rope, dict):

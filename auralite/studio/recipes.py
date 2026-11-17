@@ -30,7 +30,9 @@ class SettingsError(ValueError):
     """Settings that cannot work together, explained."""
 
 
-def _from_dict(cls: Any, data: dict[str, Any]) -> Any:
+def _from_dict(cls: Any, data: Any) -> Any:
+    if isinstance(data, cls):
+        return data
     names = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in dict(data).items() if k in names})
 
@@ -115,6 +117,16 @@ class TrainSettings:
     chat_template: str = ""            # dialogs: the template ("": the trainer's, chatml)
     prompt_weight: float | None = None  # dialogs: the prompt's share of the loss (None: auto)
     pack_dialogs: bool = False         # dialogs: whole dialogs per window
+    depth_scaled_init: bool = True
+    truncated_init: bool = True
+    init_std: float = 0.02
+    use_layer_scale: bool = False
+    layer_scale_init: float = 1e-4
+    fuse_projections: bool = False
+    stochastic_round: bool = True
+    native_bf16: bool = False
+    async_bookkeeper: bool = True
+    bookkeeper_lag: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -298,6 +310,16 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
         params["optimizer"] = s.optimizer
     if float(s.time_limit_min) > 0:
         params["time_budget_s"] = 60.0 * float(s.time_limit_min)
+    params["depth_scaled_init"] = bool(s.depth_scaled_init)
+    params["truncated_init"] = bool(s.truncated_init)
+    params["init_std"] = float(s.init_std)
+    params["use_layer_scale"] = bool(s.use_layer_scale)
+    params["layer_scale_init"] = float(s.layer_scale_init)
+    params["fuse_projections"] = bool(s.fuse_projections)
+    params["stochastic_round"] = bool(s.stochastic_round)
+    params["native_bf16"] = bool(s.native_bf16)
+    params["async_bookkeeper"] = bool(s.async_bookkeeper)
+    params["bookkeeper_lag"] = int(s.bookkeeper_lag)
     if int(s.autosave_every) > 0:
         # 2.20: the Studio saves into the run's folder (runs.RunRecorder.checkpoint_params)
         params["autosave_every"] = int(s.autosave_every)

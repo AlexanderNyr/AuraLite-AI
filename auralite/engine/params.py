@@ -36,6 +36,8 @@ KNOWN_TRAIN_PARAMS = frozenset({
     "corpus_cache_path", "d_ff", "d_model", "dialog_loss", "dialog_packing", "dpo_positive",
     "dropout",
     "early_stopping_cooldown", "early_stopping_patience", "epochs", "grad_clip",
+    "depth_scaled_init", "truncated_init", "init_std", "use_layer_scale", "layer_scale_init", "pad_id",
+    "fuse_projections", "stochastic_round", "use_stochastic_round", "native_bf16", "async_bookkeeper", "bookkeeper_lag",
     "eval_every_steps",
     "kv_cache_dtype", "lora_alpha", "lora_embeddings", "lora_lr", "lora_rank", "lora_rslora",
     "lora_targets", "loss_chunk_tokens", "lr", "lr_schedule", "max_steps", "max_tokens",

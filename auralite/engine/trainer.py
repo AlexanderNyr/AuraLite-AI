@@ -46,6 +46,7 @@ from auralite.engine import dialogs as _dialogs
 from auralite.engine import shards as _shards
 from auralite.engine import nf4 as _nf4
 from auralite.engine import sizing as _sizing
+from auralite.engine.bookkeeper import AsyncBookkeeper
 from auralite.engine.corpus import TextCorpus
 from auralite.engine.losses import AUTO_MIN_VALUES, ChunkedLoss, auto_chunk_tokens
 from auralite.engine.shards import TextSources, TokenShards
@@ -445,6 +446,9 @@ class TrainerMixin:
         """
         self.model.eval()
         total, count = 0.0, 0
+        use_amp = getattr(self, "_use_amp", False)
+        amp_device = getattr(self, "_amp_device", self.device.type if self.device.type in ("cuda", "cpu") else "cpu")
+        amp_t = getattr(self, "_amp_t", None)
         try:
             n_batches = len(loader) if hasattr(loader, "__len__") else 0
             if max_batches is not None and n_batches:
@@ -454,13 +458,14 @@ class TrainerMixin:
                     break
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
-                if chunked is not None:
-                    hidden = self.model(xb, return_hidden=True)
-                    loss = chunked(hidden.reshape(-1, hidden.size(-1)),
-                                   cast(Any, self.model).head.weight, yb.reshape(-1))
-                else:
-                    out = self.model(xb)
-                    loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
+                with torch.amp.autocast(amp_device, enabled=use_amp, dtype=amp_t):
+                    if chunked is not None:
+                        hidden = self.model(xb, return_hidden=True)
+                        loss = chunked(hidden.reshape(-1, hidden.size(-1)),
+                                       cast(Any, self.model).head.weight, yb.reshape(-1))
+                    else:
+                        out = self.model(xb)
+                        loss = criterion(out.reshape(-1, out.size(-1)), yb.reshape(-1))
                 # 2.15: dialogs learn only some targets; plain text learns all
                 learned = int((yb != IGNORE_INDEX).sum())
                 total += loss.item() * learned
@@ -1749,6 +1754,12 @@ class TrainerMixin:
             self.hf_path = None
 
             use_gradient_checkpointing = params.get("use_gradient_checkpointing", False)
+            depth_scaled_init = params.get("depth_scaled_init", True)
+            truncated_init = params.get("truncated_init", True)
+            init_std = params.get("init_std", 0.02)
+            use_layer_scale = params.get("use_layer_scale", False)
+            layer_scale_init = params.get("layer_scale_init", 1e-4)
+            pad_id = params.get("pad_id", None)
 
             self.model = ModernTransformer(
                 vocab_size=self.vocab_size,
@@ -1769,6 +1780,12 @@ class TrainerMixin:
                 num_experts=num_experts,
                 tie_word_embeddings=tie_word_embeddings,
                 use_qk_norm=use_qk_norm,
+                depth_scaled_init=depth_scaled_init,
+                truncated_init=truncated_init,
+                init_std=init_std,
+                use_layer_scale=use_layer_scale,
+                layer_scale_init=layer_scale_init,
+                pad_id=pad_id,
             ).to(self.device)
 
             # a new model comes from no Hugging Face checkpoint (2.18.1)
@@ -1844,6 +1861,14 @@ class TrainerMixin:
                 logger.info(f"[AuraLite] LoRA rank {int(lora_rank)} on the continued model "
                             f"({lora_targets}: {', '.join(lora_names)}; a fresh optimizer)")
         native_model: Any = getattr(self.model, "module", self.model)
+        if params.get("fuse_projections", False) and hasattr(native_model, "fuse_projections"):
+            native_model.fuse_projections()
+            logger.info("[AuraLite] Fused linear projections: QKV attention and SwiGLU FFN with _muon_splits")
+        native_bf16 = bool(params.get("native_bf16", False))
+        if native_bf16:
+            from .optimizers import setup_native_bf16_precision
+            n_bf16, n_fp32 = setup_native_bf16_precision(native_model)
+            logger.info(f"[AuraLite] Native BF16 precision enabled: {n_bf16} Muon matrices in BF16, {n_fp32} AdamW params in FP32")
         if resuming and "use_gradient_checkpointing" in params \
                 and hasattr(native_model, "set_gradient_checkpointing"):
             # 2.18: also for a loaded model (it was a constructor argument only)
@@ -1906,10 +1931,14 @@ class TrainerMixin:
                 logger.warning("[AuraLite] WARNING: no eligible 2-D matrices for Muon (LoRA-only?). Using AdamW.")
                 optimizer_name = "adamw"
             else:
+                stochastic_round = bool(params.get("stochastic_round", True))
+                if native_bf16 and not stochastic_round:
+                    logger.warning("[AuraLite] Native BF16 training requires stochastic rounding. Enabling stochastic_round.")
+                    stochastic_round = True
                 sub_optimizers = [
                     Muon(muon_params, lr=muon_lr, momentum=muon_momentum,
                          weight_decay=weight_decay, adjust_lr_fn=muon_adjust_lr,
-                         ns_steps=muon_ns_steps),
+                         ns_steps=muon_ns_steps, stochastic_round=stochastic_round),
                 ]
                 adam_groups = []
                 if adam_decay_params:
@@ -1984,6 +2013,8 @@ class TrainerMixin:
         #   "bf16" — autocast bf16 on CUDA *and* CPU (bf16 needs no scaler);
         #            bf16 is far more forgiving than fp16 for training
         #   "none" — force full fp32 everywhere (debugging / determinism)
+        if native_bf16 and not params.get("amp_dtype"):
+            amp_dtype = "bf16"
         if amp_dtype == "none":
             use_amp = False
             amp_t = None
@@ -1995,7 +2026,10 @@ class TrainerMixin:
             amp_t = torch.float16
         amp_device = self.device.type if self.device.type in ("cuda", "cpu") else "cpu"
         self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=bool(use_amp and amp_t is torch.float16))
+            "cuda", enabled=bool(use_amp and amp_t is torch.float16 and not native_bf16))
+        self._use_amp = use_amp
+        self._amp_device = amp_device
+        self._amp_t = amp_t
         if use_amp:
             logger.info(f"[AuraLite] AMP: {amp_dtype} autocast on {amp_device}")
         if scaler_state_to_restore is not None:
@@ -2572,10 +2606,12 @@ class TrainerMixin:
             run_params = dict(run_state_in.get("params") or run_params)
             rng = run_state_in.get("rng") or {}
             if isinstance(rng.get("torch"), torch.Tensor):
-                torch.set_rng_state(rng["torch"])
+                with contextlib.suppress(Exception):
+                    torch.set_rng_state(rng["torch"].to(dtype=torch.uint8, device="cpu"))
             if rng.get("cuda") is not None and torch.cuda.is_available():
-                with contextlib.suppress(RuntimeError, ValueError):
-                    torch.cuda.set_rng_state_all(rng["cuda"])
+                with contextlib.suppress(Exception):
+                    cuda_states = [s.to(dtype=torch.uint8, device="cpu") if isinstance(s, torch.Tensor) else s for s in rng["cuda"]] if isinstance(rng["cuda"], (list, tuple)) else rng["cuda"]
+                    torch.cuda.set_rng_state_all(cuda_states)
             logger.info(f"[AuraLite] Continuing the run at epoch {start_epoch + 1}/{epochs}, "
                         f"batch {start_batch:,}/{n_loader_batches:,} (optimizer step "
                         f"{run_opt_steps:,}, {tokens_seen:,} tokens so far)")
@@ -2663,6 +2699,14 @@ class TrainerMixin:
             epoch_t0       = time.time()
             last_report_t  = 0.0
 
+            use_async_bookkeeper = bool(params.get("async_bookkeeper", self.device.type == "cuda"))
+            bookkeeper = AsyncBookkeeper(lag_steps=int(params.get("bookkeeper_lag", 2)), window_size=300)
+            if start_loss > 0.0 and epoch == start_epoch:
+                bookkeeper.running_total_loss = start_loss
+                bookkeeper.logged_steps = first_batch
+            self.bookkeeper = bookkeeper
+            accum_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
+
             # IMPROVED: gradient accumulation loop. 2.16: on dialogs a step
             # averages over the tokens it learns (_token_weighted_batches)
             batches: Any = (_token_weighted_batches(loader, accumulation_steps,
@@ -2715,14 +2759,24 @@ class TrainerMixin:
                 stepped = False
                 if (batch_idx + 1) % accumulation_steps == 0:
                     self._scaler_unscale_optimizer()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                     self._scaler_step_optimizer()
                     self.scaler.update()
                     self.scheduler.step()
                     run_opt_steps += 1
                     stepped = True
+                    if use_async_bookkeeper:
+                        accum_loss_gpu = accum_loss_gpu + (loss.detach() * accumulation_steps)
+                        bookkeeper.submit_losses(accum_loss_gpu)
+                        bookkeeper.submit_grad_norm(grad_norm, run_opt_steps)
+                        accum_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
+                        bookkeeper.process_ready_items()
+                        running_loss = bookkeeper.running_total_loss
+                elif use_async_bookkeeper:
+                    accum_loss_gpu = accum_loss_gpu + (loss.detach() * accumulation_steps)
 
-                running_loss += loss.item() * accumulation_steps
+                if not use_async_bookkeeper:
+                    running_loss += loss.item() * accumulation_steps
                 seen_batches += 1
                 completed_batches_total += 1
                 tokens_seen += yb.numel()
@@ -2811,6 +2865,10 @@ class TrainerMixin:
 
                 if budget_done:
                     break
+
+            if use_async_bookkeeper:
+                bookkeeper.process_ready_items(force_all=True)
+                running_loss = bookkeeper.running_total_loss
 
             if seen_batches:
                 last_train_loss = running_loss / seen_batches

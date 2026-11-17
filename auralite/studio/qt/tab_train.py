@@ -255,6 +255,52 @@ class TrainTab(QWidget):
                                     "minutes anyway (Library: Continue); this also saves it "
                                     "after every N epochs"))
         adv.addRow(tr("Save a copy every:"), self.autosave)
+
+        self.depth_scaled_init = QCheckBox(tr("Depth-scaled residual init (1/sqrt(2L))"))
+        self.depth_scaled_init.setChecked(True)
+        adv.addRow("", self.depth_scaled_init)
+
+        self.truncated_init = QCheckBox(tr("Truncated normal weight init ([-3σ, 3σ])"))
+        self.truncated_init.setChecked(True)
+        self.init_std = QDoubleSpinBox()
+        self.init_std.setRange(0.001, 0.5)
+        self.init_std.setSingleStep(0.005)
+        self.init_std.setValue(0.02)
+        std_row = QHBoxLayout()
+        std_row.addWidget(self.truncated_init)
+        std_row.addWidget(self.init_std)
+        adv.addRow(tr("Truncated Init / Std:"), std_row)
+
+        self.use_layer_scale = QCheckBox(tr("LayerScale branch multipliers"))
+        self.layer_scale_init = QLineEdit("1e-4")
+        self.layer_scale_init.setFixedWidth(70)
+        ls_row = QHBoxLayout()
+        ls_row.addWidget(self.use_layer_scale)
+        ls_row.addWidget(self.layer_scale_init)
+        adv.addRow(tr("LayerScale / Init:"), ls_row)
+
+        self.fuse_projections = QCheckBox(tr("Fused linear projections (QKV + SwiGLU / _muon_splits)"))
+        adv.addRow("", self.fuse_projections)
+
+        self.stochastic_round = QCheckBox(tr("Stochastic rounding in BF16 Muon"))
+        self.stochastic_round.setChecked(True)
+        adv.addRow("", self.stochastic_round)
+
+        self.native_bf16 = QCheckBox(tr("Native BF16 training"))
+        self.native_bf16.setChecked(False)
+        self.stochastic_round.toggled.connect(self._sync_native_bf16_state)
+        adv.addRow("", self.native_bf16)
+
+        self.async_bookkeeper = QCheckBox(tr("Async Bookkeeper (non-blocking CUDA telemetry)"))
+        self.async_bookkeeper.setChecked(True)
+        self.bookkeeper_lag = QSpinBox()
+        self.bookkeeper_lag.setRange(0, 20)
+        self.bookkeeper_lag.setValue(3)
+        bk_row = QHBoxLayout()
+        bk_row.addWidget(self.async_bookkeeper)
+        bk_row.addWidget(self.bookkeeper_lag)
+        adv.addRow(tr("Async Bookkeeper / Lag:"), bk_row)
+
         self.advanced.body_layout.addLayout(adv)
         run_form.addRow(self.advanced)
 
@@ -541,6 +587,11 @@ class TrainTab(QWidget):
                              n_layers=int(self.layers.value()), n_heads=int(self.heads.value()),
                              n_kv_heads=int(self.kv_heads.value()), d_ff=int(self.ffn.value()))
 
+    def _sync_native_bf16_state(self, checked: bool) -> None:
+        self.native_bf16.setEnabled(checked)
+        if not checked:
+            self.native_bf16.setChecked(False)
+
     def settings(self) -> TrainSettings:
         lr_text = self.lr.text().strip().lower()
         autosave = int(self.autosave.value())
@@ -572,7 +623,17 @@ class TrainTab(QWidget):
             tokenizer_path=self.tokenizer_path.text().strip(),
             continue_model=self.continue_model.isChecked(),
             chat_template=str(self.template.currentData()),
-            prompt_weight=_auto_float(self.prompt_weight), pack_dialogs=self.pack.isChecked())
+            prompt_weight=_auto_float(self.prompt_weight), pack_dialogs=self.pack.isChecked(),
+            depth_scaled_init=self.depth_scaled_init.isChecked(),
+            truncated_init=self.truncated_init.isChecked(),
+            init_std=float(self.init_std.value()),
+            use_layer_scale=self.use_layer_scale.isChecked(),
+            layer_scale_init=float(self.layer_scale_init.text().strip() or 1e-4),
+            fuse_projections=self.fuse_projections.isChecked(),
+            stochastic_round=self.stochastic_round.isChecked(),
+            native_bf16=self.native_bf16.isChecked() and self.stochastic_round.isChecked(),
+            async_bookkeeper=self.async_bookkeeper.isChecked(),
+            bookkeeper_lag=int(self.bookkeeper_lag.value()))
 
     def apply_settings(self, s: TrainSettings) -> None:
         """Fill the whole form from settings (2.20: Repeat a run of the library)."""
@@ -630,6 +691,17 @@ class TrainTab(QWidget):
         self.prompt_weight.setText("auto" if s.prompt_weight is None
                                    else f"{s.prompt_weight:g}")
         self.pack.setChecked(bool(s.pack_dialogs))
+        self.depth_scaled_init.setChecked(bool(s.depth_scaled_init))
+        self.truncated_init.setChecked(bool(s.truncated_init))
+        self.init_std.setValue(float(s.init_std))
+        self.use_layer_scale.setChecked(bool(s.use_layer_scale))
+        self.layer_scale_init.setText(str(s.layer_scale_init))
+        self.fuse_projections.setChecked(bool(s.fuse_projections))
+        self.stochastic_round.setChecked(bool(s.stochastic_round))
+        self.native_bf16.setEnabled(bool(s.stochastic_round))
+        self.native_bf16.setChecked(bool(s.native_bf16 and s.stochastic_round))
+        self.async_bookkeeper.setChecked(bool(s.async_bookkeeper))
+        self.bookkeeper_lag.setValue(int(s.bookkeeper_lag))
         self._size_changed()
 
     def apply_run(self, run: runlib.Run) -> None:

@@ -472,6 +472,7 @@ def native_config(hf: dict) -> dict:
         "tie_word_embeddings": tie, "use_qk_norm": family in ("qwen3", "qwen3_5"),
         "qk_norm_shared": family in ("qwen3", "qwen3_5"), "head_dim": explicit_head,
         "qkv_bias": family == "qwen2", "norm_eps": float(hf.get("rms_norm_eps", 1e-6)),
+        "depth_scaled_init": False, "truncated_init": False,
     }
     if rotary_dim is not None:
         out["rotary_dim"] = rotary_dim
