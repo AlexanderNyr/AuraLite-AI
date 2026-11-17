@@ -36,6 +36,7 @@ for _name in dir(_legacy):
 # v2.6.5: the memory-mapped corpus helpers live in `auralite.engine.dataset` only —
 # they were added after the decomposition, so they never travelled through
 # `_legacy` (which still re-exports everything it used to define).
+from .bookkeeper import AsyncBookkeeper  
 from .dataset import PagedDataset, write_tokens_memmap  # noqa: E402
 
 # 2.18: big datasets (token shards) and big models (presets, memory plans)

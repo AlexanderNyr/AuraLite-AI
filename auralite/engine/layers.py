@@ -247,6 +247,11 @@ class Attention(nn.Module):
         self.W_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
         self.W_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bool(qkv_bias))
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        # Фьюжнутый QKV с _muon_splits
+        self.q_dim = n_heads * self.head_dim
+        self.kv_dim = self.n_kv_heads * self.head_dim
+        self.fused_qkv = False
+        self.W_qkv: nn.Linear | None = None
         # 2.23: an output gate (Qwen3.5): the heads' output times sigmoid(W_g x), before W_o
         self.output_gate = bool(output_gate)
         if self.output_gate:
@@ -535,7 +540,10 @@ class Attention(nn.Module):
 
     def _proj(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """The projection `name` of `x`, plus its LoRA adapter's delta if it has one."""
-        out = getattr(self, name)(x)
+        proj = getattr(self, name)
+        if hasattr(proj, "weight") and x.dtype != proj.weight.dtype and not torch.is_autocast_enabled():
+            x = x.to(proj.weight.dtype)
+        out = proj(x)
         lora = self.lora
         if lora is not None and name in lora:
             out = out + lora[name](x)
@@ -546,15 +554,49 @@ class Attention(nn.Module):
         if self._cache is not None:
             self._cache.truncate(end)
 
+    def fuse_qkv(self) -> None:
+        """Фьюзит раздробленные W_q, W_k, W_v в одну матрицу W_qkv применяя _muon_splits."""
+        if self.fused_qkv and self.W_qkv is not None:
+            return
+        device = self.W_q.weight.device
+        dtype = self.W_q.weight.dtype
+        has_bias = self.W_q.bias is not None
+        W_qkv = nn.Linear(self.W_q.in_features, self.q_dim + 2 * self.kv_dim, bias=has_bias, device=device, dtype=dtype)
+        with torch.no_grad():
+            W_qkv.weight.copy_(torch.cat([self.W_q.weight, self.W_k.weight, self.W_v.weight], dim=0))
+            if has_bias and self.W_q.bias is not None and self.W_k.bias is not None and self.W_v.bias is not None:
+                W_qkv.bias.copy_(torch.cat([self.W_q.bias, self.W_k.bias, self.W_v.bias], dim=0))
+        W_qkv.weight._muon_splits = (self.q_dim, self.kv_dim, self.kv_dim)
+        self.W_qkv = W_qkv
+        self.fused_qkv = True
+        self.W_q.weight.requires_grad_(False)
+        self.W_k.weight.requires_grad_(False)
+        self.W_v.weight.requires_grad_(False)
+        if self.W_q.bias is not None:
+            self.W_q.bias.requires_grad_(False)
+        if self.W_k.bias is not None:
+            self.W_k.bias.requires_grad_(False)
+        if self.W_v.bias is not None:
+            self.W_v.bias.requires_grad_(False)
+
     # ---- Forward -----------------------------------------------------
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False,
                 capture: dict | None = None) -> torch.Tensor:
         B, T, _ = x.shape
 
-        q = self._proj("W_q", x).view(B, T, self.n_heads,    self.head_dim)
-        k = self._proj("W_k", x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self._proj("W_v", x).view(B, T, self.n_kv_heads, self.head_dim)
+        if self.fused_qkv and self.W_qkv is not None and self.lora is None:
+            if x.dtype != self.W_qkv.weight.dtype and not torch.is_autocast_enabled():
+                x = x.to(self.W_qkv.weight.dtype)
+            qkv = self.W_qkv(x)
+            q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q = q.view(B, T, self.n_heads,    self.head_dim)
+            k = k.view(B, T, self.n_kv_heads, self.head_dim)
+            v = v.view(B, T, self.n_kv_heads, self.head_dim)
+        else:
+            q = self._proj("W_q", x).view(B, T, self.n_heads,    self.head_dim)
+            k = self._proj("W_k", x).view(B, T, self.n_kv_heads, self.head_dim)
+            v = self._proj("W_v", x).view(B, T, self.n_kv_heads, self.head_dim)
 
         # QK-norm: normalize per head BEFORE rotary embeddings.
         if self.use_qk_norm:
@@ -684,13 +726,38 @@ class FeedForward(nn.Module):
 
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
         self.gate = nn.Linear(d_model, d_ff, bias=False)
         self.up   = nn.Linear(d_model, d_ff, bias=False)
         self.down = nn.Linear(d_ff, d_model, bias=False)
+        # Фьюжнутый Gate Up 
+        self.fused = False
+        self.gate_up_proj: nn.Linear | None = None
         # LoRA adapters (None until enable_lora is called on the parent model)
         self.lora: nn.ModuleDict | None = None
 
+    def fuse_projections(self) -> None:
+        """Фьюжит раздробленные gate и up в один gate_up_proj с _muon_splits."""
+        if self.fused and self.gate_up_proj is not None:
+            return
+        device = self.gate.weight.device
+        dtype = self.gate.weight.dtype
+        gate_up_proj = nn.Linear(self.d_model, self.d_ff * 2, bias=False, device=device, dtype=dtype)
+        with torch.no_grad():
+            gate_up_proj.weight.copy_(torch.cat([self.gate.weight, self.up.weight], dim=0))
+        gate_up_proj.weight._muon_splits = (self.d_ff, self.d_ff)
+        self.gate_up_proj = gate_up_proj
+        self.fused = True
+        self.gate.weight.requires_grad_(False)
+        self.up.weight.requires_grad_(False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused and self.gate_up_proj is not None and self.lora is None:
+            from auralite.kernels.swiglu import apply_swiglu
+            if x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
+                x = x.to(self.gate_up_proj.weight.dtype)
+            return self.down(apply_swiglu(self.gate_up_proj(x)))
         if self.lora is None:
             return self.down(F.silu(self.gate(x)) * self.up(x))
         # LoRA path: add low-rank deltas to the projections that have one
@@ -859,7 +926,9 @@ class TransformerBlock(nn.Module):
                  qk_norm_shared: bool = False,
                  rotary_dim: int | None = None,
                  output_gate: bool = False,
-                 linear_attention: dict | None = None):
+                 linear_attention: dict | None = None,
+                 use_layer_scale: bool = False,
+                 layer_scale_init: float = 1e-4):
         super().__init__()
         self.attn_norm = RMSNorm(d_model, eps=norm_eps)
         self.attn: nn.Module
@@ -883,13 +952,27 @@ class TransformerBlock(nn.Module):
         self.ffn       = Top2MoE(d_model, d_ff, num_experts=num_experts) if use_moe else FeedForward(d_model, d_ff)
         self.dropout   = ResidualDropout(dropout) if dropout > 0 else nn.Identity()
         self.use_checkpoint = use_checkpoint
+        self.use_layer_scale = bool(use_layer_scale)
+        if self.use_layer_scale:
+            self.ls_1 = nn.Parameter(torch.ones(d_model) * float(layer_scale_init))
+            self.ls_2 = nn.Parameter(torch.ones(d_model) * float(layer_scale_init))
+        else:
+            self.ls_1 = None
+            self.ls_2 = None
 
     def _forward_impl(self, x: torch.Tensor,
                       start_pos: int = 0, use_cache: bool = False,
                       capture: dict | None = None) -> torch.Tensor:
         """Internal forward pass (used by checkpointing)."""
-        x = x + self.dropout(self.attn(self.attn_norm(x), start_pos, use_cache, capture))
-        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
+        attn_out = self.dropout(self.attn(self.attn_norm(x), start_pos, use_cache, capture))
+        if self.use_layer_scale and self.ls_1 is not None:
+            attn_out = attn_out * self.ls_1
+        x = x + attn_out
+
+        ffn_out = self.dropout(self.ffn(self.ffn_norm(x)))
+        if self.use_layer_scale and self.ls_2 is not None:
+            ffn_out = ffn_out * self.ls_2
+        x = x + ffn_out
         return x
 
     def forward(self, x: torch.Tensor,
@@ -903,5 +986,123 @@ class TransformerBlock(nn.Module):
             )
         return self._forward_impl(x, start_pos, use_cache, capture)
 
+    def fuse_projections(self) -> None:
+        """фьюжнутые QKV проэкции и FFN gate/up проэкции."""
+        if hasattr(self.attn, "fuse_qkv"):
+            self.attn.fuse_qkv()
+        if hasattr(self.ffn, "fuse_projections"):
+            self.ffn.fuse_projections()
+        elif hasattr(self.ffn, "experts"):
+            for expert in self.ffn.experts:
+                if hasattr(expert, "fuse_projections"):
+                    expert.fuse_projections()
 
-__all__ = ["ROPE_TABLE_PREBUILD", "linear_dtype", "RMSNorm", "HeadwiseRMSNorm", "Attention", "FeedForward", "Top2MoE", "ResidualDropout", "TransformerBlock", "_get_flex_attention", "_flex_attention_available", "_flex_block_mask", "_FLEX_COMPILED", "_sdpa_supports_gqa"]
+
+class PositionWiseFeedForward(nn.Module):
+    """FFN с объеденным gate_up_proj и _muon_splits."""
+
+    def __init__(self, d_model: int, d_ff: int, bias: bool = False):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.gate_up_proj = nn.Linear(d_model, d_ff * 2, bias=bias)
+        self.gate_up_proj.weight._muon_splits = (d_ff, d_ff)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from auralite.kernels.swiglu import apply_swiglu
+        if hasattr(self.gate_up_proj, "weight") and x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
+            x = x.to(self.gate_up_proj.weight.dtype)
+        gate_up = self.gate_up_proj(x)
+        activated = apply_swiglu(gate_up)
+        return self.down_proj(activated)
+
+
+class GroupedQueryAttention(nn.Module):
+    """GQA с фьюжнутым W_qkv и _muon_splits"""
+
+    def __init__(self, d_model: int, num_heads: int, num_kv_heads: int, dropout_rate: float = 0.0):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads
+        self.n_rep = self.num_heads // self.num_kv_heads
+
+        self.q_dim = num_heads * self.head_dim
+        self.kv_dim = num_kv_heads * self.head_dim
+        self.W_qkv = nn.Linear(d_model, self.q_dim + 2 * self.kv_dim, bias=False)
+        self.W_qkv.weight._muon_splits = (self.q_dim, self.kv_dim, self.kv_dim)
+        self.W_o = nn.Linear(num_heads * self.head_dim, d_model, bias=False)
+
+        self.dropout_rate = dropout_rate
+        self.q_norm = HeadwiseRMSNorm(self.num_heads, self.head_dim)
+        self.k_norm = HeadwiseRMSNorm(self.num_kv_heads, self.head_dim)
+
+    def forward(self, q_in: torch.Tensor, k_in=None, v_in=None, mask=None, apply_rope: bool = True, cos=None, sin=None):
+        batch_size, seq_len, _ = q_in.shape
+        if hasattr(self.W_qkv, "weight") and q_in.dtype != self.W_qkv.weight.dtype and not torch.is_autocast_enabled():
+            q_in = q_in.to(self.W_qkv.weight.dtype)
+        qkv = self.W_qkv(q_in)
+        q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if apply_rope:
+            if cos is None or sin is None:
+                t = torch.arange(seq_len, device=q.device, dtype=torch.float32)
+                inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=q.device).float() / self.head_dim))
+                freqs = torch.outer(t, inv_freq)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos, sin = emb.cos()[None, :, :].to(dtype=q.dtype), emb.sin()[None, :, :].to(dtype=q.dtype)
+
+            def rotate_half(x_in):
+                x1, x2 = x_in.chunk(2, dim=-1)
+                return torch.cat((-x2, x1), dim=-1)
+
+            cos_bc = cos.unsqueeze(1)
+            sin_bc = sin.unsqueeze(1)
+            q = (q * cos_bc) + (rotate_half(q) * sin_bc)
+            k = (k * cos_bc) + (rotate_half(k) * sin_bc)
+
+        if self.n_rep > 1:
+            k = k[:, :, None, :, :].expand(batch_size, self.num_kv_heads, self.n_rep, seq_len, self.head_dim).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+            v = v[:, :, None, :, :].expand(batch_size, self.num_kv_heads, self.n_rep, seq_len, self.head_dim).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+
+        context = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout_rate if self.training else 0.0,
+            is_causal=(mask is None),
+        )
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return self.W_o(context)
+
+ # Небольшой рефакторинг
+__all__ = [
+    "ROPE_TABLE_PREBUILD",
+    "linear_dtype",
+    "RMSNorm",
+    "HeadwiseRMSNorm",
+    "Attention",
+    "FeedForward",
+    "PositionWiseFeedForward",
+    "GroupedQueryAttention",
+    "Top2MoE",
+    "ResidualDropout",
+    "TransformerBlock",
+    "_get_flex_attention",
+    "_flex_attention_available",
+    "_flex_block_mask",
+    "_FLEX_COMPILED",
+    "_sdpa_supports_gqa",
+]

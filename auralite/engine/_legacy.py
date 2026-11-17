@@ -2069,7 +2069,7 @@ class AuraLiteEngine(GenerationMixin, TrainerMixin, ContextWindowMixin,
         if isinstance(rng_state, dict):
             try:
                 if rng_state.get("torch") is not None:
-                    torch.set_rng_state(rng_state["torch"])
+                    torch.set_rng_state(rng_state["torch"].to(dtype=torch.uint8, device="cpu"))
                 if torch.cuda.is_available() and rng_state.get("cuda") is not None:
                     torch.cuda.set_rng_state_all(rng_state["cuda"])
                 if rng_state.get("numpy") is not None:

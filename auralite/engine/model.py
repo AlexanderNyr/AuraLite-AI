@@ -12,7 +12,7 @@ import torch.nn as nn
 import logging
 from typing import Any, cast
 
-from .layers import ROPE_TABLE_PREBUILD, Attention, RMSNorm, TransformerBlock
+from .layers import ROPE_TABLE_PREBUILD, Attention, RMSNorm, HeadwiseRMSNorm, TransformerBlock
 from .nf4 import NF4Linear
 
 logger = logging.getLogger("auralite")
@@ -103,7 +103,13 @@ class ModernTransformer(nn.Module):
                  layer_types: list[str] | tuple[str, ...] | None = None,
                  linear_attention: dict | None = None,
                  attn_output_gate: bool = False,
-                 rotary_dim: int | None = None):
+                 rotary_dim: int | None = None,
+                 depth_scaled_init: bool = True,
+                 truncated_init: bool = True,
+                 init_std: float = 0.02,
+                 use_layer_scale: bool = False,
+                 layer_scale_init: float = 1e-4,
+                 pad_id: int | None = None):
         super().__init__()
         # 2.23: hybrid models (Qwen3.5) - `layer_types` says which layers are
         # "linear_attention" (Gated DeltaNet, with the dims of `linear_attention`) and which
@@ -127,6 +133,12 @@ class ModernTransformer(nn.Module):
         self.linear_attention = linear_attention
         self.attn_output_gate = bool(attn_output_gate)
         self.rotary_dim = int(rotary_dim) if rotary_dim else None
+        self.depth_scaled_init = bool(depth_scaled_init)
+        self.truncated_init = bool(truncated_init)
+        self.init_std = float(init_std)
+        self.use_layer_scale = bool(use_layer_scale)
+        self.layer_scale_init = float(layer_scale_init)
+        self.pad_id = int(pad_id) if pad_id is not None and pad_id >= 0 else None
         # 2.18.1: the fields of models imported from Hugging Face (hf_models.py)
         # - an explicit head size, q/k/v biases (Qwen2), the RMSNorm epsilon
         # and one QK-norm scale shared by the heads (Qwen3)
@@ -181,6 +193,8 @@ class ModernTransformer(nn.Module):
                              head_dim=head_dim, qkv_bias=qkv_bias,
                              norm_eps=norm_eps, qk_norm_shared=qk_norm_shared,
                              rotary_dim=rotary_dim, output_gate=attn_output_gate,
+                             use_layer_scale=use_layer_scale,
+                             layer_scale_init=layer_scale_init,
                              linear_attention=(linear_attention if layer_types is not None
                                                and layer_types[i] == "linear_attention"
                                                else None))
@@ -189,8 +203,31 @@ class ModernTransformer(nn.Module):
         self.final_norm  = RMSNorm(d_model, eps=norm_eps)
         self.head        = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Modern weight init (GPT-2 / LLaMA style)
+        # Modern weight init (GPT-2 / LLaMA style / Truncated normal)
         self.apply(self._init_weights)
+
+        # Depthscaled инициализация по слоям
+        # Масштабирует выходные проекции каждого блока пропорционально 1/sqrt(2 * (layer_idx + 1)),
+        # стабилизируя рост дисперсии в resudsial ветке с ростом глубины.
+        if self.depth_scaled_init:
+            for layer_idx, layer in enumerate(self.layers):
+                layer_scale = 1.0 / math.sqrt(2.0 * (layer_idx + 1))
+                with torch.no_grad():
+                    attn = getattr(layer, "attn", None)
+                    if attn is not None and hasattr(attn, "W_o") and hasattr(attn.W_o, "weight"):
+                        attn.W_o.weight.mul_(layer_scale)
+                    ffn = getattr(layer, "ffn", None)
+                    if ffn is not None:
+                        if hasattr(ffn, "down") and hasattr(ffn.down, "weight"):
+                            ffn.down.weight.mul_(layer_scale)
+                        elif hasattr(ffn, "down_proj") and hasattr(ffn.down_proj, "weight"):
+                            ffn.down_proj.weight.mul_(layer_scale)
+                        elif hasattr(ffn, "experts"):
+                            for expert in ffn.experts:
+                                if hasattr(expert, "down") and hasattr(expert.down, "weight"):
+                                    expert.down.weight.mul_(layer_scale)
+                                elif hasattr(expert, "down_proj") and hasattr(expert.down_proj, "weight"):
+                                    expert.down_proj.weight.mul_(layer_scale)
 
         # Weight tying: output head shares the embedding matrix when enabled.
         # Gradients from both the input embedding path and LM-head path accumulate
@@ -340,14 +377,53 @@ class ModernTransformer(nn.Module):
         self.head = new_head
         self.tie_word_embeddings = False
 
-    @staticmethod
-    def _init_weights(module: nn.Module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def fuse_projections(self) -> None:
+        """Фьюжнутая линейная проекция (QKV внимание & SwiGLU FFN)."""
+        for layer in self.layers:
+            if hasattr(layer, "fuse_projections"):
+                layer.fuse_projections()
+
+    def _init_weights(self, module: nn.Module | None = None):
+        if module is None:
+            module = self
+            std = 0.02
+            truncated = True
+            pad_id = None
+        else:
+            std = getattr(self, "init_std", 0.02)
+            truncated = getattr(self, "truncated_init", True)
+            pad_id = getattr(self, "pad_id", None)
+
+        if truncated:
+            if isinstance(module, nn.Linear):
+                torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3.0 * std, b=3.0 * std)
+                if pad_id is not None and pad_id >= 0:
+                    with torch.no_grad():
+                        module.weight[pad_id].fill_(0)
+            elif isinstance(module, (nn.LayerNorm, RMSNorm, HeadwiseRMSNorm)):
+                if hasattr(module, "weight") and module.weight is not None:
+                    torch.nn.init.ones_(module.weight)
+                if hasattr(module, "bias") and module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+        else:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if pad_id is not None and pad_id >= 0:
+                    with torch.no_grad():
+                        module.weight[pad_id].fill_(0)
+            elif isinstance(module, (nn.LayerNorm, RMSNorm, HeadwiseRMSNorm)):
+                if hasattr(module, "weight") and module.weight is not None:
+                    torch.nn.init.ones_(module.weight)
+                if hasattr(module, "bias") and module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor,
                 start_pos: int = 0, use_cache: bool = False,
@@ -371,6 +447,8 @@ class ModernTransformer(nn.Module):
         what `AuraLiteEngine.attention_maps()` turns into an attention matrix
         for the GUI's heatmap. Default None keeps the hot path untouched.
         """
+        if x.device != self.embedding.weight.device:
+            x = x.to(self.embedding.weight.device)
         h = self.embedding(x)
         for index, layer in enumerate(self.layers):
             layer_capture = capture.setdefault(index, {}) if capture is not None else None
@@ -380,6 +458,8 @@ class ModernTransformer(nn.Module):
         h = self.final_norm(h)
         if return_hidden:
             return h
+        if hasattr(self.head, "weight") and h.dtype != self.head.weight.dtype and not torch.is_autocast_enabled():
+            h = h.to(self.head.weight.dtype)
         return self.head(h)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
