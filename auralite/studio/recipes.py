@@ -117,8 +117,8 @@ class TrainSettings:
     chat_template: str = ""            # dialogs: the template ("": the trainer's, chatml)
     prompt_weight: float | None = None  # dialogs: the prompt's share of the loss (None: auto)
     pack_dialogs: bool = False         # dialogs: whole dialogs per window
-    depth_scaled_init: bool = True
-    truncated_init: bool = True
+    depth_scaled_init: bool = False    # 2.28: opt-in, as in the trainer
+    truncated_init: bool = False       # 2.28: opt-in, as in the trainer
     init_std: float = 0.02
     use_layer_scale: bool = False
     layer_scale_init: float = 1e-4
@@ -310,16 +310,18 @@ def pretrain_params(settings: TrainSettings, data_kind: str) -> dict[str, Any]:
         params["optimizer"] = s.optimizer
     if float(s.time_limit_min) > 0:
         params["time_budget_s"] = 60.0 * float(s.time_limit_min)
-    params["depth_scaled_init"] = bool(s.depth_scaled_init)
-    params["truncated_init"] = bool(s.truncated_init)
-    params["init_std"] = float(s.init_std)
-    params["use_layer_scale"] = bool(s.use_layer_scale)
-    params["layer_scale_init"] = float(s.layer_scale_init)
-    params["fuse_projections"] = bool(s.fuse_projections)
-    params["stochastic_round"] = bool(s.stochastic_round)
-    params["native_bf16"] = bool(s.native_bf16)
-    params["async_bookkeeper"] = bool(s.async_bookkeeper)
-    params["bookkeeper_lag"] = int(s.bookkeeper_lag)
+    # 2.28: these switches reach the params only when they differ from the defaults.
+    # Emitting them always overrode the trainer's own defaults (depth_scaled_init was
+    # turned back on by a default Studio session) and broke 2.24's "key for key" run.
+    defaults = TrainSettings()
+    for name, cast in (("depth_scaled_init", bool), ("truncated_init", bool),
+                       ("init_std", float), ("use_layer_scale", bool),
+                       ("layer_scale_init", float), ("fuse_projections", bool),
+                       ("stochastic_round", bool), ("native_bf16", bool),
+                       ("async_bookkeeper", bool), ("bookkeeper_lag", int)):
+        value = cast(getattr(s, name))
+        if value != cast(getattr(defaults, name)):
+            params[name] = value
     if int(s.autosave_every) > 0:
         # 2.20: the Studio saves into the run's folder (runs.RunRecorder.checkpoint_params)
         params["autosave_every"] = int(s.autosave_every)

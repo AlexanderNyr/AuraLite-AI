@@ -60,9 +60,25 @@ class _RMSNormFunction(torch.autograd.Function):
 def linear_dtype(module: nn.Module) -> torch.dtype:
     """The dtype a projection computes in: its weight's, or a 4-bit layer's (2.18.1)."""
     weight = getattr(module, "weight", None)
+    if callable(weight):
+        # int8 dynamic quantization (cpu_quantize=True, $AURALITE_CPU_INT8) exposes
+        # `weight` as a method, so `module.weight.dtype` raised AttributeError.
+        weight = weight()
     if isinstance(weight, torch.Tensor):
         return weight.dtype
     return getattr(module, "dtype", torch.float32)
+
+
+def cast_to_linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """`x` in the dtype `module` computes in (a no-op while autocasting).
+
+    Only a float weight takes a cast: an int8 dynamic-quantized layer keeps a
+    `qint8` weight and wants a float input unchanged (torch issue 74540).
+    """
+    dtype = linear_dtype(module)
+    if dtype.is_floating_point and x.dtype != dtype and not torch.is_autocast_enabled():
+        return x.to(dtype)
+    return x
 
 
 def _rms_norm(module: nn.Module, x: torch.Tensor, weight: torch.Tensor,
@@ -541,8 +557,7 @@ class Attention(nn.Module):
     def _proj(self, name: str, x: torch.Tensor) -> torch.Tensor:
         """The projection `name` of `x`, plus its LoRA adapter's delta if it has one."""
         proj = getattr(self, name)
-        if hasattr(proj, "weight") and x.dtype != proj.weight.dtype and not torch.is_autocast_enabled():
-            x = x.to(proj.weight.dtype)
+        x = cast_to_linear(proj, x)
         out = proj(x)
         lora = self.lora
         if lora is not None and name in lora:
@@ -755,8 +770,7 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused and self.gate_up_proj is not None and self.lora is None:
             from auralite.kernels.swiglu import apply_swiglu
-            if x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
-                x = x.to(self.gate_up_proj.weight.dtype)
+            x = cast_to_linear(self.gate_up_proj, x)
             return self.down(apply_swiglu(self.gate_up_proj(x)))
         if self.lora is None:
             return self.down(F.silu(self.gate(x)) * self.up(x))
@@ -1011,8 +1025,7 @@ class PositionWiseFeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from auralite.kernels.swiglu import apply_swiglu
-        if hasattr(self.gate_up_proj, "weight") and x.dtype != self.gate_up_proj.weight.dtype and not torch.is_autocast_enabled():
-            x = x.to(self.gate_up_proj.weight.dtype)
+        x = cast_to_linear(self.gate_up_proj, x)
         gate_up = self.gate_up_proj(x)
         activated = apply_swiglu(gate_up)
         return self.down_proj(activated)

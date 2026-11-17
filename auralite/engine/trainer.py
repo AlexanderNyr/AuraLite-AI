@@ -1933,7 +1933,10 @@ class TrainerMixin:
                 logger.warning("[AuraLite] WARNING: no eligible 2-D matrices for Muon (LoRA-only?). Using AdamW.")
                 optimizer_name = "adamw"
             else:
-                stochastic_round = bool(params.get("stochastic_round", True))
+                # `use_stochastic_round` was the 2.27 name; keep it readable so
+                # old params files keep working (and stay in KNOWN_TRAIN_PARAMS).
+                stochastic_round = bool(params.get("stochastic_round",
+                                               params.get("use_stochastic_round", True)))
                 if native_bf16 and not stochastic_round:
                     logger.warning("[AuraLite] Native BF16 training requires stochastic rounding. Enabling stochastic_round.")
                     stochastic_round = True

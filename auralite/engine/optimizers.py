@@ -137,7 +137,7 @@ class Muon(optim.Optimizer):
                 if splits is not None:
                     update_chunks = torch.split(update, splits, dim=0)
                     p_chunks = torch.split(p_fp32, splits, dim=0)
-                    for u_chunk, p_chunk in zip(update_chunks, p_chunks):
+                    for u_chunk, p_chunk in zip(update_chunks, p_chunks, strict=True):
                         ortho_chunk = _newton_schulz_ortho(u_chunk, ns_steps, eps)
                         chunk_lr = _muon_adjust_lr(lr, adjust_fn, u_chunk.shape)
                         p_chunk.add_(ortho_chunk.float(), alpha=-chunk_lr)
